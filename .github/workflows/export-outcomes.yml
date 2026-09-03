@@ -1,0 +1,50 @@
+name: 🗄️ Archive Outcome Streams
+
+on:
+  schedule:
+    - cron: "30 18 * * *"   # 18:30 UTC = 00:00 IST — once daily, off the bot's own cron
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needs write, unlike analyze-confluence.yml, to commit the archive
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install --quiet -r requirements.txt
+
+      - name: 🗄️ Export new outcomes since last run
+        id: export
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+        run: |
+          set +e
+          python3 src/export_outcomes.py --data-dir data/outcomes \
+            2>&1 | tee export_output.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## 🗄️ Outcome Archive Export"
+            echo '```'; cat export_output.txt; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: ⚠️ Fail on real error
+        if: steps.export.outputs.exit_code != '0'
+        run: exit 1
+
+      - name: 📦 Commit archive if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/outcomes/
+          if git diff --cached --quiet; then
+            echo "No archive changes to commit."
+          else
+            git commit -m "chore: archive outcome streams $(date -u +%Y-%m-%d)"
+            git push
+          fi
