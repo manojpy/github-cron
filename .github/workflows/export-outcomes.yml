@@ -49,26 +49,28 @@ jobs:
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
+          # Clone data repo with auth
+          git clone https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git /tmp/data-repo
+          
+          # Set git config INSIDE the cloned repo
+          cd /tmp/data-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Clone data repo
-          git clone https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git /tmp/data-repo
-          
           # Copy archive files
           mkdir -p /tmp/data-repo/outcome /tmp/data-repo/shadow
-          cp src/data/outcomes/outcome/*.jsonl /tmp/data-repo/outcome/ 2>/dev/null || true
-          cp src/data/outcomes/shadow/*.jsonl /tmp/data-repo/shadow/ 2>/dev/null || true
+          cp /home/runner/work/github-cron/github-cron/src/data/outcomes/outcome/*.jsonl /tmp/data-repo/outcome/ 2>/dev/null || true
+          cp /home/runner/work/github-cron/github-cron/src/data/outcomes/shadow/*.jsonl /tmp/data-repo/shadow/ 2>/dev/null || true
           
           # Copy state file
-          cp src/data/outcomes/.state.json /tmp/data-repo/ 2>/dev/null || true
+          cp /home/runner/work/github-cron/github-cron/src/data/outcomes/.state.json /tmp/data-repo/ 2>/dev/null || true
           
           # Commit and push
-          cd /tmp/data-repo
           git add .
           if git diff --cached --quiet; then
             echo "No data changes to commit."
             exit 0
           fi
           git commit -m "chore: archive outcome streams $(date -u +%Y-%m-%d)"
+          git remote set-url origin https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git
           git push origin main
