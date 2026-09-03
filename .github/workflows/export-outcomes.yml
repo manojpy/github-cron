@@ -6,8 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # needs write, unlike analyze-confluence.yml, to commit the archive
-  pull-requests: write  # needed to create PR
+  contents: write
 
 jobs:
   archive:
@@ -26,7 +25,7 @@ jobs:
           REDIS_URL: ${{ secrets.REDIS_URL }}
         run: |
           set +e
-          python3 src/export_outcomes.py --data-dir data/outcomes \
+          python3 src/export_outcomes.py --data-dir src/data/outcomes \
             2>&1 | tee export_output.txt
           echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
           {
@@ -38,32 +37,38 @@ jobs:
         if: steps.export.outputs.exit_code != '0'
         run: exit 1
 
-      - name: 📦 Commit and create PR
+      - name: 🧹 Cleanup old archives
+        run: |
+          python3 src/cleanup_outcomes.py \
+            --data-dir src/data/outcomes \
+            --max-age-days 90 \
+            --max-size-mb 100 \
+            --max-total-mb 400
+
+      - name: 📦 Push to data repository
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
-          BRANCH_NAME="archive/outcomes-${{ github.run_id }}"
-          git checkout -b "$BRANCH_NAME"
+          # Clone data repo
+          git clone https://x-access-token:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git /tmp/data-repo
           
-          git add data/outcomes/
+          # Copy archive files
+          mkdir -p /tmp/data-repo/outcome /tmp/data-repo/shadow
+          cp src/data/outcomes/outcome/*.jsonl /tmp/data-repo/outcome/ 2>/dev/null || true
+          cp src/data/outcomes/shadow/*.jsonl /tmp/data-repo/shadow/ 2>/dev/null || true
+          
+          # Copy state file
+          cp src/data/outcomes/.state.json /tmp/data-repo/ 2>/dev/null || true
+          
+          # Commit and push
+          cd /tmp/data-repo
+          git add .
           if git diff --cached --quiet; then
-            echo "No archive changes to commit."
+            echo "No data changes to commit."
             exit 0
           fi
-          
           git commit -m "chore: archive outcome streams $(date -u +%Y-%m-%d)"
-          git push -u origin "$BRANCH_NAME"
-          
-          # Create PR if one doesn't already exist
-          if gh pr view "$BRANCH_NAME" --json number --jq .number 2>/dev/null; then
-            echo "PR already exists for $BRANCH_NAME"
-          else
-            gh pr create \
-              --title "📦 Archive outcome streams $(date -u +%Y-%m-%d)" \
-              --body "Automated archive of outcome_log_stream and shadow_log_stream data." \
-              --base main \
-              --head "$BRANCH_NAME"
-          fi
+          git push origin main
