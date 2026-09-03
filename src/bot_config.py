@@ -7,6 +7,7 @@ import json
 import asyncio
 from pathlib import Path
 from typing import Dict, Any, List, Union, Set
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
@@ -112,6 +113,7 @@ CONFIG_OVERRIDE_ALLOWED_FIELDS: Set[str] = {
 
 BRAIN_DISABLED_KEYS_METADATA_KEY = "brain_disabled_alert_keys"
 CONFIG_OVERRIDE_METADATA_KEY = "config_override"
+PAIR_THRESHOLDS_METADATA_KEY = "pair_confluence_thresholds"
 
 class Constants:
     MIN_WICK_RATIO = 0.2
@@ -147,9 +149,28 @@ class Constants:
     REVERSAL_PRIOR_LEG_MIN_RANGE_MULT = 0.5 
     OSCILLATOR_GROUP_MIN_VOTES = 1
     REVERSAL_MIN_PRIOR_BODY_RATIO: float = 0.40
+    MACRO_CORR_WINDOW = 20
+    MACRO_CORR_LOW = 0.3
+    MACRO_CORR_HIGH = 0.6
+    MACRO_MULT_MODERATE = 1.15
+    MACRO_MULT_FULL = 1.30
+    MACRO_RS_EASE_FACTOR = 0.75
 
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
+
+@dataclass
+class BtcMacroContext:
+    """Snapshot of the macro reference pair's (default BTCUSD) directional
+    state for one run, computed once and passed to every other pair's
+    _apply_and_dispatch_alerts() call. Shadow-mode only for now — see
+    cfg.ENABLE_MACRO_CONTEXT_GATE."""
+    confirmation_buy: bool
+    confirmation_sell: bool
+    adx_ok: bool
+    close: float          # current/trigger 15m candle close
+    open: float            # current/trigger 15m candle open
+    closes: np.ndarray     # recent 15m close series, for rolling correlation
 
 class CompiledPatterns:
     VALID_SYMBOL = re.compile(r'^[A-Z0-9_]+$')
@@ -234,7 +255,12 @@ class BotConfig(BaseModel):
     ENABLE_CONFLUENCE_GATE: bool = Field(default=False) 
     CONFLUENCE_MIN_PCT: float = Field(default=60.0, ge=1.0, le=100.0, description="Min percentage of the achievable confluence total required to pass. Denominator = sum of weights of enabled, non-abstaining votes this cycle, so the threshold auto-scales when votes are enabled/disabled — no manual retuning needed")
     CONFLUENCE_MIN_ABS_SCORE: float = Field(default=18.0, ge=0.0, le=50.0, description="Absolute weighted-score floor required to pass the confluence gate, applied alongside CONFLUENCE_MIN_PCT. The stricter of the two (percentage-of-total vs this fixed floor) wins, so a low-vote-count cycle can't clear the gate on percentage alone")
+    ENABLE_PAIR_THRESHOLDS: bool = Field(default=False, description="If true, a per-pair abs-score floor learned by the brain and stored in Redis (metadata:pair_confluence_thresholds) is used in place of CONFLUENCE_MIN_ABS_SCORE for that pair's confluence gate. Falls back to CONFLUENCE_MIN_ABS_SCORE when no pair-specific value is stored yet, or when this is off")
+    BRAIN_PAIR_THRESHOLD_MIN_SAMPLE: int = Field(default=30, ge=1, description="Minimum resolved-outcome sample size a pair needs before the brain will compute/apply a per-pair confluence threshold for it")
     OB_MIN_OTHER_SCORE: float = Field(default=3.0, ge=0.0, le=50.0, description="Min weighted score from votes OTHER than base_trend and order_block required before the OB vote is allowed to count toward the confluence total. base_trend is excluded because it's a precondition for evaluation, not independent confluence. Default 3.0 is set above oi_funding's 2.5 weight so oi_funding alone can't pair with OB to clear the gate")
+    ENABLE_MACRO_CONTEXT_GATE: bool = Field(default=False, description="Computes a BTC-trend-alignment confluence multiplier (correlation + relative-strength based) for every alt-pair alert and records it alongside the outcome for later brain analysis. SHADOW MODE ONLY — the multiplier is never applied to the live confluence 'required' floor yet; see MACRO_CONTEXT_LIVE")
+    MACRO_CONTEXT_LIVE: bool = Field(default=False, description="Reserved: once shadow-mode data shows the macro multiplier helps, flip this to have it actually widen the confluence gate. No code path currently reads this — applying it is a deliberate follow-up change, not automatic")
+    MACRO_REFERENCE_PAIR: str = Field(default="BTCUSD", description="Which pair's GateResult is treated as macro/BTC trend context. Must be present in cfg.PAIRS and included in the current run's pairs_to_process for the gate to compute anything")
     OB_MIN_PENETRATION_ATR_MULT: float = Field(default=0.05, ge=0.0, le=2.0, description="Minimum close penetration beyond the zone edge (top for demand, bottom for supply), scaled by ATR_SHORT, required to count as a confirmed reversal. 0 disables the check. Prevents a close a fraction of a tick beyond the zone from counting as 'reversed'")
     OB_CONFIRM_LOOKAHEAD_CANDLES: int = Field(default=5, ge=0, le=10, description="Candles of grace after a zone is first touched during which a close beyond the opposite edge (+ OB_MIN_PENETRATION_ATR_MULT) still counts as a confirmed reversal. 0 restores the old same-candle-only behavior. A close that fully breaks the zone in the invalidating direction during the grace window kills it immediately")
     OB_PERSISTENCE_CANDLES: int = Field(default=2, ge=0, le=10, description="How many additional closed 15m candles after an OB confirmation to keep the gate valid. 0 = exact-candle-only (legacy).")
@@ -375,7 +401,7 @@ class BotConfig(BaseModel):
     OOD_RELAXED_MODE: bool = Field(default=True, description="If True, use margin-based OOD check (tolerant of small deviations); if False, use strict percentile check")
     OOD_P5: int = Field(default=5, ge=1, le=50, description="Lower percentile for OOD range (5th)")
     OOD_P95: int = Field(default=95, ge=50, le=99, description="Upper percentile for OOD range (95th)")
-
+    
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
         if not re.match(r'^\d+:[A-Za-z0-9_-]+$', v):

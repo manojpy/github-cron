@@ -13,7 +13,7 @@ import numpy as np
 
 from bot_config import (
     cfg, logger, Constants, CompiledPatterns, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
-    shutdown_event, format_ist_time, json_dumps, CONFLUENCE_WEIGHTS,
+    shutdown_event, format_ist_time, json_dumps, CONFLUENCE_WEIGHTS, BtcMacroContext,
 )
 from fetcher import (
     PriceData, DataFetcher, SessionManager, compute_backoff, validate_indicator_values,
@@ -1096,6 +1096,25 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
         )
         return None
 
+def _pct_returns(closes: np.ndarray) -> np.ndarray:
+    """Simple bar-over-bar percent returns. Empty/too-short input -> empty array."""
+    if closes is None or len(closes) < 2:
+        return np.array([])
+    prior = closes[:-1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        returns = np.diff(closes) / prior
+    return returns[np.isfinite(returns)]
+
+def rolling_correlation(alt_returns: np.ndarray, btc_returns: np.ndarray, window: int = 20) -> float:
+    """Pearson correlation of the last `window` 15m bar-returns. NaN if either
+    series is shorter than `window` or has ~zero variance (corrcoef undefined)."""
+    if len(alt_returns) < window or len(btc_returns) < window:
+        return float("nan")
+    a, b = alt_returns[-window:], btc_returns[-window:]
+    if np.std(a) == 0 or np.std(b) == 0:
+        return float("nan")
+    return float(np.corrcoef(a, b)[0, 1])
+
 async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], conditional_states: Dict[str, bool],
     raw_alerts: List[Tuple[str, str, str]], sdb: RedisStateStore, telegram_queue: TelegramQueue,
     fetcher: DataFetcher, symbol: str, correlation_id: str, logger_pair: logging.Logger,
@@ -1104,7 +1123,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     confluence_score_buy: Optional[float] = None, confluence_total_buy: Optional[float] = None,
     confluence_votes_buy: Optional[Dict[str, bool]] = None,
     confluence_score_sell: Optional[float] = None, confluence_total_sell: Optional[float] = None,
-    confluence_votes_sell: Optional[Dict[str, bool]] = None) -> Tuple[str, Dict[str, Any]]:
+    confluence_votes_sell: Optional[Dict[str, bool]] = None,
+    macro_context: Optional[BtcMacroContext] = None) -> Tuple[str, Dict[str, Any]]:
 
     def _confluence_for(alert_key: str) -> Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]:
         if alert_key in BUY_ALERT_KEYS:
@@ -1203,12 +1223,59 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         confluence_score = confluence_score_buy if is_buy_batch else confluence_score_sell
         confluence_total = confluence_total_buy if is_buy_batch else confluence_total_sell
 
+        # ── Macro Context Modifier (SHADOW MODE ONLY) ──────────────────────
+        macro_shadow: Optional[Dict[str, Any]] = None
+        if alerts_to_send and getattr(cfg, "ENABLE_MACRO_CONTEXT_GATE", False) and macro_context is not None:
+            btc_bearish = macro_context.confirmation_sell and macro_context.adx_ok
+            btc_bullish = macro_context.confirmation_buy and macro_context.adx_ok
+            if (is_buy_batch and btc_bearish) or (not is_buy_batch and btc_bullish):
+                macro_multiplier = 1.0
+                corr = rolling_correlation(
+                    _pct_returns(data_15m.close), _pct_returns(macro_context.closes),
+                    window=Constants.MACRO_CORR_WINDOW,
+                )
+                if not np.isnan(corr):
+                    if corr < Constants.MACRO_CORR_LOW:
+                        macro_multiplier = 1.0
+                    elif corr < Constants.MACRO_CORR_HIGH:
+                        macro_multiplier = Constants.MACRO_MULT_MODERATE
+                    else:
+                        macro_multiplier = Constants.MACRO_MULT_FULL
+
+                relative_strength = None
+                if o not in (None, 0) and macro_context.open not in (None, 0):
+                    alt_return_15m = (c - o) / o
+                    btc_return_15m = (macro_context.close - macro_context.open) / macro_context.open
+                    relative_strength = alt_return_15m - btc_return_15m
+                    if relative_strength > 0:
+                        macro_multiplier = max(1.0, macro_multiplier * Constants.MACRO_RS_EASE_FACTOR)
+
+                macro_shadow = {
+                    "correlation": None if np.isnan(corr) else round(corr, 3),
+                    "relative_strength": None if relative_strength is None else round(relative_strength, 5),
+                    "multiplier": round(macro_multiplier, 3),
+                    "btc_bullish": btc_bullish, "btc_bearish": btc_bearish,
+                    "would_block": False,  # filled in below, once `required` is known
+                }
+                logger_pair.info(
+                    f"[{pair_name}] 🌐 Macro shadow: corr={macro_shadow['correlation']}, "
+                    f"RS={macro_shadow['relative_strength']}, multiplier={macro_multiplier:.2f} "
+                    f"(SHADOW ONLY — not applied to dispatch)"
+                )
+
         if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
+            abs_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
+            if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
+                pair_floor = await sdb.get_pair_threshold(pair_name)
+                if pair_floor is not None:
+                    abs_floor = pair_floor
             pct_floor = confluence_total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
-            required = max(pct_floor, cfg.CONFLUENCE_MIN_ABS_SCORE)
+            required = max(pct_floor, abs_floor)
+            if macro_shadow is not None:
+                macro_shadow["would_block"] = confluence_score < (required * macro_shadow["multiplier"])
             if confluence_score < required:
                 logger_pair.info(
-                    f"[{pair_name}] Confluence gate blocked dispatch: {confluence_score:.1f}/{confluence_total:.1f} weighted score (need {required:.1f})"
+                    f"[{pair_name}] Confluence gate blocked dispatch: {confluence_score:.1f}/{confluence_total:.1f} weighted score (need {required:.1f}, abs_floor={abs_floor:.1f})"
                 )
                 alerts_to_send = []
 
@@ -1457,6 +1524,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     "config_version": hash_config_state(
                                         CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
                                     ),
+                                    "macro_correlation": macro_shadow.get("correlation") if macro_shadow else None,
+                                    "macro_relative_strength": macro_shadow.get("relative_strength") if macro_shadow else None,
+                                    "macro_multiplier": macro_shadow.get("multiplier") if macro_shadow else None,
+                                    "macro_would_block": macro_shadow.get("would_block") if macro_shadow else None,
                                 }
                                 await sdb.record_pending_outcome(
                                     pair_name, alert_key,

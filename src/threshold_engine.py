@@ -440,6 +440,29 @@ def compute_ev_by_cap(rows: List[Row], caps: List[float], min_sample: int = 10):
         ev_data.append((cap, len(subset), wr, ev, avg_w, avg_l))
     return ev_data
 
+def per_pair_thresholds(
+    rows: List[Row],
+    target_winrate: float = 0.55,
+    min_sample: int = 30,
+) -> Dict[str, Dict[str, Any]]:
+    """Per-pair analogue of recommend_threshold(): groups rows by pair and
+    independently runs the same knee/EV/target-floor logic for each pair
+    that clears min_sample. Returns {pair: recommend_threshold()-result}
+    — only for pairs where a valid (result["valid"] is True) recommendation
+    was found. Callers should still walk-forward-validate and stability-gate
+    each pair's result before applying it, same as the global recommendation."""
+    by_pair: Dict[str, List[Row]] = defaultdict(list)
+    for r in rows:
+        by_pair[r["pair"]].append(r)
+    results: Dict[str, Dict[str, Any]] = {}
+    for pair, pair_rows in by_pair.items():
+        if len(pair_rows) < min_sample:
+            continue
+        rec = recommend_threshold(pair_rows, target_winrate=target_winrate, min_sample=min_sample)
+        if rec.get("valid"):
+            results[pair] = rec
+    return results
+
 def per_pair_breakdown(rows: List[Row], min_sample: int = 10):
     stats = defaultdict(lambda: {"wins": 0, "n": 0})
     for r in rows:
@@ -708,7 +731,7 @@ def ev_and_kelly_for(
     Returns (net_ev_pct, half_kelly_fraction, win_rate)."""
     if not rows:
         return 0.0, 0.0, 0.0
-    total_cost = (fee_pct * 2) + slippage_pct  # entry + exit
+    total_cost = (fee_pct * 2) + (slippage_pct * 2)  # entry + exit for both
     net_moves = []
     for r in rows:
         mag = abs(r.get("pct_move", 0.0))
@@ -856,7 +879,7 @@ def calibration_alert(
 
 # ═══════════════════════════════════════════════════════════════════════
 #  NEW: Sequential CUSUM Drift Detector  (Recommended.txt §4)
-# ═══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════��════
 
 class CUSUMDetector:
     """Page-Hinkley / CUSUM for binary outcomes. Online, O(1) memory."""

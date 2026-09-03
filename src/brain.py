@@ -699,6 +699,52 @@ class BrainEngine:
                 ),
             })
 
+        # ── Per-pair confluence thresholds ──────────────────────────────
+        if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
+            pair_min_sample = getattr(cfg, "BRAIN_PAIR_THRESHOLD_MIN_SAMPLE", 30)
+            pair_recs = engine.per_pair_thresholds(
+                real_rows, target_winrate=target_wr, min_sample=pair_min_sample,
+            )
+            current_pair_thresholds = await self.sdb.get_pair_thresholds()
+            pair_threshold_lines = []
+            for pair, prec in pair_recs.items():
+                suggested = prec["recommended"]
+                current = current_pair_thresholds.get(pair, cfg.CONFLUENCE_MIN_ABS_SCORE)
+                if abs(suggested - current) < 0.5:
+                    continue
+                pair_rows = [r for r in real_rows if r["pair"] == pair]
+                wf = engine.validate_threshold_walk_forward(
+                    pair_rows, target_winrate=target_wr, min_sample=pair_min_sample,
+                )
+                if wf["valid"] and wf.get("passed") is False:
+                    pair_threshold_lines.append(
+                        f"  • {pair}: suggested {suggested:.1f} (was {current:.1f}) — "
+                        f"NOT applied, failed walk-forward ({wf['holdout_wr']:.0%} holdout WR)"
+                    )
+                    continue
+                history = await self.sdb.load_threshold_history(key_suffix=pair)
+                gate_ok, gate_reason = self.stability_gate.approve(suggested, history)
+                if not gate_ok:
+                    pair_threshold_lines.append(
+                        f"  • {pair}: suggested {suggested:.1f} (was {current:.1f}) — "
+                        f"NOT applied, stability gate: {gate_reason}"
+                    )
+                    continue
+                await self.sdb.save_threshold_value(suggested, key_suffix=pair)
+                applied = await self.sdb.set_pair_threshold(pair, suggested)
+                if applied:
+                    pair_threshold_lines.append(
+                        f"  • {pair}: {current:.1f} -> {suggested:.1f} "
+                        f"({prec['rec_wr']:.0%} WR, n={prec['rec_n']}) [applied]"
+                    )
+            if pair_threshold_lines:
+                recommendations.append({
+                    "type": "pair_thresholds", "severity": "medium",
+                    "message": (
+                        "Per-pair confluence thresholds (overriding CONFLUENCE_MIN_ABS_SCORE "
+                        "for these pairs only):\n" + "\n".join(pair_threshold_lines)
+                    ),
+                })
         # ── Vote importance (top lift / top drag only) ──
         vote_imp = engine.vote_importance(real_rows, min_sample=min_sample)
         if vote_imp:

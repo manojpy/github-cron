@@ -14,12 +14,11 @@ from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime, timezone
 import numpy as np
 
-# ── bot_config : only what macd_unified.py touches directly ──
 from bot_config import (
     Constants, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
     TRACE_ID, PAIR_ID, cfg, logger, logger_main,
     format_ist_time, MEMORY_CHECK_INTERVAL_PAIRS, validate_runtime_config,
-    json_dumps, json_loads, JSON_BACKEND, shutdown_event, __version__,
+    json_dumps, json_loads, JSON_BACKEND, shutdown_event, __version__, BtcMacroContext,
 )
 # ── fetcher : only orchestrator-level I/O ──
 from fetcher import (
@@ -89,7 +88,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int, fetcher: DataFetcher, symbol: str, alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
     max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN,
-    oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
+    oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None,
+    macro_context: Optional[BtcMacroContext] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
 
@@ -121,13 +121,18 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         confluence_score_sell, confluence_total_sell, confluence_votes_sell = score_sell, total_sell, votes_sell
 
         score, total = (score_buy, total_buy) if buy_side else (score_sell, total_sell)
+        abs_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
+        if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
+            pair_floor = await sdb.get_pair_threshold(pair_name)
+            if pair_floor is not None:
+                abs_floor = pair_floor
         pct_floor = total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
-        required = max(pct_floor, cfg.CONFLUENCE_MIN_ABS_SCORE)
+        required = max(pct_floor, abs_floor)
         if score < required:
             logger_pair.debug(
                 f"[{pair_name}] Confluence gate blocked: {score:.1f}/{total:.1f} weighted score "
                 f"(need {required:.1f}, pct-floor={pct_floor:.1f}, "
-                f"abs-floor={cfg.CONFLUENCE_MIN_ABS_SCORE:.1f}) — skipping Phase-2 indicators"
+                f"abs-floor={abs_floor:.1f}) — skipping Phase-2 indicators"
             )
             await _blanket_reset_pair(sdb, pair_name, logger_pair)
             return pair_name, {
@@ -186,7 +191,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         if isinstance(alert_result, tuple) and len(alert_result) == 2:
             return alert_result  # reserved: RuntimeError path inside _eval_alerts
         context, conditional_states, raw_alerts = alert_result
-
         return await _apply_and_dispatch_alerts(
             gr, context, conditional_states, raw_alerts, sdb, telegram_queue, fetcher, symbol,
             correlation_id, logger_pair, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
@@ -197,6 +201,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             confluence_score_sell=confluence_score_sell,
             confluence_total_sell=confluence_total_sell,
             confluence_votes_sell=confluence_votes_sell,
+            macro_context=macro_context,
         )
     finally:
         PAIR_ID.set("")
@@ -214,8 +219,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
 
 async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time, fetcher,
                        alerts_sent_ref=None, alerts_sent_lock=None, max_alerts_per_run=cfg.MAX_ALERTS_PER_RUN,
-                       oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None):
-
+                       oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None,
+                       macro_context: Optional[BtcMacroContext] = None):
     p_name, symbol, candles = task_data
 
     try:
@@ -234,15 +239,15 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
         data_15m = pd_15m
         data_5m = pd_5m
         data_daily = pd_daily.as_dict() if pd_daily is not None else None
-
         result = await evaluate_pair_and_alert(
             p_name, data_15m, data_5m, data_daily,
             state_db, telegram_queue, correlation_id, reference_time, fetcher, symbol,
             alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
-            oi_gate_data=oi_gate_data
+            oi_gate_data=oi_gate_data,
+            macro_context=macro_context,
         )
         return result
-    
+
     except asyncio.CancelledError:
         logger_main.warning(f"Evaluation cancelled for {p_name}")
         raise
@@ -446,6 +451,48 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     logger_main.debug(f"Ready to evaluate {len(prepared_tasks)} pairs")
 
+    # ── Macro Context (BTC trend-alignment gate — shadow mode) ─────────
+    btc_context: Optional[BtcMacroContext] = None
+    if cfg.ENABLE_MACRO_CONTEXT_GATE:
+        ref_pair = cfg.MACRO_REFERENCE_PAIR
+        ref_candles = all_candles.get(ref_pair)
+        if ref_pair not in pairs_to_process or not ref_candles:
+            logger_main.debug(
+                f"Macro context: {ref_pair} not in this run's pairs/candles — macro shadow gate skipped"
+            )
+        else:
+            try:
+                btc_15m = parse_candles_to_numpy(ref_candles.get("15"))
+                btc_5m = parse_candles_to_numpy(ref_candles.get("5"))
+                btc_daily_pd = (
+                    parse_candles_to_numpy(ref_candles.get("D"))
+                    if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else None
+                )
+                if btc_15m is None or btc_5m is None:
+                    logger_main.warning(f"Macro context: {ref_pair} candle parse failed — macro shadow gate skipped")
+                else:
+                    btc_daily = btc_daily_pd.as_dict() if btc_daily_pd is not None else None
+                    btc_oi = oi_gate_data.get(ref_pair) if cfg.ENABLE_OI_FUNDING_FILTER else None
+                    btc_gr = await _eval_gate(
+                        ref_pair, btc_15m, btc_5m, btc_daily, state_db, correlation_id, reference_time, btc_oi,
+                    )
+                    if btc_gr is not None and not isinstance(btc_gr, tuple):
+                        btc_context = BtcMacroContext(
+                            confirmation_buy=btc_gr.confirmation_buy,
+                            confirmation_sell=btc_gr.confirmation_sell,
+                            adx_ok=btc_gr.adx_ok,
+                            close=btc_gr.c,
+                            open=btc_gr.o,
+                            closes=btc_15m.close,
+                        )
+                    else:
+                        logger_main.info(
+                            f"Macro context: {ref_pair} gate returned no result this run — macro shadow gate skipped"
+                        )
+            except Exception as e:
+                logger_main.warning(f"Macro context ({ref_pair}) eval failed, disabling macro gate this run: {e}")
+                btc_context = None
+
     logger_main.debug(f"🧠 Phase 3: Evaluating {len(prepared_tasks)} pairs...")
     eval_start = time.time()
     eval_semaphore = asyncio.Semaphore(cfg.EVAL_CONCURRENCY_LIMIT)  # NEW, e.g. 5
@@ -455,7 +502,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             return await guarded_eval(
                 t, state_db, telegram_queue, correlation_id,
                 reference_time, fetcher, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
-                oi_gate_data=oi_gate_data
+                oi_gate_data=oi_gate_data,
+                macro_context=btc_context,
             )
 
     results = await asyncio.gather(

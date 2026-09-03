@@ -8,7 +8,8 @@ import numpy as np
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 
-from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError, CONFIG_OVERRIDE_ALLOWED_FIELDS, CONFIG_OVERRIDE_METADATA_KEY, BRAIN_DISABLED_KEYS_METADATA_KEY 
+
+from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError, CONFIG_OVERRIDE_ALLOWED_FIELDS, CONFIG_OVERRIDE_METADATA_KEY, BRAIN_DISABLED_KEYS_METADATA_KEY, PAIR_THRESHOLDS_METADATA_KEY
 from threshold_engine import hash_config_state
 from fetcher import compute_backoff
 
@@ -525,6 +526,38 @@ class RedisStateStore:
             await self.set_metadata(BRAIN_DISABLED_KEYS_METADATA_KEY, json_dumps(sorted(current)))
         except Exception as e:
             logger.warning(f"Failed to update disabled-key set for '{alert_key}': {e}")
+            return False
+        return True
+
+    async def get_pair_thresholds(self) -> Dict[str, float]:
+        """All pair -> confluence-abs-score-floor overrides currently stored,
+        as learned/written by the brain. Missing or malformed data returns {}."""
+        raw = await self.get_metadata(PAIR_THRESHOLDS_METADATA_KEY)
+        if not raw:
+            return {}
+        try:
+            data = json_loads(raw)
+        except (JSONDecodeError, TypeError, ValueError) as e:
+            logger.warning(f"Ignoring malformed {PAIR_THRESHOLDS_METADATA_KEY} in Redis: {e}")
+            return {}
+        if not isinstance(data, dict):
+            logger.warning(f"Ignoring {PAIR_THRESHOLDS_METADATA_KEY} in Redis: not a JSON object")
+            return {}
+        return {k: float(v) for k, v in data.items() if isinstance(v, (int, float))}
+
+    async def get_pair_threshold(self, pair: str) -> Optional[float]:
+        """Single pair's stored abs-score floor, or None if not set — caller
+        should fall back to cfg.CONFLUENCE_MIN_ABS_SCORE in that case."""
+        thresholds = await self.get_pair_thresholds()
+        return thresholds.get(pair)
+
+    async def set_pair_threshold(self, pair: str, value: float) -> bool:
+        current = await self.get_pair_thresholds()
+        current[pair] = value
+        try:
+            await self.set_metadata(PAIR_THRESHOLDS_METADATA_KEY, json_dumps(current))
+        except Exception as e:
+            logger.warning(f"Failed to update pair threshold for '{pair}': {e}")
             return False
         return True
 
@@ -1229,14 +1262,17 @@ class RedisStateStore:
         except Exception:
             pass
 
-    # ── Threshold history (Stability Gate) ───────────────────────────────
-    async def load_threshold_history(self) -> List[float]:
+    async def load_threshold_history(self, key_suffix: str = "") -> List[float]:
+        """key_suffix="" (default) is the existing global CONFLUENCE_MIN_ABS_SCORE
+        history, unchanged. Pass a pair name to track that pair's own history
+        under a separate list (used by per-pair threshold stability checks)."""
         if self.degraded or not self._redis:
             return []
+        key = f"{RedisKeyPrefix.THRESHOLD_HISTORY}{key_suffix}"
         try:
             raw_list = await self._safe_redis_op(
-                lambda: self._redis.lrange(RedisKeyPrefix.THRESHOLD_HISTORY, 0, 9),
-                2.0, "threshold_history_load",
+                lambda: self._redis.lrange(key, 0, 9),
+                2.0, f"threshold_history_load:{key_suffix or 'global'}",
             )
             if not raw_list:
                 return []
@@ -1244,18 +1280,25 @@ class RedisStateStore:
         except Exception:
             return []
 
-    async def save_threshold_value(self, value: float) -> None:
+    async def save_threshold_value(self, value: float, key_suffix: str = "") -> None:
         if self.degraded or not self._redis:
             return
+        key = f"{RedisKeyPrefix.THRESHOLD_HISTORY}{key_suffix}"
         try:
             async with self._redis.pipeline() as pipe:
-                pipe.lpush(RedisKeyPrefix.THRESHOLD_HISTORY, str(value))
-                pipe.ltrim(RedisKeyPrefix.THRESHOLD_HISTORY, 0, 9)
+                pipe.lpush(key, str(value))
+                pipe.ltrim(key, 0, 9)
                 await self._safe_redis_op(
-                    lambda: pipe.execute(), 2.0, "threshold_history_save",
+                    lambda: pipe.execute(), 2.0, f"threshold_history_save:{key_suffix or 'global'}",
                 )
         except Exception:
             pass
+
+
+
+
+
+            
 
 class RedisLock:    
     RELEASE_LUA = """
