@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import statistics
 import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
@@ -70,7 +71,6 @@ def _resolve_config_path(alert_key: str) -> Optional[str]:
         if alert_key.startswith(prefix):
             return mapped
     return None
-
 
 def _hget_int(data: dict, key: str, default: int = 0) -> int:
     value = data.get(key)
@@ -203,9 +203,20 @@ class BrainEngine:
                     row_context = json.loads(context_raw) if context_raw else None
                 except (TypeError, ValueError):
                     row_context = None
+                
+                mae_raw = f.get("mae")
+                mfe_raw = f.get("mfe")
+                try:
+                    mae = float(mae_raw) if mae_raw not in (None, "") else None
+                except (TypeError, ValueError):
+                    mae = None
+                try:
+                    mfe = float(mfe_raw) if mfe_raw not in (None, "") else None
+                except (TypeError, ValueError):
+                    mfe = None
 
                 parsed.append({
-                    "pair": pair,
+                    "pair": pair, 
                     "alert_key": alert_key,
                     "direction": f.get("direction", "?"),
                     "score": score,
@@ -214,6 +225,9 @@ class BrainEngine:
                     "win": f.get("win") == "1",
                     "pct_move": float(f.get("pct_move", 0.0)),
                     "entry_ts": entry_ts,
+                    "session": f.get("session", "unknown"),
+                    "mae": mae,
+                    "mfe": mfe,
                     "votes": votes,
                     "context": row_context,
                 })
@@ -312,10 +326,10 @@ class BrainEngine:
         star_wr = getattr(cfg, "BRAIN_STAR_ALERT_WR", 0.70)
 
         # ── Per-alert win rate (pooled across pairs), Wilson-bound verdicts ──
-        alert_stats: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"wins": 0, "losses": 0, "pairs": set()})
+        alert_stats: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"rows": [], "pairs": set()})
         for r in real_rows:
             s = alert_stats[r["alert_key"]]
-            s["wins" if r["win"] else "losses"] += 1
+            s["rows"].append(r)
             s["pairs"].add(r["pair"])
 
         # ── CUSUM drift detection (moved up so path_to_keys below can check
@@ -326,15 +340,22 @@ class BrainEngine:
         current_disabled_keys = await self.sdb.get_disabled_alert_keys()
         auto_disable_min = getattr(cfg, "BRAIN_AUTO_DISABLE_MIN_SAMPLE", 500)
         auto_disable_on = getattr(cfg, "BRAIN_AUTO_DISABLE_ENABLED", False)
+        recency_on = getattr(cfg, "ENABLE_RECENCY_WEIGHTING", False)
+        recency_decay_days = getattr(cfg, "RECENCY_DECAY_DAYS", 7.0)
 
         alert_verdicts: Dict[str, str] = {}  # alert_key -> "disable" | "star" | "monitor"
         for alert_key, s in alert_stats.items():
-            total = s["wins"] + s["losses"]
-            s["total"] = total
+            total = len(s["rows"])
             if total < min_sample:
                 continue
-            wr = s["wins"] / total
-            lo, hi, _ = engine.wilson_ci(s["wins"], total)
+            wins = sum(1 for r in s["rows"] if r["win"])
+            if recency_on:
+                wr, n_eff, lo, hi = engine.weighted_win_rate(s["rows"], decay_days=recency_decay_days)
+                sample_label = f"{total} samples (n_eff={n_eff:.0f} recency-weighted, {recency_decay_days:.0f}d decay)"
+            else:
+                wr = wins / total
+                lo, hi, _ = engine.wilson_ci(wins, total)
+                sample_label = f"{total} samples"
             auto_eligible = auto_disable_on and total >= auto_disable_min
             if hi < disable_wr:
                 alert_verdicts[alert_key] = "disable"
@@ -342,7 +363,7 @@ class BrainEngine:
                     "type": "disable_alert", "severity": "high", "alert": alert_key,
                     "win_rate": round(wr, 3), "sample_size": total, "pairs_affected": len(s["pairs"]),
                     "message": (
-                        f"DISABLE {alert_key}: {wr:.0%} WR over {total} samples across "
+                        f"DISABLE {alert_key}: {wr:.0%} WR over {sample_label} across "
                         f"{len(s['pairs'])} pairs (95% CI upper bound {hi:.0%}, still below {disable_wr:.0%})."
                     ),
                 })
@@ -351,10 +372,41 @@ class BrainEngine:
                         recommendations.append({
                             "type": "auto_disabled", "severity": "high", "alert": alert_key,
                             "message": (
-                                f"🔒 Auto-disabled {alert_key}: {wr:.0%} WR over {total} samples "
+                                f"🔒 Auto-disabled {alert_key}: {wr:.0%} WR over {sample_label} "
                                 f"(≥{auto_disable_min} required)."
                             ),
                         })
+
+            elif lo >= cfg.MIN_WIN_RATE:
+                alert_verdicts[alert_key] = "recovered"
+                recommendations.append({
+                    "type": "recovered_alert", "severity": "low", "alert": alert_key,
+                    "win_rate": round(wr, 3), "sample_size": total,
+                    "message": (
+                        f"RECOVERED: {alert_key} at {wr:.0%} WR over {sample_label} "
+                        f"(95% CI lower bound {lo:.0%} ≥ target {cfg.MIN_WIN_RATE:.0%})."
+                    ),
+                })
+                if auto_eligible and alert_key in current_disabled_keys:
+                    if await self.sdb.set_alert_key_disabled(alert_key, False):
+                        recommendations.append({
+                            "type": "auto_reenabled", "severity": "medium", "alert": alert_key,
+                            "message": f"🔓 Re-enabled {alert_key}: recovered to {wr:.0%} WR over {sample_label}.",
+                        })
+            else:
+                alert_verdicts[alert_key] = "monitor"
+                recommendations.append({
+                    "type": "monitor", "severity": "medium", "alert": alert_key,
+                    "win_rate": round(wr, 3), "sample_size": total,
+                    "message": f"{alert_key} viable ({wr:.0%} WR, {sample_label}).",
+                })
+                if auto_eligible and alert_key in current_disabled_keys:
+                    if await self.sdb.set_alert_key_disabled(alert_key, False):
+                        recommendations.append({
+                            "type": "auto_reenabled", "severity": "medium", "alert": alert_key,
+                            "message": f"🔓 Re-enabled {alert_key}: recovered to {wr:.0%} WR over {sample_label}.",
+                        }) 
+        path_to_keys: Dict[str, List[str]] = defaultdict(list)
 
             elif lo >= cfg.MIN_WIN_RATE:  # e.g., 55% lower bound proves it's profitable again
                 alert_verdicts[alert_key] = "recovered"
@@ -543,13 +595,15 @@ class BrainEngine:
             ] if target_floor else []
             if rec_subset_kelly:
                 net_ev, half_kelly, kelly_wr = engine.ev_and_kelly_for(rec_subset_kelly)
+                kelly_maes = [r["mae"] for r in rec_subset_kelly if r.get("mae") is not None]
+                mae_note = f" | Mean MAE: {statistics.mean(kelly_maes):.2%}" if kelly_maes else ""
                 recommendations.append({
                     "type": "kelly_sizing",
                     "severity": "low",
                     "message": (
                         f"Net EV (after fees/slippage): {net_ev:+.3f}%/trade | "
                         f"Half-Kelly position size: {half_kelly:.1%} | "
-                        f"WR: {kelly_wr:.0%}"
+                        f"WR: {kelly_wr:.0%}{mae_note}"
                     ),
                 })
             recommendations.append(threshold_rec)
@@ -699,6 +753,40 @@ class BrainEngine:
                 ),
             })
 
+        # ── Per-pair session breakdown (informational) ──────────────────
+        if getattr(cfg, "ENABLE_SESSION_FILTER", False):
+            session_stats = engine.per_pair_session_breakdown(real_rows, min_sample=min_sample)
+            weak_sessions = [s for s in session_stats if s[2] < disable_wr]
+            if weak_sessions:
+                recommendations.append({
+                    "type": "weak_pair_sessions", "severity": "low",
+                    "message": (
+                        "Underperforming pair:session combos: " +
+                        ", ".join(
+                            f"{pair}/{session}({wr:.0%}, n={n})"
+                            for pair, session, wr, n in weak_sessions[:8]
+                        )
+                    ),
+                })
+
+        # ── Pain-Adjusted Win Rate (MAE/MFE-aware) ───────────────────────
+        pawr_stats = engine.pain_adjusted_win_rate(real_rows, min_sample=min_sample)
+        if pawr_stats:
+            worst_pain = sorted(
+                pawr_stats.items(), key=lambda kv: kv[1]["raw_wr"] - kv[1]["pawr"], reverse=True
+            )[:5]
+            if worst_pain and (worst_pain[0][1]["raw_wr"] - worst_pain[0][1]["pawr"]) >= 0.03:
+                recommendations.append({
+                    "type": "pain_scoring", "severity": "low",
+                    "message": (
+                        "Highest drawdown-masked win rates (raw WR vs Pain-Adjusted WR): " +
+                        ", ".join(
+                            f"{ak}({s['raw_wr']:.0%}->{s['pawr']:.0%}, mean MAE={s['mean_mae']:.2%}, n={s['n']})"
+                            for ak, s in worst_pain
+                        )
+                    ),
+                })
+       
         # ── Per-pair confluence thresholds ──────────────────────────────
         if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
             pair_min_sample = getattr(cfg, "BRAIN_PAIR_THRESHOLD_MIN_SAMPLE", 30)

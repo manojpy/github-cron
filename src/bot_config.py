@@ -172,6 +172,20 @@ class BtcMacroContext:
     open: float            # current/trigger 15m candle open
     closes: np.ndarray     # recent 15m close series, for rolling correlation
 
+@dataclass
+class ClusterContext:
+    """Same-run directional-cluster snapshot across the whole pair universe,
+    computed via a gate-only pre-pass before Phase-3 dispatch (see
+    _compute_directional_cluster in macd_unified.py). Used to detect and
+    penalize 'beta trap' situations — e.g. BTC pumps and 8 correlated alts
+    all fire BUY at once, which is really one trade wearing 8 costumes.
+    LIVE — see cfg.ENABLE_CLUSTER_GATE / CLUSTER_PCT_THRESHOLD / CLUSTER_PENALTY_PCT."""
+    buy_count: int
+    sell_count: int
+    total_pairs: int
+    buy_pct: float
+    sell_pct: float
+
 class CompiledPatterns:
     VALID_SYMBOL = re.compile(r'^[A-Z0-9_]+$')
     ESCAPE_MARKDOWN = re.compile(r'[_*\[\]()~`>#+\-=|{}.!]') 
@@ -261,6 +275,11 @@ class BotConfig(BaseModel):
     ENABLE_MACRO_CONTEXT_GATE: bool = Field(default=False, description="Computes a BTC-trend-alignment confluence multiplier (correlation + relative-strength based) for every alt-pair alert and records it alongside the outcome for later brain analysis. SHADOW MODE ONLY — the multiplier is never applied to the live confluence 'required' floor yet; see MACRO_CONTEXT_LIVE")
     MACRO_CONTEXT_LIVE: bool = Field(default=False, description="Reserved: once shadow-mode data shows the macro multiplier helps, flip this to have it actually widen the confluence gate. No code path currently reads this — applying it is a deliberate follow-up change, not automatic")
     MACRO_REFERENCE_PAIR: str = Field(default="BTCUSD", description="Which pair's GateResult is treated as macro/BTC trend context. Must be present in cfg.PAIRS and included in the current run's pairs_to_process for the gate to compute anything")
+    ENABLE_CLUSTER_GATE: bool = Field(default=False, description="If true, before dispatch a same-run gate-only pre-pass counts how many pairs are directionally aligned (buy vs sell) across the whole universe. If more than CLUSTER_PCT_THRESHOLD of pairs lean the same way as an alert's direction, that alert's confluence score is reduced by CLUSTER_PENALTY_PCT before the confluence gate check — a systemic 'beta trap' veto (BTC pumps, 8 correlated alts fire as one trade). LIVE — roughly doubles gate-eval cost per run (a lightweight pre-pass over every pair)")
+    CLUSTER_PCT_THRESHOLD: float = Field(default=0.25, ge=0.0, le=1.0, description="Fraction of the pair universe leaning the same direction (gate-level confirmation_buy/sell + adx_ok) before the cluster penalty kicks in")
+    CLUSTER_PENALTY_PCT: float = Field(default=0.15, ge=0.0, le=0.9, description="Fractional haircut applied to an alert's confluence score when its direction matches a detected cluster above CLUSTER_PCT_THRESHOLD")
+    ENABLE_RECENCY_WEIGHTING: bool = Field(default=False, description="If true, the Brain's per-alert auto-disable/recovery win-rate check (generate_recommendations) uses an exponentially recency-weighted win rate instead of a flat count — a trade from today counts ~e (2.72x) more than one exactly RECENCY_DECAY_DAYS old, and one 3x that age is nearly discarded. Reacts to regime shifts faster than the flat BRAIN_ANALYSIS_WINDOW_DAYS window. Does NOT yet apply to threshold-optimization (recommend_threshold's bucket/knee/EV machinery) — that stays unweighted for now")
+    RECENCY_DECAY_DAYS: float = Field(default=7.0, gt=0, description="Exponential time-constant for recency weighting: weight = exp(-age_days / this). Not a strict half-life (that would be this * ln(2), ~4.85 days at the default) — matches the simple exp(-age/decay) formulation")
     OB_MIN_PENETRATION_ATR_MULT: float = Field(default=0.05, ge=0.0, le=2.0, description="Minimum close penetration beyond the zone edge (top for demand, bottom for supply), scaled by ATR_SHORT, required to count as a confirmed reversal. 0 disables the check. Prevents a close a fraction of a tick beyond the zone from counting as 'reversed'")
     OB_CONFIRM_LOOKAHEAD_CANDLES: int = Field(default=5, ge=0, le=10, description="Candles of grace after a zone is first touched during which a close beyond the opposite edge (+ OB_MIN_PENETRATION_ATR_MULT) still counts as a confirmed reversal. 0 restores the old same-candle-only behavior. A close that fully breaks the zone in the invalidating direction during the grace window kills it immediately")
     OB_PERSISTENCE_CANDLES: int = Field(default=2, ge=0, le=10, description="How many additional closed 15m candles after an OB confirmation to keep the gate valid. 0 = exact-candle-only (legacy).")
@@ -287,6 +306,8 @@ class BotConfig(BaseModel):
     OUTCOME_FAVORABLE_MOVE_PCT: float = Field(default=0.3, ge=0.01, le=10.0) 
     MIN_WIN_RATE_SAMPLE: int = Field(default=20, ge=1)    
     MIN_WIN_RATE: float = Field(default=0.55, ge=0.0, le=1.0)    
+    ENABLE_SESSION_FILTER: bool = Field(default=False, description="If true, alerts are also checked against a pair:alert_key:session win-rate (session = asian/london/ny/dead per IST trading hours). Blocks alongside the existing pair:alert_key MIN_WIN_RATE check — whichever of the two is lower decides. Requires ENABLE_WIN_RATE_FILTER")
+    MIN_WIN_RATE_SESSION_SAMPLE: int = Field(default=15, ge=1, description="Minimum resolved-outcome sample size for a pair:alert_key:session combo before its win rate is trusted enough to block dispatch")
     ENABLE_BRAIN: bool = Field(default=False, description="Master switch for the Brain analysis/shadow-mode/reporting layer. Requires ENABLE_WIN_RATE_FILTER to be meaningful")
     BRAIN_SHADOW_MODE: bool = Field(default=True, description="When an alert is rejected by the win-rate filter, keep tracking what would have happened instead of discarding it")
     BRAIN_REPORT_INTERVAL_RUNS: int = Field(default=48, ge=1, le=2000, description="Send a Telegram analysis report every N cron runs (default 48 runs ≈ 12h at 15m cadence)")
@@ -766,6 +787,42 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
         if cfg.DEBUG_MODE:
             logger.debug(f"format_ist_time parsing failed for '{dt_or_ts}': {e}")
         return str(dt_or_ts)
+
+def _get_session_from_ts(ts: Any) -> str:
+    """Maps a unix timestamp (or datetime) to its IST trading session:
+    asian / london / ny / dead. The four ranges below overlap by design
+    (liquidity handoffs between sessions aren't clean cuts) — resolved by
+    checking Asian -> London -> NY in that order, so e.g. 14:00 IST (inside
+    both Asian 09:30-15:30 and London 13:30-22:00) tags as 'asian'. Anything
+    not covered by the first three (03:00-09:30 IST) is the Dead Zone."""
+    try:
+        if isinstance(ts, datetime):
+            dt = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+        else:
+            t = float(ts)
+            if t > 1_000_000_000_000:
+                t /= 1000
+            dt = datetime.fromtimestamp(t, tz=timezone.utc)
+        ist = dt.astimezone(_IST_TZ)
+        minutes = ist.hour * 60 + ist.minute
+
+        def _in_range(start_h: int, start_m: int, end_h: int, end_m: int) -> bool:
+            start, end = start_h * 60 + start_m, end_h * 60 + end_m
+            if start <= end:
+                return start <= minutes < end
+            return minutes >= start or minutes < end  # wraps past midnight (NY session)
+
+        if _in_range(9, 30, 15, 30):
+            return "asian"
+        if _in_range(13, 30, 22, 0):
+            return "london"
+        if _in_range(18, 0, 3, 0):
+            return "ny"
+        return "dead"
+    except Exception as e:
+        if cfg.DEBUG_MODE:
+            logger.debug(f"_get_session_from_ts parsing failed for '{ts}': {e}")
+        return "dead"
 
 shutdown_event = asyncio.Event()
 

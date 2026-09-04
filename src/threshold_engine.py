@@ -28,6 +28,42 @@ def wilson_ci(wins: int, n: int, z: float = 1.96) -> Tuple[float, float, float]:
     margin = (z / denom) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
     return max(0.0, centre - margin), min(1.0, centre + margin), p
 
+def recency_weight(entry_ts: Optional[float], now_ts: float, decay_days: float = 7.0) -> float:
+    """Exponential recency weight: exp(-age_days / decay_days). ... NOTE:
+    decay_days is an exponential time constant, not a strict half-life —
+    the true half-life is decay_days * ln(2) (~4.85 days at the default 7).
+    Under this formula an outcome from right now is weighted ~e (2.72x)
+    more than one exactly decay_days old, and one 3x that age is weighted
+    ~e^-3 (~5%)."""
+    if not entry_ts or decay_days <= 0:
+        return 1.0
+    age_days = max(0.0, (now_ts - float(entry_ts)) / 86400.0)
+    return math.exp(-age_days / decay_days)
+
+def weighted_win_rate(
+    rows: List[Row], now_ts: Optional[float] = None, decay_days: float = 7.0,
+) -> Tuple[Optional[float], float, float, float]:
+    """Recency-weighted win rate + a weighted Wilson-CI band. ... Returns
+    (weighted_wr, n_eff, wilson_lo, wilson_hi), where n_eff is Kish's
+    effective sample size (sum(w)^2 / sum(w^2), always <= len(rows))..."""
+    if now_ts is None:
+        now_ts = time.time()
+    if not rows:
+        return None, 0.0, 0.0, 0.0
+    sum_w = sum_w2 = sum_ww = 0.0
+    for r in rows:
+        w = recency_weight(r.get("entry_ts"), now_ts, decay_days)
+        sum_w += w
+        sum_w2 += w * w
+        if r["win"]:
+            sum_ww += w
+    if sum_w <= 0:
+        return None, 0.0, 0.0, 0.0
+    weighted_wr = sum_ww / sum_w
+    n_eff = (sum_w ** 2) / sum_w2 if sum_w2 > 0 else 0.0
+    lo, hi, _ = wilson_ci(round(weighted_wr * n_eff), max(1, round(n_eff)))
+    return weighted_wr, n_eff, lo, hi
+
 def favourable_move(row: Row) -> float:
     """pct_move is signed by price direction, not by trade outcome — a
     winning sell has a negative pct_move. Always take the magnitude of the
@@ -477,6 +513,23 @@ def per_pair_breakdown(rows: List[Row], min_sample: int = 10):
     results.sort(key=lambda x: x[1])
     return results
 
+def per_pair_session_breakdown(rows: List[Row], min_sample: int = 10):
+    """Groups by (pair, session) — e.g. reveals a pair performing well in
+    Asian hours but randomly in the Dead Zone. Returns a list of
+    (pair, session, win_rate, n) tuples, sorted worst win-rate first."""
+    stats = defaultdict(lambda: {"wins": 0, "n": 0})
+    for r in rows:
+        s = stats[(r["pair"], r.get("session", "unknown"))]
+        s["wins"] += r["win"]
+        s["n"] += 1
+    results = []
+    for (pair, session), s in stats.items():
+        if s["n"] < min_sample:
+            continue
+        results.append((pair, session, s["wins"] / s["n"], s["n"]))
+    results.sort(key=lambda x: x[2])
+    return results
+
 def per_alert_breakdown(rows: List[Row], min_sample: int = 10):
     stats = defaultdict(lambda: {"wins": 0, "n": 0, "scores": []})
     for r in rows:
@@ -492,6 +545,28 @@ def per_alert_breakdown(rows: List[Row], min_sample: int = 10):
         avg_score = sum(s["scores"]) / len(s["scores"])
         results.append((ak, wr, s["n"], avg_score))
     results.sort(key=lambda x: x[1])
+    return results
+
+def pain_adjusted_win_rate(rows: List[Row], min_sample: int = 10) -> Dict[str, Dict[str, Any]]:
+    stats = defaultdict(lambda: {"wins": 0, "n": 0, "maes": []})
+    for r in rows:
+        s = stats[r["alert_key"]]
+        s["wins"] += r["win"]
+        s["n"] += 1
+        mae = r.get("mae")
+        if mae is not None:
+            s["maes"].append(mae)
+    results: Dict[str, Dict[str, Any]] = {}
+    for ak, s in stats.items():
+        if s["n"] < min_sample or not s["maes"]:
+            continue
+        raw_wr = s["wins"] / s["n"]
+        mean_mae = statistics.mean(s["maes"])
+        results[ak] = {
+            "raw_wr": raw_wr, "mean_mae": mean_mae,
+            "pawr": raw_wr * (1 - mean_mae),
+            "n": s["n"], "mae_sample": len(s["maes"]),
+        }
     return results
 
 def outcome_attribution(
@@ -718,7 +793,7 @@ def recommend_threshold(
     result["valid"] = True
     return result
 
-# ═══════════════════════════════════════════════════════════════════════
+# ══════════════════════���════════════════════════════════════════════════
 #  NEW: Cost-Aware EV + Kelly Sizing  (Recommended.txt §5)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -932,7 +1007,7 @@ class CUSUMDetector:
         return det
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# ══════════════════════════���════════════════════════════════════════════
 #  NEW: Config Stability Gate  (Recommended.txt §3)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -960,7 +1035,7 @@ class StabilityGate:
 
 # ═══════════════════════════════════════════════════════════════════════
 #  NEW: Vote-Count OOD Gate  (Recommended.txt §8)
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════��═══════════════════════════════════════════════
 
 def _percentile(data: List[float], p: float) -> float:
     """Linear-interpolation percentile (numpy-compatible)."""
@@ -1438,7 +1513,7 @@ def regime_profile_optimizer(
             })
     return {"valid": True, "regime_field": regime_field, "regimes": regimes}
 
-# ═══════════════════════════════════════════════════════════════════════
+# ════════════��══════════════════════════════════════════════════════════
 #  RISK FLAGS — Config Version Hash & Actionability
 # ═══════════════════════════════════════════════════════════════════════
 def compare_config_versions(

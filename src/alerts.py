@@ -14,6 +14,7 @@ import numpy as np
 from bot_config import (
     cfg, logger, Constants, CompiledPatterns, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
     shutdown_event, format_ist_time, json_dumps, CONFLUENCE_WEIGHTS, BtcMacroContext,
+    ClusterContext, _get_session_from_ts,
 )
 from fetcher import (
     PriceData, DataFetcher, SessionManager, compute_backoff, validate_indicator_values,
@@ -231,7 +232,7 @@ def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str
         e_desc = escape_markdown_v2(description)
 
         is_last = (idx == len(items) - 1)
-        prefix = "└➤" if is_last else "├➤"
+        prefix = "➤" if is_last else "├➤"
 
         if condensed:
             alert_lines.append(f"{prefix} *{e_desc}*")
@@ -1124,7 +1125,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     confluence_votes_buy: Optional[Dict[str, bool]] = None,
     confluence_score_sell: Optional[float] = None, confluence_total_sell: Optional[float] = None,
     confluence_votes_sell: Optional[Dict[str, bool]] = None,
-    macro_context: Optional[BtcMacroContext] = None) -> Tuple[str, Dict[str, Any]]:
+    macro_context: Optional[BtcMacroContext] = None,
+    cluster_context: Optional[ClusterContext] = None) -> Tuple[str, Dict[str, Any]]:
 
     def _confluence_for(alert_key: str) -> Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]:
         if alert_key in BUY_ALERT_KEYS:
@@ -1263,6 +1265,20 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     f"(SHADOW ONLY — not applied to dispatch)"
                 )
 
+        # ── Correlation Cluster Penalty ("Beta Trap" filter) — LIVE ────────
+        if (alerts_to_send and getattr(cfg, "ENABLE_CLUSTER_GATE", False)
+                and cluster_context is not None and confluence_score is not None):
+            cluster_pct = cluster_context.buy_pct if is_buy_batch else cluster_context.sell_pct
+            if cluster_pct > cfg.CLUSTER_PCT_THRESHOLD:
+                raw_score = confluence_score
+                confluence_score = confluence_score * (1 - cfg.CLUSTER_PENALTY_PCT)
+                logger_pair.info(
+                    f"[{pair_name}] 🌐 Correlation cluster penalty: "
+                    f"{'buy' if is_buy_batch else 'sell'} cluster at {cluster_pct:.0%} of "
+                    f"{cluster_context.total_pairs} pairs (> {cfg.CLUSTER_PCT_THRESHOLD:.0%} threshold) — "
+                    f"confluence score {raw_score:.1f} -> {confluence_score:.1f}"
+                )
+
         if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
             abs_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
             if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
@@ -1312,6 +1328,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             win_rate_map = await sdb.batch_get_alert_win_rates(
                 pair_name, alert_keys_to_check, timeout=3.0
             )
+            current_session = _get_session_from_ts(ts_curr) if getattr(cfg, "ENABLE_SESSION_FILTER", False) else None
             surviving_alerts = []
             brain_engine = None
             if cfg.ENABLE_BRAIN:
@@ -1324,7 +1341,23 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             for alert_title, alert_extra, alert_key in alerts_to_send:
                 direction = "buy" if alert_key in BUY_ALERT_KEYS else "sell"
                 win_rate, sample = win_rate_map.get(alert_key, (None, 0))
+                failing_rate, fail_note = None, None
                 if win_rate is not None and win_rate < cfg.MIN_WIN_RATE:
+                    failing_rate = win_rate
+                    fail_note = f"{win_rate:.0%} over {sample} samples (need >= {cfg.MIN_WIN_RATE:.0%})"
+                if current_session is not None:
+                    session_win_rate, session_sample = await sdb.get_alert_win_rate_session(
+                        pair_name, alert_key, current_session
+                    )
+                    if session_win_rate is not None and session_win_rate < cfg.MIN_WIN_RATE:
+                        if failing_rate is None or session_win_rate < failing_rate:
+                            failing_rate = session_win_rate
+                            fail_note = (
+                                f"{session_win_rate:.0%} in {current_session} session over "
+                                f"{session_sample} samples (need >= {cfg.MIN_WIN_RATE:.0%})"
+                            )
+
+                if failing_rate is not None:
                     override_reason = None
                     if brain_engine:
                         try:
@@ -1338,7 +1371,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     if override_reason:
                         logger_pair.info(
                             f"[{pair_name}] 🧠 Rewardable override for {alert_key}: "
-                            f"WR={win_rate:.0%} below {cfg.MIN_WIN_RATE:.0%}, but {override_reason}"
+                            f"WR={failing_rate:.0%} below {cfg.MIN_WIN_RATE:.0%}, but {override_reason}"
                         )
                         alert_extra = f"{alert_extra} | 🧠 {override_reason}"
                         surviving_alerts.append((alert_title, alert_extra, alert_key))
@@ -1366,8 +1399,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             context=shadow_context,
                         )
                     logger_pair.info(
-                        f"[{pair_name}] Win-rate filter dropped {alert_key}: "
-                        f"{win_rate:.0%} over {sample} samples (need >= {cfg.MIN_WIN_RATE:.0%})"
+                        f"[{pair_name}] Win-rate filter dropped {alert_key}: {fail_note}"
                     )
                     continue
                 surviving_alerts.append((alert_title, alert_extra, alert_key))

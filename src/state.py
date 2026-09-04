@@ -8,11 +8,9 @@ import numpy as np
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 
-
-from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError, CONFIG_OVERRIDE_ALLOWED_FIELDS, CONFIG_OVERRIDE_METADATA_KEY, BRAIN_DISABLED_KEYS_METADATA_KEY, PAIR_THRESHOLDS_METADATA_KEY
+from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError, CONFIG_OVERRIDE_ALLOWED_FIELDS, CONFIG_OVERRIDE_METADATA_KEY, BRAIN_DISABLED_KEYS_METADATA_KEY, PAIR_THRESHOLDS_METADATA_KEY, _get_session_from_ts
 from threshold_engine import hash_config_state
 from fetcher import compute_backoff
-
 
 if TYPE_CHECKING:
     from fetcher import PriceData
@@ -826,6 +824,20 @@ class RedisStateStore:
             if is_buy
             else pct_move <= -cfg.OUTCOME_FAVORABLE_MOVE_PCT
         )
+
+        # ── MAE / MFE (path-aware, not just the binary close-vs-target outcome) ──
+        path_low = data_15m.low[entry_idx:target_idx]
+        path_high = data_15m.high[entry_idx:target_idx]
+        if len(path_low) and len(path_high):
+            if is_buy:
+                mae = max(0.0, (entry_price - float(np.min(path_low))) / entry_price)
+                mfe = max(0.0, (float(np.max(path_high)) - entry_price) / entry_price)
+            else:
+                mae = max(0.0, (float(np.max(path_high)) - entry_price) / entry_price)
+                mfe = max(0.0, (entry_price - float(np.min(path_low))) / entry_price)
+        else:
+            mae = mfe = None
+
         return {
             "alert_key": key.split(":")[-2],
             "direction": direction,
@@ -833,6 +845,8 @@ class RedisStateStore:
             "is_buy": is_buy,
             "pct_move": pct_move,
             "win": win,
+            "mae": mae,
+            "mfe": mfe,
             "conf_score": conf_score,
             "conf_total": conf_total,
             "conf_votes": conf_votes,
@@ -905,20 +919,22 @@ class RedisStateStore:
                         entry_ts = result["entry_ts"]
                         pct_move = result["pct_move"]
                         win = result["win"]
+                        mae = result["mae"]
+                        mfe = result["mfe"]
                         conf_score = result["conf_score"]
                         conf_total = result["conf_total"]
                         conf_votes = result["conf_votes"]
                         adx_val = result["adx_val"]
                         row_context = result.get("context")
-
                         stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
                         write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
                         write_pipe.expire(stats_key, stats_ttl)
-
+                        session = _get_session_from_ts(entry_ts) if entry_ts else "dead"
+                        session_stats_key = f"{stats_key}:{session}"
+                        write_pipe.hincrby(session_stats_key, "wins" if win else "losses", 1)
+                        write_pipe.expire(session_stats_key, stats_ttl)
                         stream_fields = None
                         if conf_score is not None and conf_total is not None:
-
-
                             stream_fields = { 
                                 "pair": str(pair),
                                 "alert_key": str(alert_key),
@@ -928,10 +944,13 @@ class RedisStateStore:
                                 "pct_move": f"{pct_move:.4f}",
                                 "win": "1" if win else "0",
                                 "entry_ts": str(entry_ts),
+                                "session": session,
+                                "mae": f"{mae:.5f}" if mae is not None else "",
+                                "mfe": f"{mfe:.5f}" if mfe is not None else "",
                                 "votes": json_dumps(conf_votes) if conf_votes is not None else "",
                                 "adx_val": str(adx_val) if adx_val is not None else "",
                                 "context": json_dumps(row_context) if row_context is not None else "",
-                            }
+                            } 
                         else:
                             missing_score_count += 1
                             logger_pair.debug(
@@ -973,6 +992,7 @@ class RedisStateStore:
             f"bad_payload={bad_payload_count}"
         )
 
+
     async def resolve_shadow_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
                                                 logger_pair: logging.Logger) -> None:
         """Twin of resolve_pending_outcomes for shadow (rejected) alerts. Same grading logic,
@@ -1012,10 +1032,12 @@ class RedisStateStore:
                             continue
 
                         alert_key = result["alert_key"]
-                        direction = result["direction"]
+                       direction = result["direction"]
                         entry_ts = result["entry_ts"]
                         pct_move = result["pct_move"]
                         win = result["win"]
+                        mae = result["mae"]
+                        mfe = result["mfe"]
                         conf_score = result["conf_score"]
                         conf_total = result["conf_total"]
                         conf_votes = result["conf_votes"]
@@ -1033,8 +1055,11 @@ class RedisStateStore:
                                     "direction": str(direction), "score": str(conf_score),
                                     "total": str(conf_total), "pct_move": f"{pct_move:.4f}",
                                     "win": "1" if win else "0", "entry_ts": str(entry_ts),
+                                    "session": _get_session_from_ts(entry_ts) if entry_ts else "dead",
+                                    "mae": f"{mae:.5f}" if mae is not None else "",
+                                    "mfe": f"{mfe:.5f}" if mfe is not None else "",
                                     "votes": json_dumps(conf_votes) if conf_votes is not None else "",
-                                },
+
                                 maxlen=50000, approximate=True,
                             )
                             if conf_pct >= hiconf_pct:
@@ -1075,6 +1100,24 @@ class RedisStateStore:
             return wins / total, total
         except Exception as e:
             logger.warning(f"Failed to read win rate for {pair}:{alert_key}: {e}")
+            return None, 0
+
+    async def get_alert_win_rate_session(self, pair: str, alert_key: str, session: str) -> Tuple[Optional[float], int]:
+        """Session-scoped twin of get_alert_win_rate. win_rate is None until
+        MIN_WIN_RATE_SESSION_SAMPLE is reached for this pair:alert_key:session combo."""
+        if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not getattr(cfg, "ENABLE_SESSION_FILTER", False):
+            return None, 0
+        stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}:{session}"
+        try:
+            data = await asyncio.wait_for(self._redis.hgetall(stats_key), timeout=2.0)
+            wins = int(data.get("wins", 0))
+            losses = int(data.get("losses", 0))
+            total = wins + losses
+            if total < getattr(cfg, "MIN_WIN_RATE_SESSION_SAMPLE", 15):
+                return None, total
+            return wins / total, total
+        except Exception as e:
+            logger.warning(f"Failed to read session win rate for {pair}:{alert_key}:{session}: {e}")
             return None, 0
 
     async def batch_get_alert_win_rates(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, Tuple[Optional[float], int]]:

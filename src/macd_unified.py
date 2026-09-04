@@ -19,6 +19,7 @@ from bot_config import (
     TRACE_ID, PAIR_ID, cfg, logger, logger_main,
     format_ist_time, MEMORY_CHECK_INTERVAL_PAIRS, validate_runtime_config,
     json_dumps, json_loads, JSON_BACKEND, shutdown_event, __version__, BtcMacroContext,
+    ClusterContext,
 )
 # ── fetcher : only orchestrator-level I/O ──
 from fetcher import (
@@ -259,6 +260,53 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
     finally:
         pass
 
+async def _compute_directional_cluster(
+    prepared_tasks: List[Tuple[str, str, Dict[str, Any]]],
+    state_db: RedisStateStore, correlation_id: str, reference_time: int,
+    oi_gate_data: Optional[Dict[str, Dict[str, Any]]],
+) -> Optional[ClusterContext]:
+    """..."""
+    semaphore = asyncio.Semaphore(cfg.EVAL_CONCURRENCY_LIMIT)
+
+    async def _lean(task):
+        p_name, symbol, candles = task
+        async with semaphore:
+            try:
+                pd_15m = parse_candles_to_numpy(candles.get("15"))
+                pd_5m = parse_candles_to_numpy(candles.get("5"))
+                if pd_15m is None or pd_5m is None:
+                    return None
+                pd_daily = (
+                    parse_candles_to_numpy(candles.get("D"))
+                    if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else None
+                )
+                data_daily = pd_daily.as_dict() if pd_daily is not None else None
+                oi = oi_gate_data.get(p_name) if (oi_gate_data and cfg.ENABLE_OI_FUNDING_FILTER) else None
+                gr = await _eval_gate(
+                    p_name, pd_15m, pd_5m, data_daily, state_db, correlation_id, reference_time, oi,
+                )
+                if gr is None or isinstance(gr, tuple):
+                    return None
+                if gr.confirmation_buy and gr.adx_ok:
+                    return "buy"
+                if gr.confirmation_sell and gr.adx_ok:
+                    return "sell"
+                return None
+            except Exception as e:
+                logger_main.debug(f"Cluster pre-pass eval failed for {p_name}: {e}")
+                return None
+
+    total = len(prepared_tasks)
+    if total == 0:
+        return None
+    leans = await asyncio.gather(*[_lean(t) for t in prepared_tasks])
+    buy_count = sum(1 for l in leans if l == "buy")
+    sell_count = sum(1 for l in leans if l == "sell")
+    return ClusterContext(
+        buy_count=buy_count, sell_count=sell_count, total_pairs=total,
+        buy_pct=buy_count / total, sell_pct=sell_count / total,
+    )
+
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict],
     pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue,
     correlation_id: str, lock: RedisLock, reference_time: int,
@@ -493,6 +541,23 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 logger_main.warning(f"Macro context ({ref_pair}) eval failed, disabling macro gate this run: {e}")
                 btc_context = None
 
+    # ── Correlation Cluster Detection (LIVE — see ClusterContext docstring) ──
+    cluster_context: Optional[ClusterContext] = None
+    if cfg.ENABLE_CLUSTER_GATE:
+        try:
+            cluster_context = await _compute_directional_cluster(
+                prepared_tasks, state_db, correlation_id, reference_time, oi_gate_data,
+            )
+            if cluster_context:
+                logger_main.info(
+                    f"📊 Directional cluster: buy={cluster_context.buy_count}/{cluster_context.total_pairs} "
+                    f"({cluster_context.buy_pct:.0%}), sell={cluster_context.sell_count}/{cluster_context.total_pairs} "
+                    f"({cluster_context.sell_pct:.0%})"
+                )
+        except Exception as e:
+            logger_main.warning(f"Cluster pre-pass failed, disabling cluster gate this run: {e}")
+            cluster_context = None
+
     logger_main.debug(f"🧠 Phase 3: Evaluating {len(prepared_tasks)} pairs...")
     eval_start = time.time()
     eval_semaphore = asyncio.Semaphore(cfg.EVAL_CONCURRENCY_LIMIT)  # NEW, e.g. 5
@@ -504,8 +569,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 reference_time, fetcher, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
                 oi_gate_data=oi_gate_data,
                 macro_context=btc_context,
+                cluster_context=cluster_context,
             )
-
     results = await asyncio.gather(
         *[_bounded_eval(t) for t in prepared_tasks],
         return_exceptions=True,
