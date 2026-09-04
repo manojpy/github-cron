@@ -7,7 +7,6 @@ from typing import Dict, Any, Optional, Tuple, Union
 import numpy as np
 
 from bot_config import cfg, Constants, PAIR_ID, normalize_timestamp, normalize_timestamp_array, format_ist_time, CONFLUENCE_WEIGHTS
-import alerts as alerts_module  # for RUNTIME_CONFLUENCE_WEIGHTS
 
 from fetcher import PriceData, get_last_closed_index_from_array, validate_candle_for_alerts
 from state import RedisStateStore, _blanket_reset_pair
@@ -194,10 +193,9 @@ class GateResult:
     dynamic_flow_cross_up: bool = False
     dynamic_flow_cross_down: bool = False 
 
+
 def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, float, Dict[str, bool]]:
-    # Use runtime weights if loaded from Redis, else fall back to static
-    weights = getattr(alerts_module, 'RUNTIME_CONFLUENCE_WEIGHTS', CONFLUENCE_WEIGHTS)
-    
+    weights = CONFLUENCE_WEIGHTS 
     score = 0.0
     total = 0.0
     votes: Dict[str, bool] = {}
@@ -496,7 +494,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                 f"Close={data_5m.close[i5]:.2f}"
             )
 
-        # ════════════════════════════════════════�������═══════════�����═
+        # ════════════════════════════════════════�������═══════════������═
         # PHASE 1 — Gate indicators only (cheap)
         # ════════════════════════════════════════���═══���══════
         gate_indicators = await asyncio.to_thread(

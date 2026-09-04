@@ -718,12 +718,9 @@ async def run_once() -> Optional[bool]:
             try:
                 dynamic_weights = await sdb.get_dynamic_weights()
                 if dynamic_weights:
-                    # Merge with static weights (keep any votes not in dynamic set)
-                    merged_weights = dict(CONFLUENCE_WEIGHTS)
-                    merged_weights.update(dynamic_weights)
-                    # Apply to runtime — store in alerts module for use in compute_confluence_score
-                    import alerts as alerts_module
-                    alerts_module.RUNTIME_CONFLUENCE_WEIGHTS = merged_weights
+                    # Update CONFLUENCE_WEIGHTS in-place (gates.py already imports this)
+                    from bot_config import CONFLUENCE_WEIGHTS
+                    CONFLUENCE_WEIGHTS.update(dynamic_weights)
                     logger_run.info(
                         f"⚙️ Dynamic vote weights loaded from Redis: {len(dynamic_weights)} override(s)"
                     )
