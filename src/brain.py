@@ -1012,7 +1012,7 @@ class BrainEngine:
         # ── Build concise message ──
         lines = [
             "🧠 *BRAIN REPORT*",
-            f"📊 Samples: {recs['real_sample_size']} real | {recs['shadow_sample_size']} shadow",
+            f"📊 Samples: {escape_markdown_v2(str(recs['real_sample_size']))} real | {escape_markdown_v2(str(recs['shadow_sample_size']))} shadow",
             "",
         ]
 
@@ -1020,17 +1020,17 @@ class BrainEngine:
         brier_val = ai.get("brier_score")
         if brier_val is not None:
             brier_st = ai.get("brier_status", "?")
-            lines.append(f"🎯 Calibration: {brier_val:.2f} ({brier_st})")
+            lines.append(f"🎯 Calibration: {escape_markdown_v2(f'{brier_val:.2f}')} ({escape_markdown_v2(brier_st)})")
         net_ev = ai.get("net_ev")
         if net_ev is not None:
-            lines.append(f"💰 Net EV: {net_ev:+.3f}%/trade")
+            lines.append(f"💰 Net EV: {escape_markdown_v2(f'{net_ev:+.3f}')}%/trade")
         half_kelly = ai.get("half_kelly")
         if half_kelly is not None:
-            lines.append(f"📐 Position: {half_kelly:.1%} (Half-Kelly)")
+            lines.append(f"📐 Position: {escape_markdown_v2(f'{half_kelly:.1%}')} (Half-Kelly)")
         cusum_n = ai.get("cusum_drifts", 0)
-        lines.append(f"🔍 CUSUM: {'⚠️ ' + str(cusum_n) + ' drifts' if cusum_n else 'Normal'}")
+        lines.append(f"🔍 CUSUM: {'⚠️ ' + escape_markdown_v2(str(cusum_n)) + ' drifts' if cusum_n else 'Normal'}")
         if ai.get("ood_status"):
-            lines.append(f"🛡️ OOD Gate: {ai['ood_status']}")
+            lines.append(f"🛡️ OOD Gate: {escape_markdown_v2(ai['ood_status'])}")
         lines.append("")
 
         # ── HIGH PRIORITY ACTIONS (only high severity) ──
@@ -1057,7 +1057,7 @@ class BrainEngine:
                         for k, v in suggested.items():
                             old_v = current.get(k) if isinstance(current, dict) else None
                             if old_v != v:
-                                changes.append(f"{k}: {old_v}→{v}")
+                                changes.append(f"{escape_markdown_v2(k)}: {escape_markdown_v2(str(old_v))}→{escape_markdown_v2(str(v))}")
                         if changes:
                             lines.append(f"• {escape_markdown_v2(path)}: {escape_markdown_v2(', '.join(changes[:3]))}")
                     else:
@@ -1084,7 +1084,7 @@ class BrainEngine:
         if total_recs == 0:
             lines.append("No actionable signal yet — still accumulating samples.")
         elif total_recs > shown:
-            lines.append(f"… ({total_recs - shown} more items not shown)")
+            lines.append(f"… ({escape_markdown_v2(str(total_recs - shown))} more items not shown)")
 
         # ── Assemble message ──
         msg = self._truncate_telegram(lines)
