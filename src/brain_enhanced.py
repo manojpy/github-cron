@@ -97,6 +97,34 @@ class BrainEngineV2(BaseBrainEngine):
                         "suggested": wopt["suggested_weights"],
                         "reason": "Logistic-regression optimal weights",
                     })
+
+                    # NEW: Persist to Redis for runtime override
+                    if getattr(cfg, "BRAIN_AUTO_APPLY_DYNAMIC_WEIGHTS", False):
+                        saved = await self.sdb.set_dynamic_weights(wopt["suggested_weights"])
+                        if saved:
+                            recommendations.append({
+                                "type": "dynamic_weights_applied",
+                                "severity": "medium",
+                                "message": (
+                                    f"💾 Dynamic weights persisted to Redis: {len(changed)} vote(s) updated. "
+                                    f"Will take effect on next bot run."
+                                ),
+                            })
+                        else:
+                            recommendations.append({
+                                "type": "dynamic_weights_persist_failed",
+                                "severity": "low",
+                                "message": "❌ Failed to persist dynamic weights to Redis — keeping static weights."
+                            })
+                    else:
+                        recommendations.append({
+                            "type": "dynamic_weights_shadow",
+                            "severity": "low",
+                            "message": (
+                                f"👻 Dynamic weights computed but NOT persisted. Set "
+                                f"BRAIN_AUTO_APPLY_DYNAMIC_WEIGHTS=True to auto-apply after shadow validation."
+                            ),
+                        })
                 if wopt["negative_votes"]:
                     recommendations.append({
                         "type": "negative_votes",

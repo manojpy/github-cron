@@ -559,6 +559,48 @@ class RedisStateStore:
             return False
         return True
 
+    async def get_dynamic_weights(self) -> Optional[Dict[str, float]]:
+        """Load the Brain's optimized CONFLUENCE_WEIGHTS from Redis.
+        Returns None if not stored yet (caller should fall back to static config)."""
+        if self.degraded or not self._redis:
+            return None
+        raw = await self.get_metadata("dynamic_weights")
+        if not raw:
+            return None
+        try:
+            data = json_loads(raw)
+            if not isinstance(data, dict):
+                logger.warning("Ignoring malformed dynamic_weights in Redis: not a dict")
+                return None
+            # Validate: only float values, non-negative
+            return {k: float(v) for k, v in data.items() if isinstance(v, (int, float)) and float(v) >= 0}
+        except (JSONDecodeError, TypeError, ValueError) as e:
+            logger.warning(f"Ignoring malformed dynamic_weights in Redis: {e}")
+            return None
+
+    async def set_dynamic_weights(self, weights: Dict[str, float], ttl: int = 30 * 86400) -> bool:
+        """Persist the Brain's optimized CONFLUENCE_WEIGHTS to Redis.
+        TTL default 30 days — refresh on each Brain report."""
+        if self.degraded or not self._redis:
+            return False
+        try:
+            await self.set_metadata("dynamic_weights", json_dumps(weights), ttl=ttl)
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to persist dynamic_weights: {e}")
+            return False
+
+    async def clear_dynamic_weights(self) -> bool:
+        """Remove stored dynamic weights (revert to static CONFLUENCE_WEIGHTS)."""
+        if self.degraded or not self._redis:
+            return False
+        try:
+            await self._redis.delete(f"{self.meta_prefix}dynamic_weights")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to clear dynamic_weights: {e}")
+            return False
+
     async def batch_get_metadata(self, keys: List[str], timeout: float = 5.0) -> Dict[str, Optional[str]]:
         """Fetch many metadata keys in ONE Redis round-trip (pipeline)."""
         if not self._redis or self.degraded or not keys:

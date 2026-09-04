@@ -34,6 +34,10 @@ from indicators import (
 from threshold_engine import hash_config_state
 from telegram_feedback import build_feedback_keyboard, record_feedback_pending
 
+# Runtime override for CONFLUENCE_WEIGHTS (loaded from Redis at startup)
+# Falls back to static cfg.CONFLUENCE_WEIGHTS if not set
+RUNTIME_CONFLUENCE_WEIGHTS: Dict[str, float] = dict(CONFLUENCE_WEIGHTS)
+
 def escape_markdown_v2(text: str) -> str:
     return CompiledPatterns.ESCAPE_MARKDOWN.sub(r'\\\g<0>', str(text))
 
@@ -1225,13 +1229,13 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         confluence_score = confluence_score_buy if is_buy_batch else confluence_score_sell
         confluence_total = confluence_total_buy if is_buy_batch else confluence_total_sell
 
-        # ── Macro Context Modifier (SHADOW MODE ONLY) ──────────────────────
+        # ── Macro Context Modifier (LIVE when MACRO_CONTEXT_LIVE=True) ─────
         macro_shadow: Optional[Dict[str, Any]] = None
+        macro_multiplier = 1.0
         if alerts_to_send and getattr(cfg, "ENABLE_MACRO_CONTEXT_GATE", False) and macro_context is not None:
             btc_bearish = macro_context.confirmation_sell and macro_context.adx_ok
             btc_bullish = macro_context.confirmation_buy and macro_context.adx_ok
             if (is_buy_batch and btc_bearish) or (not is_buy_batch and btc_bullish):
-                macro_multiplier = 1.0
                 corr = rolling_correlation(
                     _pct_returns(data_15m.close), _pct_returns(macro_context.closes),
                     window=Constants.MACRO_CORR_WINDOW,
@@ -1257,13 +1261,36 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     "relative_strength": None if relative_strength is None else round(relative_strength, 5),
                     "multiplier": round(macro_multiplier, 3),
                     "btc_bullish": btc_bullish, "btc_bearish": btc_bearish,
-                    "would_block": False,  # filled in below, once `required` is known
                 }
                 logger_pair.info(
-                    f"[{pair_name}] 🌐 Macro shadow: corr={macro_shadow['correlation']}, "
-                    f"RS={macro_shadow['relative_strength']}, multiplier={macro_multiplier:.2f} "
-                    f"(SHADOW ONLY — not applied to dispatch)"
+                    f"[{pair_name}] 🌐 Macro context: corr={macro_shadow['correlation']}, "
+                    f"RS={macro_shadow['relative_strength']}, multiplier={macro_multiplier:.2f}"
+                    f"{' [LIVE]' if getattr(cfg, 'MACRO_CONTEXT_LIVE', False) else ' (SHADOW ONLY)'}"
                 )
+
+# ── Existing confluence gate, but with macro multiplier ─────────────
+if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
+    abs_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
+    if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
+        pair_floor = await sdb.get_pair_threshold(pair_name)
+        if pair_floor is not None:
+            abs_floor = pair_floor
+    pct_floor = confluence_total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
+    required = max(pct_floor, abs_floor)
+    
+    # Apply macro multiplier ONLY if MACRO_CONTEXT_LIVE is enabled
+    if getattr(cfg, "MACRO_CONTEXT_LIVE", False):
+        required = required * macro_multiplier
+        if macro_shadow is not None:
+            macro_shadow["would_block"] = confluence_score < required
+    
+    if confluence_score < required:
+        logger_pair.info(
+            f"[{pair_name}] Confluence gate blocked: {confluence_score:.1f}/{confluence_total:.1f} "
+            f"weighted score (need {required:.1f}, abs_floor={abs_floor:.1f}, "
+            f"macro_mult={macro_multiplier if getattr(cfg, 'MACRO_CONTEXT_LIVE', False) else 1.0:.2f})"
+        )
+        alerts_to_send = []
 
         # ── Correlation Cluster Penalty ("Beta Trap" filter) — LIVE ────────
         if (alerts_to_send and getattr(cfg, "ENABLE_CLUSTER_GATE", False)

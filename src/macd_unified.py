@@ -85,7 +85,6 @@ def get_trigger_timestamp() -> int:
     
     return int(datetime.now(timezone.utc).timestamp())
 
-
 async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: PriceData,
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int, fetcher: DataFetcher, symbol: str, alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
@@ -713,6 +712,25 @@ async def run_once() -> Optional[bool]:
                     )
             except Exception as e:
                 logger_run.warning(f"Could not load config override from Redis (non-fatal): {e}")
+
+        # ── Dynamic Vote Weights (Brain Phase 1.5 productionization) ────────
+        if getattr(cfg, "BRAIN_AUTO_APPLY_DYNAMIC_WEIGHTS", False) and sdb and not sdb.degraded:
+            try:
+                dynamic_weights = await sdb.get_dynamic_weights()
+                if dynamic_weights:
+                    # Merge with static weights (keep any votes not in dynamic set)
+                    merged_weights = dict(CONFLUENCE_WEIGHTS)
+                    merged_weights.update(dynamic_weights)
+                    # Apply to runtime — store in alerts module for use in compute_confluence_score
+                    import alerts as alerts_module
+                    alerts_module.RUNTIME_CONFLUENCE_WEIGHTS = merged_weights
+                    logger_run.info(
+                        f"⚙️ Dynamic vote weights loaded from Redis: {len(dynamic_weights)} override(s)"
+                    )
+                else:
+                    logger_run.info("No dynamic weights in Redis — using static CONFLUENCE_WEIGHTS")
+            except Exception as e:
+                logger_run.warning(f"Failed to load dynamic weights: {e} — using static CONFLUENCE_WEIGHTS")
 
         if os.getenv("CLEAR_ALL_STATES", "false").lower() == "true": 
             if sdb and not sdb.degraded:

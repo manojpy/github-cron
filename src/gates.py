@@ -7,6 +7,7 @@ from typing import Dict, Any, Optional, Tuple, Union
 import numpy as np
 
 from bot_config import cfg, Constants, PAIR_ID, normalize_timestamp, normalize_timestamp_array, format_ist_time, CONFLUENCE_WEIGHTS
+import alerts as alerts_module  # for RUNTIME_CONFLUENCE_WEIGHTS
 
 from fetcher import PriceData, get_last_closed_index_from_array, validate_candle_for_alerts
 from state import RedisStateStore, _blanket_reset_pair
@@ -194,6 +195,9 @@ class GateResult:
     dynamic_flow_cross_down: bool = False 
 
 def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, float, Dict[str, bool]]:
+    # Use runtime weights if loaded from Redis, else fall back to static
+    weights = getattr(alerts_module, 'RUNTIME_CONFLUENCE_WEIGHTS', CONFLUENCE_WEIGHTS)
+    
     score = 0.0
     total = 0.0
     votes: Dict[str, bool] = {}
@@ -207,50 +211,50 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, flo
     oi_funding_ok = gr.oi_funding_ok_buy if is_buy else gr.oi_funding_ok_sell
     ob_gate_ok    = gr.ob_gate_ok_buy if is_buy else gr.ob_gate_ok_sell
 
-    w = CONFLUENCE_WEIGHTS["base_trend"]
+    w = weights["base_trend"]
     total += w
     votes["base_trend"] = bool(base_trend)
     if base_trend: score += w
 
     if cfg.ICHIMOKU_CLOUD_ENABLED and ichimoku_ok is not None:
-        w = CONFLUENCE_WEIGHTS["ichimoku_cloud"]
+        w = weights["ichimoku_cloud"]
         total += w
         votes["ichimoku_cloud"] = bool(ichimoku_ok)
         if ichimoku_ok: score += w
 
     if cfg.RMA_CLOUD_ENABLED and rma_cloud_ok is not None:
-        w = CONFLUENCE_WEIGHTS["rma_cloud"]
+        w = weights["rma_cloud"]
         total += w
         votes["rma_cloud"] = bool(rma_cloud_ok)
         if rma_cloud_ok: score += w
 
     if cfg.DYNAMIC_FLOW_RIBBON_ENABLED and dynamic_flow_ok is not None:
-        w = CONFLUENCE_WEIGHTS["dynamic_flow_ribbon"]
+        w = weights["dynamic_flow_ribbon"]
         total += w
         votes["dynamic_flow_ribbon"] = bool(dynamic_flow_ok)
         if dynamic_flow_ok: score += w
 
     if cfg.ENABLE_PPO_GATE:
-        w = CONFLUENCE_WEIGHTS["ppo_cross"]
+        w = weights["ppo_cross"]
         total += w
         votes["ppo_cross"] = bool(ppo_cross_ok)
         if ppo_cross_ok: score += w
 
     if cfg.RSI_GUARD_ENABLED:
-        w = CONFLUENCE_WEIGHTS["rsi_guard"]
+        w = weights["rsi_guard"]
         total += w
         votes["rsi_guard"] = bool(rsi_guard_ok)
         if rsi_guard_ok: score += w
 
     if cfg.ICHIMOKU_TK_GUARD_ENABLED and tk_guard_ok is not None:
-        w = CONFLUENCE_WEIGHTS["tk_guard"]
+        w = weights["tk_guard"]
         total += w
         votes["tk_guard"] = bool(tk_guard_ok)
         if tk_guard_ok: score += w
 
     ppo_gate_mom_ok = gr.ppo_gate_momentum_ok_buy if is_buy else gr.ppo_gate_momentum_ok_sell
     if cfg.ENABLE_PPO_GATE_MOMENTUM_VOTE and ppo_gate_mom_ok is not None:
-        w = CONFLUENCE_WEIGHTS["ppo_gate_momentum"]
+        w = weights["ppo_gate_momentum"]
         total += w
         votes["ppo_gate_momentum"] = bool(ppo_gate_mom_ok)
         if ppo_gate_mom_ok:
@@ -258,7 +262,7 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, flo
 
     rsi_guard_mom_ok = gr.rsi_guard_momentum_ok_buy if is_buy else gr.rsi_guard_momentum_ok_sell
     if cfg.ENABLE_RSI_GUARD_MOMENTUM_VOTE and rsi_guard_mom_ok is not None:
-        w = CONFLUENCE_WEIGHTS["rsi_guard_momentum"]
+        w = weights["rsi_guard_momentum"]
         total += w
         votes["rsi_guard_momentum"] = bool(rsi_guard_mom_ok)
         if rsi_guard_mom_ok:
@@ -266,7 +270,7 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, flo
 
     rma_cloud_mom_ok = gr.rma_cloud_momentum_ok_buy if is_buy else gr.rma_cloud_momentum_ok_sell
     if cfg.ENABLE_RMA_CLOUD_MOMENTUM_VOTE and rma_cloud_mom_ok is not None:
-        w = CONFLUENCE_WEIGHTS["rma_cloud_momentum"]
+        w = weights["rma_cloud_momentum"]
         total += w
         votes["rma_cloud_momentum"] = bool(rma_cloud_mom_ok)
         if rma_cloud_mom_ok:
@@ -274,61 +278,61 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, flo
 
     vwap_mom_ok = gr.vwap_momentum_ok_buy if is_buy else gr.vwap_momentum_ok_sell
     if cfg.ENABLE_VWAP_MOMENTUM_VOTE and vwap_mom_ok is not None:
-        w = CONFLUENCE_WEIGHTS["vwap_momentum"]
+        w = weights["vwap_momentum"]
         total += w
         votes["vwap_momentum"] = bool(vwap_mom_ok)
         if vwap_mom_ok:
             score += w
 
     if cfg.ENABLE_ADX_FILTER:
-        w = CONFLUENCE_WEIGHTS["adx"]
+        w = weights["adx"]
         total += w
         votes["adx"] = bool(gr.adx_ok)
         if gr.adx_ok: score += w
 
     if cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED:
-        w = CONFLUENCE_WEIGHTS["rvol"]
+        w = weights["rvol"]
         total += w
         votes["rvol"] = bool(gr.rvol_ok)
         if gr.rvol_ok: score += w
 
     if cfg.ENABLE_CPR:
-        w = CONFLUENCE_WEIGHTS["cpr"]
+        w = weights["cpr"]
         total += w
         votes["cpr"] = bool(gr.effective_cpr_ok)
         if gr.effective_cpr_ok: score += w
 
     if cfg.ENABLE_ADX_STRENGTH_VOTE and gr.adx_strength_ok is not None:
-        w = CONFLUENCE_WEIGHTS["adx_strength"]
+        w = weights["adx_strength"]
         total += w
         votes["adx_strength"] = bool(gr.adx_strength_ok)
         if gr.adx_strength_ok: score += w
 
     if cfg.ENABLE_ATR_PCTL_VOTE and gr.atr_pctl_ok is not None:
-        w = CONFLUENCE_WEIGHTS["atr_percentile"]
+        w = weights["atr_percentile"]
         total += w
         votes["atr_percentile"] = bool(gr.atr_pctl_ok)
         if gr.atr_pctl_ok: score += w
 
     if cfg.ENABLE_VOLUME_PCTL_VOTE and gr.volume_pctl_ok is not None:
-        w = CONFLUENCE_WEIGHTS["volume_percentile"]
+        w = weights["volume_percentile"]
         total += w
         votes["volume_percentile"] = bool(gr.volume_pctl_ok)
         if gr.volume_pctl_ok: score += w
 
     if cfg.ENABLE_OI_FUNDING_FILTER and oi_funding_ok is not None:
-        w = CONFLUENCE_WEIGHTS["oi_funding"]
+        w = weights["oi_funding"]
         total += w
         votes["oi_funding"] = bool(oi_funding_ok)
         if oi_funding_ok: score += w
 
     if cfg.ENABLE_OB_GATE and ob_gate_ok is not None:
-        w = CONFLUENCE_WEIGHTS["order_block"]
+        w = weights["order_block"]
         total += w
         votes["order_block"] = bool(ob_gate_ok)
         if ob_gate_ok:
             score += w
-            base_trend_weight = CONFLUENCE_WEIGHTS["base_trend"]
+            base_trend_weight = weights["base_trend"]
             other_score = score - w - (base_trend_weight if base_trend else 0.0)
             if other_score < cfg.OB_MIN_OTHER_SCORE:
                 score -= w
@@ -492,7 +496,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                 f"Close={data_5m.close[i5]:.2f}"
             )
 
-        # ════════════════════════════════════════�����═══════════�����═
+        # ════════════════════════════════════════�������═══════════�����═
         # PHASE 1 — Gate indicators only (cheap)
         # ════════════════════════════════════════���═══���══════
         gate_indicators = await asyncio.to_thread(
