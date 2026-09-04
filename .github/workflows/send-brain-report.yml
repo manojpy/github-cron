@@ -1,0 +1,160 @@
+name: 🧠 Send Brain Report (4h)
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"   # every 4 hours, on the hour UTC
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
+  REPORT_TIMEOUT: 180
+
+jobs:
+  send-brain-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: 🔑 Verify Secrets
+        run: |
+          MISSING=()
+          [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
+          [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
+          [ -z "${{ secrets.REDIS_URL }}" ] && MISSING+=("REDIS_URL")
+          [ -z "${{ secrets.DELTA_API_BASE }}" ] && MISSING+=("DELTA_API_BASE")
+
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "❌ Missing secrets: ${MISSING[*]}"
+            exit 1
+          fi
+          echo "✅ All required secrets configured"
+
+      - name: 🔨 Create Config
+        env:
+          CONFIG_JSON: ${{ secrets.MACD_CONFIG_JSON }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ -n "$CONFIG_JSON" ]]; then
+            echo "$CONFIG_JSON" > config_macd.json
+            if ! python3 -c "import json; json.load(open('config_macd.json'))" 2>/dev/null; then
+              echo "❌ config_macd.json is not valid JSON (from Secret)"
+              exit 1
+            fi
+            echo "✅ Config loaded from Secret (Fast)"
+          else
+            echo "⚠️ Secret MACD_CONFIG_JSON missing."
+            echo "🔥 Falling back to GitHub API download..."
+
+            HTTP_STATUS=$(curl -s -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3.raw" \
+              -L "https://api.github.com/repos/${{ github.repository }}/contents/config_macd.json" \
+              -o config_macd.json)
+
+            if [ "$HTTP_STATUS" != "200" ]; then
+              echo "❌ Failed to load config from all sources:"
+              echo "   1. Secret MACD_CONFIG_JSON: Not available"
+              echo "   2. GitHub API download: Failed (HTTP $HTTP_STATUS)"
+              exit 1
+            fi
+
+            if ! python3 -c "import json; json.load(open('config_macd.json'))" 2>/dev/null; then
+              echo "❌ config_macd.json is not valid JSON (from GitHub API)"
+              exit 1
+            fi
+            echo "✅ Config downloaded via API"
+          fi
+
+      - name: 🐳 Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔥 Pull Latest Image
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo "🐳 Pulling image..."
+          START=$(date +%s)
+          docker pull --quiet --platform linux/amd64 "$IMAGE"
+          echo "✅ Image ready in $(( $(date +%s) - START ))s"
+
+      - name: 🧠 Generate & Send Brain Report
+        id: brain_report
+        timeout-minutes: 3
+        run: |
+          mkdir -p logs
+          echo "🕐 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
+
+          START_TIME=$(date +%s)
+
+          ENV_FILE="$(pwd)/.bot_env"
+          cat > "$ENV_FILE" <<EOF
+          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+          REDIS_URL=${{ secrets.REDIS_URL }}
+          DELTA_API_BASE=${{ secrets.DELTA_API_BASE }}
+          EOF
+
+          timeout --signal=SIGTERM --kill-after=10s ${{ env.REPORT_TIMEOUT }}s docker run \
+            --rm \
+            --name "brain_report_${{ github.run_id }}" \
+            --platform linux/amd64 \
+            --memory="500m" \
+            --memory-swap="1000m" \
+            --cpus="1.0" \
+            --security-opt=no-new-privileges \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=32m \
+            --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=16m \
+            --env-file "$ENV_FILE" \
+            -e TZ=Asia/Kolkata \
+            -e PYTHONPATH=/app/src \
+            -e PYTHONUNBUFFERED=1 \
+            -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \
+            --entrypoint python \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            send_brain_report.py 2>&1 | tee logs/brain_report.log
+
+          EXIT_CODE=${PIPESTATUS[0]}
+          rm -f "$ENV_FILE"
+
+          if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ]; then
+            echo "⚠️ Brain report timed out after $(( $(date +%s) - START_TIME ))s"
+            exit 1
+          elif [ $EXIT_CODE -ne 0 ]; then
+            echo "❌ Brain report exited with code $EXIT_CODE"
+            exit 1
+          fi
+          echo "✅ Brain report sent"
+
+      - name: 📦 Upload Logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: brain-report-logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 7
+          compression-level: 9
+          if-no-files-found: ignore
+
+      - name: 📨 Notify Telegram on Failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MSG="🔴 Brain report workflow FAILED"$'\n'"Run: ${RUN_URL}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" \
+            -o /dev/null -w "Telegram notify HTTP %{http_code}\n"
