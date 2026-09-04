@@ -1032,7 +1032,7 @@ class RedisStateStore:
                             continue
 
                         alert_key = result["alert_key"]
-                       direction = result["direction"]
+                        direction = result["direction"]
                         entry_ts = result["entry_ts"]
                         pct_move = result["pct_move"]
                         win = result["win"]
