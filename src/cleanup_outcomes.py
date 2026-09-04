@@ -15,7 +15,7 @@ import argparse
 import gzip
 import os
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 def get_dir_size(path: Path) -> int:
@@ -38,10 +38,10 @@ def format_size(bytes: int) -> str:
     return f"{bytes:.2f} TB"
 
 def cleanup_by_age(data_dir: Path, max_age_days: int) -> int:
-    """Remove files older than max_age_days based on mtime (works for both daily and monthly files)."""
+    """Remove files older than max_age_days."""
     removed = 0
-    cutoff = datetime.utcnow() - timedelta(days=max_age_days)
-    
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+
     for label in ["outcomes", "shadow"]:
         label_dir = data_dir / label
         if not label_dir.exists():
