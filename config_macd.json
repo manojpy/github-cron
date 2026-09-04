@@ -3,6 +3,7 @@
   "TELEGRAM_CHAT_ID": "__SET_IN_GITHUB_SECRETS__",
   "REDIS_URL": "__SET_IN_GITHUB_SECRETS__",
   "DELTA_API_BASE": "https://api.india.delta.exchange",
+  "OUTCOME_DATA_DIR": "outcome-data",
   
   "BOT_NAME": "Unified Alert Bot",
   "DEBUG_MODE": false,
@@ -217,6 +218,7 @@
   "ENABLE_WIN_RATE_FILTER": true,
   "ENABLE_SESSION_FILTER": false,
   "ENABLE_BRAIN": true,
+  "BRAIN_USE_FILE_STORAGE": true, 
   "BRAIN_AUTO_DISABLE_ENABLED": true,
   "BRAIN_AUTO_APPLY_DYNAMIC_WEIGHTS": false,
   "BRAIN_SHADOW_MODE": true,
