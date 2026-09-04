@@ -998,95 +998,146 @@ class BrainEngine:
         return await self._generate_and_send(pairs, telegram_queue, logger_run)
 
     async def _generate_and_send(self, pairs: List[str], telegram_queue: Any, logger_run: logging.Logger) -> bool:
-        """Shared by maybe_generate_report (throttled) and send_report_now
-        (on-demand): build recommendations, format the Telegram message,
-        persist, and send."""
         logger_run.info("Brain generating analysis report...")
         recs = await self.generate_recommendations()
 
-        ai = recs.get("ai_metrics", {})
+        cc = recs.get("current_config", {})
+        lines = [
+            "🧠 *BRAIN ANALYSIS REPORT*",
+            f"Generated: {escape_markdown_v2(format_ist_time())}",
+            f"Pairs monitored: {len(pairs)}",
+            escape_markdown_v2(
+                f"Real trades sampled: {recs['real_sample_size']} | Shadow-tracked: {recs['shadow_sample_size']}"
+            ),
+            escape_markdown_v2(
+                f"Current: CONFLUENCE_MIN_ABS_SCORE={cc.get('CONFLUENCE_MIN_ABS_SCORE')} | "
+                f"CONFLUENCE_MIN_PCT={cc.get('CONFLUENCE_MIN_PCT')}"
+            ),
+            "",
+        ]
         high = [r for r in recs["recommendations"] if r["severity"] == "high"]
         med = [r for r in recs["recommendations"] if r["severity"] == "medium"]
         low = [r for r in recs["recommendations"] if r["severity"] == "low"]
 
-        # ── Build concise message ──
-        lines = [
-            "🧠 *BRAIN REPORT*",
-            f"📊 Samples: {escape_markdown_v2(str(recs['real_sample_size']))} real | {escape_markdown_v2(str(recs['shadow_sample_size']))} shadow",
-            "",
-        ]
-
-        # AI Metrics (compact)
-        brier_val = ai.get("brier_score")
-        if brier_val is not None:
+        # ── AI Metrics header ────────────────────────────────────────────
+        ai = recs.get("ai_metrics", {})
+        if ai:
+            lines.append("*🤖 AI METRICS*")
+            brier_val = ai.get("brier_score")
             brier_st = ai.get("brier_status", "?")
-            lines.append(f"🎯 Calibration: {escape_markdown_v2(f'{brier_val:.2f}')} ({escape_markdown_v2(brier_st)})")
-        net_ev = ai.get("net_ev")
-        if net_ev is not None:
-            lines.append(f"💰 Net EV: {escape_markdown_v2(f'{net_ev:+.3f}')}%/trade")
-        half_kelly = ai.get("half_kelly")
-        if half_kelly is not None:
-            lines.append(f"📐 Position: {escape_markdown_v2(f'{half_kelly:.1%}')} (Half-Kelly)")
-        cusum_n = ai.get("cusum_drifts", 0)
-        lines.append(f"🔍 CUSUM: {'⚠️ ' + escape_markdown_v2(str(cusum_n)) + ' drifts' if cusum_n else 'Normal'}")
-        if ai.get("ood_status"):
-            lines.append(f"🛡️ OOD Gate: {escape_markdown_v2(ai['ood_status'])}")
-        lines.append("")
+            if brier_val is not None:
+                lines.append(escape_markdown_v2(f"  Calibration (Brier): {brier_val:.3f} ({brier_st})"))
+            net_ev = ai.get("net_ev")
+            half_kelly = ai.get("half_kelly")
+            if net_ev is not None:
+                lines.append(escape_markdown_v2(f"  Net EV (fees/slippage): {net_ev:+.3f}%/trade"))
+            if half_kelly is not None:
+                lines.append(escape_markdown_v2(f"  Position Sizing: {half_kelly:.1%} (Half-Kelly)"))
+            cusum_n = ai.get("cusum_drifts", 0)
+            lines.append(escape_markdown_v2(
+                f"  CUSUM Drift Status: {'🚨 ' + str(cusum_n) + ' ALERT(S)' if cusum_n else 'Normal'}"
+            ))
+            if ai.get("ood_status"):
+                lines.append(escape_markdown_v2(f"  Vote-Count OOD Gate: {ai['ood_status']}"))
+            lines.append("")
 
-        # ── HIGH PRIORITY ACTIONS (only high severity) ──
+        # ── Auto-Block Status ──
+        auto_disabled = [r for r in recs["recommendations"] if r["type"] == "auto_disabled"]
+        auto_reenabled = [r for r in recs["recommendations"] if r["type"] == "auto_reenabled"]
+        if auto_disabled or auto_reenabled:
+            lines.append("*🔒 AUTO-BLOCK STATUS*")
+            for r in (auto_disabled + auto_reenabled)[:4]:
+                icon = "🔴" if r["type"] == "auto_disabled" else "🟢"
+                lines.append(f"{icon} {escape_markdown_v2(r['message'][:150])}")
+            lines.append("")
+
+        # ── Per-Alert Performance ──
+        perf = [r for r in recs["recommendations"] if r["type"] == "per_alert_breakdown"]
+        if perf:
+            lines.append("*📊 ALERT PERFORMANCE*")
+            for line in perf[0]["message"].split("\n")[:12]:
+                lines.append(escape_markdown_v2(line))
+            lines.append("")
+
+        # ── Parameter Autopsy ──
+        param_recs = [r for r in recs["recommendations"] if r["type"] == "parameter_autopsy"]
+        if param_recs:
+            lines.append("*🎚️ PARAMETER TUNING*")
+            for r in param_recs[:6]:
+                lines.append(f"• {escape_markdown_v2(r['message'][:180])}")
+            lines.append("")
+
+        # ── Diagnostics (Weak Pairs + Vote Quality) ──
+        weak = [r for r in recs["recommendations"] if r["type"] == "weak_pairs"]
+        vq = [r for r in recs["recommendations"] if r["type"] == "vote_importance"]
+        if weak or vq:
+            lines.append("*🔻 DIAGNOSTICS*")
+            if weak:
+                lines.append(f"• {escape_markdown_v2(weak[0]['message'][:200])}")
+            if vq:
+                lines.append(f"• {escape_markdown_v2(vq[0]['message'][:200])}")
+            lines.append("")
+
+        # ── Regime & Robustness ──
+        regime = [r for r in recs["recommendations"] if r["type"] == "regime_breakdown"]
+        mc = [r for r in recs["recommendations"] if r["type"] == "monte_carlo_robustness"]
+        if regime or mc:
+            lines.append("*📈 REGIME & ROBUSTNESS*")
+            if regime:
+                lines.append(f"• {escape_markdown_v2(regime[0]['message'][:200])}")
+            if mc:
+                lines.append(f"• {escape_markdown_v2(mc[0]['message'][:200])}")
+            lines.append("")
+
+        # ── Config Patch ──
+        if recs["config_patch"]:
+            lines.append(f"*⚙️ SUGGESTED {escape_markdown_v2('config_macd.json')} PATCH*")
+            lines.append("```")
+            patch_details = json.dumps(recs["config_patch"], indent=2)
+            if len(patch_details) > 1500:
+                patch_details = patch_details[:1500] + "\n... truncated"
+            lines.append(patch_details)
+            lines.append("```")
+            lines.append("")
+
+        # ── High Priority (remaining) ──
         if high:
-            lines.append("*🔴 ACTIONS REQUIRED*")
-            for r in high[:6]:  # Max 6 items
-                msg = r.get("message", "")
-                if len(msg) > 120:
-                    msg = msg[:120] + "..."
-                lines.append(f"• {escape_markdown_v2(msg)}")
+            lines.append("*🔴 HIGH PRIORITY*")
+            for r in high[:6]:
+                lines.append(f"• {escape_markdown_v2(r['message'][:180])}")
             lines.append("")
 
-        # ── Config Patch (compact) ──
-        if recs.get("config_patch"):
-            lines.append("*⚙️ SUGGESTED CHANGES*")
-            for patch in recs["config_patch"][:5]:  # Max 5 patches
-                path = patch.get("path", "?")
-                suggested = patch.get("suggested")
-                current = patch.get("current")
-                if suggested is not None:
-                    if isinstance(suggested, dict):
-                        # For CONFLUENCE_WEIGHTS, just show key changes
-                        changes = []
-                        for k, v in suggested.items():
-                            old_v = current.get(k) if isinstance(current, dict) else None
-                            if old_v != v:
-                                changes.append(f"{escape_markdown_v2(k)}: {escape_markdown_v2(str(old_v))}→{escape_markdown_v2(str(v))}")
-                        if changes:
-                            lines.append(f"• {escape_markdown_v2(path)}: {escape_markdown_v2(', '.join(changes[:3]))}")
-                    else:
-                        lines.append(
-                            f"• {escape_markdown_v2(path)}: "
-                            f"{escape_markdown_v2(str(current))} → "
-                            f"{escape_markdown_v2(str(suggested))}"
-                        )
-            lines.append("")
-
-        # ── WATCH (medium severity, brief) ──
+        # ── Medium Priority (remaining) ──
         if med:
             lines.append("*🟡 WATCH*")
-            for r in med[:3]:  # Max 3 items
-                msg = r.get("message", "")
-                if len(msg) > 100:
-                    msg = msg[:100] + "..."
-                lines.append(f"• {escape_markdown_v2(msg)}")
+            for r in med[:8]:
+                lines.append(f"• {escape_markdown_v2(r['message'][:180])}")
+            lines.append("")
+
+        # ── Low Priority (remaining) ──
+        if low:
+            lines.append("*🟢 STRONG PERFORMERS*")
+            for r in low[:8]:
+                lines.append(f"• {escape_markdown_v2(r['message'][:180])}")
             lines.append("")
 
         # ── Total count ──
-        total_recs = recs.get("recommendation_count", 0)
-        shown = len(high[:6]) + len(recs.get("config_patch", [])[:5]) + len(med[:3])
+        total_recs = recs["recommendation_count"]
+        shown = len(auto_disabled) + len(auto_reenabled) + len(perf) + len(param_recs[:6]) + len(weak) + len(vq) + len(regime) + len(mc) + len(high[:6]) + len(med[:8]) + len(low[:8])
         if total_recs == 0:
             lines.append("No actionable signal yet — still accumulating samples.")
         elif total_recs > shown:
-            lines.append(f"… ({escape_markdown_v2(str(total_recs - shown))} more items not shown)")
+            lines.append(
+                escape_markdown_v2(f"… ({total_recs - shown} more items not shown)")
+            )
+        lines.append("")
+        lines.append(
+            escape_markdown_v2(
+                "Stability: run weekly. If the recommended threshold moves by more than "
+                "±2.0 points between runs, the dataset is still too thin to trust a single number."
+            )
+        )
 
-        # ── Assemble message ──
         msg = self._truncate_telegram(lines)
 
         # Persist BEFORE attempting the Telegram send
@@ -1103,15 +1154,16 @@ class BrainEngine:
         if telegram_queue:
             try:
                 result = await telegram_queue.send(msg)
+
                 if result:
                     send_ok = True
-                    logger_run.info(f"🧠 Brain report sent ({len(msg)} chars)")
                 else:
                     logger_run.warning(
                         f"Brain report Telegram send returned False (likely API rejection) — "
                         f"report is still persisted at {report_key}. "
                         f"Check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID and MarkdownV2 formatting."
                     )
+
             except Exception as e:
                 logger_run.warning(
                     f"Brain report Telegram send failed ({e}) — report is still persisted at {report_key}."
