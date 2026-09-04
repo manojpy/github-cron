@@ -26,7 +26,7 @@ jobs:
 
       - name: 🧹 Cleanup old archives
         run: |
-          python3 cleanup_outcomes.py \
+          python3 src/cleanup_outcomes.py \
             --data-dir /tmp/data-repo \
             --max-age-days 90 \
             --max-size-mb 100 \
