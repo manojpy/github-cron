@@ -387,12 +387,13 @@ class BrainEngine:
                         f"(95% CI lower bound {lo:.0%} ≥ target {cfg.MIN_WIN_RATE:.0%})."
                     ),
                 })
+
                 if auto_eligible and alert_key in current_disabled_keys:
                     if await self.sdb.set_alert_key_disabled(alert_key, False):
                         recommendations.append({
                             "type": "auto_reenabled", "severity": "medium", "alert": alert_key,
                             "message": f"🔓 Re-enabled {alert_key}: recovered to {wr:.0%} WR over {sample_label}.",
-                        })
+                        }) 
             else:
                 alert_verdicts[alert_key] = "monitor"
                 recommendations.append({
@@ -405,37 +406,6 @@ class BrainEngine:
                         recommendations.append({
                             "type": "auto_reenabled", "severity": "medium", "alert": alert_key,
                             "message": f"🔓 Re-enabled {alert_key}: recovered to {wr:.0%} WR over {sample_label}.",
-                        }) 
-        path_to_keys: Dict[str, List[str]] = defaultdict(list)
-
-            elif lo >= cfg.MIN_WIN_RATE:  # e.g., 55% lower bound proves it's profitable again
-                alert_verdicts[alert_key] = "recovered"
-                recommendations.append({
-                    "type": "recovered_alert", "severity": "low", "alert": alert_key,
-                    "win_rate": round(wr, 3), "sample_size": total,
-                    "message": (
-                        f"RECOVERED: {alert_key} at {wr:.0%} WR over {total} samples "
-                        f"(95% CI lower bound {lo:.0%} ≥ target {cfg.MIN_WIN_RATE:.0%})."
-                    ),
-                })
-                if auto_eligible and alert_key in current_disabled_keys:
-                    if await self.sdb.set_alert_key_disabled(alert_key, False):
-                        recommendations.append({
-                            "type": "auto_reenabled", "severity": "medium", "alert": alert_key,
-                            "message": f"🔓 Re-enabled {alert_key}: recovered to {wr:.0%} WR over {total} samples.",
-                        })
-            else:
-                alert_verdicts[alert_key] = "monitor"
-                recommendations.append({
-                    "type": "monitor", "severity": "medium", "alert": alert_key,
-                    "win_rate": round(wr, 3), "sample_size": total,
-                    "message": f"{alert_key} viable ({wr:.0%} WR, {total} samples).",
-                })
-                if auto_eligible and alert_key in current_disabled_keys:
-                    if await self.sdb.set_alert_key_disabled(alert_key, False):
-                        recommendations.append({
-                            "type": "auto_reenabled", "severity": "medium", "alert": alert_key,
-                            "message": f"🔓 Re-enabled {alert_key}: recovered to {wr:.0%} WR over {total} samples.",
                         }) 
         path_to_keys: Dict[str, List[str]] = defaultdict(list)
         for alert_key in alert_stats:
