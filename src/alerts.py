@@ -131,7 +131,17 @@ class TelegramQueue:
                         data = await resp.json()
                         return data.get("result", {}).get("message_id")
                     if resp.status in (400, 401, 403, 404):
-                        logger.error(f"Telegram API error {resp.status} - check token/chat_id")
+                        response_text = await resp.text()
+                        try:
+                            response_json = json.loads(response_text)
+                            description = response_json.get("description", response_text)
+                        except Exception:
+                            description = response_text
+                        
+                        logger.error(
+                            f"Telegram API error {resp.status}: {description} | "
+                            f"chat_id={getattr(self, 'chat_id', '?')}"
+                        )
                         return None
                     raise Exception(f"Telegram API error {resp.status}")
 

@@ -938,8 +938,10 @@ class BrainEngine:
         if truncated.count("```") % 2 == 1:
             truncated += "\n```"
         cut_chars = len(msg) - len(truncated)
-        return truncated + f"\n\n… (truncated, {cut_chars} more characters)"
-
+        return truncated + escape_markdown_v2(
+            f"\n… (truncated, {cut_chars} more characters)"
+        )
+        
     async def maybe_generate_report(
         self,
         pairs: List[str],
@@ -977,40 +979,25 @@ class BrainEngine:
             await self._rollback_run_count()
             raise
 
-    async def send_report_now(
-        self,
-        pairs: List[str],
-        telegram_queue: Any,
-        logger_run: logging.Logger,
-    ) -> None:
-        """On-demand report send, bypassing the run-counter throttle used by
-        maybe_generate_report. Keeps the same data-source guards (brain
-        enabled, win-rate filter on, not a dry run) so a standalone/cron
-        caller can't send a report built on synthetic or absent data.
-        Intended for a separate scheduled trigger (e.g. every 4h) run
-        independently of the main bot cadence."""
+    async def send_report_now(self, pairs: List[str], telegram_queue: Any, logger_run: logging.Logger) -> bool:
         if not getattr(cfg, "ENABLE_BRAIN", True):
             logger_run.warning("ENABLE_BRAIN is off — skipping on-demand brain report.")
-            return
+            return True
+
         if not cfg.ENABLE_WIN_RATE_FILTER:
             logger_run.warning(
-                "ENABLE_BRAIN is on but ENABLE_WIN_RATE_FILTER is off — brain has no data source, skipping report."
+                "ENABLE_BRAIN is on but ENABLE_WIN_RATE_FILTER is off — "
+                "brain has no data source, skipping report."
             )
-            return
+            return True
+
         if getattr(cfg, "DRY_RUN_MODE", False):
             logger_run.info("DRY_RUN_MODE is on — skipping brain report (outcome data would be synthetic).")
-            return
-        await self._generate_and_send(pairs, telegram_queue, logger_run)
+            return True
 
-    async def _generate_and_send(
-        self,
-        pairs: List[str],
-        telegram_queue: Any,
-        logger_run: logging.Logger,
-    ) -> None:
-        """Shared by maybe_generate_report (throttled) and send_report_now
-        (on-demand): build recommendations, format the Telegram message,
-        persist, and send."""
+        return await self._generate_and_send(pairs, telegram_queue, logger_run)
+
+    async def _generate_and_send(self, pairs: List[str], telegram_queue: Any, logger_run: logging.Logger) -> bool:
         logger_run.info("Brain generating analysis report...")
         recs = await self.generate_recommendations()
 
@@ -1108,7 +1095,7 @@ class BrainEngine:
             lines.append("```")
             patch_details = json.dumps(recs["config_patch"], indent=2)
             if len(patch_details) > 1500:
-                patch_details = patch_details[:1500] + "\n... (truncated)"
+                patch_details = patch_details[:1500] + "\n... truncated"
             lines.append(patch_details)
             lines.append("```")
             lines.append("")
@@ -1140,8 +1127,9 @@ class BrainEngine:
         if total_recs == 0:
             lines.append("No actionable signal yet — still accumulating samples.")
         elif total_recs > shown:
-            lines.append(f"… ({total_recs - shown} more items not shown)")
-
+            lines.append(
+                escape_markdown_v2(f"… ({total_recs - shown} more items not shown)")
+            )
         lines.append("")
         lines.append(
             escape_markdown_v2(
@@ -1165,8 +1153,17 @@ class BrainEngine:
         send_ok = False
         if telegram_queue:
             try:
-                await telegram_queue.send(msg)
-                send_ok = True
+                result = await telegram_queue.send(msg)
+
+                if result:
+                    send_ok = True
+                else:
+                    logger_run.warning(
+                        f"Brain report Telegram send returned False (likely API rejection) — "
+                        f"report is still persisted at {report_key}. "
+                        f"Check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID and MarkdownV2 formatting."
+                    )
+
             except Exception as e:
                 logger_run.warning(
                     f"Brain report Telegram send failed ({e}) — report is still persisted at {report_key}."
@@ -1176,3 +1173,5 @@ class BrainEngine:
             f"🧠 Brain report {'sent' if send_ok else 'persisted (send failed)'} | "
             f"{len(high)} high, {len(med)} medium, {len(low)} low priority items"
         )
+
+        return send_ok
