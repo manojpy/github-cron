@@ -1001,24 +1001,27 @@ class BrainEngine:
         logger_run.info("Brain generating analysis report...")
         recs = await self.generate_recommendations()
 
-        lines = [
-            f"🧠 *BRAIN REPORT* | {escape_markdown_v2(format_ist_time())}",
-            f"Pairs: {len(pairs)} | Samples: {recs['real_sample_size']} real, {recs['shadow_sample_size']} shadow",
-            f"Current: Score≥{cfg.CONFLUENCE_MIN_ABS_SCORE} | Pct≥{cfg.CONFLUENCE_MIN_PCT}%",
-            "",
-        ]
+        def _e(v):
+            return escape_markdown_v2(str(v))
 
+        lines = [
+            f"🧠 *BRAIN REPORT* | {_e(format_ist_time())}",
+            f"Pairs: {_e(len(pairs))} | Samples: {_e(recs['real_sample_size'])} real, {_e(recs['shadow_sample_size'])} shadow",
+            f"Current: Score≥{_e(cfg.CONFLUENCE_MIN_ABS_SCORE)} | Pct≥{_e(cfg.CONFLUENCE_MIN_PCT)}%",
+            "",
+       ]
         # ── AI Metrics (single line) ──
         ai = recs.get("ai_metrics", {})
         if ai:
             parts = []
-            if ai.get("brier_score") is not None:
-                status = "MISALIBRATED" if ai["brier_score"] >= 0.20 else "OK"
-                parts.append(f"Brier: {ai['brier_score']:.3f} ({status})")
-            if ai.get("net_ev") is not None:
-                parts.append(f"EV: {ai['net_ev']:+.2f}%")
-            if ai.get("half_kelly") is not None:
-                parts.append(f"Kelly: {ai['half_kelly']:.1%}")
+
+        if ai.get("brier_score") is not None:
+            status = "MISALIBRATED" if ai["brier_score"] >= 0.20 else "OK"
+            parts.append(f"Brier: {_e(f'{ai['brier_score']:.3f}')} ({_e(status)})")
+        if ai.get("net_ev") is not None:
+            parts.append(f"EV: {_e(f'{ai['net_ev']:+.2f}%')}")
+        if ai.get("half_kelly") is not None:
+            parts.append(f"Kelly: {_e(f'{ai['half_kelly']:.1%}')}")
             cusum = ai.get("cusum_drifts", 0)
             parts.append(f"CUSUM: {'🚨 ' + str(cusum) if cusum else 'OK'}")
             lines.append("🤖 " + escape_markdown_v2(" | ".join(parts)))
@@ -1070,7 +1073,7 @@ class BrainEngine:
                     changes = sum(1 for k, v in sug.items() if isinstance(curr, dict) and curr.get(k) != v)
                     lines.append(f"• `{escape_markdown_v2(path)}`: {changes} weight changes")
                 else:
-                    lines.append(f"• `{escape_markdown_v2(path)}`: {curr} → {sug}")
+                    lines.append(f"• `{_e(path)}`: {_e(curr)} → {_e(sug)}")
                 if reason:
                     lines.append(f"  _{escape_markdown_v2(reason)}_")
             lines.append("")
