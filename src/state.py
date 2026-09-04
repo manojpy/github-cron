@@ -992,18 +992,30 @@ class RedisStateStore:
             f"bad_payload={bad_payload_count}"
         )
 
-
-    async def resolve_shadow_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
-                                                logger_pair: logging.Logger) -> None:
+    async def resolve_shadow_pending_outcomes(
+        self,
+        pair: str,
+        data_15m: "PriceData",
+        i15: int,
+        logger_pair: logging.Logger,
+    ) -> None:
         """Twin of resolve_pending_outcomes for shadow (rejected) alerts. Same grading logic,
         writes to SHADOW_STATS/SHADOW_LOG_STREAM instead, and additionally pools outcomes whose
         confluence was in the 'rewardable' bucket into SHADOW_HICONF_STATS for override checks."""
-        if self.degraded or not getattr(cfg, "ENABLE_BRAIN", False) or not getattr(cfg, "BRAIN_SHADOW_MODE", True) or not self._redis:
+        if (
+            self.degraded
+            or not getattr(cfg, "ENABLE_BRAIN", False)
+            or not getattr(cfg, "BRAIN_SHADOW_MODE", True)
+            or not self._redis
+        ):
             return
 
         keys = await self._fetch_pending_keys(
-            pair, "_shadow_pending_outcome_keys_by_pair", RedisKeyPrefix.SHADOW_PENDING,
-            logger_pair, "shadow pending",
+            pair,
+            "_shadow_pending_outcome_keys_by_pair",
+            RedisKeyPrefix.SHADOW_PENDING,
+            logger_pair,
+            "shadow pending",
         )
         if not keys:
             return
@@ -1014,7 +1026,9 @@ class RedisStateStore:
                     read_pipe.get(key)
                 raw_values = await asyncio.wait_for(read_pipe.execute(), timeout=2.0)
         except Exception as e:
-            logger_pair.warning(f"Failed to batch-fetch shadow pending outcomes for {pair}: {e}")
+            logger_pair.warning(
+                f"Failed to batch-fetch shadow pending outcomes for {pair}: {e}"
+            )
             return
 
         resolved_count = 0
@@ -1027,7 +1041,9 @@ class RedisStateStore:
 
                 for key, raw in zip(keys, raw_values):
                     try:
-                        result, skip_reason = self._parse_pending_outcome_row(key, raw, data_15m, i15)
+                        result, skip_reason = self._parse_pending_outcome_row(
+                            key, raw, data_15m, i15
+                        )
                         if skip_reason:
                             continue
 
@@ -1046,25 +1062,45 @@ class RedisStateStore:
                         write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
                         write_pipe.expire(stats_key, stats_ttl)
 
-                        if conf_score is not None and conf_total is not None and conf_total > 0:
+                        if (
+                            conf_score is not None
+                            and conf_total is not None
+                            and conf_total > 0
+                        ):
                             conf_pct = (conf_score / conf_total) * 100.0
                             write_pipe.xadd(
                                 RedisKeyPrefix.SHADOW_LOG_STREAM,
                                 {
-                                    "pair": str(pair), "alert_key": str(alert_key),
-                                    "direction": str(direction), "score": str(conf_score),
-                                    "total": str(conf_total), "pct_move": f"{pct_move:.4f}",
-                                    "win": "1" if win else "0", "entry_ts": str(entry_ts),
-                                    "session": _get_session_from_ts(entry_ts) if entry_ts else "dead",
+                                    "pair": str(pair),
+                                    "alert_key": str(alert_key),
+                                    "direction": str(direction),
+                                    "score": str(conf_score),
+                                    "total": str(conf_total),
+                                    "pct_move": f"{pct_move:.4f}",
+                                    "win": "1" if win else "0",
+                                    "entry_ts": str(entry_ts),
+                                    "session": _get_session_from_ts(entry_ts)
+                                    if entry_ts
+                                    else "dead",
                                     "mae": f"{mae:.5f}" if mae is not None else "",
                                     "mfe": f"{mfe:.5f}" if mfe is not None else "",
-                                    "votes": json_dumps(conf_votes) if conf_votes is not None else "",
-
-                                maxlen=50000, approximate=True,
+                                    "votes": json_dumps(conf_votes)
+                                    if conf_votes is not None
+                                    else "",
+                                },
+                                maxlen=50000,
+                                approximate=True,
                             )
+
                             if conf_pct >= hiconf_pct:
-                                hiconf_key = f"{RedisKeyPrefix.SHADOW_HICONF_STATS}{alert_key}"
-                                write_pipe.hincrby(hiconf_key, "wins" if win else "losses", 1)
+                                hiconf_key = (
+                                    f"{RedisKeyPrefix.SHADOW_HICONF_STATS}{alert_key}"
+                                )
+                                write_pipe.hincrby(
+                                    hiconf_key,
+                                    "wins" if win else "losses",
+                                    1,
+                                )
                                 write_pipe.expire(hiconf_key, stats_ttl)
 
                         write_pipe.delete(key)
@@ -1072,18 +1108,24 @@ class RedisStateStore:
                         resolved_count += 1
 
                     except Exception as e:
-                        logger_pair.debug(f"Failed to resolve shadow pending outcome {key}: {e}")
+                        logger_pair.debug(
+                            f"Failed to resolve shadow pending outcome {key}: {e}"
+                        )
                         continue
 
                 if pending_writes:
                     await asyncio.wait_for(write_pipe.execute(), timeout=2.0)
 
         except Exception as e:
-            logger_pair.debug(f"Failed to persist resolved shadow outcomes for {pair}: {e}")
+            logger_pair.debug(
+                f"Failed to persist resolved shadow outcomes for {pair}: {e}"
+            )
             return
 
         if resolved_count:
-            logger_pair.debug(f"[{pair}] Shadow outcome resolution | resolved={resolved_count}")
+            logger_pair.debug(
+                f"[{pair}] Shadow outcome resolution | resolved={resolved_count}"
+            )
 
     async def get_alert_win_rate(self, pair: str, alert_key: str) -> Tuple[Optional[float], int]:
         """Returns (win_rate, sample_size). win_rate is None until MIN_WIN_RATE_SAMPLE is reached."""
