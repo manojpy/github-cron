@@ -193,7 +193,6 @@ class GateResult:
     dynamic_flow_cross_up: bool = False
     dynamic_flow_cross_down: bool = False 
 
-
 def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, float, Dict[str, bool]]:
     weights = CONFLUENCE_WEIGHTS 
     score = 0.0
@@ -338,9 +337,9 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, flo
 
     return score, total, votes
 
-async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
-    data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, correlation_id: str,
-    reference_time: int, pair_oi: Optional[Dict[str, Any]] = None) -> Union[GateResult, Tuple[str, Dict[str, Any]], None]:
+async def _eval_gate(
+    pair_name: str, data_15m: PriceData, data_5m: PriceData, data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, correlation_id: str,
+    reference_time: int, pair_oi: Optional[Dict[str, Any]] = None, resolve_outcomes: bool = True) -> Union[GateResult, Tuple[str, Dict[str, Any]], None]:
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
     close_15m = None
@@ -352,7 +351,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
             return None
 
-        if cfg.ENABLE_WIN_RATE_FILTER:
+        if resolve_outcomes and cfg.ENABLE_WIN_RATE_FILTER:
             await sdb.resolve_pending_outcomes(pair_name, data_15m, i15, logger_pair)
             if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
                 await sdb.resolve_shadow_pending_outcomes(pair_name, data_15m, i15, logger_pair)
@@ -496,7 +495,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         # ════════════════════════════════════════�������═══════════������═
         # PHASE 1 — Gate indicators only (cheap)
-        # ════════════════════════════════════════���═══���══════
+        # ═══════════════════════════════════════���═══���══════
         gate_indicators = await asyncio.to_thread(
             calculate_gate_indicators_numpy, data_15m.as_dict(), data_5m.as_dict(), data_daily, reference_time
         )

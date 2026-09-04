@@ -8,6 +8,9 @@ import logging
 import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
+import os
+from pathlib import Path
+from archive_reader import load_archived_outcomes
 
 from alerts import escape_markdown_v2
 
@@ -41,9 +44,25 @@ class BrainEngineV2(BaseBrainEngine):
         self._phase_samples = _PHASE_MIN_SAMPLES
 
     async def _load_rows(self) -> tuple:
-        """Shared row loader used by original + new phases."""
-        sample_size = getattr(cfg, "BRAIN_REPORT_STREAM_SAMPLE", 5000)
+        """Shared row loader — reads from archived files if available,
+        otherwise falls back to Redis streams."""
         window_days = getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30)
+        
+        # Try file archive first (set in config or env)
+        data_dir = getattr(cfg, "OUTCOME_DATA_DIR", None) or os.environ.get("OUTCOME_DATA_DIR")
+        if data_dir and Path(data_dir).exists():
+            real_rows = load_archived_outcomes(data_dir, window_days=window_days, shadow=False)
+            shadow_rows = load_archived_outcomes(data_dir, window_days=window_days, shadow=True)
+            if real_rows or shadow_rows:
+                logger = logging.getLogger("macd_bot")
+                logger.info(
+                    f"🗄️ Brain using file archive: {len(real_rows)} real, "
+                    f"{len(shadow_rows)} shadow rows from {data_dir}"
+                )
+                return real_rows, shadow_rows
+        
+        # Fallback to Redis streams
+        sample_size = getattr(cfg, "BRAIN_REPORT_STREAM_SAMPLE", 5000)
         real_raw, shadow_raw = await asyncio.gather(
             self._read_stream(RedisKeyPrefix.OUTCOME_LOG_STREAM, sample_size),
             self._read_stream(RedisKeyPrefix.SHADOW_LOG_STREAM, sample_size),

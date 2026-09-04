@@ -1432,12 +1432,28 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
                             ),
                         }
+                        # Redis (shadow tracking)
                         await sdb.record_shadow_pending_outcome(
                             pair_name, alert_key, direction, ts_curr, close_curr,
                             confluence_score=alert_score, confluence_total=alert_total,
                             confluence_votes=alert_votes,
                             context=shadow_context,
                         )
+                        # File (long-term brain archive)
+                        if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                            from outcome_storage import append_outcome
+                            append_outcome({
+                                "pair": pair_name,
+                                "alert_key": alert_key,
+                                "direction": direction,
+                                "entry_ts": ts_curr,
+                                "price": close_curr,
+                                "score": alert_score,
+                                "total": alert_total,
+                                "votes": alert_votes,
+                                "context": shadow_context,
+                                "shadow": True,
+                            })
                     logger_pair.info(
                         f"[{pair_name}] Win-rate filter dropped {alert_key}: {fail_note}"
                     )
@@ -1508,7 +1524,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     persist_ok = await sdb.atomic_batch_update(all_state_changes)
                     if not persist_ok:
                         logger_pair.error(
-                            f"[{pair_name}] State persistence failed — alert state may be inconsistent this run"
+                            f"[{pair_name}] State persistence failed ��� alert state may be inconsistent this run"
                         )
                 await _release_dedup_claims()
                 return pair_name, {
@@ -1601,6 +1617,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     "macro_multiplier": macro_shadow.get("multiplier") if macro_shadow else None,
                                     "macro_would_block": macro_shadow.get("would_block") if macro_shadow else None,
                                 }
+                                # Redis (immediate next-run access)
                                 await sdb.record_pending_outcome(
                                     pair_name, alert_key,
                                     "buy" if alert_key in BUY_ALERT_KEYS else "sell",
@@ -1609,6 +1626,21 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     adx_val=adx_val,
                                     context=trigger_context,
                                 )
+                                # File (long-term brain archive)
+                                if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                                    from outcome_storage import append_outcome
+                                    append_outcome({
+                                        "pair": pair_name,
+                                        "alert_key": alert_key,
+                                        "direction": "buy" if alert_key in BUY_ALERT_KEYS else "sell",
+                                        "entry_ts": ts_curr,
+                                        "price": close_curr,
+                                        "score": s,
+                                        "total": t,
+                                        "votes": v,
+                                        "adx_val": adx_val,
+                                        "context": trigger_context,
+                                    })
                             await asyncio.gather(*(_record_one(alert_key) for _, _, alert_key in alerts_to_send))
                     else:
                         # Only refund if not already done

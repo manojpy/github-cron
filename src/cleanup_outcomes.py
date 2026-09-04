@@ -38,27 +38,23 @@ def format_size(bytes: int) -> str:
     return f"{bytes:.2f} TB"
 
 def cleanup_by_age(data_dir: Path, max_age_days: int) -> int:
-    """Remove files older than max_age_days."""
+    """Remove files older than max_age_days based on mtime (works for both daily and monthly files)."""
     removed = 0
     cutoff = datetime.utcnow() - timedelta(days=max_age_days)
     
-    for label in ["outcome", "shadow"]:
+    for label in ["outcomes", "shadow"]:
         label_dir = data_dir / label
         if not label_dir.exists():
             continue
         
-        for month_file in label_dir.glob("*.jsonl"):
+        for file_path in label_dir.glob("*.jsonl*"):  # includes .jsonl.gz
             try:
-                # Extract month from filename (e.g., 2026-09.jsonl)
-                month_str = month_file.stem  # e.g., '2026-09'
-                month_date = datetime.strptime(month_str, "%Y-%m")
-                
-                if month_date < cutoff:
-                    print(f"🗑️ Removing old file: {month_file}")
-                    month_file.unlink()
+                mtime = datetime.utcfromtimestamp(file_path.stat().st_mtime)
+                if mtime < cutoff:
+                    print(f"🗑️ Removing old file: {file_path}")
+                    file_path.unlink()
                     removed += 1
-            except ValueError:
-                # If we can't parse the filename, skip it
+            except OSError:
                 continue
     
     return removed
@@ -146,8 +142,8 @@ def main():
                 continue
             
             # Get all files sorted by name (YYYY-MM format sorts chronologically)
-            files = sorted(label_dir.glob("*.jsonl"))
-            
+            files = sorted(label_dir.glob("*.jsonl*"))
+
             # Remove from oldest until under limit
             for month_file in files:
                 if get_dir_size(data_dir) <= max_total_bytes:

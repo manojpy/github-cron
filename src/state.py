@@ -1004,10 +1004,9 @@ class RedisStateStore:
                             write_pipe.xadd(
                                 RedisKeyPrefix.OUTCOME_LOG_STREAM,
                                 stream_fields,
-                                maxlen=50000,
+                                maxlen=2000,
                                 approximate=True,
                             )
-
                         write_pipe.delete(key)
                         pending_writes += 1
                         resolved_count += 1
@@ -1130,10 +1129,9 @@ class RedisStateStore:
                                     if conf_votes is not None
                                     else "",
                                 },
-                                maxlen=50000,
+                                maxlen=2000,
                                 approximate=True,
                             )
-
                             if conf_pct >= hiconf_pct:
                                 hiconf_key = (
                                     f"{RedisKeyPrefix.SHADOW_HICONF_STATS}{alert_key}"

@@ -288,6 +288,7 @@ async def _compute_directional_cluster(
                 oi = oi_gate_data.get(p_name) if (oi_gate_data and cfg.ENABLE_OI_FUNDING_FILTER) else None
                 gr = await _eval_gate(
                     p_name, pd_15m, pd_5m, data_daily, state_db, correlation_id, reference_time, oi,
+                    resolve_outcomes=False,
                 )
                 if gr is None or isinstance(gr, tuple):
                     return None
