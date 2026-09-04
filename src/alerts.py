@@ -1268,29 +1268,29 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     f"{' [LIVE]' if getattr(cfg, 'MACRO_CONTEXT_LIVE', False) else ' (SHADOW ONLY)'}"
                 )
 
-# ── Existing confluence gate, but with macro multiplier ─────────────
-if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
-    abs_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
-    if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
-        pair_floor = await sdb.get_pair_threshold(pair_name)
-        if pair_floor is not None:
-            abs_floor = pair_floor
-    pct_floor = confluence_total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
-    required = max(pct_floor, abs_floor)
-    
-    # Apply macro multiplier ONLY if MACRO_CONTEXT_LIVE is enabled
-    if getattr(cfg, "MACRO_CONTEXT_LIVE", False):
-        required = required * macro_multiplier
-        if macro_shadow is not None:
-            macro_shadow["would_block"] = confluence_score < required
-    
-    if confluence_score < required:
-        logger_pair.info(
-            f"[{pair_name}] Confluence gate blocked: {confluence_score:.1f}/{confluence_total:.1f} "
-            f"weighted score (need {required:.1f}, abs_floor={abs_floor:.1f}, "
-            f"macro_mult={macro_multiplier if getattr(cfg, 'MACRO_CONTEXT_LIVE', False) else 1.0:.2f})"
-        )
-        alerts_to_send = []
+        # ── Existing confluence gate, but with macro multiplier ─────────────
+        if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
+            abs_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
+            if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
+                pair_floor = await sdb.get_pair_threshold(pair_name)
+                if pair_floor is not None:
+                    abs_floor = pair_floor
+            pct_floor = confluence_total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
+            required = max(pct_floor, abs_floor)
+            
+            # Apply macro multiplier ONLY if MACRO_CONTEXT_LIVE is enabled
+            if getattr(cfg, "MACRO_CONTEXT_LIVE", False):
+                required = required * macro_multiplier
+                if macro_shadow is not None:
+                    macro_shadow["would_block"] = confluence_score < required
+            
+            if confluence_score < required:
+                logger_pair.info(
+                    f"[{pair_name}] Confluence gate blocked: {confluence_score:.1f}/{confluence_total:.1f} "
+                    f"weighted score (need {required:.1f}, abs_floor={abs_floor:.1f}, "
+                    f"macro_mult={macro_multiplier if getattr(cfg, 'MACRO_CONTEXT_LIVE', False) else 1.0:.2f})"
+                )
+                alerts_to_send = []
 
         # ── Correlation Cluster Penalty ("Beta Trap" filter) — LIVE ────────
         if (alerts_to_send and getattr(cfg, "ENABLE_CLUSTER_GATE", False)
