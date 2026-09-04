@@ -1,0 +1,48 @@
+name: 🧹 Cleanup Outcome Archives
+
+on:
+  schedule:
+    - cron: "0 2 * * 0"   # Every Sunday at 2 AM UTC
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 📦 Clone data repository
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          git clone \
+            "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" \
+            /tmp/data-repo
+
+      - name: 🧹 Cleanup old archives
+        run: |
+          python3 cleanup_outcomes.py \
+            --data-dir /tmp/data-repo \
+            --max-age-days 90 \
+            --max-size-mb 100 \
+            --max-total-mb 400
+
+      - name: 📤 Commit and push cleanup
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          cd /tmp/data-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "chore: cleanup old outcomes $(date -u +%Y-%m-%d)"
+          git push origin main

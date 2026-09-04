@@ -87,6 +87,14 @@ jobs:
           docker pull --quiet --platform linux/amd64 "$IMAGE"
           echo "✅ Image ready in $(( $(date +%s) - START ))s"
 
+      - name: 📦 Checkout outcome-data archive
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          git clone --depth=7 \
+            "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" \
+            /tmp/data-repo
+
       - name: 🧠 Generate & Send Brain Report
         id: brain_report
         timeout-minutes: 3
@@ -119,6 +127,8 @@ jobs:
             -e TZ=Asia/Kolkata \
             -e PYTHONPATH=/app/src \
             -e PYTHONUNBUFFERED=1 \
+            -e OUTCOME_DATA_DIR=/tmp/data-repo \
+            -v "/tmp/data-repo:/tmp/data-repo:ro" \
             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \
             --entrypoint python \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
