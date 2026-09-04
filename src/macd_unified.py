@@ -569,7 +569,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 reference_time, fetcher, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
                 oi_gate_data=oi_gate_data,
                 macro_context=btc_context,
-                cluster_context=cluster_context,
             )
     results = await asyncio.gather(
         *[_bounded_eval(t) for t in prepared_tasks],
