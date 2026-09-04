@@ -1314,11 +1314,13 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     abs_floor = pair_floor
             pct_floor = confluence_total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
             required = max(pct_floor, abs_floor)
+            if getattr(cfg, "MACRO_CONTEXT_LIVE", False):
+                required = required * macro_multiplier
             if macro_shadow is not None:
-                macro_shadow["would_block"] = confluence_score < (required * macro_shadow["multiplier"])
+                macro_shadow["would_block"] = confluence_score < required
             if confluence_score < required:
                 logger_pair.info(
-                    f"[{pair_name}] Confluence gate blocked dispatch: {confluence_score:.1f}/{confluence_total:.1f} weighted score (need {required:.1f}, abs_floor={abs_floor:.1f})"
+                    f"[{pair_name}] Confluence gate blocked dispatch: {confluence_score:.1f}/{confluence_total:.1f} weighted score (need {required:.1f}, abs_floor={abs_floor:.1f}, macro_mult={macro_multiplier if getattr(cfg, 'MACRO_CONTEXT_LIVE', False) else 1.0:.2f})"
                 )
                 alerts_to_send = []
 

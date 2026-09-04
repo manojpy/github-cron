@@ -971,13 +971,48 @@ class BrainEngine:
         if run_count is None or run_count % interval != 0:
             return
 
-        logger_run.info("Brain generating analysis report...")
         try:
-            recs = await self.generate_recommendations()
-        except Exception as e:
-            logger_run.error(f"Brain report generation failed: {e}")
+            await self._generate_and_send(pairs, telegram_queue, logger_run)
+        except Exception:
             await self._rollback_run_count()
+            raise
+
+    async def send_report_now(
+        self,
+        pairs: List[str],
+        telegram_queue: Any,
+        logger_run: logging.Logger,
+    ) -> None:
+        """On-demand report send, bypassing the run-counter throttle used by
+        maybe_generate_report. Keeps the same data-source guards (brain
+        enabled, win-rate filter on, not a dry run) so a standalone/cron
+        caller can't send a report built on synthetic or absent data.
+        Intended for a separate scheduled trigger (e.g. every 4h) run
+        independently of the main bot cadence."""
+        if not getattr(cfg, "ENABLE_BRAIN", True):
+            logger_run.warning("ENABLE_BRAIN is off — skipping on-demand brain report.")
             return
+        if not cfg.ENABLE_WIN_RATE_FILTER:
+            logger_run.warning(
+                "ENABLE_BRAIN is on but ENABLE_WIN_RATE_FILTER is off — brain has no data source, skipping report."
+            )
+            return
+        if getattr(cfg, "DRY_RUN_MODE", False):
+            logger_run.info("DRY_RUN_MODE is on — skipping brain report (outcome data would be synthetic).")
+            return
+        await self._generate_and_send(pairs, telegram_queue, logger_run)
+
+    async def _generate_and_send(
+        self,
+        pairs: List[str],
+        telegram_queue: Any,
+        logger_run: logging.Logger,
+    ) -> None:
+        """Shared by maybe_generate_report (throttled) and send_report_now
+        (on-demand): build recommendations, format the Telegram message,
+        persist, and send."""
+        logger_run.info("Brain generating analysis report...")
+        recs = await self.generate_recommendations()
 
         cc = recs.get("current_config", {})
         lines = [
