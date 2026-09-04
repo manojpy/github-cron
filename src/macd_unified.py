@@ -85,12 +85,14 @@ def get_trigger_timestamp() -> int:
     
     return int(datetime.now(timezone.utc).timestamp())
 
+
 async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: PriceData,
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int, fetcher: DataFetcher, symbol: str, alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
     max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN,
     oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None,
-    macro_context: Optional[BtcMacroContext] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
+    macro_context: Optional[BtcMacroContext] = None,
+    cluster_context: Optional[ClusterContext] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
 
@@ -203,6 +205,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             confluence_total_sell=confluence_total_sell,
             confluence_votes_sell=confluence_votes_sell,
             macro_context=macro_context,
+            cluster_context=cluster_context,
         )
     finally:
         PAIR_ID.set("")
@@ -221,7 +224,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
 async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time, fetcher,
                        alerts_sent_ref=None, alerts_sent_lock=None, max_alerts_per_run=cfg.MAX_ALERTS_PER_RUN,
                        oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None,
-                       macro_context: Optional[BtcMacroContext] = None):
+                       macro_context: Optional[BtcMacroContext] = None,
+                       cluster_context: Optional[ClusterContext] = None):
     p_name, symbol, candles = task_data
 
     try:
@@ -246,6 +250,7 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
             alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
             oi_gate_data=oi_gate_data,
             macro_context=macro_context,
+            cluster_context=cluster_context,
         )
         return result
 
@@ -569,6 +574,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 reference_time, fetcher, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
                 oi_gate_data=oi_gate_data,
                 macro_context=btc_context,
+                cluster_context=cluster_context,
             )
     results = await asyncio.gather(
         *[_bounded_eval(t) for t in prepared_tasks],
