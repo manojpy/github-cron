@@ -111,7 +111,8 @@ COPY --chown=appuser:appuser src/brain.py ./
 COPY --chown=appuser:appuser src/brain_enhanced.py ./
 COPY --chown=appuser:appuser src/apply_config_override.py ./
 COPY --chown=appuser:appuser src/telegram_feedback.py ./
-COPY --chown=appuser:appuser src/macd_unified.py ./
+COPY --chown=appuser:appuser src/send_brain_report.py ./
+ COPY --chown=appuser:appuser src/macd_unified.py ./
 
 USER appuser
 
