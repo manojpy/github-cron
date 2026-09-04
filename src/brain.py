@@ -1014,14 +1014,16 @@ class BrainEngine:
         ai = recs.get("ai_metrics", {})
         if ai:
             parts = []
-
         if ai.get("brier_score") is not None:
             status = "MISALIBRATED" if ai["brier_score"] >= 0.20 else "OK"
-            parts.append(f"Brier: {_e(f'{ai['brier_score']:.3f}')} ({_e(status)})")
+            brier_str = f"{ai['brier_score']:.3f}"
+            parts.append(f"Brier: {_e(brier_str)} ({_e(status)})")
         if ai.get("net_ev") is not None:
-            parts.append(f"EV: {_e(f'{ai['net_ev']:+.2f}%')}")
+            ev_str = f"{ai['net_ev']:+.2f}%"
+            parts.append(f"EV: {_e(ev_str)}")
         if ai.get("half_kelly") is not None:
-            parts.append(f"Kelly: {_e(f'{ai['half_kelly']:.1%}')}")
+            kelly_str = f"{ai['half_kelly']:.1%}"
+            parts.append(f"Kelly: {_e(kelly_str)}")
             cusum = ai.get("cusum_drifts", 0)
             parts.append(f"CUSUM: {'🚨 ' + str(cusum) if cusum else 'OK'}")
             lines.append("🤖 " + escape_markdown_v2(" | ".join(parts)))
