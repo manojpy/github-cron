@@ -387,13 +387,12 @@ class BrainEngine:
                         f"(95% CI lower bound {lo:.0%} ≥ target {cfg.MIN_WIN_RATE:.0%})."
                     ),
                 })
-
                 if auto_eligible and alert_key in current_disabled_keys:
                     if await self.sdb.set_alert_key_disabled(alert_key, False):
                         recommendations.append({
                             "type": "auto_reenabled", "severity": "medium", "alert": alert_key,
                             "message": f"🔓 Re-enabled {alert_key}: recovered to {wr:.0%} WR over {sample_label}.",
-                        }) 
+                        })
             else:
                 alert_verdicts[alert_key] = "monitor"
                 recommendations.append({
