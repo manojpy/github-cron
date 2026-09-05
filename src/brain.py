@@ -294,6 +294,9 @@ class BrainEngine:
                         "type": "cusum_drift",
                         "severity": "high",
                         "alert": alert_key,
+                        "n": det.n,
+                        "s_neg": det.s_neg,
+                        "h": det.h,
                         "message": (
                             f"🚨 CUSUM EDGE DECAY on {alert_key}: "
                             f"drift detected after {det.n} outcomes "
@@ -1001,6 +1004,49 @@ class BrainEngine:
 
         return await self._generate_and_send(pairs, telegram_queue, logger_run)
 
+    def _build_full_markdown_report(self, recs: Dict[str, Any]) -> str:
+        """Full, untruncated report — no Telegram char budget, no top-N slicing.
+        This is what the Telegram message's 'full detail' pointer refers to."""
+        cc = recs.get("current_config", {})
+        ai = recs.get("ai_metrics", {})
+        out = [
+            f"# Brain Report — {format_ist_time()}",
+            "",
+            f"Samples: {recs['real_sample_size']} real, {recs['shadow_sample_size']} shadow "
+            f"| Gate: Score>={cc.get('CONFLUENCE_MIN_ABS_SCORE')} Pct>={cc.get('CONFLUENCE_MIN_PCT')}%",
+        ]
+        if ai.get("brier_score") is not None:
+            out.append(f"Brier score: {ai['brier_score']:.3f} ({ai.get('brier_status', 'n/a')})")
+        if ai.get("net_ev") is not None:
+            out.append(f"Net EV: {ai['net_ev']:+.3f}%/trade | Half-Kelly: {ai.get('half_kelly', 0):.1%}")
+        out.append("")
+
+        patch = recs.get("config_patch") or []
+        if patch:
+            out.append("## Suggested Config Changes")
+            for p in patch:
+                suggested = p.get("suggested")
+                if isinstance(suggested, dict):
+                    cur = p.get("current") or {}
+                    for k, v in suggested.items():
+                        out.append(f"- `{p['path']}.{k}`: {cur.get(k, 'n/a')} -> {v}")
+                else:
+                    out.append(f"- `{p['path']}`: {p.get('current')} -> {suggested}")
+            out.append("")
+
+        by_type: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for r in recs.get("recommendations", []):
+            by_type[r["type"]].append(r)
+
+        out.append("## All Findings")
+        for rtype, items in sorted(by_type.items(), key=lambda kv: -len(kv[1])):
+            out.append(f"### {rtype} ({len(items)})")
+            for r in items:
+                out.append(f"- **[{r.get('severity', 'n/a')}]** {r['message']}")
+            out.append("")
+
+        return "\n".join(out)
+
     async def _generate_and_send(self, pairs: List[str], telegram_queue: Any, logger_run: logging.Logger) -> bool:
         logger_run.info("Brain generating analysis report...")
         recs = await self.generate_recommendations()
@@ -1098,19 +1144,36 @@ class BrainEngine:
             r for r in recs["recommendations"]
             if r["severity"] in ("high", "medium") and r["type"] not in skip_types
         ]
-        if others:
+
+        # CUSUM drift repeats an identical sentence per alert — collapse into
+        # one plain-language line instead of eating up to 4-5 KEY FINDINGS slots.
+        cusum_items = [r for r in others if r["type"] == "cusum_drift"]
+        others = [r for r in others if r["type"] != "cusum_drift"]
+
+        shown_others = 0
+        if cusum_items or others:
             lines.append("*🔎 KEY FINDINGS*")
-            for r in others[:5]:
+            if cusum_items:
+                names = ", ".join(f"{r['alert']} ({r.get('n', '?')} trades)" for r in cusum_items)
+                lines.append(escape_markdown_v2(
+                    f"📉 Win-rate drifting down on {len(cusum_items)} alert(s) — "
+                    f"auto-tuning paused for these, needs your review: {names}"
+                ))
+                shown_others += len(cusum_items)
+            for r in others[:8]:
                 first_line = r["message"].split("\n")[0]
                 lines.append(f"• {escape_markdown_v2(first_line[:180])}")
+            shown_others += min(len(others), 8)
             lines.append("")
 
         total_recs = recs["recommendation_count"]
-        shown = shown_patch + len(auto_disabled[:3]) + len(auto_reenabled[:3]) + min(len(others), 5)
+        shown = shown_patch + len(auto_disabled[:3]) + len(auto_reenabled[:3]) + shown_others
         if total_recs == 0:
             lines.append("No actionable signal yet — still accumulating samples.")
         elif total_recs > shown:
-            lines.append(escape_markdown_v2(f"+{total_recs - shown} more items — full report persisted."))
+            lines.append(escape_markdown_v2(
+                f"+{total_recs - shown} more items — full detail in outcome-data/reports/."
+            ))
 
         msg = self._truncate_telegram(lines)
 
@@ -1124,6 +1187,13 @@ class BrainEngine:
             if result is None:
                 logger_run.warning(f"Failed to persist brain report {report_key}")
 
+        try:
+            from outcome_storage import save_report
+            report_path = save_report(self._build_full_markdown_report(recs))
+            logger_run.info(f"🧠 Full brain report written to {report_path}")
+        except Exception as e:
+            logger_run.warning(f"Failed to write full markdown brain report: {e}")
+            
         send_ok = False
         if telegram_queue:
             try:
