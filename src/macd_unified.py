@@ -454,9 +454,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
         # ONE round-trip for ALL writes
         if new_histories:
-            await state_db.batch_set_metadata(
-                new_histories, ttl=cfg.OI_FUNDING_MAX_SAMPLE_AGE_SEC
-            )
+            await state_db.batch_set_metadata(new_histories)
 
     if cfg.ENABLE_WIN_RATE_FILTER and not state_db.degraded and state_db._redis:
         try:
