@@ -10,7 +10,7 @@ import logging
 import statistics
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from alerts import escape_markdown_v2
 
@@ -236,6 +236,19 @@ class BrainEngine:
                 continue
         return parsed
 
+    async def _get_rows(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Load real and shadow outcome rows. Default: Redis streams.
+        Override in subclasses to read from file archives instead."""
+        sample_size = getattr(cfg, "BRAIN_REPORT_STREAM_SAMPLE", 5000)
+        window_days = getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30)
+        real_raw, shadow_raw = await asyncio.gather(
+            self._read_stream(RedisKeyPrefix.OUTCOME_LOG_STREAM, sample_size),
+            self._read_stream(RedisKeyPrefix.SHADOW_LOG_STREAM, sample_size),
+        )
+        real_rows = self._parse_rows(real_raw, window_days=window_days)
+        shadow_rows = self._parse_rows(shadow_raw, window_days=window_days)
+        return real_rows, shadow_rows
+
     # ── CUSUM drift detection ────────────────────────────────────────────
     async def _load_or_create_cusum(self, alert_key: str) -> CUSUMDetector:
         """Load persisted CUSUM state, or create a fresh detector."""
@@ -306,16 +319,7 @@ class BrainEngine:
         """Build the full recommendation set: per-alert verdicts, a confluence
         threshold suggestion, shadow-mode insight, and a machine-readable
         config patch."""
-        sample_size = getattr(cfg, "BRAIN_REPORT_STREAM_SAMPLE", 5000)
-        window_days = getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30)
-
-        real_raw, shadow_raw = await asyncio.gather(
-            self._read_stream(RedisKeyPrefix.OUTCOME_LOG_STREAM, sample_size),
-            self._read_stream(RedisKeyPrefix.SHADOW_LOG_STREAM, sample_size),
-        )
-        real_rows = self._parse_rows(real_raw, window_days=window_days)
-        shadow_rows = self._parse_rows(shadow_raw, window_days=window_days)
-
+        real_rows, shadow_rows = await self._get_rows()
         recommendations: List[Dict[str, Any]] = []
         config_patch: List[Dict[str, Any]] = []
         seen_paths = set()

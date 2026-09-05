@@ -43,6 +43,10 @@ class BrainEngineV2(BaseBrainEngine):
         super().__init__(sdb)
         self._phase_samples = _PHASE_MIN_SAMPLES
 
+    async def _get_rows(self) -> tuple:
+        """Override base class: read from file archive first, fall back to Redis."""
+        return await self._load_rows()
+
     async def _load_rows(self) -> tuple:
         """Shared row loader — reads from archived files if available,
         otherwise falls back to Redis streams."""
@@ -417,13 +421,14 @@ class BrainEngineV2(BaseBrainEngine):
         return result
 
     # ── Baseline wrapper that also exposes raw rows ──────────────────────
+
     async def _generate_baseline_recommendations(self) -> Dict[str, Any]:
-        base = await super().generate_recommendations()  # BaseBrainEngine always has it — drop the hasattr guard entirely
-        real_rows, shadow_rows = await self._load_rows()
+        base = await super().generate_recommendations()
+        real_rows, shadow_rows = await self._get_rows()
         base["_real_rows"] = real_rows
         base["_shadow_rows"] = shadow_rows
         return base
-
+    
     async def _minimal_baseline(self) -> Dict[str, Any]:
         """Fallback baseline if original BrainEngine is unavailable."""
         real_rows, shadow_rows = await self._load_rows()

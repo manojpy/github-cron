@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """File-based outcome storage for GitHub Actions persistence."""
 from __future__ import annotations
+
 import json
 import os
 import glob
 import time
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -15,15 +17,40 @@ os.makedirs(os.path.join(_OUTCOME_DIR, "outcomes"), exist_ok=True)
 os.makedirs(os.path.join(_OUTCOME_DIR, "shadow"), exist_ok=True)
 os.makedirs(os.path.join(_OUTCOME_DIR, "reports"), exist_ok=True)
 
+_write_locks: Dict[str, threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+def _get_lock(subdir: str) -> threading.Lock:
+    with _locks_guard:
+        if subdir not in _write_locks:
+            _write_locks[subdir] = threading.Lock()
+        return _write_locks[subdir]
+
 def _today_file(subdir: str) -> str:
     d = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return os.path.join(_OUTCOME_DIR, subdir, f"{d}.jsonl")
 
 def append_outcome(record: Dict[str, Any], shadow: bool = False) -> None:
     """Append a single outcome record to today's JSONL file."""
-    path = _today_file("shadow" if shadow else "outcomes")
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, default=str) + "\n")
+    subdir = "shadow" if shadow else "outcomes"
+    path = _today_file(subdir)
+    lock = _get_lock(subdir)
+    with lock:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+
+def append_outcome_batch(records: List[Dict[str, Any]], shadow: bool = False) -> None:
+    """Append multiple resolved outcome records in one file open.
+    Used by state.py at resolution time to write win/pct_move/mae/mfe."""
+    if not records:
+        return
+    subdir = "shadow" if shadow else "outcomes"
+    path = _today_file(subdir)
+    lock = _get_lock(subdir)
+    with lock:
+        with open(path, "a", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, default=str) + "\n")
 
 def load_recent_outcomes(days: int = 30, shadow: bool = False) -> List[Dict[str, Any]]:
     """Read last N days of outcome lines (newest first)."""
@@ -33,7 +60,6 @@ def load_recent_outcomes(days: int = 30, shadow: bool = False) -> List[Dict[str,
     pattern = os.path.join(_OUTCOME_DIR, subdir, "*.jsonl")
     files = sorted(glob.glob(pattern), reverse=True)
     for path in files:
-        # Stop if file is older than window
         try:
             ftime = os.path.getmtime(path)
             if ftime < cutoff and len(rows) > 1000:

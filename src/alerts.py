@@ -1440,20 +1440,20 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             context=shadow_context,
                         )
                         # File (long-term brain archive)
-                        if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
-                            from outcome_storage import append_outcome
-                            append_outcome({
-                                "pair": pair_name,
-                                "alert_key": alert_key,
-                                "direction": direction,
-                                "entry_ts": ts_curr,
-                                "price": close_curr,
-                                "score": alert_score,
-                                "total": alert_total,
-                                "votes": alert_votes,
-                                "context": shadow_context,
-                                "shadow": True,
-                            })
+       
+                    if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                        from outcome_storage import append_outcome
+                        append_outcome({
+                            "pair": pair_name,
+                            "alert_key": alert_key,
+                            "direction": direction,
+                            "entry_ts": ts_curr,
+                            "price": close_curr,
+                            "score": alert_score,
+                            "total": alert_total,
+                            "votes": alert_votes,
+                            "context": shadow_context,
+                        }, shadow=True)
                     logger_pair.info(
                         f"[{pair_name}] Win-rate filter dropped {alert_key}: {fail_note}"
                     )

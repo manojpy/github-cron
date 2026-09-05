@@ -922,9 +922,9 @@ class RedisStateStore:
         ts_mismatch_count = 0
         missing_score_count = 0
         bad_payload_count = 0
-
+  
         stats_ttl = max(cfg.STATE_EXPIRY_DAYS * 86400, 7 * 86400)
-
+        resolved_for_file: List[Dict[str, Any]] = []
         try:
             async with self._redis.pipeline() as write_pipe:
                 pending_writes = 0
@@ -1011,6 +1011,26 @@ class RedisStateStore:
                         pending_writes += 1
                         resolved_count += 1
 
+                        write_pipe.delete(key)
+                        pending_writes += 1
+                        resolved_count += 1
+                        if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                            resolved_for_file.append({
+                                "pair": str(pair),
+                                "alert_key": str(alert_key),
+                                "direction": str(direction),
+                                "entry_ts": entry_ts,
+                                "score": conf_score,
+                                "total": conf_total,
+                                "win": win,
+                                "pct_move": pct_move,
+                                "mae": mae,
+                                "mfe": mfe,
+                                "session": session,
+                                "votes": conf_votes,
+                                "adx_val": adx_val,
+                                "context": row_context,
+                            })
                     except Exception as e:
                         logger_pair.debug(f"Failed to resolve pending outcome {key}: {e}")
                         bad_payload_count += 1
@@ -1022,6 +1042,13 @@ class RedisStateStore:
         except Exception as e:
             logger_pair.debug(f"Failed to persist resolved outcomes for {pair}: {e}")
             return
+
+        if resolved_for_file and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+            try:
+                from outcome_storage import append_outcome_batch
+                append_outcome_batch(resolved_for_file, shadow=False)
+            except Exception as e:
+                logger_pair.warning(f"[{pair}] File archive write failed: {e}")
 
         logger_pair.info(
             f"[{pair}] Outcome resolution | "
@@ -1075,7 +1102,8 @@ class RedisStateStore:
         resolved_count = 0
         hiconf_pct = getattr(cfg, "BRAIN_REWARDABLE_MIN_CONFLUENCE_PCT", 80.0)
         stats_ttl = max(cfg.STATE_EXPIRY_DAYS * 86400, 7 * 86400)
-
+        resolved_for_file: List[Dict[str, Any]] = []
+        
         try:
             async with self._redis.pipeline() as write_pipe:
                 pending_writes = 0
@@ -1142,11 +1170,27 @@ class RedisStateStore:
                                     1,
                                 )
                                 write_pipe.expire(hiconf_key, stats_ttl)
-
+                
                         write_pipe.delete(key)
                         pending_writes += 1
                         resolved_count += 1
-
+                        if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                            resolved_for_file.append({
+                                "pair": str(pair),
+                                "alert_key": str(alert_key),
+                                "direction": str(direction),
+                                "entry_ts": entry_ts,
+                                "score": conf_score,
+                                "total": conf_total,
+                                "win": win,
+                                "pct_move": pct_move,
+                                "mae": mae,
+                                "mfe": mfe,
+                                "session": _get_session_from_ts(entry_ts) if entry_ts else "dead",
+                                "votes": conf_votes,
+                                "shadow": True,
+                            })
+                
                     except Exception as e:
                         logger_pair.debug(
                             f"Failed to resolve shadow pending outcome {key}: {e}"
@@ -1161,6 +1205,13 @@ class RedisStateStore:
                 f"Failed to persist resolved shadow outcomes for {pair}: {e}"
             )
             return
+    
+        if resolved_for_file and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+            try:
+                from outcome_storage import append_outcome_batch
+                append_outcome_batch(resolved_for_file, shadow=True)
+            except Exception as e:
+                logger_pair.warning(f"[{pair}] Shadow file archive write failed: {e}")
 
         if resolved_count:
             logger_pair.debug(
