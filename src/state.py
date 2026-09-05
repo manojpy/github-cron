@@ -968,6 +968,32 @@ class RedisStateStore:
                         conf_votes = result["conf_votes"]
                         adx_val = result["adx_val"]
                         row_context = result.get("context")
+                        
+                        # ── NEW: Write to file archive if enabled ──
+                        if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                            try:
+                                from outcome_storage import append_outcome
+                                append_outcome({
+                                    "pair": str(pair),
+                                    "alert_key": str(alert_key),
+                                    "direction": str(direction),
+                                    "entry_ts": entry_ts,
+                                    "price": result.get("entry_price", 0) or 0,
+                                    "score": conf_score if conf_score is not None else "",
+                                    "total": conf_total if conf_total is not None else "",
+                                    "votes": json_dumps(conf_votes) if conf_votes is not None else "",
+                                    "pct_move": f"{pct_move:.4f}",
+                                    "win": "1" if win else "0",
+                                    "mae": f"{mae:.5f}" if mae is not None else "",
+                                    "mfe": f"{mfe:.5f}" if mfe is not None else "",
+                                    "context": json_dumps(row_context) if row_context is not None else "",
+                                    "session": session,
+                                    "adx_val": str(adx_val) if adx_val is not None else "",
+                                    "shadow": False,
+                                })
+                            except Exception as e:
+                                logger_pair.debug(f"File write failed for {pair}:{alert_key}: {e}")
+                        
                         stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
                         write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
                         write_pipe.expire(stats_key, stats_ttl)
@@ -1098,6 +1124,31 @@ class RedisStateStore:
                         conf_score = result["conf_score"]
                         conf_total = result["conf_total"]
                         conf_votes = result["conf_votes"]
+                        row_context = result.get("context")
+                        
+                        # ── NEW: Write to file archive if enabled ──
+                        if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                            try:
+                                from outcome_storage import append_outcome
+                                append_outcome({
+                                    "pair": str(pair),
+                                    "alert_key": str(alert_key),
+                                    "direction": str(direction),
+                                    "entry_ts": entry_ts,
+                                    "price": result.get("entry_price", 0) or 0,
+                                    "score": conf_score if conf_score is not None else "",
+                                    "total": conf_total if conf_total is not None else "",
+                                    "votes": json_dumps(conf_votes) if conf_votes is not None else "",
+                                    "pct_move": f"{pct_move:.4f}",
+                                    "win": "1" if win else "0",
+                                    "mae": f"{mae:.5f}" if mae is not None else "",
+                                    "mfe": f"{mfe:.5f}" if mfe is not None else "",
+                                    "context": json_dumps(row_context) if row_context is not None else "",
+                                    "session": _get_session_from_ts(entry_ts) if entry_ts else "dead",
+                                    "shadow": True,
+                                })
+                            except Exception as e:
+                                logger_pair.debug(f"Shadow file write failed for {pair}:{alert_key}: {e}")
 
                         stats_key = f"{RedisKeyPrefix.SHADOW_STATS}{pair}:{alert_key}"
                         write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
