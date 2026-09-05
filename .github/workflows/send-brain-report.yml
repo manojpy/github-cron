@@ -128,7 +128,7 @@ jobs:
             -e PYTHONPATH=/app/src \
             -e PYTHONUNBUFFERED=1 \
             -e OUTCOME_DATA_DIR=/tmp/data-repo \
-            -v "/tmp/data-repo:/tmp/data-repo:ro" \
+            -v "/tmp/data-repo:/tmp/data-repo:rw" \
             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \
             --entrypoint python \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
