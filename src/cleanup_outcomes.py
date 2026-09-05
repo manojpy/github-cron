@@ -42,12 +42,12 @@ def cleanup_by_age(data_dir: Path, max_age_days: int) -> int:
     removed = 0
     cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
 
-    for label in ["outcomes", "shadow"]:
+    for label, pattern in (("outcomes", "*.jsonl*"), ("shadow", "*.jsonl*"), ("reports", "*.md")):
         label_dir = data_dir / label
         if not label_dir.exists():
             continue
         
-        for file_path in label_dir.glob("*.jsonl*"):  # includes .jsonl.gz
+        for file_path in label_dir.glob(pattern):  # includes .jsonl.gz for outcomes/shadow
             try:
                 mtime = datetime.utcfromtimestamp(file_path.stat().st_mtime)
                 if mtime < cutoff:
@@ -135,14 +135,13 @@ def main():
         print(f"\n⚠️ Directory size ({format_size(new_size)}) exceeds limit ({args.max_total_mb} MB)")
         print("Performing aggressive cleanup...")
         
-        # Remove oldest files first
-        for label in ["outcomes", "shadow"]:
+        for label, pattern in (("outcomes", "*.jsonl*"), ("shadow", "*.jsonl*"), ("reports", "*.md")):
             label_dir = data_dir / label
             if not label_dir.exists():
                 continue
             
-            # Get all files sorted by name (YYYY-MM format sorts chronologically)
-            files = sorted(label_dir.glob("*.jsonl*"))
+            # Get all files sorted by name (YYYY-MM-DD[...] format sorts chronologically)
+            files = sorted(label_dir.glob(pattern))
 
             # Remove from oldest until under limit
             for month_file in files:

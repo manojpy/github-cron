@@ -31,9 +31,7 @@ from indicators import (
     validate_cloud_cross, validate_conversion_cross,
     _fib_reversal_confluence_vote,
 )
-
 from threshold_engine import hash_config_state
-from telegram_feedback import build_feedback_keyboard, record_feedback_pending
 
 # Runtime override for CONFLUENCE_WEIGHTS (loaded from Redis at startup)
 # Falls back to static cfg.CONFLUENCE_WEIGHTS if not set
@@ -1569,25 +1567,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         await _refund_alert_budget(len(alerts_to_send))
                         budget_refunded = True  # Mark as refunded
                         send_success = False
-
-                    elif cfg.ENABLE_TELEGRAM_FEEDBACK:
-                        feedback_id = uuid.uuid4().hex[:12]
-                        direction = "buy" if any(ak in BUY_ALERT_KEYS for _, _, ak in alerts_to_send) else "sell"
-                        await record_feedback_pending(
-                            sdb, feedback_id, pair_name,
-                            [ak for _, _, ak in alerts_to_send], ts_curr, direction,
-                            message_id=None,
-                        )
-                        message_id = await telegram_queue.send_with_markup(
-                            msg, build_feedback_keyboard(feedback_id)
-                        )
-                        send_success = message_id is not None
-                        if send_success:
-                            await record_feedback_pending(
-                                sdb, feedback_id, pair_name,
-                                [ak for _, _, ak in alerts_to_send], ts_curr, direction,
-                                message_id=message_id,
-                            )
                     else:
                         send_success = await telegram_queue.send(msg)
 

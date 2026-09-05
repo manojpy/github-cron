@@ -43,7 +43,7 @@ from gates import compute_confluence_score, _eval_gate
 from alerts import (
     TelegramQueue, ALERT_KEYS, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
 ) 
-from telegram_feedback import poll_and_process_feedback
+
 _pair_eval_counter = 0
 
 def _sync_signal_handler(sig: int, frame: Any) -> None:
@@ -454,7 +454,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
         # ONE round-trip for ALL writes
         if new_histories:
-            await state_db.batch_set_metadata(new_histories)
+            await state_db.batch_set_metadata(new_histories, ttl=3 * 3600)
 
     if cfg.ENABLE_WIN_RATE_FILTER and not state_db.degraded and state_db._redis:
         try:
@@ -840,15 +840,6 @@ async def run_once() -> Optional[bool]:
 
         if telegram_queue is None:
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
-
-        if cfg.ENABLE_TELEGRAM_FEEDBACK and sdb and not sdb.degraded:
-            try:
-                await poll_and_process_feedback(
-                    sdb, cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, logger_run
-                )
-            except Exception as e:
-                logger_run.warning(f"Telegram feedback poll failed (non-fatal): {e}")
-
         if sdb.degraded:
             logger_run.warning(
                 "⚠️ Redis degraded — skipping distributed lock, proceeding without "

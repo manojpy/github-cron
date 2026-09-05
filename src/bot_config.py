@@ -325,8 +325,6 @@ class BotConfig(BaseModel):
     BRAIN_ANALYSIS_WINDOW_DAYS: int = Field(default=30, ge=7, le=365, description="Only analyze outcomes from the last N days")
     BRAIN_AUTO_DISABLE_ENABLED: bool = Field(default=True, description="If True, the brain writes disable_alert/reinstate verdicts directly to the live config_override in Redis instead of only reporting them")
     BRAIN_AUTO_DISABLE_MIN_SAMPLE: int = Field(default=200, ge=50, description="Min samples per individual alert_key (not pooled) before the brain will auto-disable or auto-reinstate its shared config path")
-    ENABLE_TELEGRAM_FEEDBACK: bool = Field(default=False, description="Attach 'Took Trade'/'Skipped' inline buttons to alerts and poll Telegram getUpdates each run to record taps into feedback_log_stream")
-    TELEGRAM_FEEDBACK_TTL_HOURS: int = Field(default=24, ge=1, le=168, description="How long a feedback_pending record (and its buttons) stays live before the alert is considered expired/unanswered")
     BRAIN_MC_SIMULATIONS: int = Field(default=50, ge=0, le=500, description="Block-bootstrap Monte Carlo simulations for the robustness check in the periodic brain report. 0 disables it (offline-only, never affects live gating).")
     DRY_RUN_MODE: bool = Field(default=False)
     SKIP_WARMUP: bool = Field(default=False)

@@ -615,14 +615,16 @@ class RedisStateStore:
             logger.error(f"batch_get_metadata failed for {len(keys)} keys: {e}")
             return {k: None for k in keys}
 
-    async def batch_set_metadata(self, items: Dict[str, str], timeout: float = 5.0) -> bool:
+    async def batch_set_metadata(self, items: Dict[str, str], timeout: float = 5.0,
+                                   ttl: Optional[int] = None) -> bool:
         """Write many metadata keys in ONE Redis round-trip (pipeline)."""
         if not self._redis or self.degraded or not items:
             return True
         try:
             async with self._redis.pipeline() as pipe:
                 for k, v in items.items():
-                    pipe.set(f"{self.meta_prefix}{k}", v, ex=self.metadata_expiry_seconds)
+                    pipe.set(f"{self.meta_prefix}{k}", v,
+                              ex=ttl if ttl is not None else self.metadata_expiry_seconds)
                 await asyncio.wait_for(pipe.execute(), timeout=timeout)
             return True
         except Exception as e:
@@ -999,18 +1001,13 @@ class RedisStateStore:
                                 f"[{pair}] Outcome for {alert_key} has no confluence score/total; "
                                 f"stats updated but stream entry skipped"
                             )
-
-                        if stream_fields is not None:
+                        if stream_fields is not None and not getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                             write_pipe.xadd(
                                 RedisKeyPrefix.OUTCOME_LOG_STREAM,
                                 stream_fields,
                                 maxlen=2000,
                                 approximate=True,
                             )
-                        write_pipe.delete(key)
-                        pending_writes += 1
-                        resolved_count += 1
-
                         write_pipe.delete(key)
                         pending_writes += 1
                         resolved_count += 1
@@ -1137,29 +1134,30 @@ class RedisStateStore:
                             and conf_total > 0
                         ):
                             conf_pct = (conf_score / conf_total) * 100.0
-                            write_pipe.xadd(
-                                RedisKeyPrefix.SHADOW_LOG_STREAM,
-                                {
-                                    "pair": str(pair),
-                                    "alert_key": str(alert_key),
-                                    "direction": str(direction),
-                                    "score": str(conf_score),
-                                    "total": str(conf_total),
-                                    "pct_move": f"{pct_move:.4f}",
-                                    "win": "1" if win else "0",
-                                    "entry_ts": str(entry_ts),
-                                    "session": _get_session_from_ts(entry_ts)
-                                    if entry_ts
-                                    else "dead",
-                                    "mae": f"{mae:.5f}" if mae is not None else "",
-                                    "mfe": f"{mfe:.5f}" if mfe is not None else "",
-                                    "votes": json_dumps(conf_votes)
-                                    if conf_votes is not None
-                                    else "",
-                                },
-                                maxlen=2000,
-                                approximate=True,
-                            )
+                            if not getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                                write_pipe.xadd(
+                                    RedisKeyPrefix.SHADOW_LOG_STREAM,
+                                    {
+                                        "pair": str(pair),
+                                        "alert_key": str(alert_key),
+                                        "direction": str(direction),
+                                        "score": str(conf_score),
+                                        "total": str(conf_total),
+                                        "pct_move": f"{pct_move:.4f}",
+                                        "win": "1" if win else "0",
+                                        "entry_ts": str(entry_ts),
+                                        "session": _get_session_from_ts(entry_ts)
+                                        if entry_ts
+                                        else "dead",
+                                        "mae": f"{mae:.5f}" if mae is not None else "",
+                                        "mfe": f"{mfe:.5f}" if mfe is not None else "",
+                                        "votes": json_dumps(conf_votes)
+                                        if conf_votes is not None
+                                        else "",
+                                    },
+                                    maxlen=2000,
+                                    approximate=True,
+                                )
                             if conf_pct >= hiconf_pct:
                                 hiconf_key = (
                                     f"{RedisKeyPrefix.SHADOW_HICONF_STATS}{alert_key}"
@@ -1468,13 +1466,7 @@ class RedisStateStore:
                     lambda: pipe.execute(), 2.0, f"threshold_history_save:{key_suffix or 'global'}",
                 )
         except Exception:
-            pass
-
-
-
-
-
-            
+            pass       
 
 class RedisLock:    
     RELEASE_LUA = """
