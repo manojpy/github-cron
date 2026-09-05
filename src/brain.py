@@ -1112,6 +1112,8 @@ class BrainEngine:
         elif total_recs > shown:
             lines.append(escape_markdown_v2(f"+{total_recs - shown} more items — full report persisted."))
 
+        msg = self._truncate_telegram(lines)
+
         # Persist BEFORE attempting the Telegram send
         report_key = f"brain_report:{int(time.time())}"
         if self.sdb._redis and not self.sdb.degraded:
@@ -1122,28 +1124,13 @@ class BrainEngine:
             if result is None:
                 logger_run.warning(f"Failed to persist brain report {report_key}")
 
-        # Split into multiple messages if needed
-        msg = "\n".join(lines)
-        chunks: List[str] = []
-        while msg:
-            if len(msg) <= 4000:
-                chunks.append(msg)
-                break
-            cut = msg.rfind("\n", 0, 4000)
-            if cut <= 0:
-                cut = 4000
-            chunks.append(msg[:cut])
-            msg = msg[cut:].lstrip("\n")
-
         send_ok = False
         if telegram_queue:
             try:
-                all_sent = True
-                for chunk in chunks:
-                    result = await telegram_queue.send(chunk)
-                    if not result:
-                        all_sent = False
-                send_ok = all_sent
+                result = await telegram_queue.send(msg)
+
+                if result:
+                    send_ok = True
                 else:
                     logger_run.warning(
                         f"Brain report Telegram send returned False (likely API rejection) — "
