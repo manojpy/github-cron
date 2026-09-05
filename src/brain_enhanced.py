@@ -418,10 +418,11 @@ class BrainEngineV2(BaseBrainEngine):
 
     # ── Baseline wrapper that also exposes raw rows ──────────────────────
     async def _generate_baseline_recommendations(self) -> Dict[str, Any]:
-        base = await super().generate_recommendations()  # BaseBrainEngine always has it — drop the hasattr guard entirely
-        real_rows, shadow_rows = await self._load_rows()
-        base["_real_rows"] = real_rows
-        base["_shadow_rows"] = shadow_rows
+        # super().generate_recommendations() now calls self._load_rows()
+        # internally, which dynamically dispatches to THIS class's override
+        # below — so base already ran on file-archive-preferred rows, and
+        # _real_rows/_shadow_rows are already attached. No second load needed.
+        base = await super().generate_recommendations()
         return base
 
     async def _minimal_baseline(self) -> Dict[str, Any]:
