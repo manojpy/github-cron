@@ -171,6 +171,7 @@ class BrainEngineV2(BaseBrainEngine):
                 msg_parts.append(f"{ak}: {wr:.0%} WR (n={cnt}, avg score {avg_s:.1f}){flag}")
             recommendations.append({
                 "type": "per_alert_breakdown", "severity": "low",
+                "data": alert_stats,
                 "message": "Per-alert breakdown:\n" + "\n".join(msg_parts),
             })
 
@@ -290,6 +291,7 @@ class BrainEngineV2(BaseBrainEngine):
                 if inter["type"] == "synergy":
                     recommendations.append({
                         "type": "vote_interaction",
+                        "kind": "synergy",
                         "severity": "low",
                         "message": (
                             f"🔗 Synergy: {v1} + {v2} together = {inter['wr_both']:.0%} WR "
@@ -301,6 +303,7 @@ class BrainEngineV2(BaseBrainEngine):
                 else:
                     recommendations.append({
                         "type": "vote_interaction",
+                        "kind": "poison",
                         "severity": "medium",
                         "message": (
                             f"☠️ Poison: {v2} kills {v1}. Together={inter['wr_both']:.0%} WR, "

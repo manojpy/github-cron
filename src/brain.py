@@ -12,7 +12,7 @@ import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
-from alerts import escape_markdown_v2
+from alerts import escape_markdown_v2, BUY_ALERT_KEYS, SELL_ALERT_KEYS
 
 from bot_config import cfg, json_dumps, format_ist_time, CONFLUENCE_WEIGHTS
 from state import RedisKeyPrefix, RedisStateStore
@@ -883,6 +883,7 @@ class BrainEngine:
             "generated_at": int(time.time()),
             "real_sample_size": len(real_rows),
             "shadow_sample_size": len(shadow_rows),
+            "overall_win_rate": round(sum(1 for r in real_rows if r["win"]) / len(real_rows), 4) if real_rows else None,
             "recommendation_count": len(recommendations),
             "recommendations": recommendations,
             "shadow_summary": shadow_summary,
@@ -1052,61 +1053,76 @@ class BrainEngine:
         recs = await self.generate_recommendations()
 
         cc = recs.get("current_config", {})
+        min_sample = getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
+
         lines = [
             "🧠 *BRAIN REPORT*",
             escape_markdown_v2(format_ist_time()),
-            escape_markdown_v2(
-                f"Samples: {recs['real_sample_size']} real, {recs['shadow_sample_size']} shadow | "
-                f"Score≥{cc.get('CONFLUENCE_MIN_ABS_SCORE')} Pct≥{cc.get('CONFLUENCE_MIN_PCT')}%"
-            ),
+            escape_markdown_v2(f"{recs['real_sample_size']} real samples, {recs['shadow_sample_size']} shadow"),
+            "",
         ]
 
-        # ── Calibration / drift warnings (only if something's actually wrong) ──
+        # ── WIN RATE: the headline number, vs your own target ──
         ai = recs.get("ai_metrics", {})
-        warn_bits = []
-        if ai.get("brier_score") is not None and ai.get("brier_status") not in (None, "OK"):
-            warn_bits.append(f"Brier {ai['brier_score']:.3f} ({ai['brier_status']})")
-        if ai.get("cusum_drifts"):
-            warn_bits.append(f"CUSUM {ai['cusum_drifts']} alert(s)")
-        if warn_bits:
-            lines.append(escape_markdown_v2("⚠️ " + " | ".join(warn_bits)))
-
-        # ── Net EV / position sizing (directly actionable, worth the space) ──
+        overall_wr = recs.get("overall_win_rate")
+        target_wr = cfg.MIN_WIN_RATE
+        lines.append("*📊 WIN RATE*")
+        if overall_wr is not None:
+            status = "✅" if overall_wr >= target_wr else "⚠️"
+            lines.append(escape_markdown_v2(
+                f"Overall: {overall_wr:.0%} vs min target {target_wr:.0%}  ({status})"
+            ))
+        else:
+            lines.append(escape_markdown_v2("Overall: not enough samples yet"))
+        lines.append(escape_markdown_v2(
+            f"Gate threshold: Score≥{cc.get('CONFLUENCE_MIN_ABS_SCORE')} Pct≥{cc.get('CONFLUENCE_MIN_PCT')}%"
+        ))
         size_bits = []
         if ai.get("net_ev") is not None:
             size_bits.append(f"EV {ai['net_ev']:+.3f}%/trade")
         if ai.get("half_kelly") is not None:
             size_bits.append(f"Half-Kelly {ai['half_kelly']:.1%}")
+        if ai.get("brier_score") is not None and ai.get("brier_status") not in (None, "OK"):
+            size_bits.append(f"Brier {ai['brier_score']:.3f} ({ai['brier_status']})")
         if size_bits:
             lines.append(escape_markdown_v2("💰 " + " | ".join(size_bits)))
         lines.append("")
 
-        # ── Weakest / strongest alerts (extremes only — full table stays in Redis) ──
+        # ── TOP ALERTS: best buy / best sell, ranked by win rate ──
         perf = next((r for r in recs["recommendations"] if r["type"] == "per_alert_breakdown"), None)
-        if perf:
-            rows = [ln for ln in perf["message"].split("\n")[1:] if ln and not ln.startswith("...")]
-            if rows:
-                lines.append(escape_markdown_v2(f"📊 Weakest: {rows[0]}"))
-                if len(rows) > 1:
-                    lines.append(escape_markdown_v2(f"📊 Strongest: {rows[-1]}"))
+        alert_data = perf.get("data") if perf else None
+        if alert_data:
+            buy_ranked = sorted((t for t in alert_data if t[0] in BUY_ALERT_KEYS), key=lambda t: -t[1])
+            sell_ranked = sorted((t for t in alert_data if t[0] in SELL_ALERT_KEYS), key=lambda t: -t[1])
+            if buy_ranked or sell_ranked:
+                lines.append(escape_markdown_v2(f"🏆 TOP ALERTS (min {min_sample} trades)"))
+                if buy_ranked:
+                    lines.append("Buy:")
+                    for ak, wr, n, _ in buy_ranked[:2]:
+                        lines.append(escape_markdown_v2(f" • {ak}: {wr:.0%} ({n} trades)"))
+                if sell_ranked:
+                    lines.append("Sell:")
+                    for ak, wr, n, _ in sell_ranked[:2]:
+                        lines.append(escape_markdown_v2(f" • {ak}: {wr:.0%} ({n} trades)"))
                 lines.append("")
 
-        # ── Auto-block status (actual state changes, always worth surfacing) ──
-        auto_disabled = [r for r in recs["recommendations"] if r["type"] == "auto_disabled"]
-        auto_reenabled = [r for r in recs["recommendations"] if r["type"] == "auto_reenabled"]
-        if auto_disabled or auto_reenabled:
-            lines.append("*🔒 AUTO-BLOCK*")
-            for r in (auto_disabled + auto_reenabled)[:3]:
-                icon = "🔴" if r["type"] == "auto_disabled" else "🟢"
-                lines.append(f"{icon} {escape_markdown_v2(r['message'][:150])}")
+        # ── WEAK / AVOID: disable candidates + harmful vote combos ──
+        disable_alerts = [r for r in recs["recommendations"] if r["type"] == "disable_alert"]
+        poison_combos = [r for r in recs["recommendations"]
+                          if r["type"] == "vote_interaction" and r.get("kind") == "poison"]
+        if disable_alerts or poison_combos:
+            lines.append("*📉 WEAK / AVOID*")
+            for r in disable_alerts[:3]:
+                lines.append(f"• {escape_markdown_v2(r['message'][:180])}")
+            for r in poison_combos[:3]:
+                lines.append(f"• {escape_markdown_v2(r['message'][:180])}")
             lines.append("")
 
-        # ── Suggested changes: the config patch, compacted to one line each ──
+        # ── DO THIS NOW: config patch + best counterfactual + synergy combos ──
         patch = recs["config_patch"]
         patch_derived_types = {"parameter_autopsy", "weight_optimizer"}
-        shown_patch = 0
+        action_lines = []
         if patch:
-            patch_lines = []
             for p in patch:
                 note = (p.get("note") or "").lower()
                 if "informational" in note:
@@ -1128,31 +1144,49 @@ class BrainEngine:
                         line += f" (+{len(changed) - 6} more)"
                 else:
                     line = f"• {path}: {p.get('current')} → {suggested}"
-                patch_lines.append(escape_markdown_v2(line))
-            if patch_lines:
-                lines.append("*🎯 SUGGESTED CHANGES*")
-                lines.extend(patch_lines)
-                lines.append("")
-                shown_patch = len(patch_lines)
+                action_lines.append(escape_markdown_v2(line))
+        shown_patch = len(action_lines)
 
-        # ── Other high/medium findings not already covered by the patch above ──
+        counterfactuals = [r for r in recs["recommendations"] if r["type"] == "counterfactual"]
+        for r in counterfactuals[:1]:
+            action_lines.append(f"• {escape_markdown_v2(r['message'][:200])}")
+
+        synergy_combos = [r for r in recs["recommendations"]
+                           if r["type"] == "vote_interaction" and r.get("kind") == "synergy"]
+        for r in synergy_combos[:2]:
+            action_lines.append(f"• {escape_markdown_v2(r['message'][:180])}")
+
+        if action_lines:
+            lines.append("*🎯 DO THIS NOW*")
+            lines.extend(action_lines)
+            lines.append("")
+
+        # ── AUTO-BLOCK: actual state changes made this run ──
+        auto_disabled = [r for r in recs["recommendations"] if r["type"] == "auto_disabled"]
+        auto_reenabled = [r for r in recs["recommendations"] if r["type"] == "auto_reenabled"]
+        if auto_disabled or auto_reenabled:
+            lines.append("*🔒 AUTO-BLOCK*")
+            for r in (auto_disabled + auto_reenabled)[:3]:
+                icon = "🔴" if r["type"] == "auto_disabled" else "🟢"
+                lines.append(f"{icon} {escape_markdown_v2(r['message'][:150])}")
+            lines.append("")
+
+        # ── FYI: CUSUM drift + any leftover findings — informational, goes last ──
         skip_types = patch_derived_types | {
             "dynamic_weights_applied", "dynamic_weights_shadow",
             "dynamic_weights_persist_failed", "auto_disabled", "auto_reenabled",
+            "disable_alert", "vote_interaction", "counterfactual", "per_alert_breakdown",
         }
         others = [
             r for r in recs["recommendations"]
             if r["severity"] in ("high", "medium") and r["type"] not in skip_types
         ]
-
-        # CUSUM drift repeats an identical sentence per alert — collapse into
-        # one plain-language line instead of eating up to 4-5 KEY FINDINGS slots.
         cusum_items = [r for r in others if r["type"] == "cusum_drift"]
         others = [r for r in others if r["type"] != "cusum_drift"]
 
         shown_others = 0
         if cusum_items or others:
-            lines.append("*🔎 KEY FINDINGS*")
+            lines.append("*ℹ️ FYI*")
             if cusum_items:
                 names = ", ".join(f"{r['alert']} ({r.get('n', '?')} trades)" for r in cusum_items)
                 lines.append(escape_markdown_v2(
@@ -1160,14 +1194,18 @@ class BrainEngine:
                     f"auto-tuning paused for these, needs your review: {names}"
                 ))
                 shown_others += len(cusum_items)
-            for r in others[:8]:
+            for r in others[:5]:
                 first_line = r["message"].split("\n")[0]
                 lines.append(f"• {escape_markdown_v2(first_line[:180])}")
-            shown_others += min(len(others), 8)
+            shown_others += min(len(others), 5)
             lines.append("")
 
         total_recs = recs["recommendation_count"]
-        shown = shown_patch + len(auto_disabled[:3]) + len(auto_reenabled[:3]) + shown_others
+        shown = (
+            shown_patch + len(counterfactuals[:1]) + len(synergy_combos[:2])
+            + len(disable_alerts[:3]) + len(poison_combos[:3])
+            + len(auto_disabled[:3]) + len(auto_reenabled[:3]) + shown_others
+        )
         if total_recs == 0:
             lines.append("No actionable signal yet — still accumulating samples.")
         elif total_recs > shown:

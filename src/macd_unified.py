@@ -953,11 +953,7 @@ async def run_once() -> Optional[bool]:
                 brain = BrainEngineV2(sdb)
                 if getattr(cfg, "BRAIN_REPORT_ON_DEMAND", False):
                     logger_run.info("🧠 Brain report on demand requested — forcing report generation...")
-                    # Try direct generate_report first; fall back to maybe_generate_report
-                    if hasattr(brain, "generate_report"):
-                        await brain.generate_report(pairs_to_process, telegram_queue, logger_run)
-                    else:
-                        await brain.maybe_generate_report(pairs_to_process, telegram_queue, logger_run, force=True)
+                    await brain.send_report_now(pairs_to_process, telegram_queue, logger_run)
                 else:
                     await brain.maybe_generate_report(pairs_to_process, telegram_queue, logger_run)
             except Exception as e:
