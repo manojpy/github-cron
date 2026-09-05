@@ -615,14 +615,20 @@ class RedisStateStore:
             logger.error(f"batch_get_metadata failed for {len(keys)} keys: {e}")
             return {k: None for k in keys}
 
-    async def batch_set_metadata(self, items: Dict[str, str], timeout: float = 5.0) -> bool:
-        """Write many metadata keys in ONE Redis round-trip (pipeline)."""
+    async def batch_set_metadata(self, items: Dict[str, str], timeout: float = 5.0,
+                                  ttl: Optional[int] = None) -> bool:
+        """Write many metadata keys in ONE Redis round-trip (pipeline).
+        ttl overrides the default metadata_expiry_seconds for this whole
+        batch when the caller's data has its own, shorter freshness window
+        (e.g. OI/Funding samples, which are only ever read within
+        cfg.OI_FUNDING_MAX_SAMPLE_AGE_SEC anyway)."""
         if not self._redis or self.degraded or not items:
             return True
+        expiry = ttl if ttl is not None else self.metadata_expiry_seconds
         try:
             async with self._redis.pipeline() as pipe:
                 for k, v in items.items():
-                    pipe.set(f"{self.meta_prefix}{k}", v, ex=self.metadata_expiry_seconds)
+                    pipe.set(f"{self.meta_prefix}{k}", v, ex=expiry)
                 await asyncio.wait_for(pipe.execute(), timeout=timeout)
             return True
         except Exception as e:
