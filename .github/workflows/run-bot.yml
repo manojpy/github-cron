@@ -1,8 +1,6 @@
 name: 🤖 Run MACD Unified Bot (Hybrid)
 on:
   workflow_dispatch:
-
-  workflow_dispatch:
     inputs:
       dry_run:
         description: 'Dry-run mode (log alerts only)'
