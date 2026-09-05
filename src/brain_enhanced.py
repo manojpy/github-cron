@@ -429,6 +429,9 @@ class BrainEngineV2(BaseBrainEngine):
         base["_shadow_rows"] = shadow_rows
         return base
     
+    async def generate_report(self, pairs, telegram_queue, logger_run):
+        return await self._generate_and_send(pairs, telegram_queue, logger_run)
+
     async def _minimal_baseline(self) -> Dict[str, Any]:
         """Fallback baseline if original BrainEngine is unavailable."""
         real_rows, shadow_rows = await self._load_rows()

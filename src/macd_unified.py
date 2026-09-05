@@ -730,24 +730,21 @@ async def run_once() -> Optional[bool]:
             except Exception as e:
                 logger_run.warning(f"Failed to load dynamic weights: {e} — using static CONFLUENCE_WEIGHTS")
 
-        if os.getenv("CLEAR_ALL_STATES", "false").lower() == "true": 
+        if os.getenv("CLEAR_REDIS", "false").lower() == "true":
             if sdb and not sdb.degraded:
-                logger_run.warning("🚨 CLEAR_ALL_STATES requested — purging selected Redis states...")
-                
-                def _env_bool(key: str, default: str = "false") -> bool:
-                    return os.getenv(key, default).lower() == "true"
-                
+                logger_run.warning("🚨 CLEAR_REDIS requested — purging ALL Redis states...")
+
                 st, dd, pend, sp, ast, sst, shc, strm = await _clear_all_redis_states(
                     sdb, pairs_to_process, logger_run,
-                    clear_active_states=_env_bool("CLEAR_ACTIVE_STATES", "true"),
-                    clear_dedups=_env_bool("CLEAR_DEDUPS", "true"),
-                    clear_pending_outcomes=_env_bool("CLEAR_PENDING_OUTCOMES", "true"),
-                    clear_shadow_pending=_env_bool("CLEAR_SHADOW_PENDING", "true"),
-                    clear_alert_stats=_env_bool("CLEAR_WINRATE_STATS", "false"),
-                    clear_shadow_stats=_env_bool("CLEAR_SHADOW_TRACKING", "false"),
-                    clear_outcome_streams=_env_bool("CLEAR_OUTCOME_HISTORY", "false"),
+                    clear_active_states=True,
+                    clear_dedups=True,
+                    clear_pending_outcomes=True,
+                    clear_shadow_pending=True,
+                    clear_alert_stats=True,
+                    clear_shadow_stats=True,
+                    clear_outcome_streams=True,
                 )
-                
+
                 parts = []
                 if st: parts.append(f"States: {st}")
                 if dd: parts.append(f"Dedups: {dd}")
@@ -757,8 +754,8 @@ async def run_once() -> Optional[bool]:
                 if sst: parts.append(f"ShadowStats: {sst}")
                 if shc: parts.append(f"ShadowHiConf: {shc}")
                 if strm: parts.append(f"Streams: {strm}")
-                cleared_str = " | ".join(parts) if parts else "Nothing selected to clear"
-      
+                cleared_str = " | ".join(parts) if parts else "Nothing cleared"
+
                 if telegram_queue is None:
                     telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
                 await telegram_queue.send(escape_markdown_v2(
@@ -767,7 +764,7 @@ async def run_once() -> Optional[bool]:
                     f"Time: {format_ist_time()}"
                 ))
             else:
-                logger_run.error("CLEAR_ALL_STATES=true but Redis is unavailable/degraded")
+                logger_run.error("CLEAR_REDIS=true but Redis is unavailable/degraded")
 
         if sdb.degraded and not sdb.degraded_alerted:
             logger_run.critical(
@@ -953,9 +950,19 @@ async def run_once() -> Optional[bool]:
         if cfg.ENABLE_BRAIN:
             try:
                 from brain_enhanced import BrainEngineV2
-                await BrainEngineV2(sdb).maybe_generate_report(pairs_to_process, telegram_queue, logger_run)
+                brain = BrainEngineV2(sdb)
+                if getattr(cfg, "BRAIN_REPORT_ON_DEMAND", False):
+                    logger_run.info("🧠 Brain report on demand requested — forcing report generation...")
+                    # Try direct generate_report first; fall back to maybe_generate_report
+                    if hasattr(brain, "generate_report"):
+                        await brain.generate_report(pairs_to_process, telegram_queue, logger_run)
+                    else:
+                        await brain.maybe_generate_report(pairs_to_process, telegram_queue, logger_run, force=True)
+                else:
+                    await brain.maybe_generate_report(pairs_to_process, telegram_queue, logger_run)
             except Exception as e:
                 logger_run.warning(f"Brain report generation failed: {e}")
+
         if alerts_sent_ref[0] > MAX_ALERTS_PER_RUN:
             await telegram_queue.send(escape_markdown_v2(
                 f"⚠️ HIGH ALERT VOLUME\n"

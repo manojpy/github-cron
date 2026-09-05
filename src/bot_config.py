@@ -418,6 +418,7 @@ class BotConfig(BaseModel):
     BRAIN_FEE_PCT: float = Field(default=0.0006, ge=0.0, le=0.01, description="Taker fee per side (0.06%) used in EV/Kelly calculations")
     BRAIN_SLIPPAGE_PCT: float = Field(default=0.0003, ge=0.0, le=0.01, description="Estimated slippage per side used in EV/Kelly calculations")
     BRAIN_OOD_ENABLED: bool = Field(default=True, description="Vote-count OOD gate on/off")
+    BRAIN_REPORT_ON_DEMAND: bool = Field(default=False, description="If true, force a brain report to be generated and sent on this run regardless of the normal BRAIN_REPORT_INTERVAL_RUNS cadence")
     OOD_MIN_HISTORY: int = Field(default=10, ge=5, le=100, description="Min historical samples before OOD gate activates")
     OOD_MARGIN: int = Field(default=2, ge=0, le=10, description="Extra votes allowed beyond 5th-95th percentile before flagging as OOD")
     OOD_RELAXED_MODE: bool = Field(default=True, description="If True, use margin-based OOD check (tolerant of small deviations); if False, use strict percentile check")
