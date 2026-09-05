@@ -64,7 +64,7 @@ def compress_large_files(data_dir: Path, max_size_mb: int) -> int:
     compressed = 0
     max_size_bytes = max_size_mb * 1024 * 1024
     
-    for label in ["outcome", "shadow"]:
+    for label in ["outcomes", "shadow"]:
         label_dir = data_dir / label
         if not label_dir.exists():
             continue
@@ -136,7 +136,7 @@ def main():
         print("Performing aggressive cleanup...")
         
         # Remove oldest files first
-        for label in ["outcome", "shadow"]:
+        for label in ["outcomes", "shadow"]:
             label_dir = data_dir / label
             if not label_dir.exists():
                 continue
