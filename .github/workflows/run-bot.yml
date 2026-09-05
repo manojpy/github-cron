@@ -10,43 +10,8 @@ on:
         options:
           - 'false'
           - 'true'
-      clear_states:
-        description: '🔴 MASTER: Enable Redis state clearing'
-        required: false
-        default: false
-        type: boolean
-      clear_active_states:
-        description: 'Clear active alert states (pair_state:*)'
-        required: false
-        default: false
-        type: boolean
-      clear_dedups:
-        description: 'Clear dedup keys (recent_alert:*)'
-        required: false
-        default: false
-        type: boolean
-      clear_pending_outcomes:
-        description: 'Clear pending outcome queue (outcome_pending:*)'
-        required: false
-        default: false
-        type: boolean
-      clear_shadow_pending:
-        description: 'Clear shadow pending queue (shadow_pending:*)'
-        required: false
-        default: false
-        type: boolean
-      clear_winrate_stats:
-        description: 'Clear win-rate counters (alert_stats:*)'
-        required: false
-        default: false
-        type: boolean
-      clear_shadow_tracking:
-        description: 'Clear shadow stats & hiconf (shadow_stats:*, shadow_hiconf:*)'
-        required: false
-        default: false
-        type: boolean
-      clear_outcome_history:
-        description: 'Clear resolved outcome streams & brain reports'
+      clear_redis:
+        description: '🔴 Clear ALL Redis keys on this run'
         required: false
         default: false
         type: boolean
@@ -60,14 +25,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
   BOT_TIMEOUT: 660
-  CLEAR_ALL_STATES: ${{ inputs.clear_states }}
-  CLEAR_ACTIVE_STATES: ${{ inputs.clear_active_states }}
-  CLEAR_DEDUPS: ${{ inputs.clear_dedups }}
-  CLEAR_PENDING_OUTCOMES: ${{ inputs.clear_pending_outcomes }}
-  CLEAR_SHADOW_PENDING: ${{ inputs.clear_shadow_pending }}
-  CLEAR_WINRATE_STATS: ${{ inputs.clear_winrate_stats }}
-  CLEAR_SHADOW_TRACKING: ${{ inputs.clear_shadow_tracking }}
-  CLEAR_OUTCOME_HISTORY: ${{ inputs.clear_outcome_history }}
+  CLEAR_REDIS: ${{ inputs.clear_redis }}
 
 jobs:
   run-bot:
@@ -86,16 +44,16 @@ jobs:
           [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
           [ -z "${{ secrets.REDIS_URL }}" ] && MISSING+=("REDIS_URL")
           [ -z "${{ secrets.DELTA_API_BASE }}" ] && MISSING+=("DELTA_API_BASE")
-          
+
           if [ ${#MISSING[@]} -gt 0 ]; then
             echo "❌ Missing secrets: ${MISSING[*]}"
             exit 1
           fi
-          
+
           if [ -z "${{ secrets.MACD_CONFIG_JSON }}" ]; then
             echo "⚠️ MACD_CONFIG_JSON not set — will fallback to GitHub API download"
           fi
-          
+
           echo "✅ All required secrets configured"
 
       - name: 🔨 Create Config
@@ -114,10 +72,7 @@ jobs:
             echo "⚠️ Secret MACD_CONFIG_JSON missing."
             echo "🔥 Falling back to GitHub API download..."
 
-            HTTP_STATUS=$(curl -s -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
-              -H "Accept: application/vnd.github.v3.raw" \
-              -L "https://api.github.com/repos/${{ github.repository }}/contents/config_macd.json" \
-              -o config_macd.json)
+            HTTP_STATUS=$(curl -s -w "%{http_code}" -H "Authorization: token $GH_TOKEN"               -H "Accept: application/vnd.github.v3.raw"               -L "https://api.github.com/repos/${{ github.repository }}/contents/config_macd.json"               -o config_macd.json)
 
             if [ "$HTTP_STATUS" != "200" ]; then
               echo "❌ Failed to load config from all sources:"
@@ -169,10 +124,8 @@ jobs:
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
-          git clone --depth=7 \
-            "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" \
-            /tmp/data-repo
-          
+          git clone --depth=7             "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git"             /tmp/data-repo
+
           # Fix permissions so the Docker container's non-root user can write
           chmod -R 777 /tmp/data-repo
           mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
@@ -189,11 +142,12 @@ jobs:
           echo "🕐 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
           echo "🏷️ Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           echo "🧪 Dry Run: $DRY_RUN"
+          echo "🧹 Clear Redis: $CLEAR_REDIS"
           echo "::endgroup::"
 
           START_TIME=$(date +%s)
           echo "🕐 TRIGGER_TIMESTAMP=$START_TIME ($(TZ=Asia/Kolkata date -d @$START_TIME '+%Y-%m-%d %H:%M:%S IST'))"
-          
+
 
           ENV_FILE="$(pwd)/.bot_env"
           cat > "$ENV_FILE" <<EOF
@@ -203,43 +157,16 @@ jobs:
           DELTA_API_BASE=${{ secrets.DELTA_API_BASE }}
           DRY_RUN_MODE=$DRY_RUN
           TRIGGER_TIMESTAMP=$START_TIME
-          CLEAR_ALL_STATES=$CLEAR_ALL_STATES
-          CLEAR_ACTIVE_STATES=$CLEAR_ACTIVE_STATES
-          CLEAR_DEDUPS=$CLEAR_DEDUPS
-          CLEAR_PENDING_OUTCOMES=$CLEAR_PENDING_OUTCOMES
-          CLEAR_SHADOW_PENDING=$CLEAR_SHADOW_PENDING
-          CLEAR_WINRATE_STATS=$CLEAR_WINRATE_STATS
-          CLEAR_SHADOW_TRACKING=$CLEAR_SHADOW_TRACKING
-          CLEAR_OUTCOME_HISTORY=$CLEAR_OUTCOME_HISTORY
+          CLEAR_REDIS=$CLEAR_REDIS
           EOF
 
-          timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
-            --rm \
-            --name "macd_bot_${{ github.run_id }}" \
-            --platform linux/amd64 \
-            --memory="900m" \
-            --memory-swap="1800m" \
-            --cpus="2.0" \
-            --security-opt=no-new-privileges \
-            --read-only \
-            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
-            --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m \
-            --env-file "$ENV_FILE" \
-            -e TZ=Asia/Kolkata \
-            -e PYTHONPATH=/app/src \
-            -e PYTHONUNBUFFERED=1 \
-            -e NUMBA_NUM_THREADS=2 \
-            -e OMP_NUM_THREADS=2 \
-            -e OUTCOME_DATA_DIR=/tmp/data-repo \
-            -v "/tmp/data-repo:/tmp/data-repo:rw" \
-            -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>&1 | tee logs/bot_output.log
+          timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run             --rm             --name "macd_bot_${{ github.run_id }}"             --platform linux/amd64             --memory="900m"             --memory-swap="1800m"             --cpus="2.0"             --security-opt=no-new-privileges             --read-only             --tmpfs /tmp:rw,noexec,nosuid,size=64m             --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m             --env-file "$ENV_FILE"             -e TZ=Asia/Kolkata             -e PYTHONPATH=/app/src             -e PYTHONUNBUFFERED=1             -e NUMBA_NUM_THREADS=2             -e OMP_NUM_THREADS=2             -e OUTCOME_DATA_DIR=/tmp/data-repo             -v "/tmp/data-repo:/tmp/data-repo:rw"             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro"             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>&1 | tee logs/bot_output.log
 
           EXIT_CODE=${PIPESTATUS[0]}
           DURATION=$(( $(date +%s) - START_TIME ))
           echo "execution_time=${DURATION}" >> $GITHUB_OUTPUT
           echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
-          
+
           rm -f "$ENV_FILE"
 
           if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ]; then
@@ -262,7 +189,7 @@ jobs:
             echo "message=Log file not found" >> $GITHUB_OUTPUT
             exit 0
           fi
-          
+
           if grep -q "RUN COMPLETE" "$LOG_FILE"; then
             STATUS="Success"
             DURATION=$(grep -oP "Duration:\s*\K[\d.]+(?=s)" "$LOG_FILE" | head -1 || echo "N/A")
@@ -274,7 +201,7 @@ jobs:
             STATUS="Failed"
             ERROR_MSG=$(grep -E "FATAL ERROR|Bot run failed|Error|ERROR" "$LOG_FILE" | head -1 | cut -c1-120 || echo "Unknown error")
           fi
-          
+
           echo "status=${STATUS}" >> $GITHUB_OUTPUT
           echo "duration=${DURATION:-N/A}" >> $GITHUB_OUTPUT
           echo "alerts=${ALERTS:-0}" >> $GITHUB_OUTPUT
@@ -288,7 +215,7 @@ jobs:
         run: |
           echo "## 🤖 MACD Bot Execution Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          
+
           if [ "${{ steps.results.outputs.status }}" != "Success" ]; then
             echo "### ❌ Error Details" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
@@ -330,12 +257,12 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "📦 Logs available in: **Artifacts > bot-execution-logs-${{ github.run_number }}**" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          
+
           if [ -f "logs/bot_output.log" ] && [ -s "logs/bot_output.log" ]; then
             echo "### 📄 Recent Log Output (last 50 lines)" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo '\`\`\`' >> $GITHUB_STEP_SUMMARY
             tail -n 50 logs/bot_output.log >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo '\`\`\`' >> $GITHUB_STEP_SUMMARY
           else
             echo "⚠️ No logs captured" >> $GITHUB_STEP_SUMMARY
           fi
@@ -355,10 +282,7 @@ jobs:
 
           MSG="🔴 MACD Bot workflow FAILED"$'\n'"Status: ${STATUS}"$'\n'"Exit code: ${EXIT_CODE} | Duration: ${DURATION}s"$'\n'"Error: ${ERROR_MSG}"$'\n'"Run: ${RUN_URL}"
 
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=${MSG}" \
-            -o /dev/null -w "Telegram notify HTTP %{http_code}\n"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}"             --data-urlencode "text=${MSG}"             -o /dev/null -w "Telegram notify HTTP %{http_code}\n"
 
       - name: 📤 Persist outcomes to data repo
         if: always()
