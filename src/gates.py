@@ -2,7 +2,7 @@ from __future__ import annotations
 import time
 import asyncio
 import logging
-from dataclasses import dataclass, fields as dc_fields 
+from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple, Union
 import numpy as np
 
@@ -17,12 +17,6 @@ from indicators import (
     _oi_funding_gate_reason, get_adaptive_adx_threshold_smoothed, _get_smoothed_pctl,
     _choch_gate_reason,
 )
-
-@classmethod
-def from_dicts(cls, gate: Dict[str, Any], alert: Optional[Dict[str, Any]] = None) -> "IndicatorCache":
-    merged = {**gate, **(alert or {})}
-    known = {f.name for f in dc_fields(cls)}
-    return cls(**{k: v for k, v in merged.items() if k in known})
 
 @dataclass(slots=True)
 class IndicatorCache:

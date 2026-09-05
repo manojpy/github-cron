@@ -302,26 +302,19 @@ class BrainEngine:
 
     # ── Recommendations ──────────────────────────────────────────────────────
 
-    async def _load_rows(self) -> tuple:
-        """Default row loader — reads from Redis streams. Subclasses (e.g.
-        BrainEngineV2) may override this to prefer a file archive instead;
-        generate_recommendations() below calls self._load_rows() so any
-        override is picked up automatically via dynamic dispatch."""
+    async def generate_recommendations(self) -> Dict[str, Any]:
+        """Build the full recommendation set: per-alert verdicts, a confluence
+        threshold suggestion, shadow-mode insight, and a machine-readable
+        config patch."""
         sample_size = getattr(cfg, "BRAIN_REPORT_STREAM_SAMPLE", 5000)
         window_days = getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30)
+
         real_raw, shadow_raw = await asyncio.gather(
             self._read_stream(RedisKeyPrefix.OUTCOME_LOG_STREAM, sample_size),
             self._read_stream(RedisKeyPrefix.SHADOW_LOG_STREAM, sample_size),
         )
         real_rows = self._parse_rows(real_raw, window_days=window_days)
         shadow_rows = self._parse_rows(shadow_raw, window_days=window_days)
-        return real_rows, shadow_rows
-
-    async def generate_recommendations(self) -> Dict[str, Any]:
-        """Build the full recommendation set: per-alert verdicts, a confluence
-        threshold suggestion, shadow-mode insight, and a machine-readable
-        config patch."""
-        real_rows, shadow_rows = await self._load_rows()
 
         recommendations: List[Dict[str, Any]] = []
         config_patch: List[Dict[str, Any]] = []
@@ -883,8 +876,6 @@ class BrainEngine:
             "generated_at": int(time.time()),
             "real_sample_size": len(real_rows),
             "shadow_sample_size": len(shadow_rows),
-            "_real_rows": real_rows,
-            "_shadow_rows": shadow_rows,
             "recommendation_count": len(recommendations),
             "recommendations": recommendations,
             "shadow_summary": shadow_summary,
