@@ -1,6 +1,8 @@
 name: 🤖 Run MACD Unified Bot (Hybrid)
 on:
   workflow_dispatch:
+
+  workflow_dispatch:
     inputs:
       dry_run:
         description: 'Dry-run mode (log alerts only)'
@@ -11,7 +13,12 @@ on:
           - 'false'
           - 'true'
       clear_redis:
-        description: '🔴 Clear ALL Redis keys on this run'
+        description: '🧹 Clear ALL Redis keys'
+        required: false
+        default: false
+        type: boolean
+      brain_report:
+        description: '🧠 Send Brain Report'
         required: false
         default: false
         type: boolean
@@ -26,6 +33,7 @@ env:
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
   BOT_TIMEOUT: 660
   CLEAR_REDIS: ${{ inputs.clear_redis }}
+  BRAIN_REPORT_ON_DEMAND: ${{ inputs.brain_report }}
 
 jobs:
   run-bot:
@@ -143,7 +151,8 @@ jobs:
           echo "🏷️ Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           echo "🧪 Dry Run: $DRY_RUN"
           echo "🧹 Clear Redis: $CLEAR_REDIS"
-          echo "::endgroup::"
+          echo "🧠 Brain Report: $BRAIN_REPORT_ON_DEMAND"
+          echo "::endgroup::"  
 
           START_TIME=$(date +%s)
           echo "🕐 TRIGGER_TIMESTAMP=$START_TIME ($(TZ=Asia/Kolkata date -d @$START_TIME '+%Y-%m-%d %H:%M:%S IST'))"
@@ -158,6 +167,7 @@ jobs:
           DRY_RUN_MODE=$DRY_RUN
           TRIGGER_TIMESTAMP=$START_TIME
           CLEAR_REDIS=$CLEAR_REDIS
+          BRAIN_REPORT_ON_DEMAND=$BRAIN_REPORT_ON_DEMAND
           EOF
 
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run             --rm             --name "macd_bot_${{ github.run_id }}"             --platform linux/amd64             --memory="900m"             --memory-swap="1800m"             --cpus="2.0"             --security-opt=no-new-privileges             --read-only             --tmpfs /tmp:rw,noexec,nosuid,size=64m             --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m             --env-file "$ENV_FILE"             -e TZ=Asia/Kolkata             -e PYTHONPATH=/app/src             -e PYTHONUNBUFFERED=1             -e NUMBA_NUM_THREADS=2             -e OMP_NUM_THREADS=2             -e OUTCOME_DATA_DIR=/tmp/data-repo             -v "/tmp/data-repo:/tmp/data-repo:rw"             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro"             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>&1 | tee logs/bot_output.log
