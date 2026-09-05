@@ -370,5 +370,6 @@ jobs:
           git add .
           if ! git diff --cached --quiet; then
             git commit -m "chore: bot outcomes $(date -u +%Y-%m-%d-%H:%M)"
+            git pull --rebase origin main
             git push origin main
           fi
