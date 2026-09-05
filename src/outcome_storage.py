@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from bot_config import cfg
 
-_OUTCOME_DIR = getattr(cfg, "OUTCOME_DATA_DIR", "outcome-data")
+_OUTCOME_DIR = os.environ.get("OUTCOME_DATA_DIR") or getattr(cfg, "OUTCOME_DATA_DIR", "outcome-data")
 os.makedirs(os.path.join(_OUTCOME_DIR, "outcomes"), exist_ok=True)
 os.makedirs(os.path.join(_OUTCOME_DIR, "shadow"), exist_ok=True)
 os.makedirs(os.path.join(_OUTCOME_DIR, "reports"), exist_ok=True)
