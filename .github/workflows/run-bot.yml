@@ -355,6 +355,28 @@ jobs:
             --data-urlencode "text=${MSG}" \
             -o /dev/null -w "Telegram notify HTTP %{http_code}\n"
 
+      - name: 📥 Checkout bot repo (for cleanup script)
+        if: always()
+        uses: actions/checkout@v4
+        with:
+          path: bot-src
+          sparse-checkout: |
+            src/cleanup_outcomes.py
+          sparse-checkout-cone-mode: false
+
+      - name: 🧹 Cleanup old archives
+        if: always()
+        run: |
+          if [ ! -d "/tmp/data-repo/.git" ]; then
+            echo "⚠️ Data repo not found, skipping cleanup"
+            exit 0
+          fi
+          python3 "${{ github.workspace }}/bot-src/src/cleanup_outcomes.py" \
+            --data-dir /tmp/data-repo \
+            --max-age-days 90 \
+            --max-size-mb 100 \
+            --max-total-mb 400
+
       - name: 📤 Persist outcomes to data repo
         if: always()
         env:
