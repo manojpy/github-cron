@@ -172,6 +172,11 @@ jobs:
           git clone --depth=7 \
             "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" \
             /tmp/data-repo
+          
+          # Fix permissions so the Docker container's non-root user can write
+          chmod -R 777 /tmp/data-repo
+          mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
+          chmod -R 777 /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
 
       - name: 🚀 Execute MACD Bot
         id: bot_run
