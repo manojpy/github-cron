@@ -74,7 +74,7 @@ def load_archived_outcomes(
     shadow: bool = False,
 ) -> List[Dict[str, Any]]:
     """Load outcomes from archived JSONL files (newest first)."""
-    label = "shadow" if shadow else "outcome"
+    label = "shadow" if shadow else "outcomes"
     root = Path(data_dir) / label
     if not root.exists():
         return []
