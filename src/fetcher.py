@@ -1286,33 +1286,82 @@ class PriceData:
 async def verify_mark_price_agrees(fetcher: DataFetcher, pair_name: str, ts_curr: int,
     is_green: bool, is_red: bool, reference_time: int, logger_pair: logging.Logger) -> Optional[bool]:
     try:
-        raw = await fetcher.fetch_candles(f"MARK:{pair_name}", "15", 3, reference_time, for_confirmation=True)
-        result = raw.get("result", {}) if raw else {}
-        if not result or not all(k in result for k in ("t", "o", "c")):
-            logger_pair.warning(f"[{pair_name}] Mark price check unavailable — inconclusive")
+        raw = await fetcher.fetch_candles(
+            f"MARK:{pair_name}",
+            "15",
+            5,
+            reference_time,
+            for_confirmation=True,
+        )
+
+        res = (raw or {}).get("result") or {}
+
+        if not all(k in res for k in ("t", "o", "c")):
+            logger_pair.warning(
+                f"[{pair_name}] Mark price check unavailable — inconclusive"
+            )
             return None
 
-        ts_arr = np.array(result["t"])
-        matches = np.flatnonzero(np.abs(ts_arr - ts_curr) <= 5)
+        try:
+            ts_arr = normalize_timestamp_array(
+                np.asarray(res["t"], dtype=np.int64)
+            )
+            o_arr = np.asarray(res["o"], dtype=np.float64)
+            c_arr = np.asarray(res["c"], dtype=np.float64)
+        except Exception as e:
+            logger_pair.warning(
+                f"[{pair_name}] Mark price array conversion failed: {e} — inconclusive"
+            )
+            return None
+
+        if len(ts_arr) == 0 or len(o_arr) != len(ts_arr) or len(c_arr) != len(ts_arr):
+            logger_pair.warning(
+                f"[{pair_name}] Mark price arrays malformed — inconclusive"
+            )
+            return None
+
+        target_ts = normalize_timestamp(ts_curr)
+
+        matches = np.flatnonzero(np.abs(ts_arr - target_ts) <= 5)
+
         if matches.size == 0:
-            logger_pair.warning(f"[{pair_name}] Mark price candle for {format_ist_time(ts_curr)} not found — inconclusive")
+            logger_pair.warning(
+                f"[{pair_name}] Mark price candle for {format_ist_time(ts_curr)} not found — inconclusive"
+            )
             return None
 
         idx = int(matches[-1])
-        mo, mc = float(result["o"][idx]), float(result["c"][idx])
+
+        mo = float(o_arr[idx])
+        mc = float(c_arr[idx])
+
+        if not np.isfinite(mo) or not np.isfinite(mc) or mo <= 0 or mc <= 0:
+            logger_pair.warning(
+                f"[{pair_name}] Mark price candle has invalid O/C — inconclusive"
+            )
+            return None
+
         mark_is_green = mc > mo
         mark_is_red = mc < mo
 
-        if (is_green and not mark_is_green) or (is_red and not mark_is_red):
+        # Only suppress on ACTIVE disagreement. Mark doji is treated as
+        # "not disagreeing" to avoid noise suppressions.
+        if (is_green and mark_is_red) or (is_red and mark_is_green):
             logger_pair.error(
                 f"[{pair_name}] MARK PRICE DISAGREES: trade-price candle is "
                 f"{'green' if is_green else 'red'}, Mark Price shows O={mo:.4f} C={mc:.4f} "
                 f"({'green' if mark_is_green else 'red' if mark_is_red else 'doji'}) — suppressing"
             )
             return False
+
         return True
+
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        logger_pair.warning(f"[{pair_name}] Mark price check errored: {e} — inconclusive")
+        logger_pair.warning(
+            f"[{pair_name}] Mark price check errored: {e} — inconclusive"
+        )
         return None
 
 async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name: str,
