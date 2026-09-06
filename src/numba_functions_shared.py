@@ -598,6 +598,8 @@ def dynamic_flow_direction_loop(src, basis, dist, factor):
 
     return direction_out, line_out
 
+from aot_version import SOURCE_VERSION  # noqa: E402
+
 #=====================================================
 # AOT EXPORT CONFIGURATION
 #=====================================================
