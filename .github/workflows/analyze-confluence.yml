@@ -19,15 +19,25 @@ jobs:
           python-version: '3.12'
       - run: pip install --quiet -r requirements.txt
 
+      - name: 📦 Checkout outcome-data archive
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          git clone --depth=7 \
+            "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" \
+            /tmp/data-repo
+
       - name: 📊 Run confluence threshold analysis
         id: analysis
         env:
           REDIS_URL: ${{ secrets.REDIS_URL }}
+          OUTCOME_DATA_DIR: /tmp/data-repo
         run: |
           set +e
           python3 src/analyze_confluence_thresholds.py \
             --min-sample 20 --target-winrate 0.55 \
             2>&1 | tee analysis_output.txt
+
           echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
           {
             echo "## 📊 Confluence Threshold Analysis"
