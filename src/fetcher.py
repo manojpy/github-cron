@@ -451,7 +451,7 @@ class DataFetcher:
         if self._external_session is not None:
             return self._external_session
         return await SessionManager.get_session()
-
+  
     async def fetch_candles(self, symbol: str, resolution: str, limit: int, reference_time: int, expected_open_15: Optional[int] = None, for_confirmation: bool = False) -> Optional[Dict[str, Any]]:
         can_proceed, reason = await self.circuit_breaker.can_attempt()
         if not can_proceed:
@@ -462,6 +462,7 @@ class DataFetcher:
 
         minutes = int(resolution) if resolution != "D" else 1440
         interval_seconds = minutes * 60
+
         if minutes == 15 and expected_open_15 is not None:
             expected_open_ts = expected_open_15
         else:
@@ -477,20 +478,9 @@ class DataFetcher:
             "from": int(from_time),
             "to": int(to_time),
         }
-        
-        # ═══════════════════════════════════════════════════════════════
-        # 🔍 DELTA API DEBUG LOGGING (Request)
-        # ═══════════════════════════════════════════════════════════════
         url = f"{self.api_base}/v2/chart/history"
-        logger.info(
-            f"🔍 [Delta API Debug] Requesting candles | "
-            f"URL: {url} | Symbol: '{symbol}' | Resolution: '{resolution}' | "
-            f"From: {int(from_time)} ({format_ist_time(int(from_time))}) | "
-            f"To: {int(to_time)} ({format_ist_time(int(to_time))})"
-        )
-        # ═══════════════════════════════════════════════════════════════
-
         limiter = self.confirm_rate_limiter if for_confirmation else self.rate_limiter
+
         data = await limiter.call(
             async_fetch_json,
             url,
@@ -505,23 +495,12 @@ class DataFetcher:
             if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
                 await self.circuit_breaker.record_success()
                 self.fetch_stats["candles"]["success"] += 1
+
                 num_candles = len(result.get("t", []))
-                
                 if num_candles > 0:
                     last_open = result["t"][-1]
-                    first_open = result["t"][0]
-                    
-                    # ═══════════════════════════════════════════════════════════════
-                    # 🔍 DELTA API DEBUG LOGGING (Response)
-                    # ═══════════════════════════════════════════════════════════════
-                    logger.info(
-                        f"✅ [Delta API Debug] Response OK | Symbol: '{symbol}' | Resolution: '{resolution}' | "
-                        f"Candles: {num_candles} | First TS: {first_open} ({format_ist_time(first_open)}) | "
-                        f"Last TS: {last_open} ({format_ist_time(last_open)})"
-                    )
-                    # ═══════════════════════════════════════════════════════════════
-                    
                     diff = abs(expected_open_ts - last_open)
+
                     if diff > Constants.API_TIMESTAMP_TOLERANCE_SEC:
                         if last_open < expected_open_ts:
                             if logger.isEnabledFor(logging.DEBUG):
@@ -551,6 +530,7 @@ class DataFetcher:
             else:
                 logger.warning(f"Candles fetch failed | Symbol: {symbol}")
                 await self.circuit_breaker.record_failure()
+
         return None
 
     async def fetch_daily_cached(self, sdb: "RedisStateStore", symbol: str, limit: int,
@@ -582,20 +562,14 @@ class DataFetcher:
 
     async def fetch_tickers_batch(self) -> Dict[str, Dict[str, Optional[float]]]:
         self.fetch_stats.setdefault("tickers", {"success": 0, "failed": 0})
+
         can_proceed, reason = await self.circuit_breaker.can_attempt()
         if not can_proceed:
             logger.warning(f"Circuit breaker blocked tickers fetch: {reason}")
             self.fetch_stats["tickers"]["failed"] += 1
             return {}
-            
+
         url = f"{self.api_base}/v2/tickers"
-        
-        # ═══════════════════════════════════════════════════════════════
-        # 🔍 DELTA API DEBUG LOGGING (Tickers)
-        # ═══════════════════════════════════════════════════════════════
-        logger.info(f"🔍 [Delta API Debug] Requesting tickers | URL: {url}")
-        # ═══════════════════════════════════════════════════════════════
-        
         data = await self.rate_limiter.call(
             async_fetch_json,
             url,
@@ -603,6 +577,7 @@ class DataFetcher:
             backoff=cfg.CANDLE_FETCH_BACKOFF,
             timeout=self.timeout,
         )
+
         out: Dict[str, Dict[str, Optional[float]]] = {}
         if not data:
             logger.warning("Tickers fetch failed -- OI/funding filter running fail-open this run")
