@@ -1119,13 +1119,28 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
     parser.add_argument("--validate-only", action="store_true", help="Validate config and exit")
     parser.add_argument("--skip-warmup", action="store_true", help="Skip Numba JIT warmup")
+    parser.add_argument("--test-symbols", action="store_true", help="Test alternative symbol formats and exit")
+    
     args = parser.parse_args()
 
+    args = parser.parse_args()
+    
     if args.debug:
         logger.setLevel(logging.DEBUG)
         for h in logger.handlers:
             h.setLevel(logging.DEBUG)
         logger.info("Debug mode enabled via CLI flag")
+
+    # 👇 ADD THIS NEW BLOCK HERE 👇
+    if args.test_symbols:
+        logger.info("🧪 Running symbol alternative diagnostic test...")
+        async def _run_test():
+            from fetcher import test_symbol_alternatives, SessionManager
+            await test_symbol_alternatives(cfg.DELTA_API_BASE, int(time.time()))
+            await SessionManager.close_session()
+        asyncio.run(_run_test())
+        sys.exit(0)
+    # 👆 END OF NEW BLOCK 👆
 
     try:
         validate_runtime_config()
