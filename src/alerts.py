@@ -18,7 +18,7 @@ from bot_config import (
 )
 from fetcher import (
     PriceData, DataFetcher, SessionManager, compute_backoff, validate_indicator_values,
-    CandleSnapshot, cross_check_15m_against_5m,
+    CandleSnapshot, independent_candle_reverify, cross_check_15m_against_5m,
     confirm_candle_unchanged, detect_reversal_candle_pattern,
 )
 from state import RedisStateStore, TokenBucket
@@ -1213,11 +1213,25 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 reversal_bullish=context.get("reversal_bullish", False) if has_reversal_alert else False,
                 reversal_bearish=context.get("reversal_bearish", False) if has_reversal_alert else False,
             )
-            cross_check = cross_check_15m_against_5m(
-                data_5m, ts_curr, cached_snapshot, pair_name, logger_pair
+            reverified = independent_candle_reverify(
+                data_15m=data_15m.as_dict(), candle_index=i15,
+                cached=cached_snapshot,
+                min_wick_ratio=Constants.MIN_WICK_RATIO,
+                pair_name=pair_name, logger_pair=logger_pair,
             )
-            if cross_check is False:
+            if not reverified:
+                logger_pair.warning(
+                    f"[{pair_name}] Independent re-verify failed — alert suppressed. No dedup/coalesce "
+                    f"claim was taken yet, so this will be re-attempted next run if the trigger persists."
+                )
                 alerts_to_send = []
+
+            if alerts_to_send:
+                cross_check = cross_check_15m_against_5m(
+                    data_5m, ts_curr, cached_snapshot, pair_name, logger_pair
+                )
+                if cross_check is False:
+                    alerts_to_send = []
 
         is_buy_batch = any(ak in BUY_ALERT_KEYS for _, _, ak in alerts_to_send) if alerts_to_send else False
         confluence_score = confluence_score_buy if is_buy_batch else confluence_score_sell
@@ -1466,6 +1480,41 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     continue
                 deduped_alerts.append((alert_title, alert_extra, alert_key))
             alerts_to_send = deduped_alerts
+
+        # ═══════════════════════════════════════════════════════════════════
+        # SACROSANCT COLOR CHECK — absolute final guard before dispatch
+        # ═══════════════════════════════════════════════════════════════════
+        if alerts_to_send:
+            blocked_keys: Set[str] = set()
+            for _, _, alert_key in alerts_to_send:
+                if alert_key in BUY_ALERT_KEYS and not is_green:
+                    blocked_keys.add(alert_key)
+                    logger_pair.critical(
+                        f"[{pair_name}] 🚨 SACROSANCT COLOR VIOLATION: "
+                        f"BUY alert '{alert_key}' on NON-GREEN candle | "
+                        f"O={o:.4f} C={c:.4f} is_green={is_green} is_red={is_red} "
+                        f"— SUPPRESSING"
+                    )
+                elif alert_key in SELL_ALERT_KEYS and not is_red:
+                    blocked_keys.add(alert_key)
+                    logger_pair.critical(
+                        f"[{pair_name}] 🚨 SACROSANCT COLOR VIOLATION: "
+                        f"SELL alert '{alert_key}' on NON-RED candle | "
+                        f"O={o:.4f} C={c:.4f} is_green={is_green} is_red={is_red} "
+                        f"— SUPPRESSING"
+                    )
+
+            if blocked_keys:
+                alerts_to_send = [
+                    (t, e, k) for t, e, k in alerts_to_send if k not in blocked_keys
+                ]
+
+                if coalesced_dedup_key:
+                    if not alerts_to_send:
+                        await sdb.release_recent_alert(pair_name, coalesced_dedup_key)
+                else:
+                    for bk in blocked_keys:
+                        await sdb.release_recent_alert(pair_name, bk)
 
         async def _release_dedup_claims() -> None:
             """Releases whichever kind of claim was taken in step 4 above."""
