@@ -407,6 +407,16 @@ async def _eval_gate(
         buy_wick_ratio = candle_info["upper_wick_ratio"]
         sell_wick_ratio = candle_info["lower_wick_ratio"]
   
+        if is_valid_for_buy and not is_green:
+            raise RuntimeError(
+                f"[{pair_name}] INVARIANT VIOLATED: is_valid_for_buy=True on non-green candle | "
+                f"O={o:.2f} C={c:.2f}"
+            )
+        if is_valid_for_sell and not is_red:
+            raise RuntimeError(
+                f"[{pair_name}] INVARIANT VIOLATED: is_valid_for_sell=True on non-red candle | "
+                f"O={o:.2f} C={c:.2f}"
+            )
         logger_pair.debug(
             f"[{pair_name}] 🕯️ Candle | O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} | "
             f"{'🟢 GREEN' if is_green else '🔴 RED'} | "
