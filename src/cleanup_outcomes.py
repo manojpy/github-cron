@@ -81,6 +81,22 @@ def compress_large_files(data_dir: Path, max_size_mb: int) -> int:
     
     return compressed
 
+def wipe_labels(data_dir: Path, labels: list) -> int:
+    """DANGER: delete every file (any age, any size) under the given label
+    dirs. Used only when explicitly requested — bypasses age/size cleanup
+    entirely rather than layering on top of it."""
+    removed = 0
+    for label in labels:
+        label_dir = data_dir / label
+        if not label_dir.exists():
+            continue
+        for file_path in label_dir.iterdir():
+            if file_path.is_file():
+                print(f"🚨 WIPE: removing {file_path}")
+                file_path.unlink()
+                removed += 1
+    return removed
+
 def main():
     ap = argparse.ArgumentParser(description="Cleanup old outcome archive files")
     ap.add_argument("--data-dir", default="src/data/outcomes",
@@ -90,21 +106,32 @@ def main():
     ap.add_argument("--max-size-mb", type=int, default=100,
                     help="Compress files larger than this size in MB (default: 100)")
     ap.add_argument("--max-total-mb", type=int, default=400,
-                    help="Max total directory size in MB before aggressive cleanup (default: 400)")
+                    help="Max total directory size in MB before aggressive cleanup (default: 400)") 
     ap.add_argument("--dry-run", action="store_true",
                     help="Show what would be cleaned without actually deleting")
-    
+    ap.add_argument("--wipe-all", action="store_true",
+                    help="DANGER: delete ALL files in outcomes/ and reports/ regardless "
+                         "of age, instead of the normal age/size-based cleanup")
+
     args = ap.parse_args()
     data_dir = Path(args.data_dir)
     
     if not data_dir.exists():
         print(f"Data directory not found: {data_dir}")
         return
-    
+
+    if args.wipe_all:
+        print("=" * 60)
+        print("  🚨 OUTCOME DATA WIPE — outcomes/ + reports/")
+        print("=" * 60)
+        removed = wipe_labels(data_dir, ["outcomes", "reports"])
+        print(f"\n✅ Wipe complete — removed {removed} file(s)")
+        return
+
     print("=" * 60)
     print("  OUTCOME DATA CLEANUP")
     print("=" * 60)
-    
+
     # Show current size
     current_size = get_dir_size(data_dir)
     print(f"Current size: {format_size(current_size)}")
