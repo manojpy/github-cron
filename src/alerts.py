@@ -18,7 +18,7 @@ from bot_config import (
 )
 from fetcher import (
     PriceData, DataFetcher, SessionManager, compute_backoff, validate_indicator_values,
-    CandleSnapshot, independent_candle_reverify, cross_check_15m_against_5m,
+    CandleSnapshot, cross_check_15m_against_5m,
     confirm_candle_unchanged, detect_reversal_candle_pattern,
 )
 from state import RedisStateStore, TokenBucket
@@ -1213,25 +1213,11 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 reversal_bullish=context.get("reversal_bullish", False) if has_reversal_alert else False,
                 reversal_bearish=context.get("reversal_bearish", False) if has_reversal_alert else False,
             )
-            reverified = independent_candle_reverify(
-                data_15m=data_15m.as_dict(), candle_index=i15,
-                cached=cached_snapshot,
-                min_wick_ratio=Constants.MIN_WICK_RATIO,
-                pair_name=pair_name, logger_pair=logger_pair,
+            cross_check = cross_check_15m_against_5m(
+                data_5m, ts_curr, cached_snapshot, pair_name, logger_pair
             )
-            if not reverified:
-                logger_pair.warning(
-                    f"[{pair_name}] Independent re-verify failed — alert suppressed. No dedup/coalesce "
-                    f"claim was taken yet, so this will be re-attempted next run if the trigger persists."
-                )
+            if cross_check is False:
                 alerts_to_send = []
-
-            if alerts_to_send:
-                cross_check = cross_check_15m_against_5m(
-                    data_5m, ts_curr, cached_snapshot, pair_name, logger_pair
-                )
-                if cross_check is False:
-                    alerts_to_send = []
 
         is_buy_batch = any(ak in BUY_ALERT_KEYS for _, _, ak in alerts_to_send) if alerts_to_send else False
         confluence_score = confluence_score_buy if is_buy_batch else confluence_score_sell
