@@ -1555,7 +1555,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         )
                         await _refund_alert_budget(len(alerts_to_send))
                         budget_refunded = True
-                        send_success = False        # ← ADD
+                        send_success = False
+
                     elif mark_agrees is None:
                         logger_pair.warning(
                             f"[{pair_name}] Mark price check inconclusive — alert suppressed this run, "
@@ -1572,7 +1573,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         )
                         await _refund_alert_budget(len(alerts_to_send))
                         budget_refunded = True
-                        send_success = False        # ← ADD
+                        send_success = False            
                     else:
                         send_success = await telegram_queue.send(msg)
 
