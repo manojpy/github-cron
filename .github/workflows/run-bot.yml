@@ -1,4 +1,5 @@
 name: 🤖 Run MACD Unified Bot (Hybrid)
+
 on:
   workflow_dispatch:
     inputs:
@@ -50,16 +51,13 @@ jobs:
           [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
           [ -z "${{ secrets.REDIS_URL }}" ] && MISSING+=("REDIS_URL")
           [ -z "${{ secrets.DELTA_API_BASE }}" ] && MISSING+=("DELTA_API_BASE")
-
           if [ ${#MISSING[@]} -gt 0 ]; then
             echo "❌ Missing secrets: ${MISSING[*]}"
             exit 1
           fi
-
           if [ -z "${{ secrets.MACD_CONFIG_JSON }}" ]; then
             echo "⚠️ MACD_CONFIG_JSON not set — will fallback to GitHub API download"
           fi
-
           echo "✅ All required secrets configured"
 
       - name: 🔨 Create Config
@@ -77,16 +75,16 @@ jobs:
           else
             echo "⚠️ Secret MACD_CONFIG_JSON missing."
             echo "🔥 Falling back to GitHub API download..."
-
-            HTTP_STATUS=$(curl -s -w "%{http_code}" -H "Authorization: token $GH_TOKEN"               -H "Accept: application/vnd.github.v3.raw"               -L "https://api.github.com/repos/${{ github.repository }}/contents/config_macd.json"               -o config_macd.json)
-
+            HTTP_STATUS=$(curl -s -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3.raw" \
+              -L "https://api.github.com/repos/${{ github.repository }}/contents/config_macd.json" \
+              -o config_macd.json)
             if [ "$HTTP_STATUS" != "200" ]; then
               echo "❌ Failed to load config from all sources:"
               echo "   1. Secret MACD_CONFIG_JSON: Not available"
               echo "   2. GitHub API download: Failed (HTTP $HTTP_STATUS)"
               exit 1
             fi
-
             if ! python3 -c "import json; json.load(open('config_macd.json'))" 2>/dev/null; then
               echo "❌ config_macd.json is not valid JSON (from GitHub API)"
               exit 1
@@ -113,13 +111,10 @@ jobs:
         run: |
           BUFFER=$(python3 -c "import json; print(json.load(open('config_macd.json')).get('CANDLE_MIN_AGE_BUFFER', 60))" 2>/dev/null || echo 60)
           STALENESS=$(python3 -c "import json; print(json.load(open('config_macd.json')).get('MAX_CANDLE_STALENESS_SEC', 1200))" 2>/dev/null || echo 1200)
-
           NOW=$(date +%s)
           LAST_CLOSE=$(( (NOW / 900) * 900 ))  # The :00, :15, :30, :45 boundary
           AGE=$(( NOW - LAST_CLOSE ))
-
           echo "🕐 Last 15m candle closed ${AGE}s ago (need ${BUFFER}s buffer, max staleness ${STALENESS}s)"
-
           if [ "$AGE" -lt "$BUFFER" ]; then
             echo "⚠️ WARNING: Only ${AGE}s since candle close (buffer=${BUFFER}s) — may be rejected as unstable" >> $GITHUB_STEP_SUMMARY
           elif [ "$AGE" -gt "$STALENESS" ]; then
@@ -130,12 +125,41 @@ jobs:
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
-          git clone --depth=7             "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git"             /tmp/data-repo
-
+          git clone --depth=7 \
+            "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" \
+            /tmp/data-repo
           # Fix permissions so the Docker container's non-root user can write
           chmod -R 777 /tmp/data-repo
           mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
           chmod -R 777 /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
+
+      # ═══════════════════════════════════════════════════════════
+      # TEMPORARY DIAGNOSTIC STEP (Remove after testing)
+      # ═══════════════════════════════════════════════════════════
+      - name: 🧪 Test Delta API Symbols (Temporary)
+        env:
+          DELTA_API_BASE: ${{ secrets.DELTA_API_BASE }}
+        run: |
+          cat << 'EOF' > test_symbols.py
+          import requests, time, os
+          API_BASE = os.environ.get("DELTA_API_BASE", "https://cdn.india.deltaex.org")
+          ENDPOINT = f"{API_BASE}/v2/chart/history"
+          to_time = int(time.time())
+          from_time = to_time - (24 * 60 * 60)
+          symbols = ["BTCUSD", "MARK:BTCUSD", "INDEX:BTCUSD", "BTCUSD_MARK", "BTC/USD"]
+          print(f"🔍 Testing Delta API at {ENDPOINT}\n")
+          for sym in symbols:
+              try:
+                  r = requests.get(ENDPOINT, params={"symbol": sym, "resolution": "15", "from": from_time, "to": to_time}, timeout=10)
+                  candles = r.json().get("result", {}).get("t", [])
+                  if r.status_code == 200 and candles:
+                      print(f"✅ {sym:<15} -> ACCEPTED ({len(candles)} candles)")
+                  else:
+                      print(f"❌ {sym:<15} -> REJECTED/EMPTY (Status: {r.status_code})")
+              except Exception as e:
+                  print(f"🚨 {sym:<15} -> ERROR: {e}")
+          EOF
+          python3 test_symbols.py
 
       - name: 🚀 Execute MACD Bot
         id: bot_run
@@ -151,11 +175,10 @@ jobs:
           echo "🧹 Clear Redis: $CLEAR_REDIS"
           echo "🧠 Brain Report: $BRAIN_REPORT_ON_DEMAND"
           echo "::endgroup::"  
-
+          
           START_TIME=$(date +%s)
           echo "🕐 TRIGGER_TIMESTAMP=$START_TIME ($(TZ=Asia/Kolkata date -d @$START_TIME '+%Y-%m-%d %H:%M:%S IST'))"
-
-
+          
           ENV_FILE="$(pwd)/.bot_env"
           cat > "$ENV_FILE" <<EOF
           TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -167,16 +190,37 @@ jobs:
           CLEAR_REDIS=$CLEAR_REDIS
           BRAIN_REPORT_ON_DEMAND=$BRAIN_REPORT_ON_DEMAND
           EOF
-
-          timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run             --rm             --name "macd_bot_${{ github.run_id }}"             --platform linux/amd64             --memory="900m"             --memory-swap="1800m"             --cpus="2.0"             --security-opt=no-new-privileges             --read-only             --tmpfs /tmp:rw,noexec,nosuid,size=64m             --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m             --env-file "$ENV_FILE"             -e TZ=Asia/Kolkata             -e PYTHONPATH=/app/src             -e PYTHONUNBUFFERED=1             -e NUMBA_NUM_THREADS=2             -e OMP_NUM_THREADS=2             -e OUTCOME_DATA_DIR=/tmp/data-repo             -v "/tmp/data-repo:/tmp/data-repo:rw"             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro"             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>&1 | tee logs/bot_output.log
-
+          
+          timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
+            --rm \
+            --name "macd_bot_${{ github.run_id }}" \
+            --platform linux/amd64 \
+            --memory="900m" \
+            --memory-swap="1800m" \
+            --cpus="2.0" \
+            --security-opt=no-new-privileges \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m \
+            --env-file "$ENV_FILE" \
+            -e TZ=Asia/Kolkata \
+            -e PYTHONPATH=/app/src \
+            -e PYTHONUNBUFFERED=1 \
+            -e NUMBA_NUM_THREADS=2 \
+            -e OMP_NUM_THREADS=2 \
+            -e OUTCOME_DATA_DIR=/tmp/data-repo \
+            -v "/tmp/data-repo:/tmp/data-repo:rw" \
+            -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>&1 | tee logs/bot_output.log
+          
           EXIT_CODE=${PIPESTATUS[0]}
           DURATION=$(( $(date +%s) - START_TIME ))
+          
           echo "execution_time=${DURATION}" >> $GITHUB_OUTPUT
           echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
-
+          
           rm -f "$ENV_FILE"
-
+          
           if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ]; then
             echo "⚠️ Bot execution timed out after ${DURATION}s" | tee -a logs/bot_output.log
             exit 1
@@ -184,6 +228,7 @@ jobs:
             echo "❌ Bot exited with code $EXIT_CODE" | tee -a logs/bot_output.log
             exit 1
           fi
+          
           echo "✅ Bot completed successfully in ${DURATION}s"
 
       # PHASE 3: RESULTS ANALYSIS
@@ -197,7 +242,7 @@ jobs:
             echo "message=Log file not found" >> $GITHUB_OUTPUT
             exit 0
           fi
-
+          
           if grep -q "RUN COMPLETE" "$LOG_FILE"; then
             STATUS="Success"
             DURATION=$(grep -oP "Duration:\s*\K[\d.]+(?=s)" "$LOG_FILE" | head -1 || echo "N/A")
@@ -209,7 +254,7 @@ jobs:
             STATUS="Failed"
             ERROR_MSG=$(grep -E "FATAL ERROR|Bot run failed|Error|ERROR" "$LOG_FILE" | head -1 | cut -c1-120 || echo "Unknown error")
           fi
-
+          
           echo "status=${STATUS}" >> $GITHUB_OUTPUT
           echo "duration=${DURATION:-N/A}" >> $GITHUB_OUTPUT
           echo "alerts=${ALERTS:-0}" >> $GITHUB_OUTPUT
@@ -223,7 +268,7 @@ jobs:
         run: |
           echo "## 🤖 MACD Bot Execution Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-
+          
           if [ "${{ steps.results.outputs.status }}" != "Success" ]; then
             echo "### ❌ Error Details" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
@@ -265,7 +310,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "📦 Logs available in: **Artifacts > bot-execution-logs-${{ github.run_number }}**" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-
+          
           if [ -f "logs/bot_output.log" ] && [ -s "logs/bot_output.log" ]; then
             echo "### 📄 Recent Log Output (last 50 lines)" >> $GITHUB_STEP_SUMMARY
             echo '\`\`\`' >> $GITHUB_STEP_SUMMARY
@@ -287,10 +332,13 @@ jobs:
           ERROR_MSG="${{ steps.results.outputs.error_msg || 'See workflow logs' }}"
           EXIT_CODE="${{ steps.bot_run.outputs.exit_code || 'N/A' }}"
           DURATION="${{ steps.bot_run.outputs.execution_time || 'N/A' }}"
-
+          
           MSG="🔴 MACD Bot workflow FAILED"$'\n'"Status: ${STATUS}"$'\n'"Exit code: ${EXIT_CODE} | Duration: ${DURATION}s"$'\n'"Error: ${ERROR_MSG}"$'\n'"Run: ${RUN_URL}"
-
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}"             --data-urlencode "text=${MSG}"             -o /dev/null -w "Telegram notify HTTP %{http_code}\n"
+          
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" \
+            -o /dev/null -w "Telegram notify HTTP %{http_code}\n"
 
       - name: 📤 Persist outcomes to data repo
         if: always()
@@ -301,6 +349,7 @@ jobs:
             echo "⚠️ Data repo not found, skipping persist"
             exit 0
           fi
+          
           cd /tmp/data-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
