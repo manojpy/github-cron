@@ -12,6 +12,16 @@ import aiohttp
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 import numpy as np
 
+STREAM_KEY = "outcome_log_stream"
+
+def mark_symbol(pair_name: str) -> str:
+    """Delta's chart-history endpoint returns last-traded-price candles for
+    the bare symbol, and Mark Price candles for the 'MARK:' prefix — same
+    convention Delta's own charting UI uses. All signal-generation fetches
+    (Phase 1 + dispatch-time confirmation) must use this consistently, or
+    the two can silently disagree on candle color during volatile moves."""
+    return f"MARK:{pair_name}"
+
 from bot_config import (
     cfg, logger, logger_main, Constants, json_dumps, json_loads, JSONDecodeError,
     __version__, shutdown_event, format_ist_time, normalize_timestamp, normalize_timestamp_array,
@@ -656,12 +666,13 @@ class DataFetcher:
         all_tasks = []
         task_metadata = []
         for symbol, resolutions in pair_requests:
+            api_symbol = mark_symbol(symbol)
             for resolution, limit in resolutions:
                 task = self.fetch_candles(
-                    symbol, resolution, limit, reference_time, expected_open_15
+                    api_symbol, resolution, limit, reference_time, expected_open_15
                 )
                 all_tasks.append(task)
-                task_metadata.append((symbol, resolution))
+                task_metadata.append((symbol, resolution))  # keep output keyed by plain pair name
         results = await asyncio.wait_for(
             asyncio.gather(*all_tasks, return_exceptions=True),
             timeout=cfg.FETCH_PHASE_TIMEOUT_SEC
@@ -1287,7 +1298,8 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
     ts_curr: int, cached: CandleSnapshot, reference_time: int, logger_pair: logging.Logger) -> Optional[bool]:
     """Returns True=unchanged, False=confirmed repaint/mismatch, None=inconclusive (fetch/network failure)."""
     try:
-        raw = await fetcher.fetch_candles(symbol, "15", 5, reference_time, for_confirmation=True) 
+        raw = await fetcher.fetch_candles(mark_symbol(symbol), "15", 5, reference_time, for_confirmation=True)
+
         fresh = parse_candles_to_numpy(raw)
         if fresh is None:
             logger_pair.warning(f"[{pair_name}] Confirmation fetch failed — inconclusive, releasing dedup claim")
@@ -1343,116 +1355,6 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
     except Exception as e:
         logger_pair.warning(f"[{pair_name}] Confirmation check errored: {e} — inconclusive, releasing dedup claim")
         return None
-
-def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: int, cached: CandleSnapshot, min_wick_ratio: float, pair_name: str, logger_pair: logging.Logger) -> bool:
-    try:
-        raw_o = float(data_15m["open"][candle_index])
-        raw_h = float(data_15m["high"][candle_index])
-        raw_l = float(data_15m["low"][candle_index])
-        raw_c = float(data_15m["close"][candle_index])
-        raw_ts = int(data_15m["timestamp"][candle_index])
-        raw_vol = float(data_15m["volume"][candle_index])
-    except (IndexError, KeyError, TypeError, ValueError) as e:
-        logger_pair.error(
-            f"[{pair_name}] Independent re-verify: cannot read raw OHLCV at index {candle_index}: {e} — suppressing alert"
-        )
-        return False
-
-    if any(np.isnan([raw_o, raw_h, raw_l, raw_c])) or any(np.isinf([raw_o, raw_h, raw_l, raw_c])):
-        logger_pair.error(
-            f"[{pair_name}] Independent re-verify: raw OHLC contains NaN/Inf at index {candle_index} — suppressing alert"
-        )
-        return False
-
-    if raw_ts != cached.timestamp:
-        logger_pair.error(
-            f"[{pair_name}] Independent re-verify TIMESTAMP MISMATCH: raw={raw_ts} cached={cached.timestamp} "
-            f"— suppressing alert"
-        )
-        return False
-
-    if raw_vol <= 0:
-        logger_pair.error(
-            f"[{pair_name}] Independent re-verify: zero/negative volume ({raw_vol}) at dispatch — suppressing alert"
-        )
-        return False
-
-    def _close_enough(a: float, b: float) -> bool:
-        abs_diff = abs(a - b)
-        rel_tolerance = 1e-6 * max(abs(a), abs(b), 1.0)
-        abs_floor = 1e-8  # noise floor for sub-cent priced coins, e.g. $0.00001
-        return abs_diff <= max(rel_tolerance, abs_floor)
-
-    mismatches = [
-        tag for tag, a, b in (
-            ("open", raw_o, cached.open), ("high", raw_h, cached.high),
-            ("low", raw_l, cached.low), ("close", raw_c, cached.close),
-        ) if not _close_enough(a, b)
-    ]
-    if mismatches:
-        logger_pair.error(
-            f"[{pair_name}] Independent re-verify OHLC MISMATCH on {mismatches} at index {candle_index} "
-            f"| raw O={raw_o:.6f} H={raw_h:.6f} L={raw_l:.6f} C={raw_c:.6f} "
-            f"| cached O={cached.open:.6f} H={cached.high:.6f} L={cached.low:.6f} C={cached.close:.6f} "
-            f"— suppressing alert"
-        )
-        return False
-
-    raw_range = raw_h - raw_l
-    if raw_range < 1e-9:
-        logger_pair.error(f"[{pair_name}] Independent re-verify: zero-range candle at dispatch — suppressing alert")
-        return False
-
-    raw_is_green = raw_c > raw_o
-    raw_is_red = raw_c < raw_o
-
-    if raw_is_green != cached.is_green or raw_is_red != cached.is_red:
-        logger_pair.error(
-            f"[{pair_name}] Independent re-verify COLOR MISMATCH: "
-            f"raw(green={raw_is_green}, red={raw_is_red}) vs cached(green={cached.is_green}, red={cached.is_red}) "
-            f"| O={raw_o:.4f} C={raw_c:.4f} — suppressing alert"
-        )
-        return False
-
-    hi_body = max(raw_o, raw_c)
-    lo_body = min(raw_o, raw_c)
-    raw_upper_wick = raw_h - hi_body
-    raw_lower_wick = lo_body - raw_l
-    raw_body = hi_body - lo_body
-
-    raw_body_ratio = raw_body / raw_range
-    raw_upper_ratio = raw_upper_wick / raw_range
-    raw_lower_ratio = raw_lower_wick / raw_range
-
-    raw_valid_buy = raw_is_green and raw_upper_ratio < min_wick_ratio and raw_body_ratio >= Constants.MIN_BODY_RATIO
-    raw_valid_sell = raw_is_red and raw_lower_ratio < min_wick_ratio and raw_body_ratio >= Constants.MIN_BODY_RATIO
-
-    if raw_valid_buy != cached.is_valid_for_buy or raw_valid_sell != cached.is_valid_for_sell:
-        logger_pair.error(
-            f"[{pair_name}] Independent re-verify VALIDITY MISMATCH: "
-            f"raw(buy={raw_valid_buy}, sell={raw_valid_sell}) vs cached(buy={cached.is_valid_for_buy}, sell={cached.is_valid_for_sell}) "
-            f"| upper_ratio={raw_upper_ratio:.4f} lower_ratio={raw_lower_ratio:.4f} body_ratio={raw_body_ratio:.4f} "
-            f"— suppressing alert"
-        )
-        return False
-
-    if cached.reversal_pattern_name:
-        fresh_price_data = PriceData.from_dict(data_15m)
-        fresh_bullish, fresh_bearish, fresh_pattern_name = detect_reversal_candle_pattern(
-            fresh_price_data, candle_index
-        )
-        if (fresh_bullish, fresh_bearish, fresh_pattern_name) != (
-            cached.reversal_bullish, cached.reversal_bearish, cached.reversal_pattern_name
-        ):
-            logger_pair.error(
-                f"[{pair_name}] Independent re-verify PATTERN MISMATCH: "
-                f"cached='{cached.reversal_pattern_name}' (bull={cached.reversal_bullish}, bear={cached.reversal_bearish}) "
-                f"vs fresh='{fresh_pattern_name}' (bull={fresh_bullish}, bear={fresh_bearish}) "
-                f"— suppressing alert"
-            )
-            return False
-
-    return True
 
 def cross_check_15m_against_5m(data_5m: PriceData, ts_curr: int, cached: CandleSnapshot,
                                pair_name: str, logger_pair) -> Optional[bool]:
