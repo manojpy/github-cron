@@ -137,37 +137,6 @@ jobs:
           mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
           chmod -R 777 /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
 
-  
-   # ═══════════════════════════════════════════════════════════
-   # TEMPORARY DIAGNOSTIC STEP (Remove after testing)
-   # ═══════════════════════════════════════════════════════════
-
-
-     - name: 🧪 Test Delta API Symbols (Temporary)
-       env:
-         DELTA_API_BASE: ${{ secrets.DELTA_API_BASE }}
-       run: |
-         cat << 'EOF' > test_symbols.py
-         import requests, time, os
-         API_BASE = os.environ.get("DELTA_API_BASE", "https://cdn.india.deltaex.org")
-         ENDPOINT = f"{API_BASE}/v2/chart/history"
-         to_time = int(time.time())
-         from_time = to_time - (24 * 60 * 60)
-         symbols = ["BTCUSD", "MARK:BTCUSD", "INDEX:BTCUSD", "BTCUSD_MARK", "BTC/USD"]
-         print(f"🔍 Testing Delta API at {ENDPOINT}\n")
-         for sym in symbols:
-             try:
-                 r = requests.get(ENDPOINT, params={"symbol": sym, "resolution": "15", "from": from_time, "to": to_time}, timeout=10)
-                 candles = r.json().get("result", {}).get("t", [])
-                 if r.status_code == 200 and candles:
-                     print(f"✅ {sym:<15} -> ACCEPTED ({len(candles)} candles)")
-                 else:
-                     print(f"❌ {sym:<15} -> REJECTED/EMPTY (Status: {r.status_code})")
-             except Exception as e:
-                 print(f"🚨 {sym:<15} -> ERROR: {e}")
-         EOF
-         python3 test_symbols.py
-
       - name: 🚀 Execute MACD Bot
         id: bot_run
         timeout-minutes: 12
