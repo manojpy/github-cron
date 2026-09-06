@@ -452,7 +452,9 @@ class DataFetcher:
             return self._external_session
         return await SessionManager.get_session()
   
-    async def fetch_candles(self, symbol: str, resolution: str, limit: int, reference_time: int, expected_open_15: Optional[int] = None, for_confirmation: bool = False) -> Optional[Dict[str, Any]]:
+    async def fetch_candles(self, symbol: str, resolution: str, limit: int,
+                            reference_time: int, expected_open_15: Optional[int] = None,
+                            for_confirmation: bool = False) -> Optional[Dict[str, Any]]:
         can_proceed, reason = await self.circuit_breaker.can_attempt()
         if not can_proceed:
             logger.warning(f"Circuit breaker blocked candles {symbol}: {reason}")
@@ -460,7 +462,8 @@ class DataFetcher:
             self.fetch_stats["candles"]["failed"] += 1
             return None
 
-        minutes = int(resolution) if resolution != "D" else 1440
+        # ═══ Normalize resolution for both API and internal math ═══
+        api_resolution, minutes = _normalize_resolution(resolution)
         interval_seconds = minutes * 60
 
         if minutes == 15 and expected_open_15 is not None:
@@ -473,7 +476,7 @@ class DataFetcher:
         from_time = expected_open_ts - (limit * interval_seconds)
 
         params = {
-            "resolution": resolution,
+            "resolution": api_resolution,   # ← "15m", "5m", "1d" (Delta India format)
             "symbol": symbol,
             "from": int(from_time),
             "to": int(to_time),
@@ -539,7 +542,7 @@ class DataFetcher:
         cache_key = f"daily_cache:{symbol}:{day_key}"
 
         logger.debug(f"📅 Daily cache MISS | {symbol} — fetching live")
-        data = await self.fetch_candles(symbol, "D", limit, reference_time)
+        data = await self.fetch_candles(symbol, "1d", limit, reference_time)
 
         if data and data.get("result") and not sdb.degraded:
             try:
@@ -835,6 +838,28 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
         return False, False, candle_info, reason
 
     return is_valid_for_buy, is_valid_for_sell, candle_info, None
+
+def _normalize_resolution(resolution: str) -> Tuple[str, int]:
+    """
+    Return (api_resolution_string, minutes_int).
+    Handles '15', '15m', '1h', '1d', 'D', etc.
+    """
+    resolution = str(resolution).strip().lower()
+    
+    if resolution in ("d", "1d"):
+        return "1d", 1440
+    
+    if resolution.endswith("m"):
+        return resolution, int(resolution[:-1])
+    if resolution.endswith("h"):
+        return f"{resolution}", int(resolution[:-1]) * 60
+    if resolution.endswith("d"):
+        return f"{resolution}", int(resolution[:-1]) * 1440
+    if resolution.endswith("w"):
+        return f"{resolution}", int(resolution[:-1]) * 10080
+    
+    # Bare number — legacy fallback, treat as minutes
+    return f"{resolution}m", int(resolution)
 
 def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: int) -> int: 
     interval_seconds = interval_minutes * 60
@@ -1287,7 +1312,7 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
     ts_curr: int, cached: CandleSnapshot, reference_time: int, logger_pair: logging.Logger) -> Optional[bool]:
     """Returns True=unchanged, False=confirmed repaint/mismatch, None=inconclusive (fetch/network failure)."""
     try:
-        raw = await fetcher.fetch_candles(symbol, "15", 5, reference_time, for_confirmation=True) 
+        raw = await fetcher.fetch_candles(symbol, "15m", 5, reference_time, for_confirmation=True) 
         fresh = parse_candles_to_numpy(raw)
         if fresh is None:
             logger_pair.warning(f"[{pair_name}] Confirmation fetch failed — inconclusive, releasing dedup claim")

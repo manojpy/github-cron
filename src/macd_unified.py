@@ -228,9 +228,9 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
     p_name, symbol, candles = task_data
 
     try:
-        pd_15m = parse_candles_to_numpy(candles.get("15"))
-        pd_5m = parse_candles_to_numpy(candles.get("5"))
-        pd_daily = parse_candles_to_numpy(candles.get("D")) if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else None
+        pd_15m = parse_candles_to_numpy(candles.get("15m"))
+        pd_5m = parse_candles_to_numpy(candles.get("5m"))
+        pd_daily = parse_candles_to_numpy(candles.get("1d")) if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else None
 
         if pd_15m is None:
             logger_main.warning(f"Skipping {p_name}: 15m parse failed")
@@ -276,12 +276,12 @@ async def _compute_directional_cluster(
         p_name, symbol, candles = task
         async with semaphore:
             try:
-                pd_15m = parse_candles_to_numpy(candles.get("15"))
-                pd_5m = parse_candles_to_numpy(candles.get("5"))
+                pd_15m = parse_candles_to_numpy(candles.get("15m"))
+                pd_5m = parse_candles_to_numpy(candles.get("5m"))
                 if pd_15m is None or pd_5m is None:
                     return None
                 pd_daily = (
-                    parse_candles_to_numpy(candles.get("D"))
+                    parse_candles_to_numpy(candles.get("1d"))
                     if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else None
                 )
                 data_daily = pd_daily.as_dict() if pd_daily is not None else None
@@ -335,16 +335,20 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     valid_tasks = []     
     daily_symbols = []
 
+
     for pair_name in pairs_to_process:
         product_info = products_map.get(pair_name)
         if not product_info:
             continue
 
-        resolutions = [("15", limit_15m), ("5", limit_5m)]
-        pair_requests.append((pair_name, resolutions))
-        valid_tasks.append((pair_name, pair_name))
+        # Use Mark Price candles for perp data; keep clean pair_name for display/Redis
+        candle_symbol = f"MARK:{pair_name}" if getattr(cfg, "USE_MARK_PRICE_CANDLES", True) else pair_name
+       
+        resolutions = [("15m", limit_15m), ("5m", limit_5m)]
+        pair_requests.append((candle_symbol, resolutions))
+        valid_tasks.append((pair_name, candle_symbol))   # (display_name, fetch_symbol)
         if fetch_daily:
-            daily_symbols.append(pair_name)
+            daily_symbols.append(pair_name)   # daily cache uses clean name for metadata key
 
     all_candles = {}
     daily_task = None
@@ -358,7 +362,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         for sym, ck in zip(daily_symbols, cache_keys):
             raw = cached_map.get(ck)
             if raw:
-                all_candles.setdefault(sym, {})["D"] = json_loads(raw)
+                all_candles.setdefault(sym, {})["1d"] = json_loads(raw)
             else:
                 miss_symbols.append(sym)
 
@@ -380,7 +384,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             if isinstance(daily_data, Exception):
                 logger_main.warning(f"Daily fetch failed for {symbol}: {daily_data}")
                 daily_data = None
-            all_candles.setdefault(symbol, {})["D"] = daily_data
+            all_candles.setdefault(symbol, {})["1d"] = daily_data
 
     fetch_elapsed = time.time() - fetch_start
     logger_main.info(f"🌀 Phase 1 complete: {fetch_elapsed:.1f}s")
@@ -515,10 +519,10 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             )
         else:
             try:
-                btc_15m = parse_candles_to_numpy(ref_candles.get("15"))
-                btc_5m = parse_candles_to_numpy(ref_candles.get("5"))
+                btc_15m = parse_candles_to_numpy(ref_candles.get("15m"))
+                btc_5m = parse_candles_to_numpy(ref_candles.get("5m"))
                 btc_daily_pd = (
-                    parse_candles_to_numpy(ref_candles.get("D"))
+                    parse_candles_to_numpy(ref_candles.get("1d"))
                     if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else None
                 )
                 if btc_15m is None or btc_5m is None:
