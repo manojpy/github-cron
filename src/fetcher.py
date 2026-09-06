@@ -475,12 +475,12 @@ class DataFetcher:
         to_time = reference_time + (interval_seconds * buffer_periods)
         from_time = expected_open_ts - (limit * interval_seconds)
 
-        url = f"{self.api_base}/v2/chart/candles"
+        url = f"{self.api_base}/v2/history/candles"
         params = {
             "resolution": api_resolution,   # ← "15m", "5m", "1d" (Delta India format)
             "symbol": symbol,
-            "from": int(from_time),
-            "to": int(to_time),
+            "start": int(from_time),
+            "end": int(to_time),
         }
         limiter = self.confirm_rate_limiter if for_confirmation else self.rate_limiter
 
