@@ -923,7 +923,6 @@ def brier_score_and_calibration(
         brier = (total_brier / count) if count > 0 else 0.5
         return brier, curve
 
-
 def calibration_alert(
     rows: List[Row],
     bucket_size: float = 1.0,
@@ -1418,7 +1417,10 @@ def interaction_miner(
                     "delta": round(-poison_v1, 4),
                     "wr_both": round(wr_both, 4),
                     "wr_only_v1": round(wr_only_v1, 4),
+                    "wr_only_v2": round(wr_only_v2, 4),
                     "n_both": len(both),
+                    "poisoner": v2,
+                    "victim": v1,
                     "note": f"{v2} poisons {v1}",
                 })
 
@@ -1431,8 +1433,11 @@ def interaction_miner(
                         "type": "poison",
                         "delta": round(-poison_v2, 4),
                         "wr_both": round(wr_both, 4),
+                        "wr_only_v1": round(wr_only_v1, 4),
                         "wr_only_v2": round(wr_only_v2, 4),
                         "n_both": len(both),
+                        "poisoner": v1,
+                        "victim": v2,
                         "note": f"{v1} poisons {v2}",
                     })
 

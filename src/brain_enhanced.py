@@ -298,13 +298,15 @@ class BrainEngineV2(BaseBrainEngine):
                         "delta_ev": abs(inter["delta"]), 
                     })
                 else:
+                    poisoner, victim = inter["poisoner"], inter["victim"]
+                    wr_victim_alone = inter["wr_only_v1"] if victim == v1 else inter["wr_only_v2"]
                     recommendations.append({
                         "type": "vote_interaction",
                         "kind": "poison",
                         "severity": "medium",
                         "message": (
-                            f"☠️ Poison: {v2} kills {v1}. Together={inter['wr_both']:.0%} WR, "
-                            f"{v1} alone={inter['wr_only_v1']:.0%}. Avoid this combo."
+                            f"☠️ Poison: {poisoner} kills {victim}. Together={inter['wr_both']:.0%} WR, "
+                            f"{victim} alone={wr_victim_alone:.0%}. Avoid this combo."
                         ),
                         "delta_ev": abs(inter["delta"]),
                     })
