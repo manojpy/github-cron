@@ -335,20 +335,16 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     valid_tasks = []     
     daily_symbols = []
 
-
     for pair_name in pairs_to_process:
         product_info = products_map.get(pair_name)
         if not product_info:
             continue
 
-        # Use Mark Price candles for perp data; keep clean pair_name for display/Redis
-        candle_symbol = f"MARK:{pair_name}" if getattr(cfg, "USE_MARK_PRICE_CANDLES", True) else pair_name
-       
         resolutions = [("15m", limit_15m), ("5m", limit_5m)]
-        pair_requests.append((candle_symbol, resolutions))
-        valid_tasks.append((pair_name, candle_symbol))   # (display_name, fetch_symbol)
+        pair_requests.append((pair_name, resolutions))
+        valid_tasks.append((pair_name, pair_name))
         if fetch_daily:
-            daily_symbols.append(pair_name)   # daily cache uses clean name for metadata key
+            daily_symbols.append(pair_name)
 
     all_candles = {}
     daily_task = None
