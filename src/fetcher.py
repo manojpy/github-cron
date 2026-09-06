@@ -1285,25 +1285,21 @@ class PriceData:
 
 async def verify_mark_price_agrees(fetcher: DataFetcher, pair_name: str, ts_curr: int,
     is_green: bool, is_red: bool, reference_time: int, logger_pair: logging.Logger) -> Optional[bool]:
-    """Fresh Mark Price fetch, used ONLY for color agreement — Mark Price has
-    no real trade volume, so it can never be the primary data source, but it
-    IS the series a human is usually watching on the exchange app. This is
-    the actual independent second opinion the old SACROSANCT check pretended
-    to be. Returns True=agrees, False=confirmed disagreement, None=inconclusive."""
     try:
         raw = await fetcher.fetch_candles(f"MARK:{pair_name}", "15", 3, reference_time, for_confirmation=True)
-        if not raw or not all(k in raw for k in ("t", "o", "c")):
+        result = raw.get("result", {}) if raw else {}
+        if not result or not all(k in result for k in ("t", "o", "c")):
             logger_pair.warning(f"[{pair_name}] Mark price check unavailable — inconclusive")
             return None
 
-        ts_arr = np.array(raw["t"])
+        ts_arr = np.array(result["t"])
         matches = np.flatnonzero(np.abs(ts_arr - ts_curr) <= 5)
         if matches.size == 0:
             logger_pair.warning(f"[{pair_name}] Mark price candle for {format_ist_time(ts_curr)} not found — inconclusive")
             return None
 
         idx = int(matches[-1])
-        mo, mc = float(raw["o"][idx]), float(raw["c"][idx])
+        mo, mc = float(result["o"][idx]), float(result["c"][idx])
         mark_is_green = mc > mo
         mark_is_red = mc < mo
 
