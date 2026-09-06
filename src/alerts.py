@@ -705,7 +705,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     f"len={len(vwap) if vwap is not None else 0}, i15={i15}"
                 )
 
-# Reversal-candle pattern is detected once, unconditionally, so that
+        # Reversal-candle pattern is detected once, unconditionally, so that
         reversal_bullish, reversal_bearish, reversal_pattern_name = detect_reversal_candle_pattern(data_15m, i15)
 
         # Shared "wick ratio OR strong reversal candle" condition, and the
@@ -1480,6 +1480,41 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     continue
                 deduped_alerts.append((alert_title, alert_extra, alert_key))
             alerts_to_send = deduped_alerts
+
+        # ═══════════════════════════════════════════════════════════════════
+        # SACROSANCT COLOR CHECK — absolute final guard before dispatch
+        # ═══════════════════════════════════════════════════════════════════
+        if alerts_to_send:
+            blocked_keys: Set[str] = set()
+            for _, _, alert_key in alerts_to_send:
+                if alert_key in BUY_ALERT_KEYS and not is_green:
+                    blocked_keys.add(alert_key)
+                    logger_pair.critical(
+                        f"[{pair_name}] 🚨 SACROSANCT COLOR VIOLATION: "
+                        f"BUY alert '{alert_key}' on NON-GREEN candle | "
+                        f"O={o:.4f} C={c:.4f} is_green={is_green} is_red={is_red} "
+                        f"— SUPPRESSING"
+                    )
+                elif alert_key in SELL_ALERT_KEYS and not is_red:
+                    blocked_keys.add(alert_key)
+                    logger_pair.critical(
+                        f"[{pair_name}] 🚨 SACROSANCT COLOR VIOLATION: "
+                        f"SELL alert '{alert_key}' on NON-RED candle | "
+                        f"O={o:.4f} C={c:.4f} is_green={is_green} is_red={is_red} "
+                        f"— SUPPRESSING"
+                    )
+
+            if blocked_keys:
+                alerts_to_send = [
+                    (t, e, k) for t, e, k in alerts_to_send if k not in blocked_keys
+                ]
+
+                if coalesced_dedup_key:
+                    if not alerts_to_send:
+                        await sdb.release_recent_alert(pair_name, coalesced_dedup_key)
+                else:
+                    for bk in blocked_keys:
+                        await sdb.release_recent_alert(pair_name, bk)
 
         async def _release_dedup_claims() -> None:
             """Releases whichever kind of claim was taken in step 4 above."""
