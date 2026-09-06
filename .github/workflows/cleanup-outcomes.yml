@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: "0 2 * * 0"   # Every Sunday at 2 AM UTC
   workflow_dispatch:
+    inputs:
+      wipe_all:
+        description: '🚨 Wipe ALL outcomes/ + reports/ data (ignores age/size limits)'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   cleanup:
@@ -25,12 +31,19 @@ jobs:
             /tmp/data-repo
 
       - name: 🧹 Cleanup old archives
+        env:
+          WIPE_ALL: ${{ inputs.wipe_all }}
         run: |
-          python3 src/cleanup_outcomes.py \
-            --data-dir /tmp/data-repo \
-            --max-age-days 90 \
-            --max-size-mb 100 \
-            --max-total-mb 400
+          if [ "$WIPE_ALL" == "true" ]; then
+            echo "🚨 WIPE ALL requested — deleting all outcomes/ and reports/ data"
+            python3 src/cleanup_outcomes.py --data-dir /tmp/data-repo --wipe-all
+          else
+            python3 src/cleanup_outcomes.py \
+              --data-dir /tmp/data-repo \
+              --max-age-days 90 \
+              --max-size-mb 100 \
+              --max-total-mb 400
+          fi
 
       - name: 📤 Commit and push cleanup
         env:
