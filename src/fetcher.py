@@ -479,8 +479,8 @@ class DataFetcher:
         params = {
             "resolution": api_resolution,   # ← "15m", "5m", "1d" (Delta India format)
             "symbol": symbol,
-            "start": int(from_time),
-            "end": int(to_time),
+            "from": int(from_time),
+            "to": int(to_time),
         }
         limiter = self.confirm_rate_limiter if for_confirmation else self.rate_limiter
 
