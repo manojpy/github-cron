@@ -1046,7 +1046,7 @@ class RedisStateStore:
             except Exception as e:
                 logger_pair.warning(f"[{pair}] File archive write failed: {e}")
 
-        logger_pair.info(
+        logger_pair.debug(
             f"[{pair}] Outcome resolution | "
             f"pending={len(keys)} | "
             f"resolved={resolved_count} | "
