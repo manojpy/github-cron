@@ -6,8 +6,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from bot_config import cfg
-
 def _parse_jsonl_row(raw: dict) -> Optional[dict]:
     """Convert archived JSONL row → Brain _parse_rows format."""
     try:
