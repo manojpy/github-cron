@@ -48,7 +48,7 @@ def cleanup_by_age(data_dir: Path, max_age_days: int) -> int:
         
         for file_path in label_dir.glob(pattern):  # includes .jsonl.gz for outcomes/shadow
             try:
-                mtime = datetime.utcfromtimestamp(file_path.stat().st_mtime)
+                mtime = datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc)
                 if mtime < cutoff:
                     print(f"🗑️ Removing old file: {file_path}")
                     file_path.unlink()
