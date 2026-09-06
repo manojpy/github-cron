@@ -84,17 +84,32 @@ def compress_large_files(data_dir: Path, max_size_mb: int) -> int:
 def wipe_labels(data_dir: Path, labels: list) -> int:
     """DANGER: delete every file (any age, any size) under the given label
     dirs. Used only when explicitly requested — bypasses age/size cleanup
-    entirely rather than layering on top of it."""
+    entirely rather than layering on top of it.
+    
+    SAFETY: This strictly deletes FILES only. The parent folders (outcomes/, reports/) 
+    are preserved and will be automatically recreated if they somehow went missing."""
     removed = 0
     for label in labels:
         label_dir = data_dir / label
+        
+        # 1. Ensure the folder exists (recreate if missing to prevent silent failures)
         if not label_dir.exists():
+            label_dir.mkdir(parents=True, exist_ok=True)
+            print(f"📁 Recreated missing folder: {label_dir}")
             continue
-        for file_path in label_dir.iterdir():
+            
+        # 2. Delete all files inside (using rglob to catch any nested subdirectories too)
+        for file_path in label_dir.rglob('*'):
             if file_path.is_file():
                 print(f"🚨 WIPE: removing {file_path}")
                 file_path.unlink()
                 removed += 1
+                
+        # 3. Clean up any empty subdirectories left behind (but NEVER the main label_dir)
+        for dir_path in sorted(label_dir.rglob('*'), reverse=True):
+            if dir_path.is_dir() and not any(dir_path.iterdir()):
+                dir_path.rmdir()
+                
     return removed
 
 def main():
