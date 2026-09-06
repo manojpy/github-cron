@@ -13,7 +13,6 @@ Usage:
 
 import argparse
 import gzip
-import os
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path

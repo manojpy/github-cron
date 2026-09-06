@@ -330,7 +330,6 @@ class BrainEngine:
         min_sample = getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
         target_wr = cfg.MIN_WIN_RATE
         disable_wr = getattr(cfg, "BRAIN_ALERT_DISABLE_THRESHOLD_WR", 0.40)
-        star_wr = getattr(cfg, "BRAIN_STAR_ALERT_WR", 0.70)
 
         # ── Per-alert win rate (pooled across pairs), Wilson-bound verdicts ──
         alert_stats: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"rows": [], "pairs": set()})
@@ -689,20 +688,6 @@ class BrainEngine:
                     ),
                 })
 
-        # ── Config Version Regression Check ─────────────────────────────
-
-        config_comparisons = engine.compare_config_versions(real_rows, min_sample=min_sample)
-        for comp in config_comparisons:
-            if comp["regression"]:
-                recommendations.append({
-                    "type": "config_regression", "severity": "high",
-                    "message": (
-                        f"🚨 Config regression: WR fell {comp['prev_wr']:.0%}→{comp['cur_wr']:.0%} "
-                        f"after config {comp['prev_version']}→{comp['cur_version']} "
-                        f"(n={comp['prev_n']}/{comp['cur_n']}). Consider reverting."
-                    ),
-                })
-
         # ── Temporal drift (from the same recommend_threshold() call —
         #    no separate computation, no risk of disagreeing with the CLI) ──
         if rec.get("valid") and rec.get("drift_recent_wr") is not None:
@@ -908,13 +893,24 @@ class BrainEngine:
     async def _next_run_count(self) -> Optional[int]:
         """Persisted run counter (Redis INCR) — safe across cron restarts."""
         if self.sdb.degraded or not self.sdb._redis:
+            logger.warning(
+                "Brain run counter skipped: Redis is degraded or unavailable "
+                "— brain report will not fire this run."
+            )
             return None
         try:
-            return await self.sdb._safe_redis_op(
+            result = await self.sdb._safe_redis_op(
                 lambda: self.sdb._redis.incr(RedisKeyPrefix.BRAIN_RUN_COUNTER),
                 2.0, "brain_run_counter",
             )
-        except Exception:
+            if result is None:
+                logger.warning(
+                    "Brain run counter INCR returned None (Redis op likely timed out) "
+                    "— brain report will not fire this run."
+                )
+            return result
+        except Exception as e:
+            logger.warning(f"Brain run counter INCR failed: {e} — brain report will not fire this run.")
             return None
 
     async def _rollback_run_count(self) -> None:

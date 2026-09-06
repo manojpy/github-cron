@@ -5,7 +5,6 @@ import json
 import random
 import asyncio
 import logging
-import uuid
 from enum import StrEnum
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple, List, Set, Callable, Union
@@ -1279,59 +1278,57 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         # ── Existing confluence gate, but with macro multiplier ─────────────
         if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
+
+        # ── Confluence gate threshold (shared by both checks below) ────────
             abs_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
-            if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
+            if alerts_to_send and getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
                 pair_floor = await sdb.get_pair_threshold(pair_name)
                 if pair_floor is not None:
                     abs_floor = pair_floor
-            pct_floor = confluence_total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
-            required = max(pct_floor, abs_floor)
-            
-            # Apply macro multiplier ONLY if MACRO_CONTEXT_LIVE is enabled
-            if getattr(cfg, "MACRO_CONTEXT_LIVE", False):
-                required = required * macro_multiplier
+
+            def _required_confluence(total: float) -> float:
+                pct_floor = total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
+                req = max(pct_floor, abs_floor)
+                if getattr(cfg, "MACRO_CONTEXT_LIVE", False):
+                    req = req * macro_multiplier
+                return req
+
+            # ── Existing confluence gate, but with macro multiplier ─────────────
+            if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
+                required = _required_confluence(confluence_total)
                 if macro_shadow is not None:
                     macro_shadow["would_block"] = confluence_score < required
-            
-            if confluence_score < required:
-                logger_pair.info(
-                    f"[{pair_name}] Confluence gate blocked: {confluence_score:.1f}/{confluence_total:.1f} "
-                    f"weighted score (need {required:.1f}, abs_floor={abs_floor:.1f}, "
-                    f"macro_mult={macro_multiplier if getattr(cfg, 'MACRO_CONTEXT_LIVE', False) else 1.0:.2f})"
-                )
-                alerts_to_send = []
+                if confluence_score < required:
+                    logger_pair.info(
+                        f"[{pair_name}] Confluence gate blocked: {confluence_score:.1f}/{confluence_total:.1f} "
+                        f"weighted score (need {required:.1f}, abs_floor={abs_floor:.1f}, "
+                        f"macro_mult={macro_multiplier if getattr(cfg, 'MACRO_CONTEXT_LIVE', False) else 1.0:.2f})"
+                    )
+                    alerts_to_send = []
 
-        # ── Correlation Cluster Penalty ("Beta Trap" filter) — LIVE ────────
-        if (alerts_to_send and getattr(cfg, "ENABLE_CLUSTER_GATE", False)
-                and cluster_context is not None and confluence_score is not None):
-            cluster_pct = cluster_context.buy_pct if is_buy_batch else cluster_context.sell_pct
-            if cluster_pct > cfg.CLUSTER_PCT_THRESHOLD:
-                raw_score = confluence_score
-                confluence_score = confluence_score * (1 - cfg.CLUSTER_PENALTY_PCT)
-                logger_pair.info(
-                    f"[{pair_name}] 🌐 Correlation cluster penalty: "
-                    f"{'buy' if is_buy_batch else 'sell'} cluster at {cluster_pct:.0%} of "
-                    f"{cluster_context.total_pairs} pairs (> {cfg.CLUSTER_PCT_THRESHOLD:.0%} threshold) — "
-                    f"confluence score {raw_score:.1f} -> {confluence_score:.1f}"
-                )
+            # ── Correlation Cluster Penalty ("Beta Trap" filter) — LIVE ────────
+            if (alerts_to_send and getattr(cfg, "ENABLE_CLUSTER_GATE", False)
+                    and cluster_context is not None and confluence_score is not None):
+                cluster_pct = cluster_context.buy_pct if is_buy_batch else cluster_context.sell_pct
+                if cluster_pct > cfg.CLUSTER_PCT_THRESHOLD:
+                    raw_score = confluence_score
+                    confluence_score = confluence_score * (1 - cfg.CLUSTER_PENALTY_PCT)
+                    logger_pair.info(
+                        f"[{pair_name}] 🌐 Correlation cluster penalty: "
+                        f"{'buy' if is_buy_batch else 'sell'} cluster at {cluster_pct:.0%} of "
+                        f"{cluster_context.total_pairs} pairs (> {cfg.CLUSTER_PCT_THRESHOLD:.0%} threshold) — "
+                        f"confluence score {raw_score:.1f} -> {confluence_score:.1f}"
+                    )
 
-        if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
-            abs_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
-            if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
-                pair_floor = await sdb.get_pair_threshold(pair_name)
-                if pair_floor is not None:
-                    abs_floor = pair_floor
-            pct_floor = confluence_total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
-            required = max(pct_floor, abs_floor)
-            if getattr(cfg, "MACRO_CONTEXT_LIVE", False):
-                required = required * macro_multiplier
-            if macro_shadow is not None:
-                macro_shadow["would_block"] = confluence_score < required
-            if confluence_score < required:
-                logger_pair.info(
-                    f"[{pair_name}] Confluence gate blocked dispatch: {confluence_score:.1f}/{confluence_total:.1f} weighted score (need {required:.1f}, abs_floor={abs_floor:.1f}, macro_mult={macro_multiplier if getattr(cfg, 'MACRO_CONTEXT_LIVE', False) else 1.0:.2f})"
-                )
-                alerts_to_send = []
+            if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
+                required = _required_confluence(confluence_total)
+                if macro_shadow is not None:
+                    macro_shadow["would_block"] = confluence_score < required
+                if confluence_score < required:
+                    logger_pair.info(
+                        f"[{pair_name}] Confluence gate blocked dispatch: {confluence_score:.1f}/{confluence_total:.1f} weighted score (need {required:.1f}, abs_floor={abs_floor:.1f}, macro_mult={macro_multiplier if getattr(cfg, 'MACRO_CONTEXT_LIVE', False) else 1.0:.2f})"
+                    )
+                    alerts_to_send = []
 
         if alerts_to_send and getattr(cfg, "BRAIN_OOD_ENABLED", True):
             ood_survivors = []

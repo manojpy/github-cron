@@ -18,6 +18,7 @@ except ImportError:
     sys.exit("Missing dependency: pip install redis")
 
 import threshold_engine as engine
+from archive_reader import load_archived_outcomes
 
 STREAM_KEY = "outcome_log_stream"
 
@@ -83,11 +84,36 @@ def load_rows(r, pair_filter=None, direction_filter=None, alert_key_filter=None)
         sys.exit(2)
     return rows
 
+def _apply_cli_filters(rows, pair_filter=None, direction_filter=None, alert_key_filter=None):
+    """Apply the same --pair/--direction/--alert-key filters used on the
+    Redis path, and lift context['adx_val'] to a top-level key so
+    engine.regime_breakdown() (which expects it there) still works when
+    rows come from the file archive instead of Redis."""
+    out = []
+    for r in rows:
+        if pair_filter and r.get("pair") != pair_filter:
+            continue
+        if direction_filter and r.get("direction") != direction_filter:
+            continue
+        if alert_key_filter and r.get("alert_key") != alert_key_filter:
+            continue
+        ctx = r.get("context")
+        if ctx and r.get("adx_val") is None and ctx.get("adx_val") is not None:
+            r["adx_val"] = ctx.get("adx_val")
+        out.append(r)
+    return out
+
 def main():
     ap = argparse.ArgumentParser(description="Intelligent Confluence Threshold Advisor v3.0")
     ap.add_argument("--target-winrate", type=float, default=0.55)
     ap.add_argument("--min-sample", type=int, default=20)
     ap.add_argument("--bucket-size", type=float, default=1.0)
+    ap.add_argument("--data-dir", type=str, default=os.environ.get("OUTCOME_DATA_DIR"),
+                    help="Root of the outcome-data file archive (same one Brain reads). "
+                         "If set and it has data, this is used instead of Redis.")
+    ap.add_argument("--window-days", type=int, default=30,
+                    help="Rolling window in days applied to the file archive — matches "
+                         "Brain's BRAIN_ANALYSIS_WINDOW_DAYS default so both reports agree.")
     ap.add_argument("--pair", type=str, default=None)
     ap.add_argument("--direction", type=str, default=None, choices=["buy", "sell"],
                     help="Filter to one direction only")
@@ -130,12 +156,28 @@ def main():
     args = ap.parse_args()
 
     redis_url = os.environ.get("REDIS_URL")
-    if not redis_url:
-        sys.exit("Set REDIS_URL in your environment first.")
 
-    r = redis.from_url(redis_url, decode_responses=True)
-    rows = load_rows(r, args.pair, args.direction, args.alert_key)
+    rows = None
+    if args.data_dir:
+        archive_rows = load_archived_outcomes(args.data_dir, window_days=args.window_days, shadow=False)
+        if archive_rows:
+            rows = _apply_cli_filters(archive_rows, args.pair, args.direction, args.alert_key)
+            if rows:
+                print(f"📁 Loaded {len(rows)} rows from file archive: {args.data_dir} "
+                      f"(window={args.window_days}d)", file=sys.stderr)
+
+    if not rows:
+        if not redis_url:
+            print("No usable file-archive data and REDIS_URL not set — nothing to analyze.",
+                  file=sys.stderr)
+            sys.exit(2)
+        r = redis.from_url(redis_url, decode_responses=True)
+        rows = load_rows(r, args.pair, args.direction, args.alert_key)
+        print(f"🗄️ Loaded {len(rows)} rows from Redis stream (fallback — no archive data found)",
+              file=sys.stderr)
+
     n = len(rows)
+
     overall_wr = sum(row["win"] for row in rows) / n
 
     buy_wr, buy_n, sell_wr, sell_n = engine.direction_split(rows)

@@ -793,7 +793,7 @@ def recommend_threshold(
     result["valid"] = True
     return result
 
-# ══════════════════════���════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 #  NEW: Cost-Aware EV + Kelly Sizing  (Recommended.txt §5)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1007,7 +1007,7 @@ class CUSUMDetector:
         return det
 
 
-# ══════════════════════════���════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 #  NEW: Config Stability Gate  (Recommended.txt §3)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1391,9 +1391,10 @@ def interaction_miner(
             if len(both) < min_sample or len(only_v1) < min_sample:
                 continue
 
+            has_v2_sample = len(only_v2) >= min_sample
             wr_both = sum(r["win"] for r in both) / len(both)
             wr_only_v1 = sum(r["win"] for r in only_v1) / len(only_v1)
-            wr_only_v2 = sum(r["win"] for r in only_v2) / len(only_v2) if only_v2 else 0.0
+            wr_only_v2 = sum(r["win"] for r in only_v2) / len(only_v2) if has_v2_sample else 0.0
             wr_neither = sum(r["win"] for r in neither) / len(neither) if neither else 0.0
 
             synergy = wr_both - max(wr_only_v1, wr_only_v2, wr_neither)
@@ -1408,21 +1409,35 @@ def interaction_miner(
                     "n_both": len(both),
                 })
 
-            poison = wr_only_v1 - wr_both
-            if poison > 0.15 and len(both) >= min_sample:
+            # v2 poisons v1: adding v2 drags a good v1 down
+            poison_v1 = wr_only_v1 - wr_both
+            if poison_v1 > 0.15 and len(both) >= min_sample:
                 interactions.append({
                     "pair": (v1, v2),
                     "type": "poison",
-                    "delta": round(-poison, 4),
+                    "delta": round(-poison_v1, 4),
                     "wr_both": round(wr_both, 4),
                     "wr_only_v1": round(wr_only_v1, 4),
                     "n_both": len(both),
                     "note": f"{v2} poisons {v1}",
                 })
 
+            # v1 poisons v2: adding v1 drags a good v2 down
+            if has_v2_sample:
+                poison_v2 = wr_only_v2 - wr_both
+                if poison_v2 > 0.15 and len(both) >= min_sample:
+                    interactions.append({
+                        "pair": (v1, v2),
+                        "type": "poison",
+                        "delta": round(-poison_v2, 4),
+                        "wr_both": round(wr_both, 4),
+                        "wr_only_v2": round(wr_only_v2, 4),
+                        "n_both": len(both),
+                        "note": f"{v1} poisons {v2}",
+                    })
+
     interactions.sort(key=lambda x: -abs(x["delta"]))
     return interactions
-
 
 # ═══════════════════════════════════════════════════════════════════════
 #  PHASE 5 — COUNTERFACTUAL SIMULATOR
