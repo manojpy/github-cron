@@ -1240,45 +1240,6 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
         )
     return last_closed_idx
 
-async def test_symbol_alternatives(api_base: str, reference_time: int):
-    """Diagnostic tool to test alternative symbol formats accepted by Delta Exchange."""
-    symbols_to_test = [
-        "BTCUSD",           # 1. Standard Last Traded Price (LTP)
-        "MARK:BTCUSD",      # 2. Mark Price
-        "INDEX:BTCUSD",     # 3. Index Price
-        "BTCUSD_MARK",      # 4. Suffix alternative
-        "BTC/USD",          # 5. Spot-style format
-    ]
-    to_time = reference_time
-    from_time = to_time - (24 * 60 * 60)  # Last 24 hours
-    
-    logger_main.info("🔍 Testing Delta Exchange India Symbol Alternatives...")
-    logger_main.info(f"🌐 Endpoint: {api_base}/v2/chart/history")
-    
-    session = await SessionManager.get_session()
-    for symbol in symbols_to_test:
-        params = {
-            "symbol": symbol,
-            "resolution": "15",
-            "from": from_time,
-            "to": to_time
-        }
-        try:
-            async with session.get(f"{api_base}/v2/chart/history", params=params, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    candles = data.get("result", {}).get("t", [])
-                    if candles:
-                        logger_main.info(f"✅ [{resp.status}] {symbol:<15} -> ACCEPTED | Candles returned: {len(candles)}")
-                    else:
-                        logger_main.info(f"⚠️ [{resp.status}] {symbol:<15} -> 200 OK but EMPTY data")
-                else:
-                    err_msg = (await resp.text())[:80].replace('\n', ' ')
-                    logger_main.info(f"❌ [{resp.status}] {symbol:<15} -> REJECTED | {err_msg}")
-        except Exception as e:
-            logger_main.error(f"🚨 [ERR] {symbol:<15} -> CONNECTION ERROR | {e}")
-    logger_main.info("✅ Symbol test complete. Check logs above for accepted formats.")
-
 @dataclass(frozen=True)
 class CandleSnapshot:
     timestamp: int
