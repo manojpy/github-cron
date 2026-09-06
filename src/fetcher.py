@@ -1283,6 +1283,42 @@ class PriceData:
     def __len__(self) -> int:
         return len(self.ts)
 
+async def verify_mark_price_agrees(fetcher: DataFetcher, pair_name: str, ts_curr: int,
+    is_green: bool, is_red: bool, reference_time: int, logger_pair: logging.Logger) -> Optional[bool]:
+    """Fresh Mark Price fetch, used ONLY for color agreement — Mark Price has
+    no real trade volume, so it can never be the primary data source, but it
+    IS the series a human is usually watching on the exchange app. This is
+    the actual independent second opinion the old SACROSANCT check pretended
+    to be. Returns True=agrees, False=confirmed disagreement, None=inconclusive."""
+    try:
+        raw = await fetcher.fetch_candles(f"MARK:{pair_name}", "15", 3, reference_time, for_confirmation=True)
+        if not raw or not all(k in raw for k in ("t", "o", "c")):
+            logger_pair.warning(f"[{pair_name}] Mark price check unavailable — inconclusive")
+            return None
+
+        ts_arr = np.array(raw["t"])
+        matches = np.flatnonzero(np.abs(ts_arr - ts_curr) <= 5)
+        if matches.size == 0:
+            logger_pair.warning(f"[{pair_name}] Mark price candle for {format_ist_time(ts_curr)} not found — inconclusive")
+            return None
+
+        idx = int(matches[-1])
+        mo, mc = float(raw["o"][idx]), float(raw["c"][idx])
+        mark_is_green = mc > mo
+        mark_is_red = mc < mo
+
+        if (is_green and not mark_is_green) or (is_red and not mark_is_red):
+            logger_pair.error(
+                f"[{pair_name}] MARK PRICE DISAGREES: trade-price candle is "
+                f"{'green' if is_green else 'red'}, Mark Price shows O={mo:.4f} C={mc:.4f} "
+                f"({'green' if mark_is_green else 'red' if mark_is_red else 'doji'}) — suppressing"
+            )
+            return False
+        return True
+    except Exception as e:
+        logger_pair.warning(f"[{pair_name}] Mark price check errored: {e} — inconclusive")
+        return None
+
 async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name: str,
     ts_curr: int, cached: CandleSnapshot, reference_time: int, logger_pair: logging.Logger) -> Optional[bool]:
     """Returns True=unchanged, False=confirmed repaint/mismatch, None=inconclusive (fetch/network failure)."""

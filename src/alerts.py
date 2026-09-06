@@ -16,10 +16,11 @@ from bot_config import (
     shutdown_event, format_ist_time, json_dumps, CONFLUENCE_WEIGHTS, BtcMacroContext,
     ClusterContext, _get_session_from_ts,
 )
+
 from fetcher import (
     PriceData, DataFetcher, SessionManager, compute_backoff, validate_indicator_values,
     CandleSnapshot, cross_check_15m_against_5m,
-    confirm_candle_unchanged, detect_reversal_candle_pattern,
+    confirm_candle_unchanged, verify_mark_price_agrees, detect_reversal_candle_pattern,
 )
 from state import RedisStateStore, TokenBucket
 from gates import GateResult, IndicatorCache
@@ -1467,41 +1468,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 deduped_alerts.append((alert_title, alert_extra, alert_key))
             alerts_to_send = deduped_alerts
 
-        # ═══════════════════════════════════════════════════════════════════
-        # SACROSANCT COLOR CHECK — absolute final guard before dispatch
-        # ═══════════════════════════════════════════════════════════════════
-        if alerts_to_send:
-            blocked_keys: Set[str] = set()
-            for _, _, alert_key in alerts_to_send:
-                if alert_key in BUY_ALERT_KEYS and not is_green:
-                    blocked_keys.add(alert_key)
-                    logger_pair.critical(
-                        f"[{pair_name}] 🚨 SACROSANCT COLOR VIOLATION: "
-                        f"BUY alert '{alert_key}' on NON-GREEN candle | "
-                        f"O={o:.4f} C={c:.4f} is_green={is_green} is_red={is_red} "
-                        f"— SUPPRESSING"
-                    )
-                elif alert_key in SELL_ALERT_KEYS and not is_red:
-                    blocked_keys.add(alert_key)
-                    logger_pair.critical(
-                        f"[{pair_name}] 🚨 SACROSANCT COLOR VIOLATION: "
-                        f"SELL alert '{alert_key}' on NON-RED candle | "
-                        f"O={o:.4f} C={c:.4f} is_green={is_green} is_red={is_red} "
-                        f"— SUPPRESSING"
-                    )
-
-            if blocked_keys:
-                alerts_to_send = [
-                    (t, e, k) for t, e, k in alerts_to_send if k not in blocked_keys
-                ]
-
-                if coalesced_dedup_key:
-                    if not alerts_to_send:
-                        await sdb.release_recent_alert(pair_name, coalesced_dedup_key)
-                else:
-                    for bk in blocked_keys:
-                        await sdb.release_recent_alert(pair_name, bk)
-
         async def _release_dedup_claims() -> None:
             """Releases whichever kind of claim was taken in step 4 above."""
             if coalesced_dedup_key:
@@ -1568,6 +1534,11 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     reconfirmed = await confirm_candle_unchanged(
                         fetcher, symbol, pair_name, ts_curr, cached_snapshot, reference_time, logger_pair
                     )
+
+                    mark_agrees = await verify_mark_price_agrees(
+                        fetcher, pair_name, ts_curr, is_green, is_red, reference_time, logger_pair
+                    ) if reconfirmed is True else None
+
                     if reconfirmed is None:
                         logger_pair.warning(
                             f"[{pair_name}] Confirmation inconclusive — alert suppressed this run, "
@@ -1581,6 +1552,22 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         logger_pair.warning(
                             f"[{pair_name}] 🔁 Confirmed repaint in send-queue window — "
                             f"alert suppressed, dedup key KEPT to prevent duplicates"
+                        )
+                        await _refund_alert_budget(len(alerts_to_send))
+                        budget_refunded = True  # Mark as refunded
+                    elif mark_agrees is None:
+                        logger_pair.warning(
+                            f"[{pair_name}] Mark price check inconclusive — alert suppressed this run, "
+                            f"dedup key RELEASED so it can retry next run"
+                        )
+                        await _release_dedup_claims()
+                        await _refund_alert_budget(len(alerts_to_send))
+                        budget_refunded = True  # Mark as refunded
+                        send_success = False
+                    elif mark_agrees is False:
+                        logger_pair.warning(
+                            f"[{pair_name}] Mark price disagreement confirmed — alert suppressed, "
+                            f"dedup key KEPT to prevent duplicates"
                         )
                         await _refund_alert_budget(len(alerts_to_send))
                         budget_refunded = True  # Mark as refunded
