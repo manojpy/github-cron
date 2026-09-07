@@ -276,26 +276,32 @@ def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str
     return f"{line1}\n{body}\n{datetime_line}"
 
 def _format_bias_header(bias_context: BiasContext) -> str:
-    """2-line pair-universe Ichimoku bias header prepended to every outgoing
-    message when cfg.ENABLE_BIAS_HEADER is True (see BiasContext docstring).
-    Line 1 names the dominant state (Up/Down/Neutral, by pair count — ties
-    break Up > Down > Neutral) with its own emoji + percentage. Line 2 always
-    lists all three percentages in fixed order, independent of which is
-    dominant. Returned pre-escaped for MarkdownV2."""
     up_pct = round(bias_context.up_pct * 100)
     down_pct = round(bias_context.down_pct * 100)
     neutral_pct = round(bias_context.neutral_pct * 100)
 
+    # (count, emoji, arrow, label, pct)  — ties break Up > Down > Neutral
     candidates = [
-        (bias_context.up_count, "🟢▲", "Uptrend", up_pct),
-        (bias_context.down_count, "🔴▼", "Downtrend", down_pct),
-        (bias_context.neutral_count, "⚪➖", "Neutral", neutral_pct),
+        (bias_context.up_count,    "🟢", "▲", "Uptrend",   up_pct),
+        (bias_context.down_count,  "🔴", "▼", "Downtrend", down_pct),
+        (bias_context.neutral_count, "⚪", "◽", "Neutral", neutral_pct),
     ]
-    _, emoji, label, pct = max(candidates, key=lambda t: t[0])
+    _, emoji, arrow, label, pct = max(candidates, key=lambda t: t[0])
 
-    line1 = f"{emoji} Bias \\- {label}\\({pct}%\\)"
-    line2 = f"{up_pct}%▲ {down_pct}%▼ {neutral_pct}%➖"
-    return f"{line1}\n{line2}"
+    # Non-dominant fragments in fixed order: up → down → neutral
+    fragments = []
+    for lbl, arr, p in (
+        ("Uptrend",   "▲", up_pct),
+        ("Downtrend", "▼", down_pct),
+        ("Neutral",   "◽", neutral_pct),
+    ):
+        if lbl != label:
+            fragments.append(f"{arr}{p}%")
+
+    return (
+        f"{emoji} Bias \\- {arrow}{label}\\({pct}%\\), "
+        f"{' '.join(fragments)}"
+    )
 
 def create_pivot_alert(level: str, is_buy: bool) -> Dict[str, Any]:
     """Factory function to create pivot alert definitions (check_fn/extra_fn are lambdas closing over `level`/`is_buy`)"""
@@ -617,7 +623,7 @@ async def dispatch_combined_alerts(
         return 0
 
     TELEGRAM_LIMIT = 4096
-    DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     # ── Order: sell first if dominant bias is sell, else buy first ──
     dominant_sell = (
