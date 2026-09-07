@@ -230,8 +230,9 @@ def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional
         line2 = f"*{e_desc}*"
     
     spacing = " " * 24
-    line3 = f"📅 {e_date}{spacing}⏰ {e_time}"
-    
+
+    line3 = f"📆 {e_date}{spacing}⏰ {e_time}"
+
     return f"{line1}\n{line2}\n{line3}"
         
 def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str]], score: Optional[float] = None, total: Optional[float] = None) -> str:
@@ -662,7 +663,7 @@ async def dispatch_combined_alerts(
     if not ordered:
         return 0
 
-    # ── Assemble sections ──
+     # ── Assemble atomic pair blocks ──
     bias_footer = ""
     if cfg.ENABLE_BIAS_HEADER and bias_context is not None:
         bias_footer = f"\n{_format_bias_header(bias_context)}"
@@ -675,66 +676,82 @@ async def dispatch_combined_alerts(
         f"📆  {escape_markdown_v2(date_str)}{spacing}⏰ {escape_markdown_v2(time_str)}"
     )
 
-    sections: List[str] = []
+    # Build atomic blocks so we never split inside a pair
+    pair_blocks: List[Tuple[str, AlertPayload]] = []
     for p in ordered:
-        sections.append(p.msg_body)
-        sections.append(DIVIDER)
+        block = p.msg_body + "\n" + DIVIDER
+        pair_blocks.append((block, p))
 
-    # ── Split by Telegram 4096 limit (accounting for join separators) ──
     messages: List[str] = []
+    message_payloads: List[List[AlertPayload]] = []  # parallel: which payloads are in each message
     current_parts: List[str] = []
+    current_payloads: List[AlertPayload] = []
     current_len = 0
-    footer_len = len(bias_footer) + 1 + len(datetime_footer) + 1  # exact + safety
+    footer_len = len(bias_footer) + 1 + len(datetime_footer) + 1
 
-    for section in sections:
-        sec_len = len(section)
-        join_cost = 1 if current_parts else 0   # "\n" between parts
-        if current_parts and (current_len + join_cost + sec_len + footer_len > TELEGRAM_LIMIT):
+    for block, p in pair_blocks:
+        join_cost = 1 if current_parts else 0
+        if current_parts and (current_len + join_cost + len(block) + footer_len > TELEGRAM_LIMIT):
             messages.append("\n".join(current_parts))
-            current_parts = [section]
-            current_len = sec_len
+            message_payloads.append(current_payloads)
+            current_parts = [block]
+            current_len = len(block)
+            current_payloads = [p]
         else:
-            current_parts.append(section)
-            current_len += join_cost + sec_len
+            current_parts.append(block)
+            current_len += join_cost + len(block)
+            current_payloads.append(p)
     if current_parts:
         messages.append("\n".join(current_parts))
+        message_payloads.append(current_payloads)
 
-    # Attach shared footer to every split message so each is readable standalone
     for i in range(len(messages)):
         messages[i] = messages[i] + bias_footer + "\n" + datetime_footer
 
     # ── Attempt combined send ──
     combined_success = True
-    for msg in messages:
-        if not await telegram_queue.send(msg):
+    sent_payloads: List[AlertPayload] = []
+    all_changes: List[Tuple[str, str, None]] = []
+
+    for msg, msg_payloads in zip(messages, message_payloads):
+        if await telegram_queue.send(msg):
+            sent_payloads.extend(msg_payloads)
+            for p in msg_payloads:
+                all_changes.extend(p.state_changes)
+        else:
             combined_success = False
             break
 
-    if combined_success:
-        # Apply all deferred state changes
-        all_changes = []
-        for p in ordered:
-            all_changes.extend(p.state_changes)
+    if sent_payloads:
         if all_changes:
             await sdb.atomic_batch_update(all_changes)
         async with alerts_sent_lock:
-            alerts_sent_ref[0] += sum(p.budget_count for p in ordered)
-        for p in ordered:
+            alerts_sent_ref[0] += sum(p.budget_count for p in sent_payloads)
+        for p in sent_payloads:
             if p.record_win_rate:
                 await p.record_win_rate()
         logger_run.info(
-            f"🔔 Combined dispatch sent {len(ordered)} pair(s) in {len(messages)} message(s)"
+            f"🔔 Combined dispatch sent {len(sent_payloads)} pair(s) in {len(messages)} message(s)"
         )
+
+    if combined_success:
         return sum(p.budget_count for p in ordered)
 
-    # ── Fallback: release combined claims and send individually ──
-    logger_run.warning("Combined dispatch failed — falling back to individual sends")
-    for p in ordered:
+    # ── Fallback: only for payloads that weren't already sent ──
+    sent_ids = {id(p) for p in sent_payloads}
+    unsent = [p for p in ordered if id(p) not in sent_ids]
+
+    logger_run.warning(
+        f"Combined dispatch failed part-way — falling back to individual sends "
+        f"for {len(unsent)} unsent pair(s)"
+    )
+
+    for p in unsent:
         for dk in p.dedup_keys:
             await sdb.release_recent_alert(p.pair_name, dk)
 
     fallback_sent = 0
-    for p in ordered:
+    for p in unsent:
         claimed_keys = []
         should_send = True
         for dk in p.dedup_keys:
@@ -769,9 +786,7 @@ async def dispatch_combined_alerts(
             fallback_sent += p.budget_count
         else:
             for dk in p.dedup_keys:
-                await sdb.release_recent_alert(p.pair_name, dk)
-            async with alerts_sent_lock:
-                alerts_sent_ref[0] = max(0, alerts_sent_ref[0] - p.budget_count) 
+                await sdb.release_recent_alert(p.pair_name, dk) 
 
     return fallback_sent
 
