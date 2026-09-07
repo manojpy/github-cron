@@ -41,9 +41,8 @@ from state import (
 from gates import compute_confluence_score, _eval_gate
 
 from alerts import (
-    TelegramQueue, ALERT_KEYS, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
-) 
-
+    TelegramQueue, ALERT_KEYS, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2, dispatch_run_alerts, QueuedPairAlert,
+)
 _pair_eval_counter = 0
 
 def _sync_signal_handler(sig: int, frame: Any) -> None:
@@ -86,13 +85,14 @@ def get_trigger_timestamp() -> int:
     return int(datetime.now(timezone.utc).timestamp())
 
 async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: PriceData,
-    data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
-    reference_time: int, fetcher: DataFetcher, symbol: str, alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
-    max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN,
-    oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None,
-    macro_context: Optional[BtcMacroContext] = None,
-    cluster_context: Optional[ClusterContext] = None,
-    bias_context: Optional[BiasContext] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
+                                  data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
+                                  reference_time: int, fetcher: DataFetcher, symbol: str, alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
+                                  max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN,
+                                  oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None,
+                                  macro_context: Optional[BtcMacroContext] = None,
+                                  cluster_context: Optional[ClusterContext] = None,
+                                  bias_context: Optional[BiasContext] = None,
+                                  run_dispatch_queue: Optional[List[QueuedPairAlert]] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
 
@@ -207,6 +207,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             macro_context=macro_context,
             cluster_context=cluster_context,
             bias_context=bias_context,
+            run_dispatch_queue=run_dispatch_queue,
         )
     finally:
         PAIR_ID.set("")
@@ -227,7 +228,8 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
                        oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None,
                        macro_context: Optional[BtcMacroContext] = None,
                        cluster_context: Optional[ClusterContext] = None,
-                       bias_context: Optional[BiasContext] = None):
+                       bias_context: Optional[BiasContext] = None,
+                       run_dispatch_queue: Optional[List[QueuedPairAlert]] = None):
     p_name, symbol, candles = task_data
     try:
         pd_15m = parse_candles_to_numpy(candles.get("15"))
@@ -244,7 +246,7 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
 
         data_15m = pd_15m
         data_5m = pd_5m
-        data_daily = pd_daily.as_dict() if pd_daily is not None else None
+        data_daily = pd_daily.as_dict() if pd_daily is not None else None     
         result = await evaluate_pair_and_alert(
             p_name, data_15m, data_5m, data_daily,
             state_db, telegram_queue, correlation_id, reference_time, fetcher, symbol,
@@ -253,7 +255,9 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
             macro_context=macro_context,
             cluster_context=cluster_context,
             bias_context=bias_context,
+            run_dispatch_queue=run_dispatch_queue,
         )
+        
         return result
 
     except asyncio.CancelledError:
@@ -639,6 +643,11 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             logger_main.warning(f"Bias pre-pass failed, disabling bias header this run: {e}")
             bias_context = None
 
+    # ── Run-level combined dispatch queue ─────────────────────────────
+    run_dispatch_queue: Optional[List[QueuedPairAlert]] = (
+        [] if getattr(cfg, "ENABLE_RUN_COMBINED_DISPATCH", False) else None
+    )
+
     logger_main.debug(f"🧠 Phase 3: Evaluating {len(prepared_tasks)} pairs...")
     eval_start = time.time()
     eval_semaphore = asyncio.Semaphore(cfg.EVAL_CONCURRENCY_LIMIT)  # NEW, e.g. 5
@@ -652,6 +661,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 macro_context=btc_context,
                 cluster_context=cluster_context,
                 bias_context=bias_context,
+                run_dispatch_queue=run_dispatch_queue,
             )
     results = await asyncio.gather(
         *[_bounded_eval(t) for t in prepared_tasks],
@@ -671,6 +681,32 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     logger_main.debug(
         f"Results: {len(valid_results)} successful, {len(results) - len(valid_results)} failed"
     )
+
+    # ── Phase 3.5: Run-level combined Telegram dispatch ──────────────
+    if getattr(cfg, "ENABLE_RUN_COMBINED_DISPATCH", False) and run_dispatch_queue is not None:
+        try:
+            dispatch_summary = await dispatch_run_alerts(
+                queued_payloads=run_dispatch_queue,
+                telegram_queue=telegram_queue,
+                sdb=state_db,
+                bias_context=bias_context,
+                alerts_sent_ref=alerts_sent_ref,
+                alerts_sent_lock=alerts_sent_lock,
+                logger_run=logger_main,
+            )
+
+            logger_main.info(
+                f"📦 Combined dispatch summary | "
+                f"Queued: {dispatch_summary.get('queued_pairs', 0)} | "
+                f"Sent: {dispatch_summary.get('sent_pairs', 0)} | "
+                f"Failed: {dispatch_summary.get('failed_pairs', 0)} | "
+                f"Combined msgs: {dispatch_summary.get('combined_messages_sent', 0)} | "
+                f"Fallback msgs: {dispatch_summary.get('fallback_messages_sent', 0)}"
+            )
+
+        except Exception as e:
+            logger_main.error(f"Combined dispatch failed unexpectedly: {e}")
+
     del results, prepared_tasks, pair_requests, valid_tasks
     
     process = psutil.Process()
