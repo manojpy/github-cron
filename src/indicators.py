@@ -311,6 +311,45 @@ def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
         logger.error(f"RMA calculation failed: {e}")
         return np.full_like(data, np.nan) if data is not None else np.array([np.nan]) 
 
+def compute_daily_rma_band_bias(data_daily: Optional[Dict[str, np.ndarray]], current_close: float,
+                                  reference_time: int, period: int = 11) -> Optional[str]:
+    """RMA(period) of daily High = upper band, RMA(period) of daily Low =
+    lower band, built from CLOSED daily candles only (today's still-forming
+    bar excluded via the same day-number convention used everywhere else in
+    this file — timestamp // 86400 — so the band can't repaint intraday).
+    Returns 'up' / 'down' / 'neutral', or None if there isn't enough daily
+    history yet for this pair."""
+    if data_daily is None:
+        return None
+
+    ts_arr = data_daily.get("timestamp")
+    high_arr = data_daily.get("high")
+    low_arr = data_daily.get("low")
+    if ts_arr is None or high_arr is None or low_arr is None or len(ts_arr) == 0:
+        return None
+
+    today_day_number = reference_time // 86400
+    closed_mask = (ts_arr // 86400) < today_day_number
+    closed_high = high_arr[closed_mask]
+    closed_low = low_arr[closed_mask]
+
+    if len(closed_high) < period or len(closed_low) < period:
+        return None
+
+    rma_high = calculate_rma_numpy(closed_high, period)
+    rma_low = calculate_rma_numpy(closed_low, period)
+    upper_band = rma_high[-1]
+    lower_band = rma_low[-1]
+
+    if np.isnan(upper_band) or np.isnan(lower_band):
+        return None
+
+    if current_close > upper_band:
+        return "up"
+    elif current_close < lower_band:
+        return "down"
+    return "neutral"
+
 def calculate_ichimoku_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, conversion_periods: int = 9, base_periods: int = 26, span_b_periods: int = 52, displacement: int = 26) -> Dict[str, np.ndarray]:
     try:
         n = len(high)

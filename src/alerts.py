@@ -180,6 +180,19 @@ def _fmt_score(score: Optional[float], total: Optional[float] = None) -> str:
         return f" - {pct}%({_fmt_num(score)}/{_fmt_num(total)})"
     return f"({_fmt_num(score)})"
 
+def format_daily_bias_line(cluster_context: Optional[ClusterContext]) -> str:
+    if cluster_context is None or cluster_context.daily_bias_valid_total == 0:
+        return ""
+    total = cluster_context.daily_bias_valid_total
+    up, down = cluster_context.daily_bias_up, cluster_context.daily_bias_down
+    up_pct = (up / total) * 100
+    down_pct = (down / total) * 100
+    if up > down:
+        return f"Bias \\- Uptrend\\({up_pct:.0f}%\\)\n\n"
+    elif down > up:
+        return f"Bias \\- Downtrend\\({down_pct:.0f}%\\)\n\n"
+    return f"Bias \\- Neutral \\({up_pct:.0f}% up / {down_pct:.0f}% down\\)\n\n"
+
 def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional[str] = None, score: Optional[float] = None, total: Optional[float] = None) -> str:
     if not title: 
         title = "ALERT"
@@ -1523,12 +1536,13 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         if alerts_to_send:
             budget_refunded = False  # NEW: Flag to prevent double refund
             try:
+                bias_line = format_daily_bias_line(cluster_context)
                 if len(alerts_to_send) == 1:
                     title, extra, _ = alerts_to_send[0]
-                    msg = build_single_msg(title, pair_name, close_curr, ts_curr, extra, score=confluence_score, total=confluence_total)
+                    msg = bias_line + build_single_msg(title, pair_name, close_curr, ts_curr, extra, score=confluence_score, total=confluence_total)
                 else:
                     items = [(t, e) for t, e, _ in alerts_to_send[:25]]
-                    msg = build_batched_msg(pair_name, close_curr, ts_curr, items, score=confluence_score, total=confluence_total)
+                    msg = bias_line + build_batched_msg(pair_name, close_curr, ts_curr, items, score=confluence_score, total=confluence_total)
 
                 if not cfg.DRY_RUN_MODE:
                     reconfirmed = await confirm_candle_unchanged(

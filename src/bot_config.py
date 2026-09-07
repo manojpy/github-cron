@@ -155,6 +155,7 @@ class Constants:
     MACRO_MULT_MODERATE = 1.15
     MACRO_MULT_FULL = 1.30
     MACRO_RS_EASE_FACTOR = 0.75
+    RMA_DAILY_BAND_PERIOD: int = Field(default=11, ge=2, description="RMA period applied to daily High/Low to build the market-bias band")
 
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
@@ -179,12 +180,19 @@ class ClusterContext:
     _compute_directional_cluster in macd_unified.py). Used to detect and
     penalize 'beta trap' situations — e.g. BTC pumps and 8 correlated alts
     all fire BUY at once, which is really one trade wearing 8 costumes.
-    LIVE — see cfg.ENABLE_CLUSTER_GATE / CLUSTER_PCT_THRESHOLD / CLUSTER_PENALTY_PCT."""
+    LIVE — see cfg.ENABLE_CLUSTER_GATE / CLUSTER_PCT_THRESHOLD / CLUSTER_PENALTY_PCT.
+
+    daily_bias_* fields are a separate, independent metric: how many pairs'
+    LIVE price sits above/below/inside a daily-timeframe RMA(11) High/Low
+    band, regardless of whether any alert gate passed for that pair."""
     buy_count: int
     sell_count: int
     total_pairs: int
     buy_pct: float
     sell_pct: float
+    daily_bias_up: int = 0
+    daily_bias_down: int = 0
+    daily_bias_valid_total: int = 0
 
 class CompiledPatterns:
     VALID_SYMBOL = re.compile(r'^[A-Z0-9_]+$')

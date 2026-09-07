@@ -14,6 +14,8 @@ from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime, timezone
 import numpy as np
 
+from indicators import compute_daily_rma_band_bias
+
 from bot_config import (
     Constants, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
     TRACE_ID, PAIR_ID, cfg, logger, logger_main,
@@ -279,7 +281,7 @@ async def _compute_directional_cluster(
                 pd_15m = parse_candles_to_numpy(candles.get("15"))
                 pd_5m = parse_candles_to_numpy(candles.get("5"))
                 if pd_15m is None or pd_5m is None:
-                    return None
+                    return None, None
                 pd_daily = (
                     parse_candles_to_numpy(candles.get("D"))
                     if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else None
@@ -291,25 +293,40 @@ async def _compute_directional_cluster(
                     resolve_outcomes=False,
                 )
                 if gr is None or isinstance(gr, tuple):
-                    return None
+                    return None, None
+
+                daily_bias = compute_daily_rma_band_bias(
+                    data_daily, gr.c, reference_time, period=cfg.RMA_DAILY_BAND_PERIOD
+                )
+
                 if gr.confirmation_buy and gr.adx_ok:
-                    return "buy"
+                    return "buy", daily_bias
                 if gr.confirmation_sell and gr.adx_ok:
-                    return "sell"
-                return None
+                    return "sell", daily_bias
+                return None, daily_bias
             except Exception as e:
                 logger_main.debug(f"Cluster pre-pass eval failed for {p_name}: {e}")
-                return None
+                return None, None
 
     total = len(prepared_tasks)
     if total == 0:
         return None
-    leans = await asyncio.gather(*[_lean(t) for t in prepared_tasks])
+    results = await asyncio.gather(*[_lean(t) for t in prepared_tasks])
+    leans = [r[0] for r in results]
+    daily_biases = [r[1] for r in results]
+
     buy_count = sum(1 for l in leans if l == "buy")
     sell_count = sum(1 for l in leans if l == "sell")
+
+    valid_biases = [b for b in daily_biases if b is not None]
+    bias_up = sum(1 for b in valid_biases if b == "up")
+    bias_down = sum(1 for b in valid_biases if b == "down")
+
     return ClusterContext(
         buy_count=buy_count, sell_count=sell_count, total_pairs=total,
         buy_pct=buy_count / total, sell_pct=sell_count / total,
+        daily_bias_up=bias_up, daily_bias_down=bias_down,
+        daily_bias_valid_total=len(valid_biases),
     )
 
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict],
@@ -329,7 +346,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER,
         cfg.RMA_200_PERIOD * 3 
     )
-    daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else 0
+    pivot_needs = cfg.PIVOT_LOOKBACK_PERIOD if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else 0
+    rma_band_needs = cfg.RMA_DAILY_BAND_PERIOD * 4  # warm-up margin for RMA convergence
+    daily_limit = max(pivot_needs, rma_band_needs)
     fetch_daily = cfg.ENABLE_PIVOT or cfg.ENABLE_CPR
     pair_requests = []
     valid_tasks = []     
