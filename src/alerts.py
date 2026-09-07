@@ -185,13 +185,20 @@ def format_daily_bias_line(cluster_context: Optional[ClusterContext]) -> str:
         return ""
     total = cluster_context.daily_bias_valid_total
     up, down = cluster_context.daily_bias_up, cluster_context.daily_bias_down
+    neutral = total - up - down
     up_pct = (up / total) * 100
     down_pct = (down / total) * 100
+    neutral_pct = (neutral / total) * 100
+
     if up > down:
-        return f"Bias \\- Uptrend\\({up_pct:.0f}%\\)\n\n"
+        icon, label, pct = "🟢▲", "Uptrend", up_pct
     elif down > up:
-        return f"Bias \\- Downtrend\\({down_pct:.0f}%\\)\n\n"
-    return f"Bias \\- Neutral \\({up_pct:.0f}% up / {down_pct:.0f}% down\\)\n\n"
+        icon, label, pct = "🔴▼", "Downtrend", down_pct
+    else:
+        icon, label, pct = "⬜", "Neutral", neutral_pct
+
+    breakdown = f"_{up_pct:.0f}%▲ {down_pct:.0f}%▼ {neutral_pct:.0f}%➖_"
+    return f"{icon} Bias \\- {label}\\({pct:.0f}%\\)\n{breakdown}\n\n"
 
 def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional[str] = None, score: Optional[float] = None, total: Optional[float] = None) -> str:
     if not title: 
