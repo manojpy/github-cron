@@ -311,44 +311,59 @@ def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
         logger.error(f"RMA calculation failed: {e}")
         return np.full_like(data, np.nan) if data is not None else np.array([np.nan]) 
 
-def compute_daily_rma_band_bias(data_daily: Optional[Dict[str, np.ndarray]], current_close: float,
-                                  reference_time: int, period: int = 11) -> Optional[str]:
-    """RMA(period) of daily High = upper band, RMA(period) of daily Low =
-    lower band, built from CLOSED daily candles only (today's still-forming
-    bar excluded via the same day-number convention used everywhere else in
-    this file — timestamp // 86400 — so the band can't repaint intraday).
-    Returns 'up' / 'down' / 'neutral', or None if there isn't enough daily
-    history yet for this pair."""
+def calculate_daily_rma11_bias(data_daily: Dict[str, np.ndarray], reference_time: int) -> str:
+    """
+    Determine daily timeframe bias based on RMA 11 band of high and low.
+    Returns: 'uptrend'  -> close > RMA(high,11)
+             'downtrend'-> close < RMA(low,11)
+             'neutral'  -> inside band or data insufficient.
+    """
     if data_daily is None:
-        return None
+        return "neutral"
 
-    ts_arr = data_daily.get("timestamp")
-    high_arr = data_daily.get("high")
-    low_arr = data_daily.get("low")
-    if ts_arr is None or high_arr is None or low_arr is None or len(ts_arr) == 0:
-        return None
+    close_arr = data_daily.get("close")
+    high_arr  = data_daily.get("high")
+    low_arr   = data_daily.get("low")
+    ts_arr    = data_daily.get("timestamp")
 
-    today_day_number = reference_time // 86400
-    closed_mask = (ts_arr // 86400) < today_day_number
-    closed_high = high_arr[closed_mask]
-    closed_low = low_arr[closed_mask]
+    if close_arr is None or high_arr is None or low_arr is None:
+        return "neutral"
 
-    if len(closed_high) < period or len(closed_low) < period:
-        return None
+    n = len(close_arr)
+    if n < 11:
+        return "neutral"
 
-    rma_high = calculate_rma_numpy(closed_high, period)
-    rma_low = calculate_rma_numpy(closed_low, period)
-    upper_band = rma_high[-1]
-    lower_band = rma_low[-1]
+    # Most recent closed daily candle (not future)
+    if ts_arr is not None and len(ts_arr) == n:
+        valid_mask = ts_arr <= reference_time
+        if not np.any(valid_mask):
+            return "neutral"
+        last_idx = int(np.where(valid_mask)[0][-1])
+    else:
+        last_idx = n - 1
 
-    if np.isnan(upper_band) or np.isnan(lower_band):
-        return None
+    if last_idx < 10:
+        return "neutral"
 
-    if current_close > upper_band:
-        return "up"
-    elif current_close < lower_band:
-        return "down"
-    return "neutral"
+    rma_high = calculate_rma_numpy(high_arr[:last_idx + 1], 11)
+    rma_low  = calculate_rma_numpy(low_arr[:last_idx + 1], 11)
+
+    if rma_high is None or rma_low is None or len(rma_high) == 0:
+        return "neutral"
+
+    current_close = float(close_arr[last_idx])
+    band_high     = float(rma_high[-1])
+    band_low      = float(rma_low[-1])
+
+    if np.isnan(band_high) or np.isnan(band_low) or band_high <= band_low:
+        return "neutral"
+
+    if current_close > band_high:
+        return "uptrend"
+    elif current_close < band_low:
+        return "downtrend"
+    else:
+        return "neutral"
 
 def calculate_ichimoku_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, conversion_periods: int = 9, base_periods: int = 26, span_b_periods: int = 52, displacement: int = 26) -> Dict[str, np.ndarray]:
     try:

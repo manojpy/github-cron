@@ -180,25 +180,27 @@ def _fmt_score(score: Optional[float], total: Optional[float] = None) -> str:
         return f" - {pct}%({_fmt_num(score)}/{_fmt_num(total)})"
     return f"({_fmt_num(score)})"
 
-def format_daily_bias_line(cluster_context: Optional[ClusterContext]) -> str:
-    if cluster_context is None or cluster_context.daily_bias_valid_total == 0:
+def _format_bias_message(distribution: Optional[Dict[str, int]]) -> str:
+    """Format the daily RMA 11 dominant-bias header for Telegram (MarkdownV2)."""
+    if distribution is None:
         return ""
-    total = cluster_context.daily_bias_valid_total
-    up, down = cluster_context.daily_bias_up, cluster_context.daily_bias_down
-    neutral = total - up - down
-    up_pct = (up / total) * 100
-    down_pct = (down / total) * 100
-    neutral_pct = (neutral / total) * 100
 
-    if up > down:
-        icon, label, pct = "🟢▲", "Uptrend", up_pct
-    elif down > up:
-        icon, label, pct = "🔴▼", "Downtrend", down_pct
+    uptrend_pct   = distribution.get("uptrend_pct", 0)
+    downtrend_pct = distribution.get("downtrend_pct", 0)
+    neutral_pct   = distribution.get("neutral_pct", 0)
+
+    # Pick the dominant direction
+    if uptrend_pct >= downtrend_pct and uptrend_pct >= neutral_pct:
+        emoji, arrow, label, pct = "🟢", "▲", "Uptrend", uptrend_pct
+    elif downtrend_pct >= uptrend_pct and downtrend_pct >= neutral_pct:
+        emoji, arrow, label, pct = "🔴", "▼", "Downtrend", downtrend_pct
     else:
-        icon, label, pct = "⬜", "Neutral", neutral_pct
+        emoji, arrow, label, pct = "⚪", "➖", "Neutral", neutral_pct
 
-    breakdown = f"_{up_pct:.0f}%▲ {down_pct:.0f}%▼ {neutral_pct:.0f}%➖_"
-    return f"{icon} Bias \\- {label}\\({pct:.0f}%\\)\n{breakdown}\n\n"
+    line1 = escape_markdown_v2(f"{emoji}{arrow} Bias - {label}({pct}%)")
+    line2 = escape_markdown_v2(f"{uptrend_pct}%▲ {downtrend_pct}%▼ {neutral_pct}%➖")
+
+    return f"{line1}\n{line2}"
 
 def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional[str] = None, score: Optional[float] = None, total: Optional[float] = None) -> str:
     if not title: 
@@ -1159,7 +1161,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     confluence_score_sell: Optional[float] = None, confluence_total_sell: Optional[float] = None,
     confluence_votes_sell: Optional[Dict[str, bool]] = None,
     macro_context: Optional[BtcMacroContext] = None,
-    cluster_context: Optional[ClusterContext] = None) -> Tuple[str, Dict[str, Any]]:
+    cluster_context: Optional[ClusterContext] = None,
+    bias_distribution: Optional[Dict[str, int]] = None) -> Tuple[str, Dict[str, Any]]:
 
     def _confluence_for(alert_key: str) -> Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]:
         if alert_key in BUY_ALERT_KEYS:
@@ -1543,13 +1546,17 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         if alerts_to_send:
             budget_refunded = False  # NEW: Flag to prevent double refund
             try:
-                bias_line = format_daily_bias_line(cluster_context)
                 if len(alerts_to_send) == 1:
                     title, extra, _ = alerts_to_send[0]
-                    msg = bias_line + build_single_msg(title, pair_name, close_curr, ts_curr, extra, score=confluence_score, total=confluence_total)
+                    msg = build_single_msg(title, pair_name, close_curr, ts_curr, extra, score=confluence_score, total=confluence_total)
                 else:
                     items = [(t, e) for t, e, _ in alerts_to_send[:25]]
-                    msg = bias_line + build_batched_msg(pair_name, close_curr, ts_curr, items, score=confluence_score, total=confluence_total)
+                    msg = build_batched_msg(pair_name, close_curr, ts_curr, items, score=confluence_score, total=confluence_total)
+
+                # ── Daily RMA 11 Bias Header ──
+                bias_prefix = _format_bias_message(bias_distribution)
+                if bias_prefix:
+                    msg = f"{bias_prefix}\n\n{msg}"
 
                 if not cfg.DRY_RUN_MODE:
                     reconfirmed = await confirm_candle_unchanged(
