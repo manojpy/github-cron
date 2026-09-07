@@ -364,10 +364,6 @@ class BotConfig(BaseModel):
     BIAS_ICHIMOKU_BASE_PERIODS: int = Field(default=65, ge=1, le=400, description="Base (Kijun) length for the bias-header cloud")
     BIAS_ICHIMOKU_SPANB_PERIODS: int = Field(default=130, ge=1, le=500, description="Leading Span B length for the bias-header cloud")
     BIAS_ICHIMOKU_DISPLACEMENT: int = Field(default=65, ge=1, le=400, description="Forward displacement for the bias-header cloud")
-    ENABLE_RUN_COMBINED_DISPATCH: bool = Field(default=True) 
-    RUN_COMBINED_CHAR_LIMIT: int = Field(default=4000, ge=500, le=4096) 
-    RUN_COMBINED_SPLIT_REPEAT_FOOTER: bool = Field(default=True) 
-    RUN_COMBINED_DEFAULT_DIRECTION_FIRST: str = Field(default="SELL") 
     RMA_CLOUD_ENABLED: bool = Field(default=True, description="Enable RMA(fast)/RMA(50) 15m cloud as trend gate; green (buy) when RMA_fast>RMA50, red (sell) when RMA_fast<RMA50. Reuses the existing RMA50(15m)/RMA_50_PERIOD used for base trend.")
     RMA_CLOUD_FAST_PERIOD: int = Field(default=20, ge=2, le=200, description="RMA Cloud fast period (15m). Slow leg reuses RMA_50_PERIOD.")
     DYNAMIC_FLOW_RIBBON_ENABLED: bool = Field(default=True, description="Enable the 15m Dynamic Flow Ribbon (BigBeluga) as a third cloud-group trend gate alongside Ichimoku Cloud and RMA Cloud; green (buy) when the band-flip direction is bullish, red (sell) when bearish")
@@ -490,13 +486,6 @@ class BotConfig(BaseModel):
     def validate_ppo_params(cls, v):
         if not (1 <= v <= 100):
             raise ValueError(f'PPO parameter must be 1-100, got {v}')
-        return v
-
-    @field_validator('RUN_COMBINED_DEFAULT_DIRECTION_FIRST')
-    def validate_run_combined_default_direction_first(cls, v: str) -> str:
-        v = str(v).upper()
-        if v not in {"SELL", "BUY"}:
-            raise ValueError("RUN_COMBINED_DEFAULT_DIRECTION_FIRST must be either 'SELL' or 'BUY'")
         return v
 
     @model_validator(mode='after')
