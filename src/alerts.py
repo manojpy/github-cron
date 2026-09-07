@@ -1553,7 +1553,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     msg = build_batched_msg(pair_name, close_curr, ts_curr, items, score=confluence_score, total=confluence_total)
 
                 if cfg.ENABLE_BIAS_HEADER and bias_context is not None:
-                    msg = f"{_format_bias_header(bias_context)}\n\n{msg}"
+                    body, _, datetime_line = msg.rpartition("\n")
+                    msg = f"{body}\n{_format_bias_header(bias_context)}\n{datetime_line}"
 
                 if not cfg.DRY_RUN_MODE:
                     reconfirmed = await confirm_candle_unchanged(
