@@ -19,17 +19,18 @@ from bot_config import (
     TRACE_ID, PAIR_ID, cfg, logger, logger_main,
     format_ist_time, MEMORY_CHECK_INTERVAL_PAIRS, validate_runtime_config,
     json_dumps, json_loads, JSON_BACKEND, shutdown_event, __version__, BtcMacroContext,
-    ClusterContext,
+    ClusterContext, BiasContext,
 )
 # ── fetcher : only orchestrator-level I/O ──
 from fetcher import (
     SessionManager, DataFetcher, PriceData, parse_candles_to_numpy,
+    get_last_closed_index_from_array,
 )
 # ── indicators : only helpers macd_unified.py calls directly ──
 from indicators import (
     get_utc_date_key, should_reset_daily_state, warmup_if_needed,
     _normalize_samples, _prune_stale_samples, _oi_funding_gate_reason,
-    calculate_daily_rma11_bias,
+    calculate_ichimoku_numpy,
 )
 # ── state / gates / alerts : trim to direct usage ──
 from state import (
@@ -91,7 +92,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None,
     macro_context: Optional[BtcMacroContext] = None,
     cluster_context: Optional[ClusterContext] = None,
-    bias_distribution: Optional[Dict[str, int]] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
+    bias_context: Optional[BiasContext] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
 
@@ -205,7 +206,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             confluence_votes_sell=confluence_votes_sell,
             macro_context=macro_context,
             cluster_context=cluster_context,
-            bias_distribution=bias_distribution,
+            bias_context=bias_context,
         )
     finally:
         PAIR_ID.set("")
@@ -226,9 +227,8 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
                        oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None,
                        macro_context: Optional[BtcMacroContext] = None,
                        cluster_context: Optional[ClusterContext] = None,
-                       bias_distribution: Optional[Dict[str, int]] = None):
+                       bias_context: Optional[BiasContext] = None):
     p_name, symbol, candles = task_data
-
     try:
         pd_15m = parse_candles_to_numpy(candles.get("15"))
         pd_5m = parse_candles_to_numpy(candles.get("5"))
@@ -252,7 +252,7 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
             oi_gate_data=oi_gate_data,
             macro_context=macro_context,
             cluster_context=cluster_context,
-            bias_distribution=bias_distribution,
+            bias_context=bias_context,
         )
         return result
 
@@ -315,6 +315,63 @@ async def _compute_directional_cluster(
         buy_pct=buy_count / total, sell_pct=sell_count / total,
     )
 
+async def _compute_bias_context(
+    prepared_tasks: List[Tuple[str, str, Dict[str, Any]]],
+    reference_time: int,
+) -> Optional[BiasContext]:
+    """Pair-universe Ichimoku directional-bias pre-pass (23/65/130/65 on 15m
+    by default — see cfg.BIAS_ICHIMOKU_*). Cosmetic only: feeds the header
+    line prepended to every outgoing alert this run (cfg.ENABLE_BIAS_HEADER);
+    never gates or filters an alert. See BiasContext docstring for the
+    per-pair up/down/neutral classification rule."""
+    up = down = neutral = 0
+    counted = 0
+
+    for p_name, symbol, candles in prepared_tasks:
+        try:
+            pd_15m = parse_candles_to_numpy(candles.get("15"))
+            if pd_15m is None:
+                continue
+
+            i15 = get_last_closed_index_from_array(pd_15m.ts, 15, reference_time, p_name)
+            if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
+                continue
+
+            ichimoku = calculate_ichimoku_numpy(
+                pd_15m.high, pd_15m.low, pd_15m.close,
+                cfg.BIAS_ICHIMOKU_CONVERSION_PERIODS,
+                cfg.BIAS_ICHIMOKU_BASE_PERIODS,
+                cfg.BIAS_ICHIMOKU_SPANB_PERIODS,
+                cfg.BIAS_ICHIMOKU_DISPLACEMENT,
+            )
+            price = pd_15m.close[i15]
+            cloud_upper = ichimoku['cloud_upper'][i15]
+            cloud_lower = ichimoku['cloud_lower'][i15]
+            future_green = bool(ichimoku['future_green'][i15])
+            future_red = bool(ichimoku['future_red'][i15])
+
+            if np.isnan(price) or np.isnan(cloud_upper) or np.isnan(cloud_lower):
+                continue
+
+            counted += 1
+            if price > cloud_upper and future_green:
+                up += 1
+            elif price < cloud_lower and future_red:
+                down += 1
+            else:
+                neutral += 1
+        except Exception as e:
+            logger_main.debug(f"Bias pre-pass failed for {p_name}: {e}")
+            continue
+
+    if counted == 0:
+        return None
+
+    return BiasContext(
+        up_count=up, down_count=down, neutral_count=neutral, total_pairs=counted,
+        up_pct=up / counted, down_pct=down / counted, neutral_pct=neutral / counted,
+    )
+
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict],
     pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue,
     correlation_id: str, lock: RedisLock, reference_time: int,
@@ -332,8 +389,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER,
         cfg.RMA_200_PERIOD * 3 
     )
-    fetch_daily = True  # Always fetch daily for RMA11 bias + pivot/CPR
-    daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else 15
+    daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else 0
+    fetch_daily = cfg.ENABLE_PIVOT or cfg.ENABLE_CPR
     pair_requests = []
     valid_tasks = []     
     daily_symbols = []
@@ -498,32 +555,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     else:
         state_db._shadow_pending_outcome_keys_by_pair = None
 
-    # ── Daily RMA 11 Bias Computation (all pairs) ──
-    pair_bias_map: Dict[str, str] = {}
-    for pair_name in pairs_to_process:
-        candles = all_candles.get(pair_name, {})
-        pd_daily = parse_candles_to_numpy(candles.get("D")) if candles.get("D") else None
-        if pd_daily is not None:
-            bias = calculate_daily_rma11_bias(pd_daily.as_dict(), reference_time)
-            pair_bias_map[pair_name] = bias
-        else:
-            pair_bias_map[pair_name] = "neutral"
-
-    total_pairs_bias = len(pair_bias_map)
-    uptrend_count   = sum(1 for v in pair_bias_map.values() if v == "uptrend")
-    downtrend_count = sum(1 for v in pair_bias_map.values() if v == "downtrend")
-    neutral_count   = total_pairs_bias - uptrend_count - downtrend_count
-
-    bias_distribution = {
-        "uptrend_pct":   round((uptrend_count   / total_pairs_bias) * 100) if total_pairs_bias else 0,
-        "downtrend_pct": round((downtrend_count / total_pairs_bias) * 100) if total_pairs_bias else 0,
-        "neutral_pct":   round((neutral_count   / total_pairs_bias) * 100) if total_pairs_bias else 0,
-    }
-    logger_main.info(
-        f"📊 Daily RMA11 Bias | ▲:{uptrend_count} ▼:{downtrend_count} ➖:{neutral_count} "
-        f"({bias_distribution['uptrend_pct']}%▲ {bias_distribution['downtrend_pct']}%▼ {bias_distribution['neutral_pct']}%➖)"
-    )
-
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
 
     prepared_tasks = []
@@ -592,6 +623,22 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             logger_main.warning(f"Cluster pre-pass failed, disabling cluster gate this run: {e}")
             cluster_context = None
 
+    # ── Pair-Universe Ichimoku Bias Header (cosmetic only — see BiasContext docstring) ──
+    bias_context: Optional[BiasContext] = None
+    if cfg.ENABLE_BIAS_HEADER:
+        try:
+            bias_context = await _compute_bias_context(prepared_tasks, reference_time)
+            if bias_context:
+                logger_main.info(
+                    f"🧭 Bias: up={bias_context.up_count}/{bias_context.total_pairs} "
+                    f"({bias_context.up_pct:.0%}), down={bias_context.down_count}/{bias_context.total_pairs} "
+                    f"({bias_context.down_pct:.0%}), neutral={bias_context.neutral_count}/{bias_context.total_pairs} "
+                    f"({bias_context.neutral_pct:.0%})"
+                )
+        except Exception as e:
+            logger_main.warning(f"Bias pre-pass failed, disabling bias header this run: {e}")
+            bias_context = None
+
     logger_main.debug(f"🧠 Phase 3: Evaluating {len(prepared_tasks)} pairs...")
     eval_start = time.time()
     eval_semaphore = asyncio.Semaphore(cfg.EVAL_CONCURRENCY_LIMIT)  # NEW, e.g. 5
@@ -604,9 +651,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 oi_gate_data=oi_gate_data,
                 macro_context=btc_context,
                 cluster_context=cluster_context,
-                bias_distribution=bias_distribution,
+                bias_context=bias_context,
             )
-
     results = await asyncio.gather(
         *[_bounded_eval(t) for t in prepared_tasks],
         return_exceptions=True,

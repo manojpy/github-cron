@@ -186,6 +186,27 @@ class ClusterContext:
     buy_pct: float
     sell_pct: float
 
+@dataclass
+class BiasContext:
+    """Same-run Ichimoku directional-bias snapshot across the whole pair
+    universe (23/65/130/65 on 15m by default — see BIAS_ICHIMOKU_* config),
+    computed via a pre-pass before Phase-3 dispatch (see
+    _compute_bias_context in macd_unified.py). Purely a cosmetic header
+    prepended to every outgoing Telegram message this run — see
+    cfg.ENABLE_BIAS_HEADER. Never gates or filters an alert.
+    A pair counts as:
+      up      - last closed 15m close above the cloud AND future cloud green
+      down    - last closed 15m close below the cloud AND future cloud red
+      neutral - everything else (inside the cloud, NaN cloud, or a
+                mismatched price/future-cloud combination)"""
+    up_count: int
+    down_count: int
+    neutral_count: int
+    total_pairs: int
+    up_pct: float
+    down_pct: float
+    neutral_pct: float
+
 class CompiledPatterns:
     VALID_SYMBOL = re.compile(r'^[A-Z0-9_]+$')
     ESCAPE_MARKDOWN = re.compile(r'[_*\[\]()~`>#+\-=|{}.!]') 
@@ -338,6 +359,11 @@ class BotConfig(BaseModel):
     ICHIMOKU_TK_CONVERSION_PERIODS: int = Field(default=23, ge=1, le=300, description="Tenkan (conversion) length used for TK guard + cross alerts, independent of cloud conversion length")
     ICHIMOKU_TK_BASE_PERIODS: int = Field(default=65, ge=1, le=400, description="Kijun (base) length used for TK guard + cross alerts, independent of cloud base length")
     ICHIMOKU_TK_GUARD_ENABLED: bool = Field(default=True, description="Require 15m Tenkan(conversion) vs Kijun(base) alignment: buy needs conversion>=base, sell needs conversion<=base")
+    ENABLE_BIAS_HEADER: bool = Field(default=True, description="Prepend a pair-universe Ichimoku directional-bias header (cosmetic only, does not gate alerts) to every outgoing Telegram message")
+    BIAS_ICHIMOKU_CONVERSION_PERIODS: int = Field(default=23, ge=1, le=300, description="Conversion (Tenkan) length for the standalone bias-header Ichimoku cloud, independent of the alert-gate cloud")
+    BIAS_ICHIMOKU_BASE_PERIODS: int = Field(default=65, ge=1, le=400, description="Base (Kijun) length for the bias-header cloud")
+    BIAS_ICHIMOKU_SPANB_PERIODS: int = Field(default=130, ge=1, le=500, description="Leading Span B length for the bias-header cloud")
+    BIAS_ICHIMOKU_DISPLACEMENT: int = Field(default=65, ge=1, le=400, description="Forward displacement for the bias-header cloud")
     RMA_CLOUD_ENABLED: bool = Field(default=True, description="Enable RMA(fast)/RMA(50) 15m cloud as trend gate; green (buy) when RMA_fast>RMA50, red (sell) when RMA_fast<RMA50. Reuses the existing RMA50(15m)/RMA_50_PERIOD used for base trend.")
     RMA_CLOUD_FAST_PERIOD: int = Field(default=20, ge=2, le=200, description="RMA Cloud fast period (15m). Slow leg reuses RMA_50_PERIOD.")
     DYNAMIC_FLOW_RIBBON_ENABLED: bool = Field(default=True, description="Enable the 15m Dynamic Flow Ribbon (BigBeluga) as a third cloud-group trend gate alongside Ichimoku Cloud and RMA Cloud; green (buy) when the band-flip direction is bullish, red (sell) when bearish")

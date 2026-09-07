@@ -14,9 +14,8 @@ import numpy as np
 from bot_config import (
     cfg, logger, Constants, CompiledPatterns, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
     shutdown_event, format_ist_time, json_dumps, CONFLUENCE_WEIGHTS, BtcMacroContext,
-    ClusterContext, _get_session_from_ts,
+    ClusterContext, BiasContext, _get_session_from_ts,
 )
-
 from fetcher import (
     PriceData, DataFetcher, SessionManager, compute_backoff, validate_indicator_values,
     CandleSnapshot, cross_check_15m_against_5m,
@@ -180,28 +179,6 @@ def _fmt_score(score: Optional[float], total: Optional[float] = None) -> str:
         return f" - {pct}%({_fmt_num(score)}/{_fmt_num(total)})"
     return f"({_fmt_num(score)})"
 
-def _format_bias_message(distribution: Optional[Dict[str, int]]) -> str:
-    """Format the daily RMA 11 dominant-bias header for Telegram (MarkdownV2)."""
-    if distribution is None:
-        return ""
-
-    uptrend_pct   = distribution.get("uptrend_pct", 0)
-    downtrend_pct = distribution.get("downtrend_pct", 0)
-    neutral_pct   = distribution.get("neutral_pct", 0)
-
-    # Pick the dominant direction
-    if uptrend_pct >= downtrend_pct and uptrend_pct >= neutral_pct:
-        emoji, arrow, label, pct = "🟢", "▲", "Uptrend", uptrend_pct
-    elif downtrend_pct >= uptrend_pct and downtrend_pct >= neutral_pct:
-        emoji, arrow, label, pct = "🔴", "▼", "Downtrend", downtrend_pct
-    else:
-        emoji, arrow, label, pct = "⚪", "➖", "Neutral", neutral_pct
-
-    line1 = escape_markdown_v2(f"{emoji}{arrow} Bias - {label}({pct}%)")
-    line2 = escape_markdown_v2(f"{uptrend_pct}%▲ {downtrend_pct}%▼ {neutral_pct}%➖")
-
-    return f"{line1}\n{line2}"
-
 def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional[str] = None, score: Optional[float] = None, total: Optional[float] = None) -> str:
     if not title: 
         title = "ALERT"
@@ -283,6 +260,28 @@ def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str
     datetime_line = f"📆  {e_date}{spacing}⏰ {e_time}"
     
     return f"{line1}\n{body}\n{datetime_line}"
+
+def _format_bias_header(bias_context: BiasContext) -> str:
+    """2-line pair-universe Ichimoku bias header prepended to every outgoing
+    message when cfg.ENABLE_BIAS_HEADER is True (see BiasContext docstring).
+    Line 1 names the dominant state (Up/Down/Neutral, by pair count — ties
+    break Up > Down > Neutral) with its own emoji + percentage. Line 2 always
+    lists all three percentages in fixed order, independent of which is
+    dominant. Returned pre-escaped for MarkdownV2."""
+    up_pct = round(bias_context.up_pct * 100)
+    down_pct = round(bias_context.down_pct * 100)
+    neutral_pct = round(bias_context.neutral_pct * 100)
+
+    candidates = [
+        (bias_context.up_count, "🟢▲", "Uptrend", up_pct),
+        (bias_context.down_count, "🔴▼", "Downtrend", down_pct),
+        (bias_context.neutral_count, "⚪➖", "Neutral", neutral_pct),
+    ]
+    _, emoji, label, pct = max(candidates, key=lambda t: t[0])
+
+    line1 = f"{emoji} Bias \\- {label}\\({pct}%\\)"
+    line2 = f"{up_pct}%▲ {down_pct}%▼ {neutral_pct}%➖"
+    return f"{line1}\n{line2}"
 
 def create_pivot_alert(level: str, is_buy: bool) -> Dict[str, Any]:
     """Factory function to create pivot alert definitions (check_fn/extra_fn are lambdas closing over `level`/`is_buy`)"""
@@ -1162,7 +1161,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     confluence_votes_sell: Optional[Dict[str, bool]] = None,
     macro_context: Optional[BtcMacroContext] = None,
     cluster_context: Optional[ClusterContext] = None,
-    bias_distribution: Optional[Dict[str, int]] = None) -> Tuple[str, Dict[str, Any]]:
+    bias_context: Optional[BiasContext] = None) -> Tuple[str, Dict[str, Any]]:
 
     def _confluence_for(alert_key: str) -> Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]:
         if alert_key in BUY_ALERT_KEYS:
@@ -1553,10 +1552,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     items = [(t, e) for t, e, _ in alerts_to_send[:25]]
                     msg = build_batched_msg(pair_name, close_curr, ts_curr, items, score=confluence_score, total=confluence_total)
 
-                # ── Daily RMA 11 Bias Header ──
-                bias_prefix = _format_bias_message(bias_distribution)
-                if bias_prefix:
-                    msg = f"{bias_prefix}\n\n{msg}"
+                if cfg.ENABLE_BIAS_HEADER and bias_context is not None:
+                    msg = f"{_format_bias_header(bias_context)}\n\n{msg}"
 
                 if not cfg.DRY_RUN_MODE:
                     reconfirmed = await confirm_candle_unchanged(
