@@ -283,6 +283,611 @@ def _format_bias_header(bias_context: BiasContext) -> str:
     line2 = f"{up_pct}%▲ {down_pct}%▼ {neutral_pct}%➖"
     return f"{line1}\n{line2}"
 
+# ─────────────────────────────────────────────────────────────────────
+# Run-level combined dispatch support
+# ─────────────────────────────────────────────────────────────────────
+
+RUN_COMBINED_SEPARATOR = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+@dataclass
+class QueuedPairAlert:
+    """
+    One direction-specific alert payload queued for run-level combined dispatch.
+
+    If a pair somehow has both BUY and SELL alerts in the same run, it should be
+    split into two QueuedPairAlert objects: one BUY payload and one SELL payload.
+    """
+    pair: str
+    direction: str                     # "BUY" or "SELL"
+    price: float
+    ts: int
+    score: Optional[float]
+    total: Optional[float]
+    items: List[Tuple[str, str]]       # (title, extra)
+    activation_changes: List[Tuple[str, str, None]]
+    alert_keys: List[str]
+    alert_count: int
+    outcome_metas: List[Dict[str, Any]]
+
+async def _refund_global_alert_budget(
+    n: int,
+    alerts_sent_ref: Optional[List[int]],
+    alerts_sent_lock: Optional[asyncio.Lock],
+) -> None:
+    """
+    Global helper for refunding the per-run alert budget.
+    The existing _apply_and_dispatch_alerts() also has a nested _refund_alert_budget();
+    this one is used by the run-level dispatcher.
+    """
+    if n > 0 and alerts_sent_ref is not None and alerts_sent_lock is not None:
+        async with alerts_sent_lock:
+            alerts_sent_ref[0] = max(0, alerts_sent_ref[0] - n)
+
+
+def _run_direction_order(bias_context: Optional[BiasContext]) -> List[str]:
+    """
+    Returns direction order for combined dispatch.
+
+    Dominant bias down  -> ["SELL", "BUY"]
+    Dominant bias up    -> ["BUY", "SELL"]
+    Neutral / no bias   -> configured default first
+    """
+    default = str(getattr(cfg, "RUN_COMBINED_DEFAULT_DIRECTION_FIRST", "SELL")).upper()
+    if default not in ("SELL", "BUY"):
+        default = "SELL"
+
+    if bias_context is None:
+        first = default
+    else:
+        # Tie-break intentionally favors SELL when down_count == up_count.
+        if (
+            bias_context.down_count >= bias_context.up_count
+            and bias_context.down_count >= bias_context.neutral_count
+        ):
+            first = "SELL"
+        elif (
+            bias_context.up_count > bias_context.down_count
+            and bias_context.up_count >= bias_context.neutral_count
+        ):
+            first = "BUY"
+        else:
+            first = default
+
+    second = "BUY" if first == "SELL" else "SELL"
+    return [first, second]
+
+def _queued_alert_sort_key(payload: QueuedPairAlert, direction_order: List[str]):
+    """
+    Sort key:
+      1. Direction order based on dominant bias
+      2. Confluence percentage descending
+      3. Absolute score descending
+      4. Total achievable score descending
+      5. Alert count descending
+      6. Pair name ascending
+    """
+    try:
+        dir_index = direction_order.index(payload.direction)
+    except ValueError:
+        dir_index = 99
+
+    pct = 0.0
+    if payload.score is not None and payload.total not in (None, 0):
+        try:
+            pct = (payload.score / payload.total) * 100.0
+        except Exception:
+            pct = 0.0
+
+    return (
+        dir_index,
+        -pct,
+        -(payload.score or 0.0),
+        -(payload.total or 0.0),
+        -payload.alert_count,
+        payload.pair,
+    )
+
+def _render_run_footer(bias_context: Optional[BiasContext], ts: int) -> str:
+    """
+    Shared footer for combined dispatch:
+      Bias line(s)
+      Date/time line
+    """
+    date_str = format_ist_time(ts, '%d-%m-%Y')
+    time_str = format_ist_time(ts, '%H:%M IST')
+
+    e_date = escape_markdown_v2(date_str)
+    e_time = escape_markdown_v2(time_str)
+
+    spacing = " " * 12
+    datetime_line = f"📆  {e_date}{spacing}⏰ {e_time}"
+
+    if cfg.ENABLE_BIAS_HEADER and bias_context is not None:
+        return f"{_format_bias_header(bias_context)}\n{datetime_line}"
+
+    return datetime_line
+
+def _render_queued_pair_block(payload: QueuedPairAlert) -> str:
+    """
+    Renders one pair block without the global bias/date footer.
+    This is the combined-message version of build_batched_msg().
+    """
+    if not payload.items:
+        return ""
+
+    price_str = _format_price(payload.price)
+
+    e_pair = escape_markdown_v2(payload.pair)
+    e_score = escape_markdown_v2(_fmt_score(payload.score, payload.total))
+    e_price = escape_markdown_v2(price_str)
+
+    headline_emoji = payload.items[0][0].split(" ", 1)[0] if payload.items[0][0] else "📊"
+    e_headline_emoji = escape_markdown_v2(headline_emoji)
+
+    lines = [
+        f"{e_headline_emoji} *{e_pair}{e_score}* \\- *{e_price}*"
+    ]
+
+    condensed = len(payload.items) > 2
+
+    for idx, (title, extra) in enumerate(payload.items):
+        parts = title.split(" ", 1)
+        description = parts[1] if len(parts) == 2 else title
+        e_desc = escape_markdown_v2(description)
+
+        is_last = idx == len(payload.items) - 1
+        prefix = "➤" if is_last else "├➤"
+
+        if condensed:
+            lines.append(f"{prefix} *{e_desc}*")
+        else:
+            extra_clean = _clean_extra_text(extra)
+            e_extra = escape_markdown_v2(extra_clean)
+            if e_extra:
+                lines.append(f"{prefix} *{e_desc}* : _{e_extra}_")
+            else:
+                lines.append(f"{prefix} *{e_desc}*")
+
+    return "\n".join(lines)
+
+def _build_combined_message_chunks(
+    payload_blocks: List[Tuple[QueuedPairAlert, str]],
+    footer: str,
+    limit: int,
+) -> List[Tuple[str, List[QueuedPairAlert]]]:
+    """
+    Builds Telegram-ready combined messages.
+
+    Returns:
+      [
+          (message_text, [payload, payload, ...]),
+          ...
+      ]
+
+    Chunking is done at pair-block boundaries.
+    """
+    if not payload_blocks:
+        return []
+
+    repeat_footer = bool(getattr(cfg, "RUN_COMBINED_SPLIT_REPEAT_FOOTER", True))
+    sep = "\n" + RUN_COMBINED_SEPARATOR + "\n"
+
+    chunks: List[Tuple[str, List[QueuedPairAlert]]] = []
+    current_blocks: List[str] = []
+    current_payloads: List[QueuedPairAlert] = []
+
+    def _make_msg(blocks: List[str], include_footer: bool) -> str:
+        body = sep.join(blocks)
+        if include_footer:
+            return f"{body}{sep}{footer}"
+        return body
+
+    for payload, block in payload_blocks:
+        candidate_footer = footer if ((len(chunks) == 0) or repeat_footer) else ""
+        candidate_blocks = current_blocks + [block]
+        candidate_body = sep.join(candidate_blocks)
+        candidate_msg = (
+            f"{candidate_body}{sep}{candidate_footer}"
+            if candidate_footer
+            else candidate_body
+        )
+
+        if len(candidate_msg) <= limit or not current_blocks:
+            current_blocks.append(block)
+            current_payloads.append(payload)
+        else:
+            include_footer = (len(chunks) == 0) or repeat_footer
+            chunks.append((_make_msg(current_blocks, include_footer), current_payloads))
+
+            current_blocks = [block]
+            current_payloads = [payload]
+
+    if current_blocks:
+        include_footer = (len(chunks) == 0) or repeat_footer
+        chunks.append((_make_msg(current_blocks, include_footer), current_payloads))
+
+    return chunks
+
+def _build_payload_message(
+    payload: QueuedPairAlert,
+    items: List[Tuple[str, str]],
+    bias_context: Optional[BiasContext],
+) -> str:
+    """
+    Builds a normal per-pair Telegram message for fallback dispatch.
+    """
+    if not items:
+        return ""
+
+    if len(items) == 1:
+        title, extra = items[0]
+        msg = build_single_msg(
+            title,
+            payload.pair,
+            payload.price,
+            payload.ts,
+            extra,
+            score=payload.score,
+            total=payload.total,
+        )
+    else:
+        msg = build_batched_msg(
+            payload.pair,
+            payload.price,
+            payload.ts,
+            items,
+            score=payload.score,
+            total=payload.total,
+        )
+
+    if cfg.ENABLE_BIAS_HEADER and bias_context is not None:
+        body, _, datetime_line = msg.rpartition("\n")
+        msg = f"{body}\n{_format_bias_header(bias_context)}\n{datetime_line}"
+
+    return msg
+
+async def _send_payload_individually(
+    payload: QueuedPairAlert,
+    telegram_queue: TelegramQueue,
+    bias_context: Optional[BiasContext],
+    logger_run: logging.Logger,
+) -> bool:
+    """
+    Fallback sender: sends one queued pair payload as its own Telegram message.
+
+    If the message is too long, it attempts to split the pair's alert items
+    across multiple messages.
+    """
+    if not payload.items:
+        return True
+
+    limit = int(getattr(cfg, "RUN_COMBINED_CHAR_LIMIT", 4000))
+
+    full_msg = _build_payload_message(payload, payload.items, bias_context)
+    if len(full_msg) <= limit:
+        ok = await telegram_queue.send(full_msg)
+        if not ok:
+            logger_run.error(f"Fallback individual send failed for {payload.pair}")
+        return ok
+
+    # Chunk items if the full pair message is too large.
+    current: List[Tuple[str, str]] = []
+
+    for item in payload.items:
+        candidate = current + [item]
+        candidate_msg = _build_payload_message(payload, candidate, bias_context)
+
+        if len(candidate_msg) <= limit or not current:
+            current = candidate
+        else:
+            msg = _build_payload_message(payload, current, bias_context)
+            ok = await telegram_queue.send(msg)
+            if not ok:
+                logger_run.error(
+                    f"Fallback chunk send failed for {payload.pair}; "
+                    f"remaining items for this pair may not be sent"
+                )
+                return False
+            current = [item]
+
+    if current:
+        msg = _build_payload_message(payload, current, bias_context)
+        ok = await telegram_queue.send(msg)
+        if not ok:
+            logger_run.error(f"Fallback final chunk send failed for {payload.pair}")
+        return ok
+
+    return True
+
+def _build_queued_pair_payloads(
+    pair_name: str,
+    alerts_to_send: List[Tuple[str, str, str]],
+    price: float,
+    ts: int,
+    direction_scores: Dict[str, Tuple[Optional[float], Optional[float]]],
+    confluence_for_fn: Callable[[str], Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]],
+    context: Dict[str, Any],
+    gr: GateResult,
+    macro_shadow: Optional[Dict[str, Any]],
+    adx_val: float,
+) -> List[QueuedPairAlert]:
+    """
+    Converts surviving alerts into direction-specific queued payloads.
+
+    BUY and SELL are separated so run-level ordering/grouping works cleanly.
+    """
+    if not alerts_to_send:
+        return []
+
+    trigger_context = {
+        "rsi_curr": context.get("rsi_curr"),
+        "rsi_adaptive_buy": gr.rsi_adaptive_buy,
+        "rsi_adaptive_sell": gr.rsi_adaptive_sell,
+        "ppo_curr": context.get("ppo_curr"),
+        "ppo_adaptive_threshold": gr.ppo_adaptive_threshold,
+        "buy_wick_ratio": gr.buy_wick_ratio,
+        "sell_wick_ratio": gr.sell_wick_ratio,
+        "adx_val": gr.adx_val,
+        "config_version": hash_config_state(
+            CONFLUENCE_WEIGHTS,
+            cfg.CONFLUENCE_MIN_ABS_SCORE,
+            cfg.CONFLUENCE_MIN_PCT,
+        ),
+        "macro_correlation": macro_shadow.get("correlation") if macro_shadow else None,
+        "macro_relative_strength": macro_shadow.get("relative_strength") if macro_shadow else None,
+        "macro_multiplier": macro_shadow.get("multiplier") if macro_shadow else None,
+        "macro_would_block": macro_shadow.get("would_block") if macro_shadow else None,
+    }
+
+    payloads: List[QueuedPairAlert] = []
+
+    for direction, key_set in (("BUY", BUY_ALERT_KEYS), ("SELL", SELL_ALERT_KEYS)):
+        selected = [
+            (title, extra, alert_key)
+            for title, extra, alert_key in alerts_to_send
+            if alert_key in key_set
+        ]
+
+        if not selected:
+            continue
+
+        score, total = direction_scores.get(direction, (None, None))
+
+        # Fallback if direction score was not explicitly supplied.
+        if score is None and total is None:
+            try:
+                s0, t0, _ = confluence_for_fn(selected[0][2])
+                score, total = s0, t0
+            except Exception:
+                score, total = None, None
+
+        items = [(title, extra) for title, extra, _ in selected]
+
+        activation_changes = [
+            (f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None)
+            for _, _, alert_key in selected
+        ]
+
+        alert_keys = [alert_key for _, _, alert_key in selected]
+
+        outcome_metas: List[Dict[str, Any]] = []
+
+        if cfg.ENABLE_WIN_RATE_FILTER and not cfg.DRY_RUN_MODE:
+            for _, _, alert_key in selected:
+                s, t, v = confluence_for_fn(alert_key)
+                outcome_metas.append({
+                    "pair": pair_name,
+                    "alert_key": alert_key,
+                    "direction": direction.lower(),
+                    "entry_ts": ts,
+                    "price": price,
+                    "score": s,
+                    "total": t,
+                    "votes": v,
+                    "adx_val": adx_val,
+                    "context": trigger_context,
+                })
+
+        payloads.append(
+            QueuedPairAlert(
+                pair=pair_name,
+                direction=direction,
+                price=price,
+                ts=ts,
+                score=score,
+                total=total,
+                items=items,
+                activation_changes=activation_changes,
+                alert_keys=alert_keys,
+                alert_count=len(items),
+                outcome_metas=outcome_metas,
+            )
+        )
+
+    return payloads
+
+async def _finalize_sent_queued_alerts(
+    sdb: RedisStateStore,
+    payloads: List[QueuedPairAlert],
+    logger_run: logging.Logger,
+) -> None:
+    """
+    Marks Redis alert states ACTIVE and records pending outcomes for payloads
+    that were actually sent successfully.
+    """
+    if not payloads:
+        return
+
+    changes: List[Tuple[str, str, None]] = []
+    for payload in payloads:
+        changes.extend(payload.activation_changes)
+
+    if changes:
+        ok = await sdb.atomic_batch_update(changes)
+        if not ok:
+            logger_run.error(
+                "Combined dispatch: state persistence failed after Telegram send. "
+                "Alerts were sent but Redis ACTIVE state may be inconsistent."
+            )
+
+    if cfg.ENABLE_WIN_RATE_FILTER and not cfg.DRY_RUN_MODE:
+        for payload in payloads:
+            for meta in payload.outcome_metas:
+                try:
+                    await sdb.record_pending_outcome(
+                        meta["pair"],
+                        meta["alert_key"],
+                        meta["direction"],
+                        meta["entry_ts"],
+                        meta["price"],
+                        confluence_score=meta["score"],
+                        confluence_total=meta["total"],
+                        confluence_votes=meta["votes"],
+                        adx_val=meta["adx_val"],
+                        context=meta["context"],
+                    )
+
+                    if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                        from outcome_storage import append_outcome
+                        append_outcome(meta)
+
+                except Exception as e:
+                    logger_run.warning(
+                        f"Failed recording outcome for {meta.get('pair')}:"
+                        f"{meta.get('alert_key')}: {e}"
+                    )
+
+
+async def dispatch_run_alerts(
+    queued_payloads: List[QueuedPairAlert],
+    telegram_queue: TelegramQueue,
+    sdb: RedisStateStore,
+    bias_context: Optional[BiasContext],
+    alerts_sent_ref: Optional[List[int]],
+    alerts_sent_lock: Optional[asyncio.Lock],
+    logger_run: logging.Logger,
+) -> Dict[str, Any]:
+    """
+    Final run-level dispatcher.
+
+    1. Sort payloads by dominant bias direction, then confluence score.
+    2. Build combined Telegram message(s).
+    3. Send combined message(s).
+    4. If combined send fails, fall back to individual pair messages.
+    5. Mark Redis states ACTIVE and record outcomes only for sent alerts.
+    6. Refund alert budget for alerts that ultimately failed.
+    """
+    summary: Dict[str, Any] = {
+        "queued_pairs": len(queued_payloads),
+        "sent_pairs": 0,
+        "failed_pairs": 0,
+        "combined_messages_sent": 0,
+        "fallback_messages_sent": 0,
+    }
+
+    if not queued_payloads:
+        return summary
+
+    limit = int(getattr(cfg, "RUN_COMBINED_CHAR_LIMIT", 4000))
+
+    direction_order = _run_direction_order(bias_context)
+    ordered_payloads = sorted(
+        queued_payloads,
+        key=lambda p: _queued_alert_sort_key(p, direction_order),
+    )
+
+    ts = ordered_payloads[0].ts
+    footer = _render_run_footer(bias_context, ts)
+
+    payload_blocks: List[Tuple[QueuedPairAlert, str]] = []
+    oversized_payloads: List[QueuedPairAlert] = []
+
+    # Pre-filter payloads whose single block is already too large.
+    # These will be sent via fallback individual dispatcher, where item-level
+    # splitting can be attempted.
+    for payload in ordered_payloads:
+        block = _render_queued_pair_block(payload)
+        conservative_len = (
+            len(block)
+            + len(footer)
+            + (len(RUN_COMBINED_SEPARATOR) * 2)
+            + 10
+        )
+
+        if conservative_len > limit:
+            oversized_payloads.append(payload)
+        else:
+            payload_blocks.append((payload, block))
+
+    chunks = _build_combined_message_chunks(payload_blocks, footer, limit)
+
+    unsent_payloads: List[QueuedPairAlert] = list(oversized_payloads)
+    failed_payloads: List[QueuedPairAlert] = []
+
+    # ── Send combined chunks ─────────────────────────────────────────
+    for chunk_idx, (msg, chunk_payloads) in enumerate(chunks):
+        ok = False
+
+        if cfg.DRY_RUN_MODE:
+            logger_run.info(
+                f"[DRY RUN] Combined alert part {chunk_idx + 1}/{len(chunks)}:\n{msg}"
+            )
+            ok = True
+        else:
+            ok = await telegram_queue.send(msg)
+
+        if ok:
+            await _finalize_sent_queued_alerts(sdb, chunk_payloads, logger_run)
+            summary["sent_pairs"] += len(chunk_payloads)
+            summary["combined_messages_sent"] += 1
+        else:
+            logger_run.error(
+                f"Combined dispatch part {chunk_idx + 1}/{len(chunks)} failed. "
+                f"Falling back to individual messages for remaining payloads."
+            )
+
+            # This chunk plus all later chunks become fallback candidates.
+            unsent_payloads.extend(chunk_payloads)
+            for _, later_payloads in chunks[chunk_idx + 1:]:
+                unsent_payloads.extend(later_payloads)
+            break
+
+    # ── Fallback: send remaining payloads individually ───────────────
+    if unsent_payloads:
+        for payload in unsent_payloads:
+            ok = False
+
+            if cfg.DRY_RUN_MODE:
+                msg = _build_payload_message(payload, payload.items, bias_context)
+                logger_run.info(f"[DRY RUN] Fallback pair alert:\n{msg}")
+                ok = True
+            else:
+                ok = await _send_payload_individually(
+                    payload,
+                    telegram_queue,
+                    bias_context,
+                    logger_run,
+                )
+
+            if ok:
+                await _finalize_sent_queued_alerts(sdb, [payload], logger_run)
+                summary["sent_pairs"] += 1
+                summary["fallback_messages_sent"] += 1
+            else:
+                failed_payloads.append(payload)
+                summary["failed_pairs"] += 1
+                logger_run.error(
+                    f"Fallback individual dispatch failed for {payload.pair}. "
+                    f"State NOT marked ACTIVE, dedup claim retained, budget refunded."
+                )
+
+    # ── Refund budget for alerts that were never sent ────────────────
+    if failed_payloads:
+        refund_count = sum(p.alert_count for p in failed_payloads)
+        await _refund_global_alert_budget(refund_count, alerts_sent_ref, alerts_sent_lock)
+
+    return summary
+
 def create_pivot_alert(level: str, is_buy: bool) -> Dict[str, Any]:
     """Factory function to create pivot alert definitions (check_fn/extra_fn are lambdas closing over `level`/`is_buy`)"""
     if is_buy:
@@ -1150,18 +1755,20 @@ def rolling_correlation(alt_returns: np.ndarray, btc_returns: np.ndarray, window
         return float("nan")
     return float(np.corrcoef(a, b)[0, 1])
 
+
 async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], conditional_states: Dict[str, bool],
-    raw_alerts: List[Tuple[str, str, str]], sdb: RedisStateStore, telegram_queue: TelegramQueue,
-    fetcher: DataFetcher, symbol: str, correlation_id: str, logger_pair: logging.Logger,
-    alerts_sent_ref: List[int], alerts_sent_lock: asyncio.Lock, max_alerts_per_run: int,
-    data_5m: PriceData,
-    confluence_score_buy: Optional[float] = None, confluence_total_buy: Optional[float] = None,
-    confluence_votes_buy: Optional[Dict[str, bool]] = None,
-    confluence_score_sell: Optional[float] = None, confluence_total_sell: Optional[float] = None,
-    confluence_votes_sell: Optional[Dict[str, bool]] = None,
-    macro_context: Optional[BtcMacroContext] = None,
-    cluster_context: Optional[ClusterContext] = None,
-    bias_context: Optional[BiasContext] = None) -> Tuple[str, Dict[str, Any]]:
+                                     raw_alerts: List[Tuple[str, str, str]], sdb: RedisStateStore, telegram_queue: TelegramQueue,
+                                     fetcher: DataFetcher, symbol: str, correlation_id: str, logger_pair: logging.Logger,
+                                     alerts_sent_ref: List[int], alerts_sent_lock: asyncio.Lock, max_alerts_per_run: int,
+                                     data_5m: PriceData,
+                                     confluence_score_buy: Optional[float] = None, confluence_total_buy: Optional[float] = None,
+                                     confluence_votes_buy: Optional[Dict[str, bool]] = None,
+                                     confluence_score_sell: Optional[float] = None, confluence_total_sell: Optional[float] = None,
+                                     confluence_votes_sell: Optional[Dict[str, bool]] = None,
+                                     macro_context: Optional[BtcMacroContext] = None,
+                                     cluster_context: Optional[ClusterContext] = None,
+                                     bias_context: Optional[BiasContext] = None,
+                                     run_dispatch_queue: Optional[List[QueuedPairAlert]] = None) -> Tuple[str, Dict[str, Any]]:
 
     def _confluence_for(alert_key: str) -> Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]:
         if alert_key in BUY_ALERT_KEYS:
@@ -1328,6 +1935,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         f"{cluster_context.total_pairs} pairs (> {cfg.CLUSTER_PCT_THRESHOLD:.0%} threshold) — "
                         f"confluence score {raw_score:.1f} -> {confluence_score:.1f}"
                     )
+                    if is_buy_batch:
+                        confluence_score_buy = confluence_score
+                    else:
+                        confluence_score_sell = confluence_score
 
             if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
                 required = _required_confluence(confluence_total)
@@ -1477,7 +2088,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             if not should_send:
                 logger_pair.debug(
                     f"[{pair_name}] Coalesced {direction} alert deduped (within "
-                    f"{cfg.COALESCE_DEDUP_WINDOW_SEC}s) — skipping dispatch"
+                    f"{cfg.COALESCE_DEDUP_WINDOW_SEC}s) ��� skipping dispatch"
                 )
                 alerts_to_send = []
         elif alerts_to_send:
@@ -1542,7 +2153,118 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     }
                 }
 
-        if alerts_to_send:
+    # ── Run-level combined dispatch queueing ─────────────────────────
+    combined_dispatch_enabled = bool(
+        getattr(cfg, "ENABLE_RUN_COMBINED_DISPATCH", False)
+        and run_dispatch_queue is not None
+    )
+
+    if alerts_to_send and combined_dispatch_enabled:
+        budget_refunded = False
+        queued_count = len(alerts_to_send)
+
+        try:
+            if not cfg.DRY_RUN_MODE:
+                reconfirmed = await confirm_candle_unchanged(
+                    fetcher, symbol, pair_name, ts_curr, cached_snapshot, reference_time, logger_pair
+                )
+                mark_agrees = await verify_mark_price_agrees(
+                    fetcher, pair_name, ts_curr, is_green, is_red, reference_time, logger_pair
+                ) if reconfirmed is True else None
+
+                if reconfirmed is None:
+                    logger_pair.warning(
+                        f"[{pair_name}] Confirmation inconclusive — alert suppressed this run, "
+                        f"dedup key RELEASED so it can retry next run"
+                    )
+                    await _release_dedup_claims()
+                    await _refund_alert_budget(queued_count)
+                    budget_refunded = True
+                    alerts_to_send = []
+
+                elif reconfirmed is False:
+                    logger_pair.warning(
+                        f"[{pair_name}] 🔁 Confirmed repaint in send-queue window — "
+                        f"alert suppressed, dedup key KEPT to prevent duplicates"
+                    )
+                    await _refund_alert_budget(queued_count)
+                    budget_refunded = True
+                    alerts_to_send = []
+
+                elif mark_agrees is None:
+                    logger_pair.warning(
+                        f"[{pair_name}] Mark price check inconclusive — alert suppressed this run, "
+                        f"dedup key RELEASED so it can retry next run"
+                    )
+                    await _release_dedup_claims()
+                    await _refund_alert_budget(queued_count)
+                    budget_refunded = True
+                    alerts_to_send = []
+
+                elif mark_agrees is False:
+                    logger_pair.warning(
+                        f"[{pair_name}] Mark price disagreement confirmed — alert suppressed, "
+                        f"dedup key KEPT to prevent duplicates"
+                    )
+                    await _refund_alert_budget(queued_count)
+                    budget_refunded = True
+                    alerts_to_send = []
+
+            if alerts_to_send:
+                direction_scores = {
+                    "BUY": (confluence_score_buy, confluence_total_buy),
+                    "SELL": (confluence_score_sell, confluence_total_sell),
+                }
+
+                queued_payloads = _build_queued_pair_payloads(
+                    pair_name=pair_name,
+                    alerts_to_send=alerts_to_send,
+                    price=close_curr,
+                    ts=ts_curr,
+                    direction_scores=direction_scores,
+                    confluence_for_fn=_confluence_for,
+                    context=context,
+                    gr=gr,
+                    macro_shadow=macro_shadow,
+                    adx_val=adx_val,
+                )
+
+                if queued_payloads:
+                    run_dispatch_queue.extend(queued_payloads)
+
+                    # Persist resets now.
+                    # Activations are persisted later by dispatch_run_alerts()
+                    # only if Telegram send actually succeeds.
+                    if resets_to_apply:
+                        await sdb.atomic_batch_update(resets_to_apply)
+
+                    return pair_name, {
+                        "state": "ALERT_QUEUED",
+                        "ts": int(time.time()),
+                        "summary": {
+                            "alerts": len(queued_payloads),
+                            "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                            "hist_rma": round(hist_curr, 4),
+                            "suppression": "Queued for combined dispatch"
+                        }
+                    }
+                else:
+                    await _refund_alert_budget(queued_count)
+                    budget_refunded = True
+                    alerts_to_send = []
+
+        except Exception as e:
+            if not budget_refunded:
+                await _refund_alert_budget(queued_count)
+
+            logger_pair.error(
+                f"Combined dispatch queueing failed for {pair_name}: {e} | "
+                f"State NOT marked ACTIVE, dedup claim retained, budget refunded"
+            )
+            alerts_to_send = []
+
+    # ── Existing immediate per-pair dispatch path ────────────────────
+        if alerts_to_send and not combined_dispatch_enabled:
             budget_refunded = False  # NEW: Flag to prevent double refund
             try:
                 if len(alerts_to_send) == 1:
@@ -1560,7 +2282,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     reconfirmed = await confirm_candle_unchanged(
                         fetcher, symbol, pair_name, ts_curr, cached_snapshot, reference_time, logger_pair
                     )
-
                     mark_agrees = await verify_mark_price_agrees(
                         fetcher, pair_name, ts_curr, is_green, is_red, reference_time, logger_pair
                     ) if reconfirmed is True else None
@@ -1574,7 +2295,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         await _refund_alert_budget(len(alerts_to_send))
                         budget_refunded = True
                         send_success = False
-                    elif reconfirmed is False:           
+
+                    elif reconfirmed is False:
                         logger_pair.warning(
                             f"[{pair_name}] 🔁 Confirmed repaint in send-queue window — "
                             f"alert suppressed, dedup key KEPT to prevent duplicates"
@@ -1592,6 +2314,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         await _refund_alert_budget(len(alerts_to_send))
                         budget_refunded = True
                         send_success = False
+
                     elif mark_agrees is False:
                         logger_pair.warning(
                             f"[{pair_name}] Mark price disagreement confirmed — alert suppressed, "
@@ -1599,7 +2322,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         )
                         await _refund_alert_budget(len(alerts_to_send))
                         budget_refunded = True
-                        send_success = False            
+                        send_success = False
+
                     else:
                         send_success = await telegram_queue.send(msg)
 
@@ -1609,6 +2333,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"🔔🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
                             f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                         )
+
                         if cfg.ENABLE_WIN_RATE_FILTER:
                             async def _record_one(alert_key: str):
                                 s, t, v = _confluence_for(alert_key)
@@ -1629,7 +2354,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     "macro_multiplier": macro_shadow.get("multiplier") if macro_shadow else None,
                                     "macro_would_block": macro_shadow.get("would_block") if macro_shadow else None,
                                 }
-                                # Redis (immediate next-run access)
+
                                 await sdb.record_pending_outcome(
                                     pair_name, alert_key,
                                     "buy" if alert_key in BUY_ALERT_KEYS else "sell",
@@ -1638,7 +2363,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     adx_val=adx_val,
                                     context=trigger_context,
                                 )
-                                # File (long-term brain archive)
+
                                 if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                                     from outcome_storage import append_outcome
                                     append_outcome({
@@ -1653,16 +2378,19 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                         "adx_val": adx_val,
                                         "context": trigger_context,
                                     })
+
                             await asyncio.gather(*(_record_one(alert_key) for _, _, alert_key in alerts_to_send))
+
                     else:
-                        # Only refund if not already done
                         if not budget_refunded:
                             await _refund_alert_budget(len(alerts_to_send))
+
                         logger_pair.error(
                             f"Alert dispatch failed | {pair_name} | "
                             f"State NOT marked ACTIVE, dedup claim retained for retry next run | "
                             f"Budget refunded"
-                        )               
+                        )
+
                 else:
                     # DRY RUN: mark ACTIVE anyway so this run mirrors production dedup/reset behavior
                     all_state_changes.extend(new_alert_activations)
@@ -1671,6 +2399,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             except Exception as e:
                 if not budget_refunded:
                     await _refund_alert_budget(len(alerts_to_send))
+
                 logger_pair.error(
                     f"Alert dispatch exception for {pair_name}: {e} | "
                     f"State NOT marked ACTIVE, dedup key retained, budget refunded — "
