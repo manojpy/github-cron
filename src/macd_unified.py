@@ -208,8 +208,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             bias_context=bias_context,
             batch_mode=getattr(cfg, "ENABLE_BATCHED_ALERTS", True),
         )
-
-        )
     finally:
         PAIR_ID.set("")
         global _pair_eval_counter
