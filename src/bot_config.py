@@ -155,8 +155,7 @@ class Constants:
     MACRO_MULT_MODERATE = 1.15
     MACRO_MULT_FULL = 1.30
     MACRO_RS_EASE_FACTOR = 0.75
-    RMA_DAILY_BAND_PERIOD: int = Field(default=11, ge=2, description="RMA period applied to daily High/Low to build the market-bias band")
-
+    
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
 
@@ -432,7 +431,8 @@ class BotConfig(BaseModel):
     OOD_RELAXED_MODE: bool = Field(default=True, description="If True, use margin-based OOD check (tolerant of small deviations); if False, use strict percentile check")
     OOD_P5: int = Field(default=5, ge=1, le=50, description="Lower percentile for OOD range (5th)")
     OOD_P95: int = Field(default=95, ge=50, le=99, description="Upper percentile for OOD range (95th)")
-    
+    RMA_DAILY_BAND_PERIOD: int = Field(default=11, ge=2, description="RMA period applied to daily High/Low to build the market-bias band")
+
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
         if not re.match(r'^\d+:[A-Za-z0-9_-]+$', v):
