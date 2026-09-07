@@ -193,6 +193,8 @@ def _fmt_score(score: Optional[float], total: Optional[float] = None) -> str:
         return f" - {pct}%({_fmt_num(score)}/{_fmt_num(total)})"
     return f"({_fmt_num(score)})"
 
+DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
 def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional[str] = None, score: Optional[float] = None, total: Optional[float] = None) -> str:
     if not title: 
         title = "ALERT"
@@ -225,7 +227,7 @@ def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional
     else:
         line2 = f"*{e_desc}*"
     
-    spacing = " " * 12
+    spacing = " " * 20
     line3 = f"📅 {e_date}{spacing}⏰ {e_time}"
     
     return f"{line1}\n{line2}\n{line3}"
@@ -240,7 +242,7 @@ def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str
     e_price = escape_markdown_v2(price_str)
     e_date = escape_markdown_v2(date_str)
     e_time = escape_markdown_v2(time_str)
-    spacing = " " * 12
+    spacing = " " * 20
     
     if not items:
         return f"*{e_pair}{e_score}* \\- *{e_price}*\n🗓️ {e_date}{spacing}🕙 {e_time}"
@@ -623,7 +625,6 @@ async def dispatch_combined_alerts(
         return 0
 
     TELEGRAM_LIMIT = 4096
-    DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     # ── Order: sell first if dominant bias is sell, else buy first ──
     dominant_sell = (
@@ -666,7 +667,7 @@ async def dispatch_combined_alerts(
 
     date_str = format_ist_time(int(time.time()), '%d-%m-%Y')
     time_str = format_ist_time(int(time.time()), '%H:%M IST')
-    spacing = " " * 12
+    spacing = " " * 20
     datetime_footer = (
         f"📆  {escape_markdown_v2(date_str)}{spacing}⏰ {escape_markdown_v2(time_str)}"
     )
@@ -675,8 +676,6 @@ async def dispatch_combined_alerts(
     for p in ordered:
         sections.append(p.msg_body)
         sections.append(DIVIDER)
-    if sections:
-        sections.pop()  # remove trailing divider
 
     # ── Split by Telegram 4096 limit (accounting for join separators) ──
     messages: List[str] = []
@@ -745,7 +744,7 @@ async def dispatch_combined_alerts(
 
         date_str_p = format_ist_time(p.ts, '%d-%m-%Y')
         time_str_p = format_ist_time(p.ts, '%H:%M IST')
-        spacing_p = " " * 12
+        spacing_p = " " * 20
         datetime_line_p = (
             f"📆  {escape_markdown_v2(date_str_p)}{spacing_p}⏰ {escape_markdown_v2(time_str_p)}"
         )
@@ -1789,7 +1788,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
                 if cfg.ENABLE_BIAS_HEADER and bias_context is not None:
                     body, _, datetime_line = msg.rpartition("\n")
-                    msg = f"{body}\n{_format_bias_header(bias_context)}\n{datetime_line}"
+                    msg = f"{body}\n{DIVIDER}\n{_format_bias_header(bias_context)}\n{datetime_line}"
 
                 if not cfg.DRY_RUN_MODE:
                     reconfirmed = await confirm_candle_unchanged(
