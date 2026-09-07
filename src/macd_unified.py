@@ -93,9 +93,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     macro_context: Optional[BtcMacroContext] = None,
     cluster_context: Optional[ClusterContext] = None,
     bias_context: Optional[BiasContext] = None) -> Optional[Tuple[str, Dict[str, Any], Optional[Any]]]:
-
+                                                             
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
-
     pair_oi = (oi_gate_data or {}).get(pair_name)
     gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time, pair_oi)
     if gr is None:
@@ -207,7 +206,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             macro_context=macro_context,
             cluster_context=cluster_context,
             bias_context=bias_context,
-            batch_mode=True,
+            batch_mode=getattr(cfg, "ENABLE_BATCHED_ALERTS", True),
+        )
+
         )
     finally:
         PAIR_ID.set("")
