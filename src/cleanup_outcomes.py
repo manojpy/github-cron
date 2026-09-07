@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 """
 cleanup_outcomes.py — Auto-clean old outcome archive files based on configurable limits
-
-This script runs alongside export_outcomes.py to:
-1. Remove old JSONL files that exceed a specified age
-2. Ensure the repository stays within GitHub's size limits
-3. Compress files that are getting large but not yet old enough to delete
-
-Usage:
-    python3 cleanup_outcomes.py --data-dir src/data/outcomes --max-age-days 90 --max-size-mb 500
 """
 
 import argparse
@@ -46,7 +38,7 @@ def cleanup_by_age(data_dir: Path, max_age_days: int) -> int:
         if not label_dir.exists():
             continue
         
-        for file_path in label_dir.glob(pattern):  # includes .jsonl.gz for outcomes/shadow
+        for file_path in label_dir.glob(pattern):
             try:
                 mtime = datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc)
                 if mtime < cutoff:
@@ -76,39 +68,43 @@ def compress_large_files(data_dir: Path, max_size_mb: int) -> int:
                     with open(month_file, "rb") as f_in:
                         with gzip.open(gz_file, "wb", compresslevel=6) as f_out:
                             shutil.copyfileobj(f_in, f_out)
-                    month_file.unlink()  # Remove original after successful compression
+                    month_file.unlink()
                     compressed += 1
     
     return compressed
 
 def wipe_labels(data_dir: Path, labels: list) -> int:
-    """DANGER: delete every file (any age, any size) under the given label
-    dirs. Used only when explicitly requested — bypasses age/size cleanup
-    entirely rather than layering on top of it.
+    """DANGER: delete every file (any age, any size) under the given label dirs.
     
-    SAFETY: This strictly deletes FILES only. The parent folders (outcomes/, reports/) 
-    are preserved and will be automatically recreated if they somehow went missing."""
+    SAFETY: Deletes FILES only. Parent folders are preserved, and a .gitkeep
+    file is added so Git continues tracking the folder even when empty.
+    """
     removed = 0
     for label in labels:
         label_dir = data_dir / label
         
-        # 1. Ensure the folder exists (recreate if missing to prevent silent failures)
+        # 1. Ensure the folder exists
         if not label_dir.exists():
             label_dir.mkdir(parents=True, exist_ok=True)
             print(f"📁 Recreated missing folder: {label_dir}")
-            continue
-            
-        # 2. Delete all files inside (using rglob to catch any nested subdirectories too)
+        
+        # 2. Delete all files inside (including nested ones)
         for file_path in label_dir.rglob('*'):
             if file_path.is_file():
                 print(f"🚨 WIPE: removing {file_path}")
                 file_path.unlink()
                 removed += 1
                 
-        # 3. Clean up any empty subdirectories left behind (but NEVER the main label_dir)
+        # 3. Clean up empty subdirectories (but NEVER the main label_dir)
         for dir_path in sorted(label_dir.rglob('*'), reverse=True):
             if dir_path.is_dir() and not any(dir_path.iterdir()):
                 dir_path.rmdir()
+        
+        # 4. ADD .gitkeep so Git tracks the folder even when empty
+        gitkeep = label_dir / ".gitkeep"
+        if not gitkeep.exists():
+            gitkeep.write_text("# This file ensures Git tracks this empty directory.\n")
+            print(f"📌 Added {gitkeep}")
                 
     return removed
 
@@ -147,12 +143,10 @@ def main():
     print("  OUTCOME DATA CLEANUP")
     print("=" * 60)
 
-    # Show current size
     current_size = get_dir_size(data_dir)
     print(f"Current size: {format_size(current_size)}")
     print(f"Max total size: {args.max_total_mb} MB")
     
-    # 1. Remove old files
     print(f"\n📋 Checking for files older than {args.max_age_days} days...")
     removed = cleanup_by_age(data_dir, args.max_age_days)
     if removed:
@@ -160,7 +154,6 @@ def main():
     else:
         print("No old files to remove")
     
-    # 2. Compress large files
     print(f"\n📋 Checking for files larger than {args.max_size_mb} MB...")
     compressed = compress_large_files(data_dir, args.max_size_mb)
     if compressed:
@@ -168,7 +161,6 @@ def main():
     else:
         print("No large files to compress")
     
-    # 3. Aggressive cleanup if total is too large
     new_size = get_dir_size(data_dir)
     max_total_bytes = args.max_total_mb * 1024 * 1024
     
@@ -181,17 +173,13 @@ def main():
             if not label_dir.exists():
                 continue
             
-            # Get all files sorted by name (YYYY-MM-DD[...] format sorts chronologically)
             files = sorted(label_dir.glob(pattern))
-
-            # Remove from oldest until under limit
             for month_file in files:
                 if get_dir_size(data_dir) <= max_total_bytes:
                     break
                 print(f"🗑️ Removing {month_file.name} to stay under limit")
                 month_file.unlink()
     
-    # Show final state
     final_size = get_dir_size(data_dir)
     print(f"\n{'=' * 60}")
     print(f"✅ Cleanup complete")
