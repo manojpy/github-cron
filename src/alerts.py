@@ -6,8 +6,8 @@ import random
 import asyncio
 import logging
 from enum import StrEnum
-from dataclasses import dataclass
-from typing import Dict, Any, Optional, Tuple, List, Set, Callable, Union
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional, Tuple, List, Set, Callable, Union, Awaitable
 
 import numpy as np
 
@@ -23,6 +23,8 @@ class AlertPayload:
     budget_count: int
     ts: int
     macro_shadow: Optional[Dict[str, Any]] = None
+    alert_keys: List[str] = field(default_factory=list)
+    record_win_rate: Optional[Callable[[], Awaitable[None]]] = None
 
 
 from bot_config import (
@@ -227,7 +229,7 @@ def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional
     else:
         line2 = f"*{e_desc}*"
     
-    spacing = " " * 20
+    spacing = " " * 24
     line3 = f"📅 {e_date}{spacing}⏰ {e_time}"
     
     return f"{line1}\n{line2}\n{line3}"
@@ -242,7 +244,7 @@ def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str
     e_price = escape_markdown_v2(price_str)
     e_date = escape_markdown_v2(date_str)
     e_time = escape_markdown_v2(time_str)
-    spacing = " " * 20
+    spacing = " " * 24
     
     if not items:
         return f"*{e_pair}{e_score}* \\- *{e_price}*\n🗓️ {e_date}{spacing}🕙 {e_time}"
@@ -665,9 +667,10 @@ async def dispatch_combined_alerts(
     if cfg.ENABLE_BIAS_HEADER and bias_context is not None:
         bias_footer = f"\n{_format_bias_header(bias_context)}"
 
-    date_str = format_ist_time(int(time.time()), '%d-%m-%Y')
-    time_str = format_ist_time(int(time.time()), '%H:%M IST')
-    spacing = " " * 20
+    candle_ts = ordered[0].ts
+    date_str = format_ist_time(candle_ts, '%d-%m-%Y')
+    time_str = format_ist_time(candle_ts, '%H:%M IST')
+    spacing = " " * 24
     datetime_footer = (
         f"📆  {escape_markdown_v2(date_str)}{spacing}⏰ {escape_markdown_v2(time_str)}"
     )
@@ -716,6 +719,9 @@ async def dispatch_combined_alerts(
             await sdb.atomic_batch_update(all_changes)
         async with alerts_sent_lock:
             alerts_sent_ref[0] += sum(p.budget_count for p in ordered)
+        for p in ordered:
+            if p.record_win_rate:
+                await p.record_win_rate()
         logger_run.info(
             f"🔔 Combined dispatch sent {len(ordered)} pair(s) in {len(messages)} message(s)"
         )
@@ -744,13 +750,13 @@ async def dispatch_combined_alerts(
 
         date_str_p = format_ist_time(p.ts, '%d-%m-%Y')
         time_str_p = format_ist_time(p.ts, '%H:%M IST')
-        spacing_p = " " * 20
+        spacing_p = " " * 24
         datetime_line_p = (
             f"📆  {escape_markdown_v2(date_str_p)}{spacing_p}⏰ {escape_markdown_v2(time_str_p)}"
         )
         full_msg = p.msg_body
         if cfg.ENABLE_BIAS_HEADER and bias_context is not None:
-            full_msg += "\n" + _format_bias_header(bias_context)
+            full_msg += "\n" + DIVIDER + "\n" + _format_bias_header(bias_context)
         full_msg += "\n" + datetime_line_p
 
         if await telegram_queue.send(full_msg):
@@ -758,12 +764,14 @@ async def dispatch_combined_alerts(
                 await sdb.atomic_batch_update(p.state_changes)
             async with alerts_sent_lock:
                 alerts_sent_ref[0] += p.budget_count
+            if p.record_win_rate:
+                await p.record_win_rate()
             fallback_sent += p.budget_count
         else:
             for dk in p.dedup_keys:
                 await sdb.release_recent_alert(p.pair_name, dk)
             async with alerts_sent_lock:
-                alerts_sent_ref[0] = max(0, alerts_sent_ref[0] - p.budget_count)
+                alerts_sent_ref[0] = max(0, alerts_sent_ref[0] - p.budget_count) 
 
     return fallback_sent
 
@@ -1681,10 +1689,55 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             new_alert_activations.append(
                 (f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None)
             )
+        async def _record_win_rates() -> None:
+            """Records this pair's fired alerts for later win-rate scoring.
+            Shared by both immediate mode (called right after a successful
+            send) and batch mode (stored on the payload as record_win_rate,
+            called by dispatch_combined_alerts once the real send outcome —
+            combined or fallback — is known)."""
+            async def _record_one(alert_key: str):
+                s, t, v = _confluence_for(alert_key)
+                trigger_context = {
+                    "rsi_curr": context.get("rsi_curr"),
+                    "rsi_adaptive_buy": gr.rsi_adaptive_buy,
+                    "rsi_adaptive_sell": gr.rsi_adaptive_sell,
+                    "ppo_curr": context.get("ppo_curr"),
+                    "ppo_adaptive_threshold": gr.ppo_adaptive_threshold,
+                    "buy_wick_ratio": gr.buy_wick_ratio,
+                    "sell_wick_ratio": gr.sell_wick_ratio,
+                    "adx_val": gr.adx_val,
+                    "config_version": hash_config_state(
+                        CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
+                    ),
+                    "macro_correlation": macro_shadow.get("correlation") if macro_shadow else None,
+                    "macro_relative_strength": macro_shadow.get("relative_strength") if macro_shadow else None,
+                    "macro_multiplier": macro_shadow.get("multiplier") if macro_shadow else None,
+                    "macro_would_block": macro_shadow.get("would_block") if macro_shadow else None,
+                }
+                await sdb.record_pending_outcome(
+                    pair_name, alert_key,
+                    "buy" if alert_key in BUY_ALERT_KEYS else "sell",
+                    ts_curr, close_curr,
+                    confluence_score=s, confluence_total=t, confluence_votes=v,
+                    adx_val=adx_val,
+                    context=trigger_context,
+                )
+                if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                    from outcome_storage import append_outcome
+                    append_outcome({
+                        "pair": pair_name,
+                        "alert_key": alert_key,
+                        "direction": "buy" if alert_key in BUY_ALERT_KEYS else "sell",
+                        "entry_ts": ts_curr,
+                        "price": close_curr,
+                        "score": s,
+                        "total": t,
+                        "votes": v,
+                        "adx_val": adx_val,
+                        "context": trigger_context,
+                    })
+            await asyncio.gather(*(_record_one(alert_key) for _, _, alert_key in alerts_to_send))
 
-        # ═════════════════════════════════════════════════════════════════════
-        # BATCH MODE  →  defer everything to the run-level combined dispatcher
-        # ═════════════════════════════════════════════════════════════════════
         if batch_mode and alerts_to_send:
             if len(alerts_to_send) == 1:
                 title, extra, _ = alerts_to_send[0]
@@ -1698,6 +1751,61 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             # Strip the datetime line so the run-level dispatcher can add one shared footer
             msg_body, _, _ = msg.rpartition("\n")
 
+            # Same freshness checks the legacy immediate-send path runs right
+            # before dispatch — batch mode delays the actual Telegram send
+            # until every pair in the run has finished evaluating, so this
+            # matters at least as much here, not less.
+            if not cfg.DRY_RUN_MODE:
+                reconfirmed = await confirm_candle_unchanged(
+                    fetcher, symbol, pair_name, ts_curr, cached_snapshot, reference_time, logger_pair
+                )
+                mark_agrees = await verify_mark_price_agrees(
+                    fetcher, pair_name, ts_curr, is_green, is_red, reference_time, logger_pair
+                ) if reconfirmed is True else None
+
+                if reconfirmed is None:
+                    logger_pair.warning(
+                        f"[{pair_name}] Confirmation inconclusive — alert suppressed this run, "
+                        f"dedup key RELEASED so it can retry next run"
+                    )
+                    await _release_dedup_claims()
+                    return pair_name, {
+                        "state": "SUPPRESSED", "ts": int(time.time()),
+                        "summary": {"alerts": 0, "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                                    "hist_rma": round(hist_curr, 4), "suppression": "Confirmation inconclusive"}
+                    }, None
+                elif reconfirmed is False:
+                    logger_pair.warning(
+                        f"[{pair_name}] 🔁 Confirmed repaint in send-queue window — "
+                        f"alert suppressed, dedup key KEPT to prevent duplicates"
+                    )
+                    return pair_name, {
+                        "state": "SUPPRESSED", "ts": int(time.time()),
+                        "summary": {"alerts": 0, "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                                    "hist_rma": round(hist_curr, 4), "suppression": "Confirmed repaint"}
+                    }, None
+                elif mark_agrees is None:
+                    logger_pair.warning(
+                        f"[{pair_name}] Mark price check inconclusive — alert suppressed this run, "
+                        f"dedup key RELEASED so it can retry next run"
+                    )
+                    await _release_dedup_claims()
+                    return pair_name, {
+                        "state": "SUPPRESSED", "ts": int(time.time()),
+                        "summary": {"alerts": 0, "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                                    "hist_rma": round(hist_curr, 4), "suppression": "Mark price check inconclusive"}
+                    }, None
+                elif mark_agrees is False:
+                    logger_pair.warning(
+                        f"[{pair_name}] Mark price disagreement confirmed — alert suppressed, "
+                        f"dedup key KEPT to prevent duplicates"
+                    )
+                    return pair_name, {
+                        "state": "SUPPRESSED", "ts": int(time.time()),
+                        "summary": {"alerts": 0, "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                                    "hist_rma": round(hist_curr, 4), "suppression": "Mark price disagreement"}
+                    }, None
+
             first_key = alerts_to_send[0][2]
             direction = "buy" if first_key in BUY_ALERT_KEYS else "sell"
 
@@ -1708,9 +1816,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 for _, _, alert_key in alerts_to_send:
                     dedup_keys.append(alert_key)
 
-            pending_state_changes = list(all_state_changes)
-            pending_state_changes.extend(new_alert_activations)
-
             payload = AlertPayload(
                 pair_name=pair_name,
                 direction=direction,
@@ -1718,11 +1823,20 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 total=confluence_total,
                 msg_body=msg_body,
                 dedup_keys=dedup_keys,
-                state_changes=pending_state_changes,
+                state_changes=list(new_alert_activations),
                 budget_count=len(alerts_to_send),
                 ts=ts_curr,
                 macro_shadow=macro_shadow,
+                alert_keys=[ak for _, _, ak in alerts_to_send],
+                record_win_rate=(_record_win_rates if cfg.ENABLE_WIN_RATE_FILTER else None),
             )
+            if all_state_changes:
+                persist_ok = await sdb.atomic_batch_update(all_state_changes)
+                if not persist_ok:
+                    logger_pair.error(
+                        f"[{pair_name}] State persistence failed — alert state may be inconsistent this run"
+                    )
+
             return pair_name, {
                 "state": "BATCHED",
                 "ts": int(time.time()),
@@ -1844,48 +1958,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                         )
                         if cfg.ENABLE_WIN_RATE_FILTER:
-                            async def _record_one(alert_key: str):
-                                s, t, v = _confluence_for(alert_key)
-                                trigger_context = {
-                                    "rsi_curr": context.get("rsi_curr"),
-                                    "rsi_adaptive_buy": gr.rsi_adaptive_buy,
-                                    "rsi_adaptive_sell": gr.rsi_adaptive_sell,
-                                    "ppo_curr": context.get("ppo_curr"),
-                                    "ppo_adaptive_threshold": gr.ppo_adaptive_threshold,
-                                    "buy_wick_ratio": gr.buy_wick_ratio,
-                                    "sell_wick_ratio": gr.sell_wick_ratio,
-                                    "adx_val": gr.adx_val,
-                                    "config_version": hash_config_state(
-                                        CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
-                                    ),
-                                    "macro_correlation": macro_shadow.get("correlation") if macro_shadow else None,
-                                    "macro_relative_strength": macro_shadow.get("relative_strength") if macro_shadow else None,
-                                    "macro_multiplier": macro_shadow.get("multiplier") if macro_shadow else None,
-                                    "macro_would_block": macro_shadow.get("would_block") if macro_shadow else None,
-                                }
-                                await sdb.record_pending_outcome(
-                                    pair_name, alert_key,
-                                    "buy" if alert_key in BUY_ALERT_KEYS else "sell",
-                                    ts_curr, close_curr,
-                                    confluence_score=s, confluence_total=t, confluence_votes=v,
-                                    adx_val=adx_val,
-                                    context=trigger_context,
-                                )
-                                if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
-                                    from outcome_storage import append_outcome
-                                    append_outcome({
-                                        "pair": pair_name,
-                                        "alert_key": alert_key,
-                                        "direction": "buy" if alert_key in BUY_ALERT_KEYS else "sell",
-                                        "entry_ts": ts_curr,
-                                        "price": close_curr,
-                                        "score": s,
-                                        "total": t,
-                                        "votes": v,
-                                        "adx_val": adx_val,
-                                        "context": trigger_context,
-                                    })
-                            await asyncio.gather(*(_record_one(alert_key) for _, _, alert_key in alerts_to_send))
+                            await _record_win_rates()
                     else:
                         if not budget_refunded:
                             await _refund_alert_budget(len(alerts_to_send))
