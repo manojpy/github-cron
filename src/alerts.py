@@ -678,21 +678,22 @@ async def dispatch_combined_alerts(
     if sections:
         sections.pop()  # remove trailing divider
 
-    # ── Split by Telegram 4096 limit ──
+    # ── Split by Telegram 4096 limit (accounting for join separators) ──
     messages: List[str] = []
     current_parts: List[str] = []
     current_len = 0
-    footer_len = len(bias_footer) + len(datetime_footer) + 10  # buffer
+    footer_len = len(bias_footer) + 1 + len(datetime_footer) + 1  # exact + safety
 
     for section in sections:
         sec_len = len(section)
-        if current_parts and (current_len + sec_len + footer_len > TELEGRAM_LIMIT):
+        join_cost = 1 if current_parts else 0   # "\n" between parts
+        if current_parts and (current_len + join_cost + sec_len + footer_len > TELEGRAM_LIMIT):
             messages.append("\n".join(current_parts))
             current_parts = [section]
             current_len = sec_len
         else:
             current_parts.append(section)
-            current_len += sec_len
+            current_len += join_cost + sec_len
     if current_parts:
         messages.append("\n".join(current_parts))
 
@@ -729,23 +730,29 @@ async def dispatch_combined_alerts(
 
     fallback_sent = 0
     for p in ordered:
-        # Re-check dedup individually (re-claims the key)
+        claimed_keys = []
         should_send = True
         for dk in p.dedup_keys:
-            if not await sdb.check_recent_alert(p.pair_name, dk, p.ts):
+            if await sdb.check_recent_alert(p.pair_name, dk, p.ts):
+                claimed_keys.append(dk)
+            else:
                 should_send = False
                 break
         if not should_send:
+            for dk in claimed_keys:
+                await sdb.release_recent_alert(p.pair_name, dk)
             continue
 
-        # Re-assemble full message with per-pair datetime
         date_str_p = format_ist_time(p.ts, '%d-%m-%Y')
         time_str_p = format_ist_time(p.ts, '%H:%M IST')
         spacing_p = " " * 12
         datetime_line_p = (
             f"📆  {escape_markdown_v2(date_str_p)}{spacing_p}⏰ {escape_markdown_v2(time_str_p)}"
         )
-        full_msg = p.msg_body + "\n" + datetime_line_p
+        full_msg = p.msg_body
+        if cfg.ENABLE_BIAS_HEADER and bias_context is not None:
+            full_msg += "\n" + _format_bias_header(bias_context)
+        full_msg += "\n" + datetime_line_p
 
         if await telegram_queue.send(full_msg):
             if p.state_changes:
@@ -2163,10 +2170,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             "summary": {
                 "alerts": len(alerts_to_send),
                 "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                "hist_rma": round(hist_curr, 4), 
+                "hist_rma": round(hist_curr, 4),
                 "suppression": ", ".join(failed_conditions + reasons) if (failed_conditions or reasons) else "No conditions met"
             }
-        }
+        }, None
     except asyncio.CancelledError:
         logger_pair.warning(f"Evaluation cancelled for {pair_name}")
         raise
@@ -2181,7 +2188,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 "hist_rma": 0.0,
                 "error": str(e)
             }
-        }
+        }, None
     except Exception as e:
         logger_pair.exception(
             f"❌ Error in _apply_and_dispatch_alerts for {pair_name}: {e} | Correlation: {correlation_id}"
