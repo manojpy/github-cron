@@ -533,36 +533,35 @@ def per_pair_session_breakdown(rows: List[Row], min_sample: int = 10):
 def per_alert_breakdown(rows: List[Row], min_sample: int = 10):
     stats = defaultdict(lambda: {
         "wins": 0, "n": 0, "scores": [],
+        "mfe_wins": 0, "mfe_total": 0,
         "tm_wins": 0, "tm_losses": 0,
-        "mfe_wins": 0, "mfe_fails": 0,
         "mae_losses": 0, "mae_ok": 0,
     })
     for r in rows:
         s = stats[r["alert_key"]]
-        s["wins"] += r["win"]
+        s["wins"] += r["win"]  # Now MFE-based
         s["n"] += 1
         s["scores"].append(r["score"])
+        if r.get("mfe_win") is not None:
+            s["mfe_total"] += 1
+            s["mfe_wins"] += 1 if r["mfe_win"] else 0
         if r.get("trade_result") == "win":
             s["tm_wins"] += 1
         elif r.get("trade_result") == "loss":
             s["tm_losses"] += 1
-        if r.get("mfe_win") is not None:
-            s["mfe_wins" if r["mfe_win"] else "mfe_fails"] += 1
         if r.get("mae_loss") is not None:
             s["mae_losses" if r["mae_loss"] else "mae_ok"] += 1
     results = []
     for ak, s in stats.items():
         if s["n"] < min_sample:
             continue
-        wr = s["wins"] / s["n"]
+        wr = s["wins"] / s["n"]  # MFE-based WR (primary)
         avg_score = sum(s["scores"]) / len(s["scores"])
+        mfe_wr = s["mfe_wins"] / s["mfe_total"] if s["mfe_total"] > 0 else None
         tm_total = s["tm_wins"] + s["tm_losses"]
         tm_wr = s["tm_wins"] / tm_total if tm_total > 0 else None
-        mfe_total = s["mfe_wins"] + s["mfe_fails"]
-        mfe_wr = s["mfe_wins"] / mfe_total if mfe_total > 0 else None
-        mae_total = s["mae_losses"] + s["mae_ok"]
-        mae_loss_rate = s["mae_losses"] / mae_total if mae_total > 0 else None
-        results.append((ak, wr, s["n"], avg_score, tm_wr, tm_total, mfe_wr, mfe_total, mae_loss_rate, mae_total))
+        mae_loss_rate = s["mae_losses"] / (s["mae_losses"] + s["mae_ok"]) if (s["mae_losses"] + s["mae_ok"]) > 0 else None
+        results.append((ak, wr, s["n"], avg_score, mfe_wr, tm_total, mae_loss_rate))
     results.sort(key=lambda x: x[1])
     return results
 

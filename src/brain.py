@@ -796,7 +796,7 @@ class BrainEngine:
                     ),
                 })
        
-        # ── Per-pair confluence thresholds ────────────────────���─────────
+        # ── Per-pair confluence thresholds ────────────────────�����─────────
         if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
             pair_min_sample = getattr(cfg, "BRAIN_PAIR_THRESHOLD_MIN_SAMPLE", 30)
             pair_recs = engine.per_pair_thresholds(
@@ -912,11 +912,24 @@ class BrainEngine:
         severity_order = {"high": 0, "medium": 1, "low": 2}
         recommendations.sort(key=lambda x: severity_order.get(x["severity"], 3))
 
+        # ── NEW: Calculate MFE-based overall win rate (PRIMARY) ──
+        mfe_overall_wr = None
+        close_overall_wr = None
+        if real_rows:
+            mfe_wins = sum(1 for r in real_rows if r.get("mfe_win", False))
+            mfe_total = sum(1 for r in real_rows if r.get("mfe_win") is not None)
+            if mfe_total > 0:
+                mfe_overall_wr = mfe_wins / mfe_total
+            
+            close_wins = sum(1 for r in real_rows if r.get("win", False))
+            close_overall_wr = close_wins / len(real_rows) if real_rows else None
+
         return {
             "generated_at": int(time.time()),
             "real_sample_size": len(real_rows),
             "shadow_sample_size": len(shadow_rows),
-            "overall_win_rate": round(sum(1 for r in real_rows if r["win"]) / len(real_rows), 4) if real_rows else None,
+            "overall_win_rate": mfe_overall_wr,  # PRIMARY: MFE-based
+            "close_win_rate": close_overall_wr,  # Reference: close-based
             "recommendation_count": len(recommendations),
             "recommendations": recommendations,
             "shadow_summary": shadow_summary,
@@ -933,9 +946,10 @@ class BrainEngine:
                 "cusum_drifts": len(drift_alerts),
                 "threshold_history": await self.sdb.load_threshold_history(),
                 "ood_status": ood_status,
+                "mfe_win_rate": mfe_overall_wr,  # NEW
+                "close_win_rate": close_overall_wr,  # NEW
             },
         }
-
     # ── Report generation / delivery ────────────────────────────────────────
 
     async def _next_run_count(self) -> Optional[int]:
@@ -1106,18 +1120,23 @@ class BrainEngine:
             "",
         ]
 
-        # ── WIN RATE: the headline number, vs your own target ──
+        # ── WIN RATE: MFE-based is PRIMARY (TP-hit based) ──
         ai = recs.get("ai_metrics", {})
-        overall_wr = recs.get("overall_win_rate")
+        overall_wr = recs.get("overall_win_rate")  # Now MFE-based
+        close_wr = recs.get("close_win_rate")  # Reference
         target_wr = cfg.MIN_WIN_RATE
         lines.append("*📊 WIN RATE*")
         if overall_wr is not None:
             status = "✅" if overall_wr >= target_wr else "⚠️"
             lines.append(escape_markdown_v2(
-                f"Overall: {overall_wr:.0%} vs min target {target_wr:.0%}  ({status})"
+                f"MFE Win Rate: {overall_wr:.0%} vs min target {target_wr:.0%}  ({status})"
             ))
+            if close_wr is not None:
+                lines.append(escape_markdown_v2(
+                    f"Close-based: {close_wr:.0%} (reference)"
+                ))
         else:
-            lines.append(escape_markdown_v2("Overall: not enough samples yet"))
+            lines.append(escape_markdown_v2("MFE Win Rate: not enough samples yet"))
         lines.append(escape_markdown_v2(
             f"Gate threshold: Score≥{cc.get('CONFLUENCE_MIN_ABS_SCORE')} Pct≥{cc.get('CONFLUENCE_MIN_PCT')}%"
         ))
@@ -1132,22 +1151,25 @@ class BrainEngine:
             lines.append(escape_markdown_v2("💰 " + " | ".join(size_bits)))
         lines.append("")
 
-        # ── TOP ALERTS: best buy / best sell, ranked by win rate ──
+        # ── TOP ALERTS: best buy / best sell, ranked by MFE win rate ──
         perf = next((r for r in recs["recommendations"] if r["type"] == "per_alert_breakdown"), None)
         alert_data = perf.get("data") if perf else None
         if alert_data:
-            buy_ranked = sorted((t for t in alert_data if t[0] in BUY_ALERT_KEYS), key=lambda t: -t[1])
-            sell_ranked = sorted((t for t in alert_data if t[0] in SELL_ALERT_KEYS), key=lambda t: -t[1])
+            # Now tuple format: (ak, wr, n, avg_score, mfe_wr, tm_total)
+            buy_ranked = sorted((t for t in alert_data if t[0] in BUY_ALERT_KEYS), key=lambda t: -t[4] if t[4] is not None else 0)
+            sell_ranked = sorted((t for t in alert_data if t[0] in SELL_ALERT_KEYS), key=lambda t: -t[4] if t[4] is not None else 0)
             if buy_ranked or sell_ranked:
                 lines.append(escape_markdown_v2(f"🏆 TOP ALERTS (min {min_sample} trades)"))
                 if buy_ranked:
                     lines.append("Buy:")
-                    for ak, wr, n, _ in buy_ranked[:2]:
-                        lines.append(escape_markdown_v2(f" • {ak}: {wr:.0%} ({n} trades)"))
+                    for ak, wr, n, _, mfe_wr, tm_total in buy_ranked[:2]:
+                        mfe_str = f"{mfe_wr:.0%}" if mfe_wr is not None else "n/a"
+                        lines.append(escape_markdown_v2(f" • {ak}: MFE {mfe_str} ({n} trades)"))
                 if sell_ranked:
                     lines.append("Sell:")
-                    for ak, wr, n, _ in sell_ranked[:2]:
-                        lines.append(escape_markdown_v2(f" • {ak}: {wr:.0%} ({n} trades)"))
+                    for ak, wr, n, _, mfe_wr, tm_total in sell_ranked[:2]:
+                        mfe_str = f"{mfe_wr:.0%}" if mfe_wr is not None else "n/a"
+                        lines.append(escape_markdown_v2(f" • {ak}: MFE {mfe_str} ({n} trades)"))
                 lines.append("")
 
         # ── WEAK / AVOID: disable candidates + harmful vote combos ──
