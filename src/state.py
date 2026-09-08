@@ -896,6 +896,12 @@ class RedisStateStore:
         pct_move = (future_price - entry_price) / entry_price * 100.0
 
         # ── METRIC 1: close_win (legacy point-in-time check) ──
+        # ── R:R-BASED THRESHOLDS ──
+        risk_pct = cfg.OUTCOME_MAE_LOSS_PCT / 100.0            # e.g. 0.005
+        target_pct = risk_pct * cfg.OUTCOME_RR_TARGET           # e.g. 0.010 (1.0%)
+        bonus_pct = risk_pct * cfg.OUTCOME_BONUS_RR             # e.g. 0.015 (1.5%)
+
+        # ── METRIC 1: close_win (legacy point-in-time check) ──
         close_win = (
             pct_move >= cfg.OUTCOME_FAVORABLE_MOVE_PCT
             if is_buy
@@ -903,8 +909,6 @@ class RedisStateStore:
         )
 
         # ── MAE / MFE from price path ──
-        # Start from entry_idx+1: entry is at the CLOSE of the entry candle,
-        # so that candle's own high/low already happened before our entry.
         path_start = entry_idx + 1
         path_end = min(target_idx + 1, len(data_15m.low))
         path_low = data_15m.low[path_start:path_end]
@@ -919,21 +923,23 @@ class RedisStateStore:
                 mae = max(0.0, (float(np.max(path_high)) - entry_price) / entry_price)
                 mfe = max(0.0, (entry_price - float(np.min(path_low))) / entry_price)
 
-        # ── METRIC 2: mfe_win (take-profit scenario) ──
-        # Did price EVER reach the favorable threshold within the window?
-        fav_threshold = cfg.OUTCOME_FAVORABLE_MOVE_PCT / 100.0
-        mfe_win = mfe is not None and mfe >= fav_threshold
+        # ── METRIC 2: mfe_win (TP hit at 1:2 R:R) ──
+        mfe_win = mfe is not None and mfe >= target_pct
 
-        # ── METRIC 3: mae_loss (stop-loss scenario) ──
-        # Did price EVER move adversely beyond the stop threshold?
-        mae_threshold = cfg.OUTCOME_MAE_LOSS_PCT / 100.0
-        mae_loss = mae is not None and mae >= mae_threshold
+        # ── METRIC 3: mae_loss (SL hit) ──
+        mae_loss = mae is not None and mae >= risk_pct
+
+        # ── BONUS: did price exceed the target R:R? ──
+        bonus_win = mfe is not None and mfe >= bonus_pct
+
+        # ── R-MULTIPLE ACHIEVED ──
+        rr_achieved = (mfe / risk_pct) if (mfe is not None and risk_pct > 0) else 0.0
 
         # ── BONUS: tp_first ordering (candle-by-candle) ──
         tp_first: Optional[bool] = None
         if len(path_low) and len(path_high):
-            tp_level = entry_price * (1 + fav_threshold) if is_buy else entry_price * (1 - fav_threshold)
-            sl_level = entry_price * (1 - mae_threshold) if is_buy else entry_price * (1 + mae_threshold)
+            tp_level = entry_price * (1 + target_pct) if is_buy else entry_price * (1 - target_pct)
+            sl_level = entry_price * (1 - risk_pct) if is_buy else entry_price * (1 + risk_pct)
 
             tp_hit_idx = None
             sl_hit_idx = None
@@ -971,12 +977,6 @@ class RedisStateStore:
         # ── PRIMARY WIN: configurable ──
         primary_metric = getattr(cfg, "OUTCOME_PRIMARY_METRIC", "mfe")
         if primary_metric == "mfe":
-            # Realistic trade management model:
-            #   TP hit before SL  → WIN
-            #   SL hit before TP  → LOSS
-            #   Only TP hit       → WIN
-            #   Only SL hit       → LOSS
-            #   Neither / ambiguous → fall back to close_win
             if tp_first is True:
                 win = True
             elif tp_first is False:
@@ -989,6 +989,11 @@ class RedisStateStore:
                 win = close_win  # neither hit, or ambiguous → fall back to close
         else:
             win = close_win      # legacy behavior
+
+        if win:
+            win_weight = cfg.OUTCOME_BONUS_WEIGHT if bonus_win else 1.0
+        else:
+            win_weight = 0.0
 
         return {
             "alert_key": key.split(":")[-2],
@@ -1005,6 +1010,10 @@ class RedisStateStore:
             "tp_first": tp_first,
             "mae": mae,
             "mfe": mfe,
+            # ── R:R and Bonus fields ──
+            "bonus_win": bonus_win,
+            "rr_achieved": round(rr_achieved, 2),
+            "win_weight": win_weight,
             "conf_score": conf_score,
             "conf_total": conf_total,
             "conf_votes": conf_votes,
@@ -1093,7 +1102,7 @@ class RedisStateStore:
                         write_pipe.expire(session_stats_key, stats_ttl)
                         stream_fields = None
                         if conf_score is not None and conf_total is not None:
-                            stream_fields = { 
+                            stream_fields = {
                                 "pair": str(pair),
                                 "alert_key": str(alert_key),
                                 "direction": str(direction),
@@ -1113,10 +1122,14 @@ class RedisStateStore:
                                     else "0" if result.get("tp_first") is False
                                     else ""
                                 ),
+                                # ── R:R and Bonus fields ──
+                                "bonus_win": "1" if result.get("bonus_win", False) else "0",
+                                "rr_achieved": f"{result.get('rr_achieved', 0):.2f}",
+                                "win_weight": f"{result.get('win_weight', 1.0):.2f}",
                                 "votes": json_dumps(conf_votes) if conf_votes is not None else "",
                                 "adx_val": str(adx_val) if adx_val is not None else "",
                                 "context": json_dumps(row_context) if row_context is not None else "",
-                            } 
+                            }
                         else:
                             missing_score_count += 1
                             logger_pair.debug(
@@ -1133,7 +1146,7 @@ class RedisStateStore:
                         write_pipe.delete(key)
                         pending_writes += 1
                         resolved_count += 1
-                        if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                        if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):              
                             resolved_for_file.append({
                                 "pair": str(pair),
                                 "alert_key": str(alert_key),
@@ -1149,6 +1162,10 @@ class RedisStateStore:
                                 "votes": conf_votes,
                                 "adx_val": adx_val,
                                 "context": row_context,
+                                # ── R:R and Bonus fields ──
+                                "bonus_win": result.get("bonus_win", False),
+                                "rr_achieved": result.get("rr_achieved", 0.0),
+                                "win_weight": result.get("win_weight", 1.0),
                             })
                     except Exception as e:
                         logger_pair.debug(f"Failed to resolve pending outcome {key}: {e}")
@@ -1297,11 +1314,10 @@ class RedisStateStore:
                                     "wins" if win else "losses",
                                     1,
                                 )
-                                write_pipe.expire(hiconf_key, stats_ttl)
-                
+                                write_pipe.expire(hiconf_key, stats_ttl)          
                         write_pipe.delete(key)
                         pending_writes += 1
-                        resolved_count += 1
+                        resolved_count += 1              
                         if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                             resolved_for_file.append({
                                 "pair": str(pair),
@@ -1318,7 +1334,6 @@ class RedisStateStore:
                                 "votes": conf_votes,
                                 "shadow": True,
                             })
-                
                     except Exception as e:
                         logger_pair.debug(
                             f"Failed to resolve shadow pending outcome {key}: {e}"

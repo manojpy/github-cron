@@ -43,13 +43,12 @@ def recency_weight(entry_ts: Optional[float], now_ts: float, decay_days: float =
 def weighted_win_rate(
     rows: List[Row], now_ts: Optional[float] = None, decay_days: float = 7.0,
 ) -> Tuple[Optional[float], float, float, float]:
-    """Recency-weighted win rate + a weighted Wilson-CI band. ... Returns
-    (weighted_wr, n_eff, wilson_lo, wilson_hi), where n_eff is Kish's
-    effective sample size (sum(w)^2 / sum(w^2), always <= len(rows))..."""
+    """Recency-weighted win rate + a weighted Wilson-CI band. ..."""
     if now_ts is None:
         now_ts = time.time()
     if not rows:
         return None, 0.0, 0.0, 0.0
+
     sum_w = sum_w2 = sum_ww = 0.0
     for r in rows:
         w = recency_weight(r.get("entry_ts"), now_ts, decay_days)
@@ -57,9 +56,45 @@ def weighted_win_rate(
         sum_w2 += w * w
         if r["win"]:
             sum_ww += w
+
     if sum_w <= 0:
         return None, 0.0, 0.0, 0.0
+
     weighted_wr = sum_ww / sum_w
+    n_eff = (sum_w ** 2) / sum_w2 if sum_w2 > 0 else 0.0
+    lo, hi, _ = wilson_ci(round(weighted_wr * n_eff), max(1, round(n_eff)))
+    return weighted_wr, n_eff, lo, hi
+
+def weighted_win_rate_with_bonus(
+    rows: List[Row],
+    now_ts: Optional[float] = None,
+    decay_days: float = 7.0,
+) -> Tuple[Optional[float], float, float, float]:
+    """Win rate where bonus wins (exceeded 1:2 target) count for more.
+    A bonus win with weight 1.5 counts as 1.5 wins out of 1.5 total weight.
+    Returns (weighted_wr, n_eff, wilson_lo, wilson_hi)."""
+    if now_ts is None:
+        now_ts = time.time()
+    if not rows:
+        return None, 0.0, 0.0, 0.0
+
+    sum_w = 0.0       # total weight denominator (recency only)
+    sum_ww = 0.0      # weighted wins (recency × win_weight)
+    sum_w2 = 0.0      # for n_eff
+
+    for r in rows:
+        recency_w = recency_weight(r.get("entry_ts"), now_ts, decay_days)
+        win_w = r.get("win_weight", 1.0 if r["win"] else 0.0)
+
+        sum_w += recency_w
+        sum_w2 += recency_w * recency_w
+        if r["win"]:
+            sum_ww += recency_w * win_w
+
+    if sum_w <= 0:
+        return None, 0.0, 0.0, 0.0
+
+    weighted_wr = min(sum_ww / sum_w, 1.0)
     n_eff = (sum_w ** 2) / sum_w2 if sum_w2 > 0 else 0.0
     lo, hi, _ = wilson_ci(round(weighted_wr * n_eff), max(1, round(n_eff)))
     return weighted_wr, n_eff, lo, hi
@@ -1656,14 +1691,19 @@ def multi_metric_summary(rows: List[Row], min_sample: int = 10) -> Dict[str, Any
         result["sl_before_tp_rate"] = sl_before_tp / len(tp_first_rows)
         result["ordering_sample"] = len(tp_first_rows)
 
+    # ── Bonus stats ──
+    bonus_wins = sum(1 for r in rows if r.get("bonus_win"))
+    rr_values = [r.get("rr_achieved", 0) for r in rows if r.get("rr_achieved", 0) > 0]
+    result["bonus_wins"] = bonus_wins
+    result["bonus_rate"] = bonus_wins / n if n else 0.0
+    result["avg_rr_achieved"] = statistics.fmean(rr_values) if rr_values else 0.0
+
     # Wilson CIs for the key metrics
     close_lo, close_hi, _ = wilson_ci(close_wins, n)
     mfe_lo, mfe_hi, _ = wilson_ci(mfe_wins, n)
     result["close_wilson"] = (close_lo, close_hi)
     result["mfe_wilson"] = (mfe_lo, mfe_hi)
-
     return result
-
 
 def multi_metric_per_alert(rows: List[Row], min_sample: int = 10) -> List[Dict[str, Any]]:
     """Per-alert breakdown showing all three metrics. Sorted by mfe_wr

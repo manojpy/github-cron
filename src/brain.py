@@ -232,6 +232,22 @@ class BrainEngine:
                     else None
                 )
 
+                # ── R:R and Bonus fields (backward compatible) ──
+                bonus_win_raw = f.get("bonus_win")
+                bonus_win_val = (bonus_win_raw == "1") if bonus_win_raw else False
+
+                rr_achieved_raw = f.get("rr_achieved")
+                try:
+                    rr_achieved_val = float(rr_achieved_raw) if rr_achieved_raw not in (None, "") else 0.0
+                except (TypeError, ValueError):
+                    rr_achieved_val = 0.0
+
+                win_weight_raw = f.get("win_weight")
+                try:
+                    win_weight_val = float(win_weight_raw) if win_weight_raw not in (None, "") else (1.0 if base_win else 0.0)
+                except (TypeError, ValueError):
+                    win_weight_val = 1.0 if base_win else 0.0
+
                 parsed.append({
                     "pair": pair,
                     "alert_key": alert_key,
@@ -252,6 +268,10 @@ class BrainEngine:
                     "mfe_win": mfe_win_val,
                     "mae_loss": mae_loss_val,
                     "tp_first": tp_first_val,
+                    # ── R:R and Bonus fields ──
+                    "bonus_win": bonus_win_val,
+                    "rr_achieved": rr_achieved_val,
+                    "win_weight": win_weight_val,
                 })
             except (KeyError, ValueError) as e:
                 logging.getLogger("macd_bot").debug(f"Brain: dropping malformed outcome row: {e}")
@@ -743,6 +763,7 @@ class BrainEngine:
                 # Per-alert three-metric breakdown (worst offenders only)
                 mm_per_alert = engine.multi_metric_per_alert(real_rows, min_sample=min_sample)
                 big_gap_alerts = [a for a in mm_per_alert if a["gap_mfe_vs_close"] > 0.15]
+
                 if big_gap_alerts:
                     gap_lines = [
                         f"  • {a['alert_key']}: close {a['close_wr']:.0%} vs MFE {a['mfe_wr']:.0%} "
@@ -758,6 +779,32 @@ class BrainEngine:
                             + "\n".join(gap_lines)
                         ),
                     })
+
+                # ── R:R and Bonus Analysis ──
+                if real_rows:
+                    bonus_wins = sum(1 for r in real_rows if r.get("bonus_win"))
+                    total_wins = sum(1 for r in real_rows if r["win"])
+                    rr_values = [r.get("rr_achieved", 0) for r in real_rows if r.get("rr_achieved", 0) > 0]
+                    avg_rr = statistics.mean(rr_values) if rr_values else 0.0
+
+                    # Weighted WR: bonus wins count for more
+                    total_weight = sum(r.get("win_weight", 1.0 if r["win"] else 0.0) for r in real_rows)
+                    effective_n = len(real_rows)
+                    weighted_wr_bonus = min(total_weight / effective_n, 1.0) if effective_n else 0.0
+
+                    recommendations.append({
+                        "type": "rr_analysis",
+                        "severity": "low",
+                        "message": (
+                            f"📐 R:R Analysis (target=1:{cfg.OUTCOME_RR_TARGET:.0f}, "
+                            f"bonus≥{cfg.OUTCOME_BONUS_RR:.0f}R):\n"
+                            f"  • Wins: {total_wins}/{len(real_rows)} | "
+                            f"Bonus wins: {bonus_wins} ({bonus_wins/max(total_wins,1):.0%} of wins)\n"
+                            f"  • Avg R-multiple achieved: {avg_rr:.2f}R\n"
+                            f"  • Effective WR (bonus-weighted): {weighted_wr_bonus:.1%} "
+                            f"(raw: {total_wins/len(real_rows):.1%})"
+                        ),
+                    })        
             if rec.get("overlapping_toxic"):
                 worst = max(rec["overlapping_toxic"], key=lambda t: t[1])
                 recommendations.append({
