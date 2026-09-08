@@ -328,14 +328,12 @@ class BotConfig(BaseModel):
     OB_IMPULSE_LOOKAHEAD: int = Field(default=3, ge=1, le=10, description="Candles after a candidate base candle checked for the impulsive displacement that confirms it as an order block")
     ENABLE_OB_PREMIUM_DISCOUNT_FILTER: bool = Field(default=False, description="Only accept demand-zone OB reversals below the 50% equilibrium of the OB_LOOKBACK_CANDLES dealing range (discount), and supply-zone reversals above it (premium). Zones on the wrong side are skipped entirely.")
     OUTCOME_LOOKAHEAD_CANDLES: int = Field(default=8, ge=1, le=96) 
-    OUTCOME_FAVORABLE_MOVE_PCT: float = Field(default=1, ge=0.01, le=10.0) 
+    OUTCOME_FAVORABLE_MOVE_PCT: float = Field(default=0.3, ge=0.01, le=10.0) 
+    OUTCOME_STOP_LOSS_PCT: float = Field(default=5.0, ge=0.01, le=50.0, description="Stop-loss distance (%) from entry used for the order-aware mfe_win/mae_loss outcome simulation. Independent of OUTCOME_FAVORABLE_MOVE_PCT, which still drives the legacy close_win check")
+    OUTCOME_REWARD_RISK_RATIO: float = Field(default=2.0, ge=0.1, le=10.0, description="Target distance = OUTCOME_STOP_LOSS_PCT * this ratio. Default 2.0 = 1:2 risk:reward (risk 5%, target 10%)")
+    OUTCOME_BONUS_WEIGHT_CAP: float = Field(default=0.5, ge=0.0, le=5.0, description="Max extra weight (fraction, e.g. 0.5 = up to 1.5x) awarded to a resolved mfe_win whose price overshot the target before window end, scaled linearly by overshoot/target_pct up to this cap")
     MIN_WIN_RATE_SAMPLE: int = Field(default=20, ge=1)    
     MIN_WIN_RATE: float = Field(default=0.55, ge=0.0, le=1.0)    
-    OUTCOME_MAE_LOSS_PCT: float = Field(default=0.5, ge=0.01, le=10.0)  
-    OUTCOME_PRIMARY_METRIC: str = Field(default="mfe") 
-    OUTCOME_RR_TARGET: float = Field(default=2.0, ge=1.0, le=5.0) 
-    OUTCOME_BONUS_RR: float = Field(default=3.0, ge=2.0, le=10.0) 
-    OUTCOME_BONUS_WEIGHT: float = Field(default=1.5, ge=1.0, le=3.0) 
     ENABLE_SESSION_FILTER: bool = Field(default=False, description="If true, alerts are also checked against a pair:alert_key:session win-rate (session = asian/london/ny/dead per IST trading hours). Blocks alongside the existing pair:alert_key MIN_WIN_RATE check — whichever of the two is lower decides. Requires ENABLE_WIN_RATE_FILTER")
     MIN_WIN_RATE_SESSION_SAMPLE: int = Field(default=15, ge=1, description="Minimum resolved-outcome sample size for a pair:alert_key:session combo before its win rate is trusted enough to block dispatch")
     ENABLE_BRAIN: bool = Field(default=False, description="Master switch for the Brain analysis/shadow-mode/reporting layer. Requires ENABLE_WIN_RATE_FILTER to be meaningful")
@@ -604,18 +602,6 @@ class BotConfig(BaseModel):
                     f'CONFLUENCE_MIN_ABS_SCORE ({self.CONFLUENCE_MIN_ABS_SCORE}) exceeds the max '
                     f'achievable weighted total ({max_achievable}) — every alert would be blocked forever'
                 )
-        return self
-
-    @model_validator(mode='after')
-    def validate_rr_consistency(self) -> 'BotConfig':
-        """Ensure TP is derived from SL × RR_TARGET, and bonus > target."""
-        derived_tp = self.OUTCOME_MAE_LOSS_PCT * self.OUTCOME_RR_TARGET
-        self.OUTCOME_FAVORABLE_MOVE_PCT = round(derived_tp, 4)
-        if self.OUTCOME_BONUS_RR <= self.OUTCOME_RR_TARGET:
-            raise ValueError(
-                f'OUTCOME_BONUS_RR ({self.OUTCOME_BONUS_RR}) must be > '
-                f'OUTCOME_RR_TARGET ({self.OUTCOME_RR_TARGET})'
-            )
         return self
 
     @model_validator(mode='after')

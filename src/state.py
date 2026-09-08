@@ -862,10 +862,12 @@ class RedisStateStore:
     ) -> Tuple[Optional[Dict[str, Any]], str]:
         if raw is None:
             return None, "raced"
+
         data = json_loads(raw)
         entry_ts = int(data["entry_ts"])
         direction = data["direction"]
         entry_price = float(data["entry_price"])
+
         conf_score = data.get("confluence_score")
         conf_total = data.get("confluence_total")
         conf_votes = data.get("confluence_votes")
@@ -873,6 +875,7 @@ class RedisStateStore:
 
         if entry_price <= 0:
             return None, "bad_entry_price"
+
         direction_norm = str(direction).lower()
         if direction_norm in ("buy", "long"):
             is_buy = True
@@ -894,27 +897,15 @@ class RedisStateStore:
 
         future_price = float(data_15m.close[target_idx])
         pct_move = (future_price - entry_price) / entry_price * 100.0
-
-        # ── METRIC 1: close_win (legacy point-in-time check) ──
-        # ── R:R-BASED THRESHOLDS ──
-        risk_pct = cfg.OUTCOME_MAE_LOSS_PCT / 100.0            # e.g. 0.005
-        target_pct = risk_pct * cfg.OUTCOME_RR_TARGET           # e.g. 0.010 (1.0%)
-        bonus_pct = risk_pct * cfg.OUTCOME_BONUS_RR             # e.g. 0.015 (1.5%)
-
-        # ── METRIC 1: close_win (legacy point-in-time check) ──
-        close_win = (
+        win = (
             pct_move >= cfg.OUTCOME_FAVORABLE_MOVE_PCT
             if is_buy
             else pct_move <= -cfg.OUTCOME_FAVORABLE_MOVE_PCT
         )
 
-        # ── MAE / MFE from price path ──
-        path_start = entry_idx + 1
-        path_end = min(target_idx + 1, len(data_15m.low))
-        path_low = data_15m.low[path_start:path_end]
-        path_high = data_15m.high[path_start:path_end]
-
-        mae = mfe = None
+        # ── MAE / MFE (path-aware, not just the binary close-vs-target outcome) ──
+        path_low = data_15m.low[entry_idx:target_idx]
+        path_high = data_15m.high[entry_idx:target_idx]
         if len(path_low) and len(path_high):
             if is_buy:
                 mae = max(0.0, (entry_price - float(np.min(path_low))) / entry_price)
@@ -922,78 +913,42 @@ class RedisStateStore:
             else:
                 mae = max(0.0, (float(np.max(path_high)) - entry_price) / entry_price)
                 mfe = max(0.0, (entry_price - float(np.min(path_low))) / entry_price)
+        else:
+            mae = mfe = None
 
-        # ── METRIC 2: mfe_win (TP hit at 1:2 R:R) ──
-        mfe_win = mfe is not None and mfe >= target_pct
+        # ── Order-aware stop/target simulation (1:2 R:R by default) ──────────
+        stop_pct = cfg.OUTCOME_STOP_LOSS_PCT / 100.0
+        target_pct = stop_pct * cfg.OUTCOME_REWARD_RISK_RATIO
+        if is_buy:
+            stop_price = entry_price * (1.0 - stop_pct)
+            target_price = entry_price * (1.0 + target_pct)
+        else:
+            stop_price = entry_price * (1.0 + stop_pct)
+            target_price = entry_price * (1.0 - target_pct)
 
-        # ── METRIC 3: mae_loss (SL hit) ──
-        mae_loss = mae is not None and mae >= risk_pct
-
-        # ── BONUS: did price exceed the target R:R? ──
-        bonus_win = mfe is not None and mfe >= bonus_pct
-
-        # ── R-MULTIPLE ACHIEVED ──
-        rr_achieved = (mfe / risk_pct) if (mfe is not None and risk_pct > 0) else 0.0
-
-        # ── BONUS: tp_first ordering (candle-by-candle) ──
-        tp_first: Optional[bool] = None
-        if len(path_low) and len(path_high):
-            tp_level = entry_price * (1 + target_pct) if is_buy else entry_price * (1 - target_pct)
-            sl_level = entry_price * (1 - risk_pct) if is_buy else entry_price * (1 + risk_pct)
-
-            tp_hit_idx = None
-            sl_hit_idx = None
-
-            for candle_offset in range(len(path_low)):
-                idx = path_start + candle_offset
-                candle_low = float(data_15m.low[idx])
-                candle_high = float(data_15m.high[idx])
-
-                tp_reached = candle_high >= tp_level if is_buy else candle_low <= tp_level
-                sl_reached = candle_low <= sl_level if is_buy else candle_high >= sl_level
-
-                if tp_reached and tp_hit_idx is None:
-                    tp_hit_idx = candle_offset
-                if sl_reached and sl_hit_idx is None:
-                    sl_hit_idx = candle_offset
-
-                # Early exit if both found
-                if tp_hit_idx is not None and sl_hit_idx is not None:
-                    break
-
-            if tp_hit_idx is not None and sl_hit_idx is not None:
-                if tp_hit_idx < sl_hit_idx:
-                    tp_first = True
-                elif sl_hit_idx < tp_hit_idx:
-                    tp_first = False
-                else:
-                    tp_first = None  # Same candle — can't determine intra-candle order
-            elif tp_hit_idx is not None:
-                tp_first = True   # Only TP hit
-            elif sl_hit_idx is not None:
-                tp_first = False  # Only SL hit
-            # else: neither hit → tp_first stays None
-
-        # ── PRIMARY WIN: configurable ──
-        primary_metric = getattr(cfg, "OUTCOME_PRIMARY_METRIC", "mfe")
-        if primary_metric == "mfe":
-            if tp_first is True:
-                win = True
-            elif tp_first is False:
-                win = False
-            elif mfe_win and not mae_loss:
-                win = True       # hit TP, never hit SL
-            elif mae_loss and not mfe_win:
-                win = False      # hit SL, never hit TP
+        outcome_reason = "no_hit"
+        for i in range(entry_idx, target_idx):
+            hi = float(data_15m.high[i])
+            lo = float(data_15m.low[i])
+            if is_buy:
+                target_hit = hi >= target_price
+                stop_hit = lo <= stop_price
             else:
-                win = close_win  # neither hit, or ambiguous → fall back to close
-        else:
-            win = close_win      # legacy behavior
+                target_hit = lo <= target_price
+                stop_hit = hi >= stop_price
+            if target_hit or stop_hit:
+                # Same-candle ambiguity (both levels inside this candle's
+                # range): resolved optimistically — target is assumed first.
+                outcome_reason = "target_hit" if target_hit else "stop_hit"
+                break
 
-        if win:
-            win_weight = cfg.OUTCOME_BONUS_WEIGHT if bonus_win else 1.0
-        else:
-            win_weight = 0.0
+        mfe_win = outcome_reason == "target_hit"
+        mae_loss = outcome_reason == "stop_hit"
+
+        bonus_weight = 1.0
+        if mfe_win and mfe is not None and target_pct > 0:
+            overshoot_ratio = max(0.0, mfe - target_pct) / target_pct
+            bonus_weight = 1.0 + min(overshoot_ratio, cfg.OUTCOME_BONUS_WEIGHT_CAP)
 
         return {
             "alert_key": key.split(":")[-2],
@@ -1001,19 +956,16 @@ class RedisStateStore:
             "entry_ts": entry_ts,
             "is_buy": is_buy,
             "pct_move": pct_move,
-            # ── Primary win (used by ALL downstream: threshold_engine, CUSUM, brain) ──
             "win": win,
-            # ── Three-metric breakdown (for reporting) ──
-            "close_win": close_win,
+            "close_win": win,
             "mfe_win": mfe_win,
             "mae_loss": mae_loss,
-            "tp_first": tp_first,
+            "outcome_reason": outcome_reason,
+            "bonus_weight": bonus_weight,
+            "stop_pct": stop_pct,
+            "target_pct": target_pct,
             "mae": mae,
             "mfe": mfe,
-            # ── R:R and Bonus fields ──
-            "bonus_win": bonus_win,
-            "rr_achieved": round(rr_achieved, 2),
-            "win_weight": win_weight,
             "conf_score": conf_score,
             "conf_total": conf_total,
             "conf_votes": conf_votes,
@@ -1085,7 +1037,11 @@ class RedisStateStore:
                         direction = result["direction"]
                         entry_ts = result["entry_ts"]
                         pct_move = result["pct_move"]
-                        win = result["win"]
+                        close_win = result["close_win"]
+                        mfe_win = result["mfe_win"]
+                        mae_loss = result["mae_loss"]
+                        outcome_reason = result["outcome_reason"]
+                        bonus_weight = result["bonus_weight"]
                         mae = result["mae"]
                         mfe = result["mfe"]
                         conf_score = result["conf_score"]
@@ -1094,42 +1050,40 @@ class RedisStateStore:
                         adx_val = result["adx_val"]
                         row_context = result.get("context")
                         stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
-                        write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
+                        write_pipe.hincrby(stats_key, "wins" if mfe_win else "losses", 1)
+                        write_pipe.hincrby(stats_key, "close_wins" if close_win else "close_losses", 1)
+                        if mae_loss:
+                            write_pipe.hincrby(stats_key, "stop_losses", 1)
+                        if mfe_win:
+                            write_pipe.hincrbyfloat(stats_key, "weighted_win_sum", bonus_weight)
                         write_pipe.expire(stats_key, stats_ttl)
                         session = _get_session_from_ts(entry_ts) if entry_ts else "dead"
                         session_stats_key = f"{stats_key}:{session}"
-                        write_pipe.hincrby(session_stats_key, "wins" if win else "losses", 1)
+                        write_pipe.hincrby(session_stats_key, "wins" if mfe_win else "losses", 1)
                         write_pipe.expire(session_stats_key, stats_ttl)
                         stream_fields = None
                         if conf_score is not None and conf_total is not None:
-                            stream_fields = {
+                            stream_fields = { 
                                 "pair": str(pair),
                                 "alert_key": str(alert_key),
                                 "direction": str(direction),
                                 "score": str(conf_score),
                                 "total": str(conf_total),
                                 "pct_move": f"{pct_move:.4f}",
-                                "win": "1" if win else "0",
+                                "win": "1" if mfe_win else "0",
+                                "close_win": "1" if close_win else "0",
+                                "mfe_win": "1" if mfe_win else "0",
+                                "mae_loss": "1" if mae_loss else "0",
+                                "outcome_reason": outcome_reason,
+                                "bonus_weight": f"{bonus_weight:.4f}",
                                 "entry_ts": str(entry_ts),
                                 "session": session,
                                 "mae": f"{mae:.5f}" if mae is not None else "",
                                 "mfe": f"{mfe:.5f}" if mfe is not None else "",
-                                "close_win": "1" if result.get("close_win", win) else "0",
-                                "mfe_win": "1" if result.get("mfe_win", False) else "0",
-                                "mae_loss": "1" if result.get("mae_loss", False) else "0",
-                                "tp_first": (
-                                    "1" if result.get("tp_first") is True
-                                    else "0" if result.get("tp_first") is False
-                                    else ""
-                                ),
-                                # ── R:R and Bonus fields ──
-                                "bonus_win": "1" if result.get("bonus_win", False) else "0",
-                                "rr_achieved": f"{result.get('rr_achieved', 0):.2f}",
-                                "win_weight": f"{result.get('win_weight', 1.0):.2f}",
                                 "votes": json_dumps(conf_votes) if conf_votes is not None else "",
                                 "adx_val": str(adx_val) if adx_val is not None else "",
                                 "context": json_dumps(row_context) if row_context is not None else "",
-                            }
+                            } 
                         else:
                             missing_score_count += 1
                             logger_pair.debug(
@@ -1146,7 +1100,7 @@ class RedisStateStore:
                         write_pipe.delete(key)
                         pending_writes += 1
                         resolved_count += 1
-                        if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):              
+                        if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                             resolved_for_file.append({
                                 "pair": str(pair),
                                 "alert_key": str(alert_key),
@@ -1154,7 +1108,12 @@ class RedisStateStore:
                                 "entry_ts": entry_ts,
                                 "score": conf_score,
                                 "total": conf_total,
-                                "win": win,
+                                "win": mfe_win,
+                                "close_win": close_win,
+                                "mfe_win": mfe_win,
+                                "mae_loss": mae_loss,
+                                "outcome_reason": outcome_reason,
+                                "bonus_weight": bonus_weight,
                                 "pct_move": pct_move,
                                 "mae": mae,
                                 "mfe": mfe,
@@ -1162,10 +1121,6 @@ class RedisStateStore:
                                 "votes": conf_votes,
                                 "adx_val": adx_val,
                                 "context": row_context,
-                                # ── R:R and Bonus fields ──
-                                "bonus_win": result.get("bonus_win", False),
-                                "rr_achieved": result.get("rr_achieved", 0.0),
-                                "win_weight": result.get("win_weight", 1.0),
                             })
                     except Exception as e:
                         logger_pair.debug(f"Failed to resolve pending outcome {key}: {e}")
@@ -1251,20 +1206,31 @@ class RedisStateStore:
                         )
                         if skip_reason:
                             continue
-
                         alert_key = result["alert_key"]
                         direction = result["direction"]
                         entry_ts = result["entry_ts"]
                         pct_move = result["pct_move"]
-                        win = result["win"]
+                        close_win = result["close_win"]
+                        mfe_win = result["mfe_win"]
+                        mae_loss = result["mae_loss"]
+                        outcome_reason = result["outcome_reason"]
+                        bonus_weight = result["bonus_weight"]
                         mae = result["mae"]
                         mfe = result["mfe"]
                         conf_score = result["conf_score"]
                         conf_total = result["conf_total"]
                         conf_votes = result["conf_votes"]
 
+                        # mfe_win is now the primary win/loss signal (matches
+                        # resolve_pending_outcomes); close_win/stop_losses kept
+                        # alongside for comparison.
                         stats_key = f"{RedisKeyPrefix.SHADOW_STATS}{pair}:{alert_key}"
-                        write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
+                        write_pipe.hincrby(stats_key, "wins" if mfe_win else "losses", 1)
+                        write_pipe.hincrby(stats_key, "close_wins" if close_win else "close_losses", 1)
+                        if mae_loss:
+                            write_pipe.hincrby(stats_key, "stop_losses", 1)
+                        if mfe_win:
+                            write_pipe.hincrbyfloat(stats_key, "weighted_win_sum", bonus_weight)
                         write_pipe.expire(stats_key, stats_ttl)
 
                         if (
@@ -1283,21 +1249,18 @@ class RedisStateStore:
                                         "score": str(conf_score),
                                         "total": str(conf_total),
                                         "pct_move": f"{pct_move:.4f}",
-                                        "win": "1" if win else "0",
+                                        "win": "1" if mfe_win else "0",
+                                        "close_win": "1" if close_win else "0",
+                                        "mfe_win": "1" if mfe_win else "0",
+                                        "mae_loss": "1" if mae_loss else "0",
+                                        "outcome_reason": outcome_reason,
+                                        "bonus_weight": f"{bonus_weight:.4f}",
                                         "entry_ts": str(entry_ts),
                                         "session": _get_session_from_ts(entry_ts)
                                         if entry_ts
                                         else "dead",
                                         "mae": f"{mae:.5f}" if mae is not None else "",
                                         "mfe": f"{mfe:.5f}" if mfe is not None else "",
-                                        "close_win": "1" if result.get("close_win", win) else "0",
-                                        "mfe_win": "1" if result.get("mfe_win", False) else "0",
-                                        "mae_loss": "1" if result.get("mae_loss", False) else "0",
-                                        "tp_first": (
-                                            "1" if result.get("tp_first") is True
-                                            else "0" if result.get("tp_first") is False
-                                            else ""
-                                        ),
                                         "votes": json_dumps(conf_votes)
                                         if conf_votes is not None
                                         else "",
@@ -1311,13 +1274,13 @@ class RedisStateStore:
                                 )
                                 write_pipe.hincrby(
                                     hiconf_key,
-                                    "wins" if win else "losses",
+                                    "wins" if mfe_win else "losses",
                                     1,
                                 )
-                                write_pipe.expire(hiconf_key, stats_ttl)          
+                                write_pipe.expire(hiconf_key, stats_ttl)
                         write_pipe.delete(key)
                         pending_writes += 1
-                        resolved_count += 1              
+                        resolved_count += 1
                         if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                             resolved_for_file.append({
                                 "pair": str(pair),
@@ -1326,7 +1289,12 @@ class RedisStateStore:
                                 "entry_ts": entry_ts,
                                 "score": conf_score,
                                 "total": conf_total,
-                                "win": win,
+                                "win": mfe_win,
+                                "close_win": close_win,
+                                "mfe_win": mfe_win,
+                                "mae_loss": mae_loss,
+                                "outcome_reason": outcome_reason,
+                                "bonus_weight": bonus_weight,
                                 "pct_move": pct_move,
                                 "mae": mae,
                                 "mfe": mfe,
@@ -1334,6 +1302,7 @@ class RedisStateStore:
                                 "votes": conf_votes,
                                 "shadow": True,
                             })
+                
                     except Exception as e:
                         logger_pair.debug(
                             f"Failed to resolve shadow pending outcome {key}: {e}"
