@@ -746,25 +746,9 @@ async def dispatch_combined_alerts(
         f"for {len(unsent)} unsent pair(s)"
     )
 
-    for p in unsent:
-        for dk in p.dedup_keys:
-            await sdb.release_recent_alert(p.pair_name, dk)
-
     fallback_sent = 0
     for p in unsent:
-        claimed_keys = []
-        should_send = True
-        for dk in p.dedup_keys:
-            if await sdb.check_recent_alert(p.pair_name, dk, p.ts):
-                claimed_keys.append(dk)
-            else:
-                should_send = False
-                break
-        if not should_send:
-            for dk in claimed_keys:
-                await sdb.release_recent_alert(p.pair_name, dk)
-            continue
-
+        
         date_str_p = format_ist_time(p.ts, '%d-%m-%Y')
         time_str_p = format_ist_time(p.ts, '%H:%M IST')
         spacing_p = " " * 24
@@ -785,9 +769,11 @@ async def dispatch_combined_alerts(
                 await p.record_win_rate()
             fallback_sent += p.budget_count
         else:
-            for dk in p.dedup_keys:
-                await sdb.release_recent_alert(p.pair_name, dk) 
-
+            logger_run.warning(
+                f"Individual send failed for {p.pair_name} — keeping dedup claims "
+                f"so it can't re-fire until window expires ({p.dedup_keys})"
+            )
+         
     return fallback_sent
 
 def validate_alert_definitions() -> None:
@@ -815,11 +801,28 @@ def validate_alert_definitions() -> None:
 
 validate_alert_definitions()
 
+
 async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[Dict[str, np.ndarray]],
     reference_time: int, sdb: RedisStateStore, correlation_id: str, logger_pair: logging.Logger
 ) -> Union[Tuple[Dict[str, Any], Dict[str, bool], List[Tuple[str, str, str]]], Tuple[str, Dict[str, Any]], None]:
     pair_name = gr.pair_name
     i15 = gr.i15
+    
+    # ── CRITICAL FIX: Skip if this exact candle was already processed ──
+    last_processed = await sdb.get_last_processed_candle_ts(pair_name)
+    if last_processed == gr.ts_curr:
+        logger_pair.debug(f"[{pair_name}] Candle {gr.ts_curr} already processed — skipping")
+        return pair_name, {
+            "state": "SKIPPED_ALREADY_PROCESSED",
+            "ts": int(time.time()),
+            "summary": {
+                "alerts": 0,
+                "future_cloud": "neutral",
+                "hist_rma": 0.0,
+                "suppression": f"Already processed candle {gr.ts_curr}"
+            }
+        }, None
+    
     data_15m = gr.data_15m
     close_curr = gr.close_curr
     close_prev = gr.close_prev
@@ -1308,14 +1311,16 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                         f"buy_common={buy_common} sell_common={sell_common} | "
                         f"Candle: O={gr.open_curr:.2f} C={close_curr:.2f}"
                     )
-
         conditional_states = previous_states
 
+        await sdb.set_last_processed_candle_ts(pair_name, gr.ts_curr)
+        
         return context, conditional_states, raw_alerts
 
     except asyncio.CancelledError:
         logger_pair.warning(f"Evaluation cancelled for {pair_name}")
         raise
+
     except RuntimeError as e:
         logger_pair.critical(f"🚨 INVARIANT VIOLATION in {pair_name}: {e}")
         return pair_name, {
@@ -1375,6 +1380,22 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
     pair_name = gr.pair_name
     i15, ts_curr, reference_time = gr.i15, gr.ts_curr, gr.reference_time
+    
+    # ── CRITICAL FIX: Skip if this exact candle was already processed ──
+    last_processed = await sdb.get_last_processed_candle_ts(pair_name)
+    if last_processed == ts_curr:
+        logger_pair.debug(f"[{pair_name}] Candle {ts_curr} already processed — skipping dispatch")
+        return pair_name, {
+            "state": "SKIPPED_ALREADY_PROCESSED",
+            "ts": int(time.time()),
+            "summary": {
+                "alerts": 0,
+                "future_cloud": "green" if gr.cloud_up else "red" if gr.cloud_down else "neutral",
+                "hist_rma": 0.0,
+                "suppression": f"Already processed candle {ts_curr}"
+            }
+        }, None
+    
     data_15m = gr.data_15m
     candle_info = gr.candle_info
     o, h, l, c = gr.o, gr.h, gr.l, gr.c
@@ -1775,6 +1796,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 ) if reconfirmed is True else None
 
                 if reconfirmed is None:
+                    # ⚠️ INCONCLUSIVE: Do NOT mark as processed — retry next run
                     logger_pair.warning(
                         f"[{pair_name}] Confirmation inconclusive — alert suppressed this run, "
                         f"dedup key RELEASED so it can retry next run"
@@ -1786,16 +1808,19 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     "hist_rma": round(hist_curr, 4), "suppression": "Confirmation inconclusive"}
                     }, None
                 elif reconfirmed is False:
+                    # Definitive repaint — mark as processed so it doesn't retry
                     logger_pair.warning(
                         f"[{pair_name}] 🔁 Confirmed repaint in send-queue window — "
                         f"alert suppressed, dedup key KEPT to prevent duplicates"
                     )
+                    await sdb.set_last_processed_candle_ts(pair_name, ts_curr)  # ← MARK AS PROCESSED
                     return pair_name, {
                         "state": "SUPPRESSED", "ts": int(time.time()),
                         "summary": {"alerts": 0, "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
                                     "hist_rma": round(hist_curr, 4), "suppression": "Confirmed repaint"}
                     }, None
                 elif mark_agrees is None:
+                    # ⚠️ INCONCLUSIVE: Do NOT mark as processed — retry next run
                     logger_pair.warning(
                         f"[{pair_name}] Mark price check inconclusive — alert suppressed this run, "
                         f"dedup key RELEASED so it can retry next run"
@@ -1807,10 +1832,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     "hist_rma": round(hist_curr, 4), "suppression": "Mark price check inconclusive"}
                     }, None
                 elif mark_agrees is False:
+                    # Definitive disagreement — mark as processed so it doesn't retry
                     logger_pair.warning(
                         f"[{pair_name}] Mark price disagreement confirmed — alert suppressed, "
                         f"dedup key KEPT to prevent duplicates"
                     )
+                    await sdb.set_last_processed_candle_ts(pair_name, ts_curr)  # ← MARK AS PROCESSED
                     return pair_name, {
                         "state": "SUPPRESSED", "ts": int(time.time()),
                         "summary": {"alerts": 0, "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
@@ -1852,6 +1879,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         f"[{pair_name}] State persistence failed — alert state may be inconsistent this run"
                     )
 
+            # ── CRITICAL FIX: Mark as processed on successful batch dispatch ──
+            await sdb.set_last_processed_candle_ts(pair_name, ts_curr)  # ← MARK AS PROCESSED
+            
             return pair_name, {
                 "state": "BATCHED",
                 "ts": int(time.time()),
@@ -1968,12 +1998,14 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
                     if send_success:
                         all_state_changes.extend(new_alert_activations)
+                        # ── CRITICAL FIX: Mark as processed on successful send ──
+                        await sdb.set_last_processed_candle_ts(pair_name, ts_curr)  # ← MARK AS PROCESSED
                         logger_pair.info(
                             f"🔔🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
                             f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                         )
                         if cfg.ENABLE_WIN_RATE_FILTER:
-                            await _record_win_rates()
+                            await _record_win_rates()               
                     else:
                         if not budget_refunded:
                             await _refund_alert_budget(len(alerts_to_send))

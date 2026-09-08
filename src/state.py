@@ -165,6 +165,7 @@ class RedisKeyPrefix:
     CUSUM_WATERMARK = "brain_cusum_watermark:"
     THRESHOLD_HISTORY = "brain_threshold_history:"
     VOTE_COUNT_HISTORY = "brain_vote_counts:"
+    LAST_PROCESSED_CANDLE = "last_processed_candle:"  # NEW
 
 class RedisStateStore:
     POOL_MAX_AGE_SECONDS = 3600
@@ -628,6 +629,40 @@ class RedisStateStore:
             return True
         except Exception as e:
             logger.error(f"batch_set_metadata failed: {e}")
+            return False
+
+    async def get_last_processed_candle_ts(self, pair_name: str) -> Optional[int]:
+        """Get the last candle timestamp that was fully processed for this pair.
+        Returns None if no candle has been processed yet, or if the key expired."""
+        if self.degraded or not self._redis:
+            return None
+        key = f"{RedisKeyPrefix.LAST_PROCESSED_CANDLE}{pair_name}"
+        raw = await self._safe_redis_op(
+            lambda: self._redis.get(key),
+            2.0,
+            f"last_processed_candle_get:{pair_name}",
+        )
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (ValueError, TypeError):
+            return None
+
+    async def set_last_processed_candle_ts(self, pair_name: str, ts: int) -> bool:
+        """Mark a candle timestamp as processed for this pair."""
+        if self.degraded or not self._redis:
+            return False
+        key = f"{RedisKeyPrefix.LAST_PROCESSED_CANDLE}{pair_name}"
+        try:
+            await self._safe_redis_op(
+                lambda: self._redis.set(key, str(ts), ex=self.expiry_seconds),
+                2.0,
+                f"last_processed_candle_set:{pair_name}",
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to set last_processed_candle for {pair_name}: {e}")
             return False
 
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int, window_sec: Optional[int] = None) -> bool:
