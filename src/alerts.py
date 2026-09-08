@@ -1311,10 +1311,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                         f"buy_common={buy_common} sell_common={sell_common} | "
                         f"Candle: O={gr.open_curr:.2f} C={close_curr:.2f}"
                     )
-        conditional_states = previous_states
 
-        await sdb.set_last_processed_candle_ts(pair_name, gr.ts_curr)
-        
+        conditional_states = previous_states   
         return context, conditional_states, raw_alerts
 
     except asyncio.CancelledError:
