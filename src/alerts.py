@@ -309,16 +309,24 @@ def _format_bias_header(bias_context: BiasContext) -> str:
     )
 
 def create_pivot_alert(level: str, is_buy: bool) -> Dict[str, Any]:
-    """Factory function to create pivot alert definitions (check_fn/extra_fn are lambdas closing over `level` / `is_buy`)"""
+    """Factory function to create pivot alert definitions (check_fn/extra_fn are lambdas closing over `level` / `is_buy`).
+
+    The PPO/RSI extension cap only applies to pivot_up_R2 (buy) and
+    pivot_down_S2 (sell) — all other levels fire on the wick + valid-cross
+    conditions alone, with no PPO/RSI cap."""
     if is_buy:
+        apply_cap = (level == "R2")
         return {
             "key": f"pivot_up_{level}",
             "title": f"🟢⬆️ Cross above {level}",
-            "check_fn": lambda ctx, ppo, ppo_sig, rsi: (
+            "check_fn": (lambda ctx, ppo, ppo_sig, rsi: (
                 ctx.get("buy_common_wick", False) and
                 get_pivot_alert_info(ctx, level, is_buy=True)[0] and
                 (ppo.get("curr", np.nan) < Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr", np.nan) < Constants.RSI_SIGNAL_CROSS_MAX_BUY)
-            ),
+            )) if apply_cap else (lambda ctx, ppo, ppo_sig, rsi: (
+                ctx.get("buy_common_wick", False) and
+                get_pivot_alert_info(ctx, level, is_buy=True)[0]
+            )),
             "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
                 f"${ctx['pivots'][level]:,.2f} "
                 f"[Dist: {abs(ctx['pivots'][level] - ctx['close_curr'])/ctx['pivots'][level]*100:.2f}%] "
@@ -326,14 +334,18 @@ def create_pivot_alert(level: str, is_buy: bool) -> Dict[str, Any]:
             "requires": ["pivots"]
         }
     else:
+        apply_cap = (level == "S2")
         return {
             "key": f"pivot_down_{level}",
             "title": f"🔴⬇️ Cross below {level}",
-            "check_fn": lambda ctx, ppo, ppo_sig, rsi: (
+            "check_fn": (lambda ctx, ppo, ppo_sig, rsi: (
                 ctx.get("sell_common_wick", False) and
                 get_pivot_alert_info(ctx, level, is_buy=False)[0] and
                 (ppo.get("curr", np.nan) > Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr", np.nan) > Constants.RSI_SIGNAL_CROSS_MIN_SELL)
-            ),
+            )) if apply_cap else (lambda ctx, ppo, ppo_sig, rsi: (
+                ctx.get("sell_common_wick", False) and
+                get_pivot_alert_info(ctx, level, is_buy=False)[0]
+            )),
             "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
                 f"${ctx['pivots'][level]:,.2f} "
                 f"[Dist: {abs(ctx['pivots'][level] - ctx['close_curr'])/ctx['pivots'][level]*100:.2f}%] "
@@ -994,8 +1006,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             ppohist_reversal_sell = (sell_common_wick and ppohist_curr < 0 and ppohist_m3 < ppohist_m2 < ppohist_m1 and ppohist_curr < ppohist_m1)
 
         if cfg.ENABLE_STRONG_REVERSAL_ALERT:
-            strong_reversal_buy = (buy_trend_common_relaxed and reversal_bullish and (ppo_curr < Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi_curr < Constants.RSI_SIGNAL_CROSS_MAX_BUY))  
-            strong_reversal_sell = (sell_trend_common_relaxed and reversal_bearish and (ppo_curr > Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi_curr > Constants.RSI_SIGNAL_CROSS_MIN_SELL))      
+            strong_reversal_buy = (buy_trend_common_relaxed and reversal_bullish)
+            strong_reversal_sell = (sell_trend_common_relaxed and reversal_bearish)
         else:
             strong_reversal_buy, strong_reversal_sell = False, False
 
