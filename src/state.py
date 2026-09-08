@@ -1302,7 +1302,7 @@ class RedisStateStore:
                         write_pipe.delete(key)
                         pending_writes += 1
                         resolved_count += 1
-                        if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False)
+                        if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                             resolved_for_file.append({
                                 "pair": str(pair),
                                 "alert_key": str(alert_key),
