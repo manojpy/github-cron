@@ -897,24 +897,73 @@ class RedisStateStore:
 
         future_price = float(data_15m.close[target_idx])
         pct_move = (future_price - entry_price) / entry_price * 100.0
-        win = (
+
+        # ── ORIGINAL: Close-based win/loss ──
+        close_win = (
             pct_move >= cfg.OUTCOME_FAVORABLE_MOVE_PCT
             if is_buy
             else pct_move <= -cfg.OUTCOME_FAVORABLE_MOVE_PCT
         )
 
-        # ── MAE / MFE (path-aware, not just the binary close-vs-target outcome) ──
+        # ── NEW: MFE/MAE-based trade management metrics ──
         path_low = data_15m.low[entry_idx:target_idx]
         path_high = data_15m.high[entry_idx:target_idx]
+
         if len(path_low) and len(path_high):
             if is_buy:
-                mae = max(0.0, (entry_price - float(np.min(path_low))) / entry_price)
-                mfe = max(0.0, (float(np.max(path_high)) - entry_price) / entry_price)
+                mfe_pct = max(0.0, (float(np.max(path_high)) - entry_price) / entry_price * 100.0)
+                mae_pct = max(0.0, (entry_price - float(np.min(path_low))) / entry_price * 100.0)
             else:
-                mae = max(0.0, (float(np.max(path_high)) - entry_price) / entry_price)
-                mfe = max(0.0, (entry_price - float(np.min(path_low))) / entry_price)
+                mfe_pct = max(0.0, (entry_price - float(np.min(path_low))) / entry_price * 100.0)
+                mae_pct = max(0.0, (float(np.max(path_high)) - entry_price) / entry_price * 100.0)
         else:
-            mae = mfe = None
+            mfe_pct = mae_pct = None
+
+        # ── Trade Management Win/Loss Logic ──
+        # Take-profit: Did MFE reach the favorable threshold?
+        mfe_win = False
+        if mfe_pct is not None and cfg.OUTCOME_USE_MFE_METRIC:
+            mfe_win = mfe_pct >= cfg.OUTCOME_TAKE_PROFIT_PCT
+
+        # Stop-loss: Did MAE exceed stop-loss BEFORE MFE reached target?
+        mae_loss = False
+        if (mae_pct is not None and cfg.OUTCOME_USE_MAE_METRIC
+                and cfg.OUTCOME_STOP_LOSS_PCT > 0
+                and not mfe_win):
+            mae_loss = mae_pct >= cfg.OUTCOME_STOP_LOSS_PCT
+
+        # ── Final Trade Management Outcome ──
+        if mfe_win and mae_loss:
+            # Both happened - need to determine which came FIRST
+            # Scan the path to find which event triggered first
+            for i in range(entry_idx, target_idx):
+                if is_buy:
+                    if float(data_15m.high[i]) >= entry_price * (1 + cfg.OUTCOME_TAKE_PROFIT_PCT/100):
+                        mfe_win = True
+                        mae_loss = False  # TP hit first
+                        break
+                    if float(data_15m.low[i]) <= entry_price * (1 - cfg.OUTCOME_STOP_LOSS_PCT/100):
+                        mae_loss = True
+                        mfe_win = False  # SL hit first
+                        break
+                else:
+                    if float(data_15m.low[i]) <= entry_price * (1 - cfg.OUTCOME_TAKE_PROFIT_PCT/100):
+                        mfe_win = True
+                        mae_loss = False
+                        break
+                    if float(data_15m.high[i]) >= entry_price * (1 + cfg.OUTCOME_STOP_LOSS_PCT/100):
+                        mae_loss = True
+                        mfe_win = False
+                        break
+
+        # ── Determine the "trade_result" (realistic) ──
+        if mfe_win and not mae_loss:
+            trade_result = "win"  # Took profit
+        elif mae_loss and not mfe_win:
+            trade_result = "loss"  # Hit stop loss
+        else:
+            # Neither hit - fall back to close-based
+            trade_result = "win" if close_win else "loss"
 
         return {
             "alert_key": key.split(":")[-2],
@@ -922,15 +971,22 @@ class RedisStateStore:
             "entry_ts": entry_ts,
             "is_buy": is_buy,
             "pct_move": pct_move,
-            "win": win,
-            "mae": mae,
-            "mfe": mfe,
+            "win": close_win,  # ORIGINAL - backward compat
+            "trade_result": trade_result,  # NEW - realistic
+            "close_win": close_win,  # Original metric
+            "mfe_win": mfe_win,  # New: hit target at any point
+            "mae_loss": mae_loss,  # New: hit stop-loss
+            "mfe_pct": mfe_pct,  # New: max favorable %
+            "mae_pct": mae_pct,  # New: max adverse %
+            "mae": mae_pct / 100 if mae_pct else None,  # Keep original format
+            "mfe": mfe_pct / 100 if mfe_pct else None,  # Keep original format
             "conf_score": conf_score,
             "conf_total": conf_total,
             "conf_votes": conf_votes,
             "adx_val": adx_val,
             "context": data.get("context"),
         }, ""
+
 
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
                                          logger_pair: logging.Logger) -> None:
@@ -992,13 +1048,19 @@ class RedisStateStore:
                             not_ready_count += 1
                             continue
 
+
                         alert_key = result["alert_key"]
                         direction = result["direction"]
                         entry_ts = result["entry_ts"]
                         pct_move = result["pct_move"]
-                        win = result["win"]
-                        mae = result["mae"]
-                        mfe = result["mfe"]
+                        win = result["win"]  # Original close-based
+                        trade_result = result["trade_result"]  # NEW
+                        mfe_win = result["mfe_win"]  # NEW
+                        mae_loss = result["mae_loss"]  # NEW
+                        mfe_pct = result["mfe_pct"]  # NEW
+                        mae_pct = result["mae_pct"]  # NEW
+                        mae = result["mae"]  # Original format
+                        mfe = result["mfe"]  # Original format
                         conf_score = result["conf_score"]
                         conf_total = result["conf_total"]
                         conf_votes = result["conf_votes"]
@@ -1011,6 +1073,13 @@ class RedisStateStore:
                         session_stats_key = f"{stats_key}:{session}"
                         write_pipe.hincrby(session_stats_key, "wins" if win else "losses", 1)
                         write_pipe.expire(session_stats_key, stats_ttl)
+                        
+                        # NEW: Store trade management metrics in ALERT_STATS hash
+                        if getattr(cfg, "OUTCOME_USE_MFE_METRIC", True) or getattr(cfg, "OUTCOME_USE_MAE_METRIC", True):
+                            write_pipe.hincrby(stats_key, "tm_wins" if trade_result == "win" else "tm_losses", 1)
+                            write_pipe.hincrby(stats_key, "mfe_wins" if mfe_win else "mfe_fails", 1)
+                            write_pipe.hincrby(stats_key, "mae_losses" if mae_loss else "mae_ok", 1)
+                        
                         stream_fields = None
                         if conf_score is not None and conf_total is not None:
                             stream_fields = { 
@@ -1020,7 +1089,12 @@ class RedisStateStore:
                                 "score": str(conf_score),
                                 "total": str(conf_total),
                                 "pct_move": f"{pct_move:.4f}",
-                                "win": "1" if win else "0",
+                                "win": "1" if win else "0",  # Original
+                                "trade_result": str(trade_result),  # NEW
+                                "mfe_win": "1" if mfe_win else "0",  # NEW
+                                "mae_loss": "1" if mae_loss else "0",  # NEW
+                                "mfe_pct": f"{mfe_pct:.4f}" if mfe_pct is not None else "",
+                                "mae_pct": f"{mae_pct:.4f}" if mae_pct is not None else "",
                                 "entry_ts": str(entry_ts),
                                 "session": session,
                                 "mae": f"{mae:.5f}" if mae is not None else "",
@@ -1053,7 +1127,12 @@ class RedisStateStore:
                                 "entry_ts": entry_ts,
                                 "score": conf_score,
                                 "total": conf_total,
-                                "win": win,
+                                "win": win,  # Original
+                                "trade_result": trade_result,  # NEW
+                                "mfe_win": mfe_win,  # NEW
+                                "mae_loss": mae_loss,  # NEW
+                                "mfe_pct": mfe_pct,  # NEW
+                                "mae_pct": mae_pct,  # NEW
                                 "pct_move": pct_move,
                                 "mae": mae,
                                 "mfe": mfe,
@@ -1145,15 +1224,20 @@ class RedisStateStore:
                             key, raw, data_15m, i15
                         )
                         if skip_reason:
-                            continue
+                            continue               
 
                         alert_key = result["alert_key"]
                         direction = result["direction"]
                         entry_ts = result["entry_ts"]
                         pct_move = result["pct_move"]
-                        win = result["win"]
-                        mae = result["mae"]
-                        mfe = result["mfe"]
+                        win = result["win"]  # Original close-based
+                        trade_result = result["trade_result"]  # NEW
+                        mfe_win = result["mfe_win"]  # NEW
+                        mae_loss = result["mae_loss"]  # NEW
+                        mfe_pct = result["mfe_pct"]  # NEW
+                        mae_pct = result["mae_pct"]  # NEW
+                        mae = result["mae"]  # Original format
+                        mfe = result["mfe"]  # Original format
                         conf_score = result["conf_score"]
                         conf_total = result["conf_total"]
                         conf_votes = result["conf_votes"]
@@ -1161,6 +1245,12 @@ class RedisStateStore:
                         stats_key = f"{RedisKeyPrefix.SHADOW_STATS}{pair}:{alert_key}"
                         write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
                         write_pipe.expire(stats_key, stats_ttl)
+                        
+                        # NEW: Store trade management metrics in SHADOW_STATS hash
+                        if getattr(cfg, "OUTCOME_USE_MFE_METRIC", True) or getattr(cfg, "OUTCOME_USE_MAE_METRIC", True):
+                            write_pipe.hincrby(stats_key, "tm_wins" if trade_result == "win" else "tm_losses", 1)
+                            write_pipe.hincrby(stats_key, "mfe_wins" if mfe_win else "mfe_fails", 1)
+                            write_pipe.hincrby(stats_key, "mae_losses" if mae_loss else "mae_ok", 1)
 
                         if (
                             conf_score is not None
@@ -1178,7 +1268,12 @@ class RedisStateStore:
                                         "score": str(conf_score),
                                         "total": str(conf_total),
                                         "pct_move": f"{pct_move:.4f}",
-                                        "win": "1" if win else "0",
+                                        "win": "1" if win else "0",  # Original
+                                        "trade_result": str(trade_result),  # NEW
+                                        "mfe_win": "1" if mfe_win else "0",  # NEW
+                                        "mae_loss": "1" if mae_loss else "0",  # NEW
+                                        "mfe_pct": f"{mfe_pct:.4f}" if mfe_pct is not None else "",
+                                        "mae_pct": f"{mae_pct:.4f}" if mae_pct is not None else "",
                                         "entry_ts": str(entry_ts),
                                         "session": _get_session_from_ts(entry_ts)
                                         if entry_ts
@@ -1214,7 +1309,12 @@ class RedisStateStore:
                                 "entry_ts": entry_ts,
                                 "score": conf_score,
                                 "total": conf_total,
-                                "win": win,
+                                "win": win,  # Original
+                                "trade_result": trade_result,  # NEW
+                                "mfe_win": mfe_win,  # NEW
+                                "mae_loss": mae_loss,  # NEW
+                                "mfe_pct": mfe_pct,  # NEW
+                                "mae_pct": mae_pct,  # NEW
                                 "pct_move": pct_move,
                                 "mae": mae,
                                 "mfe": mfe,
@@ -1222,7 +1322,6 @@ class RedisStateStore:
                                 "votes": conf_votes,
                                 "shadow": True,
                             })
-                
                     except Exception as e:
                         logger_pair.debug(
                             f"Failed to resolve shadow pending outcome {key}: {e}"

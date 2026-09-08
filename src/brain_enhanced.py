@@ -372,10 +372,58 @@ class BrainEngineV2(BaseBrainEngine):
                     ),
                 })
 
-        # ── Risk Flag: Config Version Regression Check ──────────────────
+        # ── Risk Flag: Config Version Regression Check ──
         version_comparisons = compare_config_versions(
             real_rows, min_sample=self._phase_samples["config_regression"]
         )
+
+        # ── NEW: Trade Management Analysis ──
+        tm_stats: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
+            "tm_wins": 0, "tm_losses": 0,
+            "mfe_wins": 0, "mfe_fails": 0,
+            "mae_losses": 0, "mae_ok": 0,
+        })
+        
+        for r in real_rows:
+            ak = r["alert_key"]
+            if r.get("trade_result") == "win":
+                tm_stats[ak]["tm_wins"] += 1
+            elif r.get("trade_result") == "loss":
+                tm_stats[ak]["tm_losses"] += 1
+            if r.get("mfe_win") is not None:
+                tm_stats[ak]["mfe_wins" if r["mfe_win"] else "mfe_fails"] += 1
+            if r.get("mae_loss") is not None:
+                tm_stats[ak]["mae_losses" if r["mae_loss"] else "mae_ok"] += 1
+
+        if tm_stats:
+            tm_lines = []
+            for ak, s in sorted(tm_stats.items(), key=lambda x: -x[1]["tm_wins"]):
+                total_tm = s["tm_wins"] + s["tm_losses"]
+                if total_tm < self._phase_samples["conditional_gating"]:
+                    continue
+                tm_wr = s["tm_wins"] / total_tm
+                mfe_wr = s["mfe_wins"] / (s["mfe_wins"] + s["mfe_fails"]) if (s["mfe_wins"] + s["mfe_fails"]) > 0 else None
+                mae_loss_rate = s["mae_losses"] / (s["mae_losses"] + s["mae_ok"]) if (s["mae_losses"] + s["mae_ok"]) > 0 else None
+                
+                line = f"  • {ak}: TM WR {tm_wr:.0%} ({total_tm} trades)"
+                if mfe_wr is not None:
+                    line += f" | MFE WR {mfe_wr:.0%}"
+                if mae_loss_rate is not None:
+                    line += f" | Stop-out {mae_loss_rate:.0%}"
+                tm_lines.append(line)
+            
+            if tm_lines:
+                recommendations.append({
+                    "type": "trade_management_breakdown",
+                    "severity": "medium",
+                    "message": (
+                        "📊 Trade Management Outcomes (TP=" + 
+                        f"{cfg.OUTCOME_TAKE_PROFIT_PCT:.1%}, SL={cfg.OUTCOME_STOP_LOSS_PCT:.1%}):\n" +
+                        "\n".join(tm_lines[:10]) +
+                        "\n\nMost alerts show higher TM WR than close-based WR — " +
+                        "the close-based metric understates actual profitability."
+                    ),
+                })
         for comp in version_comparisons:
             if comp["regression"]:
                 recommendations.append({

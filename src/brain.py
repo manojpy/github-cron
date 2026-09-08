@@ -714,6 +714,54 @@ class BrainEngine:
                 ),
             })
 
+        # ── NEW: Trade Management Breakdown (MFE/MAE-aware) ──
+        tm_stats: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
+            "tm_wins": 0, "tm_losses": 0,
+            "mfe_wins": 0, "mfe_fails": 0,
+            "mae_losses": 0, "mae_ok": 0,
+        })
+        
+        for r in real_rows:
+            ak = r["alert_key"]
+            if r.get("trade_result") == "win":
+                tm_stats[ak]["tm_wins"] += 1
+            elif r.get("trade_result") == "loss":
+                tm_stats[ak]["tm_losses"] += 1
+            if r.get("mfe_win") is not None:
+                tm_stats[ak]["mfe_wins" if r["mfe_win"] else "mfe_fails"] += 1
+            if r.get("mae_loss") is not None:
+                tm_stats[ak]["mae_losses" if r["mae_loss"] else "mae_ok"] += 1
+
+        if tm_stats:
+            tm_lines = []
+            for ak, s in sorted(tm_stats.items(), key=lambda x: -x[1]["tm_wins"]):
+                total_tm = s["tm_wins"] + s["tm_losses"]
+                if total_tm < min_sample:
+                    continue
+                tm_wr = s["tm_wins"] / total_tm
+                mfe_wr = s["mfe_wins"] / (s["mfe_wins"] + s["mfe_fails"]) if (s["mfe_wins"] + s["mfe_fails"]) > 0 else None
+                mae_loss_rate = s["mae_losses"] / (s["mae_losses"] + s["mae_ok"]) if (s["mae_losses"] + s["mae_ok"]) > 0 else None
+                
+                line = f"  • {ak}: TM WR {tm_wr:.0%} ({total_tm} trades)"
+                if mfe_wr is not None:
+                    line += f" | MFE WR {mfe_wr:.0%}"
+                if mae_loss_rate is not None:
+                    line += f" | Stop-out {mae_loss_rate:.0%}"
+                tm_lines.append(line)
+            
+            if tm_lines:
+                recommendations.append({
+                    "type": "trade_management_breakdown",
+                    "severity": "medium",
+                    "message": (
+                        "📊 Trade Management Outcomes (TP=" + 
+                        f"{cfg.OUTCOME_TAKE_PROFIT_PCT:.1%}, SL={cfg.OUTCOME_STOP_LOSS_PCT:.1%}):\n" +
+                        "\n".join(tm_lines[:10]) +
+                        "\n\nMost alerts show higher TM WR than close-based WR — " +
+                        "the close-based metric understates actual profitability."
+                    ),
+                })
+
         # ── Per-pair session breakdown (informational) ──────────────────
         if getattr(cfg, "ENABLE_SESSION_FILTER", False):
             session_stats = engine.per_pair_session_breakdown(real_rows, min_sample=min_sample)
@@ -748,7 +796,7 @@ class BrainEngine:
                     ),
                 })
        
-        # ── Per-pair confluence thresholds ──────────────────────────────
+        # ── Per-pair confluence thresholds ────────────────────���─────────
         if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
             pair_min_sample = getattr(cfg, "BRAIN_PAIR_THRESHOLD_MIN_SAMPLE", 30)
             pair_recs = engine.per_pair_thresholds(
@@ -1167,11 +1215,22 @@ class BrainEngine:
                 lines.append(f"{icon} {escape_markdown_v2(r['message'][:150])}")
             lines.append("")
 
+        # ── NEW: Display Trade Management Breakdown in report ──
+        tm_rec = next((r for r in recs["recommendations"] if r["type"] == "trade_management_breakdown"), None)
+        if tm_rec:
+            lines.append("*📊 TRADE MANAGEMENT*")
+            lines.extend(
+                escape_markdown_v2(line)
+                for line in tm_rec["message"].split("\n")[:8]
+            )
+            lines.append("")
+
         # ── FYI: CUSUM drift + any leftover findings — informational, goes last ──
         skip_types = patch_derived_types | {
             "dynamic_weights_applied", "dynamic_weights_shadow",
             "dynamic_weights_persist_failed", "auto_disabled", "auto_reenabled",
             "disable_alert", "vote_interaction", "counterfactual", "per_alert_breakdown",
+            "trade_management_breakdown",  # Already displayed above
         }
         others = [
             r for r in recs["recommendations"]
