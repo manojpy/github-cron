@@ -28,7 +28,8 @@ def format_size(bytes: int) -> str:
         bytes /= 1024.0
     return f"{bytes:.2f} TB"
 
-def cleanup_by_age(data_dir: Path, max_age_days: int) -> int:
+
+def cleanup_by_age(data_dir: Path, max_age_days: int, dry_run: bool = False) -> int:
     """Remove files older than max_age_days."""
     removed = 0
     cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
@@ -42,15 +43,17 @@ def cleanup_by_age(data_dir: Path, max_age_days: int) -> int:
             try:
                 mtime = datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc)
                 if mtime < cutoff:
-                    print(f"🗑️ Removing old file: {file_path}")
-                    file_path.unlink()
+                    prefix = "🔎 [DRY RUN] Would remove" if dry_run else "🗑️ Removing"
+                    print(f"{prefix} old file: {file_path}")
+                    if not dry_run:
+                        file_path.unlink()
                     removed += 1
             except OSError:
                 continue
     
     return removed
 
-def compress_large_files(data_dir: Path, max_size_mb: int) -> int:
+def compress_large_files(data_dir: Path, max_size_mb: int, dry_run: bool = False) -> int:
     """Compress files that exceed max_size_mb, but aren't old enough to delete."""
     compressed = 0
     max_size_bytes = max_size_mb * 1024 * 1024
@@ -64,16 +67,19 @@ def compress_large_files(data_dir: Path, max_size_mb: int) -> int:
             if month_file.stat().st_size > max_size_bytes:
                 gz_file = month_file.with_suffix(month_file.suffix + ".gz")
                 if not gz_file.exists():
-                    print(f"💾 Compressing large file: {month_file.name}")
-                    with open(month_file, "rb") as f_in:
-                        with gzip.open(gz_file, "wb", compresslevel=6) as f_out:
-                            shutil.copyfileobj(f_in, f_out)
-                    month_file.unlink()
+                    if dry_run:
+                        print(f"🔎 [DRY RUN] Would compress: {month_file.name}")
+                    else:
+                        print(f"💾 Compressing large file: {month_file.name}")
+                        with open(month_file, "rb") as f_in:
+                            with gzip.open(gz_file, "wb", compresslevel=6) as f_out:
+                                shutil.copyfileobj(f_in, f_out)
+                        month_file.unlink()
                     compressed += 1
     
     return compressed
 
-def wipe_labels(data_dir: Path, labels: list) -> int:
+def wipe_labels(data_dir: Path, labels: list, dry_run: bool = False) -> int:
     """DANGER: delete every file (any age, any size) under the given label dirs.
     
     SAFETY: Deletes FILES only. Parent folders are preserved, and a .gitkeep
@@ -83,18 +89,27 @@ def wipe_labels(data_dir: Path, labels: list) -> int:
     for label in labels:
         label_dir = data_dir / label
         
-        # 1. Ensure the folder exists
+        # 1. Ensure the folder exists (skipped in dry-run — nothing to preview creating)
         if not label_dir.exists():
+            if dry_run:
+                print(f"🔎 [DRY RUN] Would recreate missing folder: {label_dir}")
+                continue
             label_dir.mkdir(parents=True, exist_ok=True)
             print(f"📁 Recreated missing folder: {label_dir}")
         
         # 2. Delete all files inside (including nested ones)
         for file_path in label_dir.rglob('*'):
             if file_path.is_file():
-                print(f"🚨 WIPE: removing {file_path}")
-                file_path.unlink()
+                if dry_run:
+                    print(f"🔎 [DRY RUN] Would WIPE: removing {file_path}")
+                else:
+                    print(f"🚨 WIPE: removing {file_path}")
+                    file_path.unlink()
                 removed += 1
-                
+
+        if dry_run:
+            continue
+
         # 3. Clean up empty subdirectories (but NEVER the main label_dir)
         for dir_path in sorted(label_dir.rglob('*'), reverse=True):
             if dir_path.is_dir() and not any(dir_path.iterdir()):
@@ -131,16 +146,17 @@ def main():
         print(f"Data directory not found: {data_dir}")
         return
 
-    if args.wipe_all:
+if args.wipe_all:
         print("=" * 60)
-        print("  🚨 OUTCOME DATA WIPE — outcomes/ + reports/")
+        print("  🚨 OUTCOME DATA WIPE — outcomes/ + reports/" + ("  [DRY RUN]" if args.dry_run else ""))
         print("=" * 60)
-        removed = wipe_labels(data_dir, ["outcomes", "reports"])
-        print(f"\n✅ Wipe complete — removed {removed} file(s)")
+        removed = wipe_labels(data_dir, ["outcomes", "reports"], dry_run=args.dry_run)
+        verb = "Would remove" if args.dry_run else "removed"
+        print(f"\n✅ Wipe {'preview' if args.dry_run else 'complete'} — {verb} {removed} file(s)")
         return
 
     print("=" * 60)
-    print("  OUTCOME DATA CLEANUP")
+    print("  OUTCOME DATA CLEANUP" + ("  [DRY RUN]" if args.dry_run else ""))
     print("=" * 60)
 
     current_size = get_dir_size(data_dir)
@@ -148,26 +164,30 @@ def main():
     print(f"Max total size: {args.max_total_mb} MB")
     
     print(f"\n📋 Checking for files older than {args.max_age_days} days...")
-    removed = cleanup_by_age(data_dir, args.max_age_days)
+    removed = cleanup_by_age(data_dir, args.max_age_days, dry_run=args.dry_run)
     if removed:
-        print(f"✅ Removed {removed} old file(s)")
+        print(f"✅ {'Would remove' if args.dry_run else 'Removed'} {removed} old file(s)")
     else:
         print("No old files to remove")
     
     print(f"\n📋 Checking for files larger than {args.max_size_mb} MB...")
-    compressed = compress_large_files(data_dir, args.max_size_mb)
+    compressed = compress_large_files(data_dir, args.max_size_mb, dry_run=args.dry_run)
     if compressed:
-        print(f"✅ Compressed {compressed} large file(s)")
+        print(f"✅ {'Would compress' if args.dry_run else 'Compressed'} {compressed} large file(s)")
     else:
         print("No large files to compress")
     
+    # In dry-run, nothing above actually changed the filesystem, so
+    # get_dir_size() still reflects the original size — track a simulated
+    # running total instead of re-stat'ing the (unchanged) directory.
     new_size = get_dir_size(data_dir)
     max_total_bytes = args.max_total_mb * 1024 * 1024
     
     if new_size > max_total_bytes:
         print(f"\n⚠️ Directory size ({format_size(new_size)}) exceeds limit ({args.max_total_mb} MB)")
-        print("Performing aggressive cleanup...")
+        print("Performing aggressive cleanup..." if not args.dry_run else "Previewing aggressive cleanup...")
         
+        simulated_size = new_size
         for label, pattern in (("outcomes", "*.jsonl*"), ("shadow", "*.jsonl*"), ("reports", "*.md")):
             label_dir = data_dir / label
             if not label_dir.exists():
@@ -175,15 +195,20 @@ def main():
             
             files = sorted(label_dir.glob(pattern))
             for month_file in files:
-                if get_dir_size(data_dir) <= max_total_bytes:
+                current_check = simulated_size if args.dry_run else get_dir_size(data_dir)
+                if current_check <= max_total_bytes:
                     break
-                print(f"🗑️ Removing {month_file.name} to stay under limit")
-                month_file.unlink()
+                if args.dry_run:
+                    print(f"🔎 [DRY RUN] Would remove {month_file.name} to stay under limit")
+                    simulated_size -= month_file.stat().st_size
+                else:
+                    print(f"🗑️ Removing {month_file.name} to stay under limit")
+                    month_file.unlink()
     
     final_size = get_dir_size(data_dir)
     print(f"\n{'=' * 60}")
-    print(f"✅ Cleanup complete")
-    print(f"Final size: {format_size(final_size)}")
+    print(f"✅ Cleanup {'preview' if args.dry_run else 'complete'}")
+    print(f"Final size: {format_size(final_size)}" + (" (unchanged — dry run)" if args.dry_run else ""))
     print(f"Size reduction: {format_size(current_size - final_size)}")
     print(f"{'=' * 60}")
 

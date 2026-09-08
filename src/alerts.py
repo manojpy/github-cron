@@ -1766,10 +1766,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             # Strip the datetime line so the run-level dispatcher can add one shared footer
             msg_body, _, _ = msg.rpartition("\n")
 
-            logger_pair.info(
-                f"🌐🎯🟢 Queued {len(alerts_to_send)} alert(s) for {pair_name} | "
-                f"Keys: {[ak for _, _, ak in alerts_to_send]} → batch dispatch"
-            )
             if not cfg.DRY_RUN_MODE:
                 reconfirmed = await confirm_candle_unchanged(
                     fetcher, symbol, pair_name, ts_curr, cached_snapshot, reference_time, logger_pair
@@ -1821,6 +1817,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     "hist_rma": round(hist_curr, 4), "suppression": "Mark price disagreement"}
                     }, None
 
+            logger_pair.info(
+                f"🌐🎯🟢 Queued {len(alerts_to_send)} alert(s) for {pair_name} | "
+                f"Keys: {[ak for _, _, ak in alerts_to_send]} → batch dispatch"
+            )
             first_key = alerts_to_send[0][2]
             direction = "buy" if first_key in BUY_ALERT_KEYS else "sell"
 
