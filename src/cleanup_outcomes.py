@@ -146,7 +146,7 @@ def main():
         print(f"Data directory not found: {data_dir}")
         return
 
-if args.wipe_all:
+    if args.wipe_all:
         print("=" * 60)
         print("  🚨 OUTCOME DATA WIPE — outcomes/ + reports/" + ("  [DRY RUN]" if args.dry_run else ""))
         print("=" * 60)
