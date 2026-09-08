@@ -531,37 +531,19 @@ def per_pair_session_breakdown(rows: List[Row], min_sample: int = 10):
     return results
 
 def per_alert_breakdown(rows: List[Row], min_sample: int = 10):
-    stats = defaultdict(lambda: {
-        "wins": 0, "n": 0, "scores": [],
-        "mfe_wins": 0, "mfe_total": 0,
-        "tm_wins": 0, "tm_losses": 0,
-        "mae_losses": 0, "mae_ok": 0,
-    })
+    stats = defaultdict(lambda: {"wins": 0, "n": 0, "scores": []})
     for r in rows:
         s = stats[r["alert_key"]]
-        s["wins"] += r["win"]  # Now MFE-based
+        s["wins"] += r["win"]
         s["n"] += 1
         s["scores"].append(r["score"])
-        if r.get("mfe_win") is not None:
-            s["mfe_total"] += 1
-            s["mfe_wins"] += 1 if r["mfe_win"] else 0
-        if r.get("trade_result") == "win":
-            s["tm_wins"] += 1
-        elif r.get("trade_result") == "loss":
-            s["tm_losses"] += 1
-        if r.get("mae_loss") is not None:
-            s["mae_losses" if r["mae_loss"] else "mae_ok"] += 1
     results = []
     for ak, s in stats.items():
         if s["n"] < min_sample:
             continue
-        wr = s["wins"] / s["n"]  # MFE-based WR (primary)
+        wr = s["wins"] / s["n"]
         avg_score = sum(s["scores"]) / len(s["scores"])
-        mfe_wr = s["mfe_wins"] / s["mfe_total"] if s["mfe_total"] > 0 else None
-        tm_total = s["tm_wins"] + s["tm_losses"]
-        tm_wr = s["tm_wins"] / tm_total if tm_total > 0 else None
-        mae_loss_rate = s["mae_losses"] / (s["mae_losses"] + s["mae_ok"]) if (s["mae_losses"] + s["mae_ok"]) > 0 else None
-        results.append((ak, wr, s["n"], avg_score, mfe_wr, tm_total, mae_loss_rate))
+        results.append((ak, wr, s["n"], avg_score))
     results.sort(key=lambda x: x[1])
     return results
 
@@ -1624,3 +1606,121 @@ def score_actionability(rec: Dict[str, Any]) -> float:
     elif rec.get("type") == "conditional_gating":
         effort = 2.0
     return impact * confidence / effort
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  THREE-METRIC OUTCOME ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════
+
+def multi_metric_summary(rows: List[Row], min_sample: int = 10) -> Dict[str, Any]:
+    """Compute all three win/loss metrics across the full row set.
+    Returns close_wr, mfe_wr, mae_loss_rate, clean_win_rate,
+    and tp_before_sl ordering stats."""
+    n = len(rows)
+    if n < min_sample:
+        return {"valid": False, "error": "insufficient_data", "n": n}
+
+    close_wins = sum(1 for r in rows if r.get("close_win", r["win"]))
+    mfe_wins = sum(1 for r in rows if r.get("mfe_win") is True)
+    mae_losses = sum(1 for r in rows if r.get("mae_loss") is True)
+
+    # tp_first: True means TP was hit before SL (the "realistic" win)
+    tp_first_rows = [r for r in rows if r.get("tp_first") is not None]
+    tp_before_sl = sum(1 for r in tp_first_rows if r["tp_first"] is True)
+    sl_before_tp = sum(1 for r in tp_first_rows if r["tp_first"] is False)
+
+    # mfe_win but also mae_loss — hit both levels
+    both_hit = sum(
+        1 for r in rows
+        if r.get("mfe_win") is True and r.get("mae_loss") is True
+    )
+
+    # "Clean" wins: reached TP without ever hitting SL level
+    clean_wins = sum(
+        1 for r in rows
+        if r.get("mfe_win") is True and r.get("mae_loss") is not True
+    )
+
+    result: Dict[str, Any] = {
+        "valid": True,
+        "n": n,
+        "close_wr": close_wins / n,
+        "mfe_wr": mfe_wins / n,
+        "mae_loss_rate": mae_losses / n,
+        "clean_win_rate": clean_wins / n,
+        "both_hit_rate": both_hit / n,
+    }
+
+    if tp_first_rows:
+        result["tp_before_sl_rate"] = tp_before_sl / len(tp_first_rows)
+        result["sl_before_tp_rate"] = sl_before_tp / len(tp_first_rows)
+        result["ordering_sample"] = len(tp_first_rows)
+
+    # Wilson CIs for the key metrics
+    close_lo, close_hi, _ = wilson_ci(close_wins, n)
+    mfe_lo, mfe_hi, _ = wilson_ci(mfe_wins, n)
+    result["close_wilson"] = (close_lo, close_hi)
+    result["mfe_wilson"] = (mfe_lo, mfe_hi)
+
+    return result
+
+
+def multi_metric_per_alert(rows: List[Row], min_sample: int = 10) -> List[Dict[str, Any]]:
+    """Per-alert breakdown showing all three metrics. Sorted by mfe_wr
+    descending (most actionable metric first)."""
+    by_alert: Dict[str, List[Row]] = defaultdict(list)
+    for r in rows:
+        by_alert[r["alert_key"]].append(r)
+
+    results = []
+    for ak, alert_rows in by_alert.items():
+        if len(alert_rows) < min_sample:
+            continue
+        n = len(alert_rows)
+        close_wins = sum(1 for r in alert_rows if r.get("close_win", r["win"]))
+        mfe_wins = sum(1 for r in alert_rows if r.get("mfe_win") is True)
+        mae_losses = sum(1 for r in alert_rows if r.get("mae_loss") is True)
+        clean_wins = sum(
+            1 for r in alert_rows
+            if r.get("mfe_win") is True and r.get("mae_loss") is not True
+        )
+
+        results.append({
+            "alert_key": ak,
+            "n": n,
+            "close_wr": close_wins / n,
+            "mfe_wr": mfe_wins / n,
+            "mae_loss_rate": mae_losses / n,
+            "clean_win_rate": clean_wins / n,
+            "gap_mfe_vs_close": (mfe_wins - close_wins) / n,
+        })
+
+    results.sort(key=lambda x: -x["mfe_wr"])
+    return results
+
+
+def multi_metric_per_pair(rows: List[Row], min_sample: int = 15) -> List[Dict[str, Any]]:
+    """Per-pair three-metric breakdown."""
+    by_pair: Dict[str, List[Row]] = defaultdict(list)
+    for r in rows:
+        by_pair[r["pair"]].append(r)
+
+    results = []
+    for pair, pair_rows in by_pair.items():
+        if len(pair_rows) < min_sample:
+            continue
+        n = len(pair_rows)
+        close_wins = sum(1 for r in pair_rows if r.get("close_win", r["win"]))
+        mfe_wins = sum(1 for r in pair_rows if r.get("mfe_win") is True)
+        mae_losses = sum(1 for r in pair_rows if r.get("mae_loss") is True)
+
+        results.append({
+            "pair": pair,
+            "n": n,
+            "close_wr": close_wins / n,
+            "mfe_wr": mfe_wins / n,
+            "mae_loss_rate": mae_losses / n,
+        })
+
+    results.sort(key=lambda x: -x["mfe_wr"])
+    return results

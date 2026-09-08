@@ -198,12 +198,13 @@ class BrainEngine:
                     votes = json.loads(votes_raw) if votes_raw else None
                 except (TypeError, ValueError):
                     votes = None
+
                 context_raw = f.get("context")
                 try:
                     row_context = json.loads(context_raw) if context_raw else None
                 except (TypeError, ValueError):
                     row_context = None
-                
+
                 mae_raw = f.get("mae")
                 mfe_raw = f.get("mfe")
                 try:
@@ -215,14 +216,30 @@ class BrainEngine:
                 except (TypeError, ValueError):
                     mfe = None
 
+                # ── Three-metric fields (backward compatible with old rows) ──
+                close_win_raw = f.get("close_win")
+                mfe_win_raw = f.get("mfe_win")
+                mae_loss_raw = f.get("mae_loss")
+                tp_first_raw = f.get("tp_first")
+
+                base_win = f.get("win") == "1"
+                close_win_val = (close_win_raw == "1") if close_win_raw else base_win
+                mfe_win_val = (mfe_win_raw == "1") if mfe_win_raw else None
+                mae_loss_val = (mae_loss_raw == "1") if mae_loss_raw else None
+                tp_first_val = (
+                    True if tp_first_raw == "1"
+                    else False if tp_first_raw == "0"
+                    else None
+                )
+
                 parsed.append({
-                    "pair": pair, 
+                    "pair": pair,
                     "alert_key": alert_key,
                     "direction": f.get("direction", "?"),
                     "score": score,
                     "total": total,
                     "conf_pct": score / total * 100.0,
-                    "win": f.get("win") == "1",
+                    "win": base_win,
                     "pct_move": float(f.get("pct_move", 0.0)),
                     "entry_ts": entry_ts,
                     "session": f.get("session", "unknown"),
@@ -230,6 +247,11 @@ class BrainEngine:
                     "mfe": mfe,
                     "votes": votes,
                     "context": row_context,
+                    # ── Three-metric fields ──
+                    "close_win": close_win_val,
+                    "mfe_win": mfe_win_val,
+                    "mae_loss": mae_loss_val,
+                    "tp_first": tp_first_val,
                 })
             except (KeyError, ValueError) as e:
                 logging.getLogger("macd_bot").debug(f"Brain: dropping malformed outcome row: {e}")
@@ -658,7 +680,6 @@ class BrainEngine:
                         "patch is auto-applied."
                     ),
                 })
-
             anomalies_check = engine.flag_anomalous_rows(real_rows, min_sample=min_sample)
             if anomalies_check["valid"] and anomalies_check["n_flagged"] > 0:
                 top = anomalies_check["flagged"][:5]
@@ -677,6 +698,66 @@ class BrainEngine:
                         "the EV/WR numbers above. Not auto-excluded — could be a real outsized move."
                     ),
                 })
+
+            # ── Three-Metric Outcome Analysis ────────────────────────────────
+            mm_summary = engine.multi_metric_summary(real_rows, min_sample=min_sample)
+            if mm_summary.get("valid"):
+                close_wr = mm_summary["close_wr"]
+                mfe_wr = mm_summary["mfe_wr"]
+                mae_rate = mm_summary["mae_loss_rate"]
+                clean_wr = mm_summary["clean_win_rate"]
+                gap = mfe_wr - close_wr
+
+                summary_msg = (
+                    f"📐 Three-Metric Evaluation (n={mm_summary['n']}):\n"
+                    f"  • Close WR (point-in-time): {close_wr:.0%} "
+                    f"[{mm_summary['close_wilson'][0]:.0%}-{mm_summary['close_wilson'][1]:.0%}]\n"
+                    f"  • MFE WR (TP ever hit):    {mfe_wr:.0%} "
+                    f"[{mm_summary['mfe_wilson'][0]:.0%}-{mm_summary['mfe_wilson'][1]:.0%}]\n"
+                    f"  • MAE Loss Rate (SL hit):  {mae_rate:.0%}\n"
+                    f"  • Clean Win (TP w/o SL):   {clean_wr:.0%}"
+                )
+                if gap > 0.05:
+                    summary_msg += (
+                        f"\n  ⚠️ Gap: {gap:+.0%} of trades hit TP but reversed before candle 8. "
+                        f"The close-based WR underestimates true profitability by {gap:.0%}."
+                    )
+                if mm_summary.get("tp_before_sl_rate") is not None:
+                    summary_msg += (
+                        f"\n  • TP before SL: {mm_summary['tp_before_sl_rate']:.0%} "
+                        f"| SL before TP: {mm_summary.get('sl_before_tp_rate', 0):.0%} "
+                        f"(n={mm_summary.get('ordering_sample', '?')})"
+                    )
+
+                recommendations.append({
+                    "type": "three_metric_evaluation",
+                    "severity": "medium" if gap > 0.10 else "low",
+                    "close_wr": round(close_wr, 4),
+                    "mfe_wr": round(mfe_wr, 4),
+                    "mae_loss_rate": round(mae_rate, 4),
+                    "clean_win_rate": round(clean_wr, 4),
+                    "gap": round(gap, 4),
+                    "message": summary_msg,
+                })
+
+                # Per-alert three-metric breakdown (worst offenders only)
+                mm_per_alert = engine.multi_metric_per_alert(real_rows, min_sample=min_sample)
+                big_gap_alerts = [a for a in mm_per_alert if a["gap_mfe_vs_close"] > 0.15]
+                if big_gap_alerts:
+                    gap_lines = [
+                        f"  • {a['alert_key']}: close {a['close_wr']:.0%} vs MFE {a['mfe_wr']:.0%} "
+                        f"(gap {a['gap_mfe_vs_close']:+.0%}, n={a['n']})"
+                        for a in big_gap_alerts[:5]
+                    ]
+                    recommendations.append({
+                        "type": "close_vs_mfe_gap",
+                        "severity": "medium",
+                        "message": (
+                            f"🔍 Alerts where MFE WR >> Close WR (take-profit would have captured "
+                            f"these wins but the point-in-time check misses them):\n"
+                            + "\n".join(gap_lines)
+                        ),
+                    })
             if rec.get("overlapping_toxic"):
                 worst = max(rec["overlapping_toxic"], key=lambda t: t[1])
                 recommendations.append({
@@ -714,54 +795,6 @@ class BrainEngine:
                 ),
             })
 
-        # ── NEW: Trade Management Breakdown (MFE/MAE-aware) ──
-        tm_stats: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
-            "tm_wins": 0, "tm_losses": 0,
-            "mfe_wins": 0, "mfe_fails": 0,
-            "mae_losses": 0, "mae_ok": 0,
-        })
-        
-        for r in real_rows:
-            ak = r["alert_key"]
-            if r.get("trade_result") == "win":
-                tm_stats[ak]["tm_wins"] += 1
-            elif r.get("trade_result") == "loss":
-                tm_stats[ak]["tm_losses"] += 1
-            if r.get("mfe_win") is not None:
-                tm_stats[ak]["mfe_wins" if r["mfe_win"] else "mfe_fails"] += 1
-            if r.get("mae_loss") is not None:
-                tm_stats[ak]["mae_losses" if r["mae_loss"] else "mae_ok"] += 1
-
-        if tm_stats:
-            tm_lines = []
-            for ak, s in sorted(tm_stats.items(), key=lambda x: -x[1]["tm_wins"]):
-                total_tm = s["tm_wins"] + s["tm_losses"]
-                if total_tm < min_sample:
-                    continue
-                tm_wr = s["tm_wins"] / total_tm
-                mfe_wr = s["mfe_wins"] / (s["mfe_wins"] + s["mfe_fails"]) if (s["mfe_wins"] + s["mfe_fails"]) > 0 else None
-                mae_loss_rate = s["mae_losses"] / (s["mae_losses"] + s["mae_ok"]) if (s["mae_losses"] + s["mae_ok"]) > 0 else None
-                
-                line = f"  • {ak}: TM WR {tm_wr:.0%} ({total_tm} trades)"
-                if mfe_wr is not None:
-                    line += f" | MFE WR {mfe_wr:.0%}"
-                if mae_loss_rate is not None:
-                    line += f" | Stop-out {mae_loss_rate:.0%}"
-                tm_lines.append(line)
-            
-            if tm_lines:
-                recommendations.append({
-                    "type": "trade_management_breakdown",
-                    "severity": "medium",
-                    "message": (
-                        "📊 Trade Management Outcomes (TP=" + 
-                        f"{cfg.OUTCOME_TAKE_PROFIT_PCT:.1%}, SL={cfg.OUTCOME_STOP_LOSS_PCT:.1%}):\n" +
-                        "\n".join(tm_lines[:10]) +
-                        "\n\nMost alerts show higher TM WR than close-based WR — " +
-                        "the close-based metric understates actual profitability."
-                    ),
-                })
-
         # ── Per-pair session breakdown (informational) ──────────────────
         if getattr(cfg, "ENABLE_SESSION_FILTER", False):
             session_stats = engine.per_pair_session_breakdown(real_rows, min_sample=min_sample)
@@ -796,7 +829,7 @@ class BrainEngine:
                     ),
                 })
        
-        # ── Per-pair confluence thresholds ────────────────────�����─────────
+        # ── Per-pair confluence thresholds ──────────────────────────────
         if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
             pair_min_sample = getattr(cfg, "BRAIN_PAIR_THRESHOLD_MIN_SAMPLE", 30)
             pair_recs = engine.per_pair_thresholds(
@@ -912,24 +945,11 @@ class BrainEngine:
         severity_order = {"high": 0, "medium": 1, "low": 2}
         recommendations.sort(key=lambda x: severity_order.get(x["severity"], 3))
 
-        # ── NEW: Calculate MFE-based overall win rate (PRIMARY) ──
-        mfe_overall_wr = None
-        close_overall_wr = None
-        if real_rows:
-            mfe_wins = sum(1 for r in real_rows if r.get("mfe_win", False))
-            mfe_total = sum(1 for r in real_rows if r.get("mfe_win") is not None)
-            if mfe_total > 0:
-                mfe_overall_wr = mfe_wins / mfe_total
-            
-            close_wins = sum(1 for r in real_rows if r.get("win", False))
-            close_overall_wr = close_wins / len(real_rows) if real_rows else None
-
         return {
             "generated_at": int(time.time()),
             "real_sample_size": len(real_rows),
             "shadow_sample_size": len(shadow_rows),
-            "overall_win_rate": mfe_overall_wr,  # PRIMARY: MFE-based
-            "close_win_rate": close_overall_wr,  # Reference: close-based
+            "overall_win_rate": round(sum(1 for r in real_rows if r["win"]) / len(real_rows), 4) if real_rows else None,
             "recommendation_count": len(recommendations),
             "recommendations": recommendations,
             "shadow_summary": shadow_summary,
@@ -946,10 +966,9 @@ class BrainEngine:
                 "cusum_drifts": len(drift_alerts),
                 "threshold_history": await self.sdb.load_threshold_history(),
                 "ood_status": ood_status,
-                "mfe_win_rate": mfe_overall_wr,  # NEW
-                "close_win_rate": close_overall_wr,  # NEW
             },
         }
+
     # ── Report generation / delivery ────────────────────────────────────────
 
     async def _next_run_count(self) -> Optional[int]:
@@ -1120,23 +1139,18 @@ class BrainEngine:
             "",
         ]
 
-        # ── WIN RATE: MFE-based is PRIMARY (TP-hit based) ──
+        # ── WIN RATE: the headline number, vs your own target ──
         ai = recs.get("ai_metrics", {})
-        overall_wr = recs.get("overall_win_rate")  # Now MFE-based
-        close_wr = recs.get("close_win_rate")  # Reference
+        overall_wr = recs.get("overall_win_rate")
         target_wr = cfg.MIN_WIN_RATE
         lines.append("*📊 WIN RATE*")
         if overall_wr is not None:
             status = "✅" if overall_wr >= target_wr else "⚠️"
             lines.append(escape_markdown_v2(
-                f"MFE Win Rate: {overall_wr:.0%} vs min target {target_wr:.0%}  ({status})"
+                f"Overall: {overall_wr:.0%} vs min target {target_wr:.0%}  ({status})"
             ))
-            if close_wr is not None:
-                lines.append(escape_markdown_v2(
-                    f"Close-based: {close_wr:.0%} (reference)"
-                ))
         else:
-            lines.append(escape_markdown_v2("MFE Win Rate: not enough samples yet"))
+            lines.append(escape_markdown_v2("Overall: not enough samples yet"))
         lines.append(escape_markdown_v2(
             f"Gate threshold: Score≥{cc.get('CONFLUENCE_MIN_ABS_SCORE')} Pct≥{cc.get('CONFLUENCE_MIN_PCT')}%"
         ))
@@ -1149,27 +1163,40 @@ class BrainEngine:
             size_bits.append(f"Brier {ai['brier_score']:.3f} ({ai['brier_status']})")
         if size_bits:
             lines.append(escape_markdown_v2("💰 " + " | ".join(size_bits)))
+
+        # ── Three-metric inline display ──
+        mm = next(
+            (r for r in recs["recommendations"] if r["type"] == "three_metric_evaluation"),
+            None,
+        )
+        if mm:
+            lines.append(escape_markdown_v2(
+                f"  Close: {mm['close_wr']:.0%} | MFE(TP): {mm['mfe_wr']:.0%} | "
+                f"MAE(SL): {mm['mae_loss_rate']:.0%} | Clean: {mm['clean_win_rate']:.0%}"
+            ))
+            if mm.get("gap", 0) > 0.05:
+                lines.append(escape_markdown_v2(
+                    f"  ⚠️ +{mm['gap']:.0%} hidden wins (hit TP, reversed before close)"
+                ))
+
         lines.append("")
 
-        # ── TOP ALERTS: best buy / best sell, ranked by MFE win rate ──
+        # ── TOP ALERTS: best buy / best sell, ranked by win rate ──
         perf = next((r for r in recs["recommendations"] if r["type"] == "per_alert_breakdown"), None)
         alert_data = perf.get("data") if perf else None
         if alert_data:
-            # Now tuple format: (ak, wr, n, avg_score, mfe_wr, tm_total)
-            buy_ranked = sorted((t for t in alert_data if t[0] in BUY_ALERT_KEYS), key=lambda t: -t[4] if t[4] is not None else 0)
-            sell_ranked = sorted((t for t in alert_data if t[0] in SELL_ALERT_KEYS), key=lambda t: -t[4] if t[4] is not None else 0)
+            buy_ranked = sorted((t for t in alert_data if t[0] in BUY_ALERT_KEYS), key=lambda t: -t[1])
+            sell_ranked = sorted((t for t in alert_data if t[0] in SELL_ALERT_KEYS), key=lambda t: -t[1])
             if buy_ranked or sell_ranked:
                 lines.append(escape_markdown_v2(f"🏆 TOP ALERTS (min {min_sample} trades)"))
                 if buy_ranked:
                     lines.append("Buy:")
-                    for ak, wr, n, _, mfe_wr, tm_total in buy_ranked[:2]:
-                        mfe_str = f"{mfe_wr:.0%}" if mfe_wr is not None else "n/a"
-                        lines.append(escape_markdown_v2(f" • {ak}: MFE {mfe_str} ({n} trades)"))
+                    for ak, wr, n, _ in buy_ranked[:2]:
+                        lines.append(escape_markdown_v2(f" • {ak}: {wr:.0%} ({n} trades)"))
                 if sell_ranked:
                     lines.append("Sell:")
-                    for ak, wr, n, _, mfe_wr, tm_total in sell_ranked[:2]:
-                        mfe_str = f"{mfe_wr:.0%}" if mfe_wr is not None else "n/a"
-                        lines.append(escape_markdown_v2(f" • {ak}: MFE {mfe_str} ({n} trades)"))
+                    for ak, wr, n, _ in sell_ranked[:2]:
+                        lines.append(escape_markdown_v2(f" • {ak}: {wr:.0%} ({n} trades)"))
                 lines.append("")
 
         # ── WEAK / AVOID: disable candidates + harmful vote combos ──
@@ -1237,22 +1264,11 @@ class BrainEngine:
                 lines.append(f"{icon} {escape_markdown_v2(r['message'][:150])}")
             lines.append("")
 
-        # ── NEW: Display Trade Management Breakdown in report ──
-        tm_rec = next((r for r in recs["recommendations"] if r["type"] == "trade_management_breakdown"), None)
-        if tm_rec:
-            lines.append("*📊 TRADE MANAGEMENT*")
-            lines.extend(
-                escape_markdown_v2(line)
-                for line in tm_rec["message"].split("\n")[:8]
-            )
-            lines.append("")
-
         # ── FYI: CUSUM drift + any leftover findings — informational, goes last ──
         skip_types = patch_derived_types | {
             "dynamic_weights_applied", "dynamic_weights_shadow",
             "dynamic_weights_persist_failed", "auto_disabled", "auto_reenabled",
             "disable_alert", "vote_interaction", "counterfactual", "per_alert_breakdown",
-            "trade_management_breakdown",  # Already displayed above
         }
         others = [
             r for r in recs["recommendations"]
