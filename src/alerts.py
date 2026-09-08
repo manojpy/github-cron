@@ -748,7 +748,6 @@ async def dispatch_combined_alerts(
 
     fallback_sent = 0
     for p in unsent:
-        
         date_str_p = format_ist_time(p.ts, '%d-%m-%Y')
         time_str_p = format_ist_time(p.ts, '%H:%M IST')
         spacing_p = " " * 24
@@ -769,11 +768,13 @@ async def dispatch_combined_alerts(
                 await p.record_win_rate()
             fallback_sent += p.budget_count
         else:
+            # Send failed. Keep the dedup claims so the alert cannot
+            # re-fire on the next run until the dedup window expires.
             logger_run.warning(
                 f"Individual send failed for {p.pair_name} — keeping dedup claims "
-                f"so it can't re-fire until window expires ({p.dedup_keys})"
+                f"({p.dedup_keys}) so it won't re-fire until window expires"
             )
-         
+
     return fallback_sent
 
 def validate_alert_definitions() -> None:
