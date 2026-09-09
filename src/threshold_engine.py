@@ -1752,7 +1752,6 @@ def multi_metric_per_alert(rows: List[Row], min_sample: int = 10) -> List[Dict[s
     results.sort(key=lambda x: -x["mfe_wr"])
     return results
 
-
 def multi_metric_per_pair(rows: List[Row], min_sample: int = 15) -> List[Dict[str, Any]]:
     """Per-pair three-metric breakdown."""
     by_pair: Dict[str, List[Row]] = defaultdict(list)

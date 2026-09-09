@@ -452,31 +452,3 @@ class BrainEngineV2(BaseBrainEngine):
     
     async def generate_report(self, pairs, telegram_queue, logger_run):
         return await self._generate_and_send(pairs, telegram_queue, logger_run)
-
-    async def _minimal_baseline(self) -> Dict[str, Any]:
-        """Fallback baseline if original BrainEngine is unavailable."""
-        real_rows, shadow_rows = await self._load_rows()
-        return {
-            "generated_at": int(time.time()),
-            "real_sample_size": len(real_rows),
-            "shadow_sample_size": len(shadow_rows),
-            "recommendation_count": 0,
-            "recommendations": [],
-            "shadow_summary": {},
-            "config_patch": [],
-            "current_config": {
-                "CONFLUENCE_MIN_ABS_SCORE": cfg.CONFLUENCE_MIN_ABS_SCORE,
-                "CONFLUENCE_MIN_PCT": cfg.CONFLUENCE_MIN_PCT,
-            },
-            "ai_metrics": {
-                "brier_score": 0.5,
-                "brier_status": "Unknown",
-                "net_ev": None,
-                "half_kelly": None,
-                "cusum_drifts": 0,
-                "threshold_history": await self.sdb.load_threshold_history(),
-                "ood_status": "Unknown",
-            },
-            "_real_rows": real_rows,
-            "_shadow_rows": shadow_rows,
-        }
