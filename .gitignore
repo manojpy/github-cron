@@ -20,6 +20,9 @@ env/
 config_macd.json
 .env
 
+# Runtime outcome data (JSONL archives, brain reports)
+outcome-data/
+
 # OS Metadata
 .DS_Store
 Thumbs.db

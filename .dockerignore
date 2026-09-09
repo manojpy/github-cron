@@ -41,6 +41,9 @@ docs/
 .env
 .env.local
 
+# Runtime outcome data (mounted as volume at runtime, not baked into image)
+outcome-data/
+
 # But DON'T ignore these (required for build):
 !requirements.txt
 !Dockerfile
