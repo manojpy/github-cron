@@ -16,10 +16,10 @@ from typing import Optional, Any, Callable, Dict, Tuple
 import importlib.util
 import numpy as np
 
-from aot_function_registry import AOT_FUNCTION_NAMES as REQUIRED_AOT_FUNCTIONS
+from aot_meta import AOT_FUNCTION_NAMES as REQUIRED_AOT_FUNCTIONS
 
 try:
-    from aot_version import SOURCE_VERSION as _SHARED_SOURCE_VERSION
+    from aot_meta import SOURCE_VERSION as _SHARED_SOURCE_VERSION
 except ImportError:
     _SHARED_SOURCE_VERSION = None
 
