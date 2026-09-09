@@ -37,10 +37,7 @@ FROM deps-builder AS aot-builder
 WORKDIR /build
 
 # Only copy files the compiler actually imports.
-# Do NOT copy aot_bridge.py or macd_unified.py here — changing business logic
-# should not invalidate the AOT compilation cache.
-COPY src/aot_version.py ./
-COPY src/aot_function_registry.py ./
+COPY src/aot_meta.py ./
 COPY src/numba_functions_shared.py ./
 COPY src/aot_build.py ./
 
@@ -93,8 +90,7 @@ COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled.so ./
 COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled.version ./
 
 # Copy AOT / bridge files (change rarely — keep early for layer cache)
-COPY --chown=appuser:appuser src/aot_version.py ./
-COPY --chown=appuser:appuser src/aot_function_registry.py ./
+COPY --chown=appuser:appuser src/aot_meta.py ./
 COPY --chown=appuser:appuser src/numba_functions_shared.py ./
 COPY --chown=appuser:appuser src/aot_bridge.py ./
 COPY --chown=appuser:appuser src/numeric_selftest.py ./
