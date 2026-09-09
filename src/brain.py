@@ -198,11 +198,13 @@ class BrainEngine:
                     votes = json.loads(votes_raw) if votes_raw else None
                 except (TypeError, ValueError):
                     votes = None
+
                 context_raw = f.get("context")
                 try:
                     row_context = json.loads(context_raw) if context_raw else None
                 except (TypeError, ValueError):
                     row_context = None
+
                 mae_raw = f.get("mae")
                 mfe_raw = f.get("mfe")
                 try:
@@ -213,37 +215,47 @@ class BrainEngine:
                     mfe = float(mfe_raw) if mfe_raw not in (None, "") else None
                 except (TypeError, ValueError):
                     mfe = None
-                has_new_fields = "mfe_win" in f
-                if has_new_fields:
-                    mfe_win = f.get("mfe_win") == "1"
-                    close_win = f.get("close_win") == "1"
-                    mae_loss = f.get("mae_loss") == "1"
-                    outcome_reason = f.get("outcome_reason", "unknown")
-                    try:
-                        bonus_weight = float(f.get("bonus_weight", 1.0))
-                    except (TypeError, ValueError):
-                        bonus_weight = 1.0
-                else:
-                    legacy_win = f.get("win") == "1"
-                    mfe_win = legacy_win
-                    close_win = legacy_win
-                    mae_loss = False
-                    outcome_reason = "legacy"
-                    bonus_weight = 1.0
+
+                # ── Three-metric fields (backward compatible with old rows) ──
+                close_win_raw = f.get("close_win")
+                mfe_win_raw = f.get("mfe_win")
+                mae_loss_raw = f.get("mae_loss")
+                tp_first_raw = f.get("tp_first")
+
+                base_win = f.get("win") == "1"
+                close_win_val = (close_win_raw == "1") if close_win_raw else base_win
+                mfe_win_val = (mfe_win_raw == "1") if mfe_win_raw else None
+                mae_loss_val = (mae_loss_raw == "1") if mae_loss_raw else None
+                tp_first_val = (
+                    True if tp_first_raw == "1"
+                    else False if tp_first_raw == "0"
+                    else None
+                )
+
+                # ── R:R and Bonus fields (backward compatible) ──
+                bonus_win_raw = f.get("bonus_win")
+                bonus_win_val = (bonus_win_raw == "1") if bonus_win_raw else False
+
+                rr_achieved_raw = f.get("rr_achieved")
+                try:
+                    rr_achieved_val = float(rr_achieved_raw) if rr_achieved_raw not in (None, "") else 0.0
+                except (TypeError, ValueError):
+                    rr_achieved_val = 0.0
+
+                win_weight_raw = f.get("win_weight")
+                try:
+                    win_weight_val = float(win_weight_raw) if win_weight_raw not in (None, "") else (1.0 if base_win else 0.0)
+                except (TypeError, ValueError):
+                    win_weight_val = 1.0 if base_win else 0.0
 
                 parsed.append({
-                    "pair": pair, 
+                    "pair": pair,
                     "alert_key": alert_key,
                     "direction": f.get("direction", "?"),
                     "score": score,
                     "total": total,
                     "conf_pct": score / total * 100.0,
-                    "win": mfe_win,
-                    "close_win": close_win,
-                    "mfe_win": mfe_win,
-                    "mae_loss": mae_loss,
-                    "outcome_reason": outcome_reason,
-                    "bonus_weight": bonus_weight,
+                    "win": base_win,
                     "pct_move": float(f.get("pct_move", 0.0)),
                     "entry_ts": entry_ts,
                     "session": f.get("session", "unknown"),
@@ -251,6 +263,15 @@ class BrainEngine:
                     "mfe": mfe,
                     "votes": votes,
                     "context": row_context,
+                    # ── Three-metric fields ──
+                    "close_win": close_win_val,
+                    "mfe_win": mfe_win_val,
+                    "mae_loss": mae_loss_val,
+                    "tp_first": tp_first_val,
+                    # ── R:R and Bonus fields ──
+                    "bonus_win": bonus_win_val,
+                    "rr_achieved": rr_achieved_val,
+                    "win_weight": win_weight_val,
                 })
             except (KeyError, ValueError) as e:
                 logging.getLogger("macd_bot").debug(f"Brain: dropping malformed outcome row: {e}")
@@ -377,8 +398,13 @@ class BrainEngine:
                 continue
             wins = sum(1 for r in s["rows"] if r["win"])
             if recency_on:
-                wr, n_eff, lo, hi = engine.weighted_win_rate(s["rows"], decay_days=recency_decay_days)
-                sample_label = f"{total} samples (n_eff={n_eff:.0f} recency-weighted, {recency_decay_days:.0f}d decay)"
+                wr, n_eff, lo, hi = engine.weighted_win_rate_with_bonus(
+                    s["rows"], decay_days=recency_decay_days
+                )
+                sample_label = (
+                    f"{total} samples (n_eff={n_eff:.0f} "
+                    f"recency+bonus-weighted, {recency_decay_days:.0f}d decay)"
+                )
             else:
                 wr = wins / total
                 lo, hi, _ = engine.wilson_ci(wins, total)
@@ -679,7 +705,6 @@ class BrainEngine:
                         "patch is auto-applied."
                     ),
                 })
-
             anomalies_check = engine.flag_anomalous_rows(real_rows, min_sample=min_sample)
             if anomalies_check["valid"] and anomalies_check["n_flagged"] > 0:
                 top = anomalies_check["flagged"][:5]
@@ -698,6 +723,102 @@ class BrainEngine:
                         "the EV/WR numbers above. Not auto-excluded — could be a real outsized move."
                     ),
                 })
+
+            # ── Three-Metric Outcome Analysis ────────────────────────────────
+            mm_summary = engine.multi_metric_summary(real_rows, min_sample=min_sample)
+            if mm_summary.get("valid"):
+                close_wr = mm_summary["close_wr"]
+                mfe_wr = mm_summary["mfe_wr"]
+                mae_rate = mm_summary["mae_loss_rate"]
+                clean_wr = mm_summary["clean_win_rate"]
+                gap = mfe_wr - close_wr
+                summary_msg = (
+                    f"📐 Three-Metric Evaluation (n={mm_summary['n']}):\n"
+                    f"  • Close WR (point-in-time): {close_wr:.0%} "
+                    f"[{mm_summary['close_wilson'][0]:.0%}-{mm_summary['close_wilson'][1]:.0%}]\n"
+                    f"  • MFE WR (TP ever hit):    {mfe_wr:.0%} "
+                    f"[{mm_summary['mfe_wilson'][0]:.0%}-{mm_summary['mfe_wilson'][1]:.0%}]\n"
+                    f"  • MAE Loss Rate (SL hit):  {mae_rate:.0%}\n"
+                    f"  • Clean Win (TP w/o SL):   {clean_wr:.0%}"
+                )
+                if gap > 0.05:
+                    summary_msg += (
+                        f"\n⚠️ Gap: {gap:+.0%} of trades hit TP but reversed before "
+                        f"candle {cfg.OUTCOME_LOOKAHEAD_CANDLES}. "
+                        f"The close-based WR underestimates true profitability by {gap:.0%}."
+                    )
+                 if mm_summary.get("tp_before_sl_rate") is not None:
+                    summary_msg += (
+                        f"\n• TP before SL: {mm_summary['tp_before_sl_rate']:.0%} "
+                        f"| SL before TP: {mm_summary.get('sl_before_tp_rate', 0):.0%} "
+                        f"(n={mm_summary.get('ordering_sample', '?')})"
+                    )
+                if mm_summary.get("bonus_rate") is not None:
+                    summary_msg += (
+                        f"\n  • Bonus wins (≥{cfg.OUTCOME_BONUS_RR:.0f}R): "
+                        f"{mm_summary['bonus_rate']:.0%} of trades"
+                        f" | Avg R-multiple: {mm_summary['avg_rr_achieved']:.2f}R"
+                        f" | Bonus-weighted WR: {mm_summary.get('weighted_wr', 0):.1%}"
+                    )
+                recommendations.append({
+                    "type": "three_metric_evaluation",
+                    "severity": "medium" if gap > 0.10 else "low",
+                    "close_wr": round(close_wr, 4),
+                    "mfe_wr": round(mfe_wr, 4),
+                    "mae_loss_rate": round(mae_rate, 4),
+                    "clean_win_rate": round(clean_wr, 4),
+                    "gap": round(gap, 4),
+                    "bonus_rate": round(mm_summary.get("bonus_rate", 0.0), 4),
+                    "avg_rr_achieved": round(mm_summary.get("avg_rr_achieved", 0.0), 2),
+                    "weighted_wr": round(mm_summary.get("weighted_wr", 0.0), 4),
+                    "message": summary_msg,
+                })
+
+                # Per-alert three-metric breakdown (worst offenders only)
+                mm_per_alert = engine.multi_metric_per_alert(real_rows, min_sample=min_sample)
+                big_gap_alerts = [a for a in mm_per_alert if a["gap_mfe_vs_close"] > 0.15]
+
+                if big_gap_alerts:
+                    gap_lines = [
+                        f"  • {a['alert_key']}: close {a['close_wr']:.0%} vs MFE {a['mfe_wr']:.0%} "
+                        f"(gap {a['gap_mfe_vs_close']:+.0%}, n={a['n']})"
+                        for a in big_gap_alerts[:5]
+                    ]
+                    recommendations.append({
+                        "type": "close_vs_mfe_gap",
+                        "severity": "medium",
+                        "message": (
+                            f"🔍 Alerts where MFE WR >> Close WR (take-profit would have captured "
+                            f"these wins but the point-in-time check misses them):\n"
+                            + "\n".join(gap_lines)
+                        ),
+                    })
+
+                # ── R:R and Bonus Analysis ──
+                if real_rows:
+                    bonus_wins = sum(1 for r in real_rows if r.get("bonus_win"))
+                    total_wins = sum(1 for r in real_rows if r["win"])
+                    rr_values = [r.get("rr_achieved", 0) for r in real_rows if r.get("rr_achieved", 0) > 0]
+                    avg_rr = statistics.mean(rr_values) if rr_values else 0.0
+
+                    # Weighted WR: bonus wins count for more
+                    total_weight = sum(r.get("win_weight", 1.0 if r["win"] else 0.0) for r in real_rows)
+                    effective_n = len(real_rows)
+                    weighted_wr_bonus = min(total_weight / effective_n, 1.0) if effective_n else 0.0
+
+                    recommendations.append({
+                        "type": "rr_analysis",
+                        "severity": "low",
+                        "message": (
+                            f"📐 R:R Analysis (target=1:{cfg.OUTCOME_RR_TARGET:.0f}, "
+                            f"bonus≥{cfg.OUTCOME_BONUS_RR:.0f}R):\n"
+                            f"  • Wins: {total_wins}/{len(real_rows)} | "
+                            f"Bonus wins: {bonus_wins} ({bonus_wins/max(total_wins,1):.0%} of wins)\n"
+                            f"  • Avg R-multiple achieved: {avg_rr:.2f}R\n"
+                            f"  • Effective WR (bonus-weighted): {weighted_wr_bonus:.1%} "
+                            f"(raw: {total_wins/len(real_rows):.1%})"
+                        ),
+                    })        
             if rec.get("overlapping_toxic"):
                 worst = max(rec["overlapping_toxic"], key=lambda t: t[1])
                 recommendations.append({
@@ -1103,7 +1224,34 @@ class BrainEngine:
             size_bits.append(f"Brier {ai['brier_score']:.3f} ({ai['brier_status']})")
         if size_bits:
             lines.append(escape_markdown_v2("💰 " + " | ".join(size_bits)))
-        lines.append("")
+
+        # ── Three-metric inline display ──
+        mm = next(
+            (r for r in recs["recommendations"] if r["type"] == "three_metric_evaluation"),
+            None,
+        )
+        if mm:
+            lines.append(escape_markdown_v2(
+                f"  Close: {mm['close_wr']:.0%} | MFE(TP): {mm['mfe_wr']:.0%} | "
+                f"MAE(SL): {mm['mae_loss_rate']:.0%} | Clean: {mm['clean_win_rate']:.0%}"
+            ))
+            if mm.get("bonus_rate") is not None:
+                lines.append(escape_markdown_v2(
+                    f"  Bonus(≥{cfg.OUTCOME_BONUS_RR:.0f}R): {mm['bonus_rate']:.0%} of trades | "
+                    f"Avg RR: {mm['avg_rr_achieved']:.2f}R | "
+                    f"Bonus-wtd WR: {mm.get('weighted_wr', 0):.1%}"
+                ))
+            if mm.get("gap", 0) > 0.10:
+                lines.append(escape_markdown_v2(
+                    f"  🔴 +{mm['gap']:.0%} HIDDEN WINS — hit TP then reversed before the "
+                    f"candle-{cfg.OUTCOME_LOOKAHEAD_CANDLES} close. "
+                    f"Close-WR understates true edge."
+                ))
+            elif mm.get("gap", 0) > 0.05:
+                lines.append(escape_markdown_v2(
+                    f"  ⚠️ +{mm['gap']:.0%} hidden wins (hit TP, reversed before close)"
+                ))
+            lines.append("")
 
         # ── TOP ALERTS: best buy / best sell, ranked by win rate ──
         perf = next((r for r in recs["recommendations"] if r["type"] == "per_alert_breakdown"), None)

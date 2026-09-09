@@ -415,6 +415,26 @@ class BrainEngineV2(BaseBrainEngine):
             CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
         )
 
+        # ── Bonus-aware metrics ──────────────────────────────────────────
+        if real_rows:
+            bonus_count = sum(1 for r in real_rows if r.get("bonus_win"))
+            total_wins = sum(1 for r in real_rows if r["win"])
+            rr_vals = [r.get("rr_achieved", 0) for r in real_rows if r.get("rr_achieved", 0) > 0]
+            ai_metrics["bonus_wins"] = bonus_count
+            # NOTE: this is bonus wins as a fraction of WINS (not all trades).
+            # multi_metric_summary's "bonus_rate" is bonus wins / all trades.
+            ai_metrics["bonus_rate_of_wins"] = bonus_count / max(total_wins, 1)
+            ai_metrics["avg_rr_achieved"] = round(
+                sum(rr_vals) / len(rr_vals), 2
+            ) if rr_vals else 0.0
+            # ── Bonus-weighted win rate (win_weight-aware) ──
+            total_win_weight = sum(
+                r.get("win_weight", 1.0 if r["win"] else 0.0) for r in real_rows
+            )
+            ai_metrics["weighted_wr"] = round(
+                min(total_win_weight / len(real_rows), 1.0), 4
+            ) if real_rows else 0.0
+
         # ── Re-assemble final report ─────────────────────────────────────
         result = dict(base_recs)
         result["recommendations"] = recommendations
@@ -423,7 +443,6 @@ class BrainEngineV2(BaseBrainEngine):
         return result
 
     # ── Baseline wrapper that also exposes raw rows ──────────────────────
-
     async def _generate_baseline_recommendations(self) -> Dict[str, Any]:
         base = await super().generate_recommendations()
         real_rows, shadow_rows = await self._get_rows()

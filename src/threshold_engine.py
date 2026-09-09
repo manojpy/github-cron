@@ -43,9 +43,14 @@ def recency_weight(entry_ts: Optional[float], now_ts: float, decay_days: float =
 def weighted_win_rate(
     rows: List[Row], now_ts: Optional[float] = None, decay_days: float = 7.0,
 ) -> Tuple[Optional[float], float, float, float]:
-    """Recency-weighted win rate + a weighted Wilson-CI band. ... Returns
-    (weighted_wr, n_eff, wilson_lo, wilson_hi), where n_eff is Kish's
-    effective sample size (sum(w)^2 / sum(w^2), always <= len(rows))..."""
+    """Recency-weighted win rate + a weighted Wilson-CI band.
+
+    Bonus-aware: each win is additionally scaled by its win_weight
+    (default 1.0; bonus wins carry up to cfg.OUTCOME_BONUS_WEIGHT),
+    so bonus wins contribute proportionally more.
+
+    Returns (weighted_wr, n_eff, wilson_lo, wilson_hi).
+    """
     if now_ts is None:
         now_ts = time.time()
     if not rows:
@@ -56,10 +61,44 @@ def weighted_win_rate(
         sum_w += w
         sum_w2 += w * w
         if r["win"]:
-            sum_ww += w * r.get("bonus_weight", 1.0)
+            sum_ww += w * r.get("win_weight", 1.0)
     if sum_w <= 0:
         return None, 0.0, 0.0, 0.0
-    weighted_wr = sum_ww / sum_w
+    weighted_wr = min(sum_ww / sum_w, 1.0)
+    n_eff = (sum_w ** 2) / sum_w2 if sum_w2 > 0 else 0.0
+    lo, hi, _ = wilson_ci(round(weighted_wr * n_eff), max(1, round(n_eff)))
+    return weighted_wr, n_eff, lo, hi
+
+def weighted_win_rate_with_bonus(
+    rows: List[Row],
+    now_ts: Optional[float] = None,
+    decay_days: float = 7.0,
+) -> Tuple[Optional[float], float, float, float]:
+    """Win rate where bonus wins (exceeded 1:2 target) count for more.
+    A bonus win with weight 1.5 counts as 1.5 wins out of 1.5 total weight.
+    Returns (weighted_wr, n_eff, wilson_lo, wilson_hi)."""
+    if now_ts is None:
+        now_ts = time.time()
+    if not rows:
+        return None, 0.0, 0.0, 0.0
+
+    sum_w = 0.0       # total weight denominator (recency only)
+    sum_ww = 0.0      # weighted wins (recency × win_weight)
+    sum_w2 = 0.0      # for n_eff
+
+    for r in rows:
+        recency_w = recency_weight(r.get("entry_ts"), now_ts, decay_days)
+        win_w = r.get("win_weight", 1.0 if r["win"] else 0.0)
+
+        sum_w += recency_w
+        sum_w2 += recency_w * recency_w
+        if r["win"]:
+            sum_ww += recency_w * win_w
+
+    if sum_w <= 0:
+        return None, 0.0, 0.0, 0.0
+
+    weighted_wr = min(sum_ww / sum_w, 1.0)
     n_eff = (sum_w ** 2) / sum_w2 if sum_w2 > 0 else 0.0
     lo, hi, _ = wilson_ci(round(weighted_wr * n_eff), max(1, round(n_eff)))
     return weighted_wr, n_eff, lo, hi
@@ -1034,7 +1073,7 @@ class StabilityGate:
 
 # ═══════════════════════════════════════════════════════════════════════
 #  NEW: Vote-Count OOD Gate  (Recommended.txt §8)
-# ═══════════════════════��═══════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 
 def _percentile(data: List[float], p: float) -> float:
     """Linear-interpolation percentile (numpy-compatible)."""
@@ -1174,6 +1213,7 @@ def _sigmoid(z: float) -> float:
     ez = math.exp(z)
     return ez / (1.0 + ez)
 
+
 def optimize_vote_weights(
     rows: List[Row],
     current_weights: Dict[str, float],
@@ -1186,7 +1226,7 @@ def optimize_vote_weights(
     vote_names = sorted(current_weights.keys())
     X: List[List[float]] = []
     y: List[float] = []
-
+    sample_weights: List[float] = []
     for r in rows:
         votes = r.get("votes")
         if not votes or not isinstance(votes, dict):
@@ -1194,6 +1234,7 @@ def optimize_vote_weights(
         vec = [1.0] + [1.0 if votes.get(vn) else 0.0 for vn in vote_names]
         X.append(vec)
         y.append(1.0 if r["win"] else 0.0)
+        sample_weights.append(r.get("win_weight", 1.0) if r["win"] else 1.0)
 
     n = len(X)
     if n < min_sample:
@@ -1203,17 +1244,20 @@ def optimize_vote_weights(
     beta = [0.0] * (len(vote_names) + 1)
     beta[0] = math.log(win_rate / (1 - win_rate)) if 0 < win_rate < 1 else 0.0
 
+    total_sw = sum(sample_weights)
     for iteration in range(max_iter):
         grad = [0.0] * len(beta)
         for i in range(n):
             z = sum(beta[j] * X[i][j] for j in range(len(beta)))
             p = _sigmoid(z)
             error = p - y[i]
+            sw = sample_weights[i]
             for j in range(len(beta)):
-                grad[j] += error * X[i][j]
-        # Normalize by n, add L2 regularization
+                grad[j] += error * X[i][j] * sw
+        # Normalize by total sample weight (not n), add L2 regularization
         for j in range(len(beta)):
-            grad[j] = grad[j] / n + l2 * beta[j]
+            grad[j] = grad[j] / total_sw + l2 * beta[j]
+
         # Use cosine-annealed learning rate (0.05 → 0.001)
         step = lr * (0.5 * (1 + math.cos(math.pi * iteration / max_iter)))
         for j in range(len(beta)):
@@ -1363,8 +1407,6 @@ def conditional_performance(
         "gap": round(gap, 4),
         "recommendation": recommendation,
     }
-
-
 # ═══════════════════════════════════════════════════════════════════════
 #  PHASE 4 — VOTE INTERACTION MINER
 # ═══════════════════════════════════════════════════════════════════════
@@ -1606,3 +1648,133 @@ def score_actionability(rec: Dict[str, Any]) -> float:
     elif rec.get("type") == "conditional_gating":
         effort = 2.0
     return impact * confidence / effort
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  THREE-METRIC OUTCOME ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════
+
+def multi_metric_summary(rows: List[Row], min_sample: int = 10) -> Dict[str, Any]:
+    """Compute all three win/loss metrics across the full row set.
+    Returns close_wr, mfe_wr, mae_loss_rate, clean_win_rate,
+    and tp_before_sl ordering stats."""
+    n = len(rows)
+    if n < min_sample:
+        return {"valid": False, "error": "insufficient_data", "n": n}
+
+    close_wins = sum(1 for r in rows if r.get("close_win", r["win"]))
+    mfe_wins = sum(1 for r in rows if r.get("mfe_win") is True)
+    mae_losses = sum(1 for r in rows if r.get("mae_loss") is True)
+
+    # tp_first: True means TP was hit before SL (the "realistic" win)
+    tp_first_rows = [r for r in rows if r.get("tp_first") is not None]
+    tp_before_sl = sum(1 for r in tp_first_rows if r["tp_first"] is True)
+    sl_before_tp = sum(1 for r in tp_first_rows if r["tp_first"] is False)
+
+    # mfe_win but also mae_loss — hit both levels
+    both_hit = sum(
+        1 for r in rows
+        if r.get("mfe_win") is True and r.get("mae_loss") is True
+    )
+
+    # "Clean" wins: reached TP without ever hitting SL level
+    clean_wins = sum(
+        1 for r in rows
+        if r.get("mfe_win") is True and r.get("mae_loss") is not True
+    )
+
+    result: Dict[str, Any] = {
+        "valid": True,
+        "n": n,
+        "close_wr": close_wins / n,
+        "mfe_wr": mfe_wins / n,
+        "mae_loss_rate": mae_losses / n,
+        "clean_win_rate": clean_wins / n,
+        "both_hit_rate": both_hit / n,
+    }
+
+    if tp_first_rows:
+        result["tp_before_sl_rate"] = tp_before_sl / len(tp_first_rows)
+        result["sl_before_tp_rate"] = sl_before_tp / len(tp_first_rows)
+        result["ordering_sample"] = len(tp_first_rows)
+
+    # ── Bonus stats ──
+    bonus_wins = sum(1 for r in rows if r.get("bonus_win"))
+    rr_values = [r.get("rr_achieved", 0) for r in rows if r.get("rr_achieved", 0) > 0]
+    result["bonus_wins"] = bonus_wins
+    result["bonus_rate"] = bonus_wins / n if n else 0.0
+    result["avg_rr_achieved"] = statistics.fmean(rr_values) if rr_values else 0.0
+
+    # ── Bonus-weighted win rate (win_weight-aware) ──
+    total_win_weight = sum(
+        r.get("win_weight", 1.0 if r["win"] else 0.0) for r in rows
+    )
+    result["weighted_wr"] = min(total_win_weight / n, 1.0) if n else 0.0
+    result["weighted_wr_raw"] = sum(1 for r in rows if r["win"]) / n
+
+    # Wilson CIs for the key metrics
+    close_lo, close_hi, _ = wilson_ci(close_wins, n)
+    mfe_lo, mfe_hi, _ = wilson_ci(mfe_wins, n)
+    result["close_wilson"] = (close_lo, close_hi)
+    result["mfe_wilson"] = (mfe_lo, mfe_hi)
+    return result
+
+def multi_metric_per_alert(rows: List[Row], min_sample: int = 10) -> List[Dict[str, Any]]:
+    """Per-alert breakdown showing all three metrics. Sorted by mfe_wr
+    descending (most actionable metric first)."""
+    by_alert: Dict[str, List[Row]] = defaultdict(list)
+    for r in rows:
+        by_alert[r["alert_key"]].append(r)
+
+    results = []
+    for ak, alert_rows in by_alert.items():
+        if len(alert_rows) < min_sample:
+            continue
+        n = len(alert_rows)
+        close_wins = sum(1 for r in alert_rows if r.get("close_win", r["win"]))
+        mfe_wins = sum(1 for r in alert_rows if r.get("mfe_win") is True)
+        mae_losses = sum(1 for r in alert_rows if r.get("mae_loss") is True)
+        clean_wins = sum(
+            1 for r in alert_rows
+            if r.get("mfe_win") is True and r.get("mae_loss") is not True
+        )
+
+        results.append({
+            "alert_key": ak,
+            "n": n,
+            "close_wr": close_wins / n,
+            "mfe_wr": mfe_wins / n,
+            "mae_loss_rate": mae_losses / n,
+            "clean_win_rate": clean_wins / n,
+            "gap_mfe_vs_close": (mfe_wins - close_wins) / n,
+        })
+
+    results.sort(key=lambda x: -x["mfe_wr"])
+    return results
+
+
+def multi_metric_per_pair(rows: List[Row], min_sample: int = 15) -> List[Dict[str, Any]]:
+    """Per-pair three-metric breakdown."""
+    by_pair: Dict[str, List[Row]] = defaultdict(list)
+    for r in rows:
+        by_pair[r["pair"]].append(r)
+
+    results = []
+    for pair, pair_rows in by_pair.items():
+        if len(pair_rows) < min_sample:
+            continue
+        n = len(pair_rows)
+        close_wins = sum(1 for r in pair_rows if r.get("close_win", r["win"]))
+        mfe_wins = sum(1 for r in pair_rows if r.get("mfe_win") is True)
+        mae_losses = sum(1 for r in pair_rows if r.get("mae_loss") is True)
+
+        results.append({
+            "pair": pair,
+            "n": n,
+            "close_wr": close_wins / n,
+            "mfe_wr": mfe_wins / n,
+            "mae_loss_rate": mae_losses / n,
+        })
+
+    results.sort(key=lambda x: -x["mfe_wr"])
+    return results
