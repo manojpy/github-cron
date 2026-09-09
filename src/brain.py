@@ -330,6 +330,9 @@ class BrainEngine:
                 continue
             det = await self._load_or_create_cusum(alert_key)
             for r in rows_sorted:
+                # Deliberately binary: CUSUM detects edge DECAY. s_neg only
+                # accumulates on losses (x < mu), so bonus-weighting wins
+                # cannot change decay detection — keep raw win/loss here.
                 drifted = det.update(r["win"])
                 if drifted:
                     drift_alerts.append({
@@ -359,7 +362,6 @@ class BrainEngine:
         )
 
     # ── Recommendations ──────────────────────────────────────────────────────
-
     async def generate_recommendations(self) -> Dict[str, Any]:
         """Build the full recommendation set: per-alert verdicts, a confluence
         threshold suggestion, shadow-mode insight, and a machine-readable
@@ -368,7 +370,6 @@ class BrainEngine:
         recommendations: List[Dict[str, Any]] = []
         config_patch: List[Dict[str, Any]] = []
         seen_paths = set()
-
         min_sample = getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
         target_wr = cfg.MIN_WIN_RATE
         disable_wr = getattr(cfg, "BRAIN_ALERT_DISABLE_THRESHOLD_WR", 0.40)
@@ -390,8 +391,8 @@ class BrainEngine:
         auto_disable_on = getattr(cfg, "BRAIN_AUTO_DISABLE_ENABLED", False)
         recency_on = getattr(cfg, "ENABLE_RECENCY_WEIGHTING", False)
         recency_decay_days = getattr(cfg, "RECENCY_DECAY_DAYS", 7.0)
-
         alert_verdicts: Dict[str, str] = {}  # alert_key -> "disable" | "star" | "monitor"
+
         for alert_key, s in alert_stats.items():
             total = len(s["rows"])
             if total < min_sample:
@@ -409,7 +410,9 @@ class BrainEngine:
                 wr = wins / total
                 lo, hi, _ = engine.wilson_ci(wins, total)
                 sample_label = f"{total} samples"
+
             auto_eligible = auto_disable_on and total >= auto_disable_min
+
             if hi < disable_wr:
                 alert_verdicts[alert_key] = "disable"
                 recommendations.append({
@@ -429,7 +432,6 @@ class BrainEngine:
                                 f"(≥{auto_disable_min} required)."
                             ),
                         })
-
             elif lo >= cfg.MIN_WIN_RATE:
                 alert_verdicts[alert_key] = "recovered"
                 recommendations.append({
@@ -458,7 +460,8 @@ class BrainEngine:
                         recommendations.append({
                             "type": "auto_reenabled", "severity": "medium", "alert": alert_key,
                             "message": f"🔓 Re-enabled {alert_key}: recovered to {wr:.0%} WR over {sample_label}.",
-                        }) 
+                        })
+
         path_to_keys: Dict[str, List[str]] = defaultdict(list)
         for alert_key in alert_stats:
             path = _resolve_config_path(alert_key)
@@ -497,6 +500,7 @@ class BrainEngine:
                         f"needs a per-direction config key or manual review."
                     ),
                 })
+
         # Warn on any disable-worthy alert with no config path at all (exact or prefix)
         for alert_key, verdict in alert_verdicts.items():
             if verdict == "disable" and not _resolve_config_path(alert_key):
@@ -507,6 +511,7 @@ class BrainEngine:
                         f"_ALERT_CONFIG_MAP — no config_patch was emitted. Add a mapping or disable manually."
                     ),
                 })
+
         threshold_rec: Dict[str, Any] = {}
         net_ev = half_kelly = kelly_wr = None
         rec = engine.recommend_threshold(
@@ -542,13 +547,13 @@ class BrainEngine:
                         f"{ca['observed']:.0%} (n={ca['n']})"
                     ),
                 })
+
         if rec.get("valid") and abs(rec["recommended"] - cfg.CONFLUENCE_MIN_ABS_SCORE) >= 0.5:
             target_floor = rec["recommended"]
             rec_n = rec["rec_n"]
             rec_wr = rec["rec_wr"]
             ev, rr = rec["rec_ev"], rec["rec_rr"]
             buy_wr, buy_n, sell_wr, sell_n = rec["buy_wr"], rec["buy_n"], rec["sell_wr"], rec["sell_n"]
-
             direction_note = ""
             if buy_wr is not None and sell_wr is not None:
                 direction_note = f" | Buy WR {buy_wr:.0%} ({buy_n}), Sell WR {sell_wr:.0%} ({sell_n})"
@@ -593,6 +598,7 @@ class BrainEngine:
                     f"{wf_note}"
                 ),
             }
+
             # ── Stability Gate check on threshold recommendation ─────────────
             if emit_patch:
                 history = await self.sdb.load_threshold_history()
@@ -600,7 +606,6 @@ class BrainEngine:
                     target_floor, history,
                 )
                 if not gate_ok:
-                    # Downgrade: don't emit the patch, warn instead
                     threshold_rec["severity"] = "medium"
                     threshold_rec["stability_blocked"] = True
                     threshold_rec["message"] += (
@@ -610,7 +615,7 @@ class BrainEngine:
                     emit_patch = False
                 else:
                     await self.sdb.save_threshold_value(target_floor)
-        
+
             # ── Net EV + Kelly sizing at recommended threshold ───────────────
             rec_subset_kelly = [
                 r for r in real_rows if r["score"] >= target_floor
@@ -628,6 +633,7 @@ class BrainEngine:
                         f"WR: {kelly_wr:.0%}{mae_note}"
                     ),
                 })
+
             recommendations.append(threshold_rec)
             if emit_patch:
                 config_patch.append({
@@ -637,201 +643,197 @@ class BrainEngine:
                 rec_subset = [r for r in real_rows if r["score"] >= target_floor]
                 avg_total = sum(r["total"] for r in rec_subset) / rec_n if rec_n else 0.0
                 suggested_pct = min(100.0, (target_floor / avg_total) * 100.0) if avg_total else cfg.CONFLUENCE_MIN_PCT
-
                 config_patch.append({
                     "path": "CONFLUENCE_MIN_PCT", "current": cfg.CONFLUENCE_MIN_PCT,
                     "suggested": round(suggested_pct, 1), "supporting_samples": rec_n,
                     "note": "Derived from suggested abs score / avg total this window — informational, "
-                            "the abs score patch above is the one that reliably binds.",
+                    "the abs score patch above is the one that reliably binds.",
                 })
 
-            if cfg.BRAIN_MC_SIMULATIONS > 0:
-                mc = engine.monte_carlo_walk_forward(
-                    real_rows, n_simulations=cfg.BRAIN_MC_SIMULATIONS,
-                    min_sample=min_sample, target_winrate=target_wr,
-                )
-                if mc["valid"]:
-                    robust_icon = "✅ ROBUST" if mc["robustness_score"] > 2.0 else "⚠️ FRAGILE"
-                    recommendations.append({
-                        "type": "monte_carlo_robustness", "severity": "low",
-                        "message": (
-                            f"Monte Carlo ({mc['n_simulations']} block-bootstrap sims): "
-                            f"OOS WR mean {mc['oos_wr_mean']:.0%} ±{mc['oos_wr_std']:.0%}, "
-                            f"worst-case (5th pct) {mc['oos_wr_p5']:.0%}. "
-                            f"Robustness {mc['robustness_score']:.2f} — {robust_icon}\n"
-                            f"Diagnostic only — does not change the config patch above."
-                        ),
-                    })
-
-            rb = engine.regime_breakdown(real_rows, min_sample=min_sample)
-            if rb["valid"] and "wr_gap" in rb:
-                trending, ranging = rb["regimes"]["trending"], rb["regimes"]["ranging"]
-                gap = rb["wr_gap"]
-                gap_note = (
-                    "NOT regime-neutral — worth tracking separately"
-                    if abs(gap) > 0.10 else "roughly regime-neutral so far"
-                )
-                recommendations.append({
-                    "type": "regime_breakdown", "severity": "low",
-                    "message": (
-                        f"Regime split (median ADX {rb['median_adx']:.1f} this window): "
-                        f"trending WR {trending['wr']:.0%} (n={trending['n']}, {trending['confidence']}) "
-                        f"vs ranging WR {ranging['wr']:.0%} (n={ranging['n']}, {ranging['confidence']}). "
-                        f"Gap {gap:+.1%} — {gap_note}.\n"
-                        f"Diagnostic only — no regime-specific threshold applied yet."
-                    ),
-                })
-
-            attribution = engine.outcome_attribution(
-                real_rows, CONFLUENCE_WEIGHTS, threshold=target_floor, min_sample=min_sample,
+        if cfg.BRAIN_MC_SIMULATIONS > 0:
+            mc = engine.monte_carlo_walk_forward(
+                real_rows, n_simulations=cfg.BRAIN_MC_SIMULATIONS,
+                min_sample=min_sample, target_winrate=target_wr,
             )
-            flagged = [
-                e for e in attribution
-                if e.get("rescued_valid") and e["n_rescued"] >= min_sample and e["rescued_wr"] < target_wr - 0.10
+            if mc["valid"]:
+                robust_icon = "✅ ROBUST" if mc["robustness_score"] > 2.0 else "⚠️ FRAGILE"
+                recommendations.append({
+                    "type": "monte_carlo_robustness", "severity": "low",
+                    "message": (
+                        f"Monte Carlo ({mc['n_simulations']} block-bootstrap sims): "
+                        f"OOS WR mean {mc['oos_wr_mean']:.0%} ±{mc['oos_wr_std']:.0%}, "
+                        f"worst-case (5th pct) {mc['oos_wr_p5']:.0%}. "
+                        f"Robustness {mc['robustness_score']:.2f} — {robust_icon}\n"
+                        f"Diagnostic only — does not change the config patch above."
+                    ),
+                })
+
+        rb = engine.regime_breakdown(real_rows, min_sample=min_sample)
+        if rb["valid"] and "wr_gap" in rb:
+            trending, ranging = rb["regimes"]["trending"], rb["regimes"]["ranging"]
+            gap = rb["wr_gap"]
+            gap_note = (
+                "NOT regime-neutral — worth tracking separately"
+                if abs(gap) > 0.10 else "roughly regime-neutral so far"
+            )
+            recommendations.append({
+                "type": "regime_breakdown", "severity": "low",
+                "message": (
+                    f"Regime split (median ADX {rb['median_adx']:.1f} this window): "
+                    f"trending WR {trending['wr']:.0%} (n={trending['n']}, {trending['confidence']}) "
+                    f"vs ranging WR {ranging['wr']:.0%} (n={ranging['n']}, {ranging['confidence']}). "
+                    f"Gap {gap:+.1%} — {gap_note}.\n"
+                    f"Diagnostic only — no regime-specific threshold applied yet."
+                ),
+            })
+
+        attribution = engine.outcome_attribution(
+            real_rows, CONFLUENCE_WEIGHTS, threshold=target_floor, min_sample=min_sample,
+        )
+        flagged = [
+            e for e in attribution
+            if e.get("rescued_valid") and e["n_rescued"] >= min_sample and e["rescued_wr"] < target_wr - 0.10
+        ]
+        if flagged:
+            lines = [
+                f"  • {e['vote']}: rescues {e['n_rescued']} trades ({e['rescued_pct']:.0%} of its True cases) "
+                f"at only {e['rescued_wr']:.0%} WR [{e['rescued_wilson_lo']:.0%}-{e['rescued_wilson_hi']:.0%}]"
+                for e in flagged[:5]
             ]
-            if flagged:
-                lines = [
-                    f"  • {e['vote']}: rescues {e['n_rescued']} trades ({e['rescued_pct']:.0%} of its True cases) "
-                    f"at only {e['rescued_wr']:.0%} WR [{e['rescued_wilson_lo']:.0%}-{e['rescued_wilson_hi']:.0%}]"
-                    for e in flagged[:5]
-                ]
-                recommendations.append({
-                    "type": "outcome_attribution", "severity": "medium",
-                    "message": (
-                        f"Outcome attribution at threshold {target_floor:.1f}: {len(flagged)} vote(s) are "
-                        f"propping up trades that clear the bar only because of that vote's weight, and "
-                        "those specific trades underperform target WR:\n" + "\n".join(lines) + "\n"
-                        "Consider re-checking these votes' weights — this is diagnostic, no config "
-                        "patch is auto-applied."
-                    ),
-                })
-            anomalies_check = engine.flag_anomalous_rows(real_rows, min_sample=min_sample)
-            if anomalies_check["valid"] and anomalies_check["n_flagged"] > 0:
-                top = anomalies_check["flagged"][:5]
-                anomaly_lines = [
-                    f"  • {f['pair']} {f['alert_key']} pct_move={f['pct_move']:+.1f}% "
-                    f"(robust z={f['robust_z']:.1f}, ts={f['entry_ts']})"
-                    for f in top
-                ]
-                recommendations.append({
-                    "type": "data_anomaly", "severity": "medium",
-                    "message": (
-                        f"⚠️ {anomalies_check['n_flagged']} of {anomalies_check['n_total']} outcome "
-                        f"rows have a pct_move statistically far from the rest (median "
-                        f"{anomalies_check['median_pct_move']:+.2f}%):\n" + "\n".join(anomaly_lines) + "\n"
-                        "Worth checking these against exchange data for a bad tick before trusting "
-                        "the EV/WR numbers above. Not auto-excluded — could be a real outsized move."
-                    ),
-                })
+            recommendations.append({
+                "type": "outcome_attribution", "severity": "medium",
+                "message": (
+                    f"Outcome attribution at threshold {target_floor:.1f}: {len(flagged)} vote(s) are "
+                    f"propping up trades that clear the bar only because of that vote's weight, and "
+                    "those specific trades underperform target WR:\n" + "\n".join(lines) + "\n"
+                    "Consider re-checking these votes' weights — this is diagnostic, no config "
+                    "patch is auto-applied."
+                ),
+            })
 
-            # ── Three-Metric Outcome Analysis ────────────────────────────────
-            mm_summary = engine.multi_metric_summary(real_rows, min_sample=min_sample)
-            if mm_summary.get("valid"):
-                close_wr = mm_summary["close_wr"]
-                mfe_wr = mm_summary["mfe_wr"]
-                mae_rate = mm_summary["mae_loss_rate"]
-                clean_wr = mm_summary["clean_win_rate"]
-                gap = mfe_wr - close_wr
-                summary_msg = (
-                    f"📐 Three-Metric Evaluation (n={mm_summary['n']}):\n"
-                    f"  • Close WR (point-in-time): {close_wr:.0%} "
-                    f"[{mm_summary['close_wilson'][0]:.0%}-{mm_summary['close_wilson'][1]:.0%}]\n"
-                    f"  • MFE WR (TP ever hit):    {mfe_wr:.0%} "
-                    f"[{mm_summary['mfe_wilson'][0]:.0%}-{mm_summary['mfe_wilson'][1]:.0%}]\n"
-                    f"  • MAE Loss Rate (SL hit):  {mae_rate:.0%}\n"
-                    f"  • Clean Win (TP w/o SL):   {clean_wr:.0%}"
+        anomalies_check = engine.flag_anomalous_rows(real_rows, min_sample=min_sample)
+        if anomalies_check["valid"] and anomalies_check["n_flagged"] > 0:
+            top = anomalies_check["flagged"][:5]
+            anomaly_lines = [
+                f"  • {f['pair']} {f['alert_key']} pct_move={f['pct_move']:+.1f}% "
+                f"(robust z={f['robust_z']:.1f}, ts={f['entry_ts']})"
+                for f in top
+            ]
+            recommendations.append({
+                "type": "data_anomaly", "severity": "medium",
+                "message": (
+                    f"⚠️ {anomalies_check['n_flagged']} of {anomalies_check['n_total']} outcome "
+                    f"rows have a pct_move statistically far from the rest (median "
+                    f"{anomalies_check['median_pct_move']:+.2f}%):\n" + "\n".join(anomaly_lines) + "\n"
+                    "Worth checking these against exchange data for a bad tick before trusting "
+                    "the EV/WR numbers above. Not auto-excluded — could be a real outsized move."
+                ),
+            })
+
+        # ── Three-Metric Outcome Analysis ────────────────────────────────
+        mm_summary = engine.multi_metric_summary(real_rows, min_sample=min_sample)
+        if mm_summary.get("valid"):
+            close_wr = mm_summary["close_wr"]
+            mfe_wr = mm_summary["mfe_wr"]
+            mae_rate = mm_summary["mae_loss_rate"]
+            clean_wr = mm_summary["clean_win_rate"]
+            gap = mfe_wr - close_wr
+            summary_msg = (
+                f"📐 Three-Metric Evaluation (n={mm_summary['n']}):\n"
+                f"  • Close WR (point-in-time): {close_wr:.0%} "
+                f"[{mm_summary['close_wilson'][0]:.0%}-{mm_summary['close_wilson'][1]:.0%}]\n"
+                f"  • MFE WR (TP ever hit):    {mfe_wr:.0%} "
+                f"[{mm_summary['mfe_wilson'][0]:.0%}-{mm_summary['mfe_wilson'][1]:.0%}]\n"
+                f"  • MAE Loss Rate (SL hit):  {mae_rate:.0%}\n"
+                f"  • Clean Win (TP w/o SL):   {clean_wr:.0%}"
+            )
+            if gap > 0.05:
+                summary_msg += (
+                    f"\n⚠️ Gap: {gap:+.0%} of trades hit TP but reversed before "
+                    f"candle {cfg.OUTCOME_LOOKAHEAD_CANDLES}. "
+                    f"The close-based WR underestimates true profitability by {gap:.0%}."
                 )
-                if gap > 0.05:
-                    summary_msg += (
-                        f"\n⚠️ Gap: {gap:+.0%} of trades hit TP but reversed before "
-                        f"candle {cfg.OUTCOME_LOOKAHEAD_CANDLES}. "
-                        f"The close-based WR underestimates true profitability by {gap:.0%}."
-                    )
-                 if mm_summary.get("tp_before_sl_rate") is not None:
-                    summary_msg += (
-                        f"\n• TP before SL: {mm_summary['tp_before_sl_rate']:.0%} "
-                        f"| SL before TP: {mm_summary.get('sl_before_tp_rate', 0):.0%} "
-                        f"(n={mm_summary.get('ordering_sample', '?')})"
-                    )
-                if mm_summary.get("bonus_rate") is not None:
-                    summary_msg += (
-                        f"\n  • Bonus wins (≥{cfg.OUTCOME_BONUS_RR:.0f}R): "
-                        f"{mm_summary['bonus_rate']:.0%} of trades"
-                        f" | Avg R-multiple: {mm_summary['avg_rr_achieved']:.2f}R"
-                        f" | Bonus-weighted WR: {mm_summary.get('weighted_wr', 0):.1%}"
-                    )
-                recommendations.append({
-                    "type": "three_metric_evaluation",
-                    "severity": "medium" if gap > 0.10 else "low",
-                    "close_wr": round(close_wr, 4),
-                    "mfe_wr": round(mfe_wr, 4),
-                    "mae_loss_rate": round(mae_rate, 4),
-                    "clean_win_rate": round(clean_wr, 4),
-                    "gap": round(gap, 4),
-                    "bonus_rate": round(mm_summary.get("bonus_rate", 0.0), 4),
-                    "avg_rr_achieved": round(mm_summary.get("avg_rr_achieved", 0.0), 2),
-                    "weighted_wr": round(mm_summary.get("weighted_wr", 0.0), 4),
-                    "message": summary_msg,
-                })
+            if mm_summary.get("tp_before_sl_rate") is not None:
+                summary_msg += (
+                    f"\n• TP before SL: {mm_summary['tp_before_sl_rate']:.0%} "
+                    f"| SL before TP: {mm_summary.get('sl_before_tp_rate', 0):.0%} "
+                    f"(n={mm_summary.get('ordering_sample', '?')})"
+                )
+            if mm_summary.get("bonus_rate") is not None:
+                summary_msg += (
+                    f"\n  • Bonus wins (≥{cfg.OUTCOME_BONUS_RR:.0f}R): "
+                    f"{mm_summary['bonus_rate']:.0%} of trades"
+                    f" | Avg R-multiple: {mm_summary['avg_rr_achieved']:.2f}R"
+                    f" | Bonus-weighted WR: {mm_summary.get('weighted_wr', 0):.1%}"
+                )
+            recommendations.append({
+                "type": "three_metric_evaluation",
+                "severity": "medium" if gap > 0.10 else "low",
+                "close_wr": round(close_wr, 4),
+                "mfe_wr": round(mfe_wr, 4),
+                "mae_loss_rate": round(mae_rate, 4),
+                "clean_win_rate": round(clean_wr, 4),
+                "gap": round(gap, 4),
+                "bonus_rate": round(mm_summary.get("bonus_rate", 0.0), 4),
+                "avg_rr_achieved": round(mm_summary.get("avg_rr_achieved", 0.0), 2),
+                "weighted_wr": round(mm_summary.get("weighted_wr", 0.0), 4),
+                "message": summary_msg,
+            })
 
-                # Per-alert three-metric breakdown (worst offenders only)
-                mm_per_alert = engine.multi_metric_per_alert(real_rows, min_sample=min_sample)
-                big_gap_alerts = [a for a in mm_per_alert if a["gap_mfe_vs_close"] > 0.15]
+        # Per-alert three-metric breakdown (worst offenders only)
+        mm_per_alert = engine.multi_metric_per_alert(real_rows, min_sample=min_sample)
+        big_gap_alerts = [a for a in mm_per_alert if a["gap_mfe_vs_close"] > 0.15]
+        if big_gap_alerts:
+            gap_lines = [
+                f"  • {a['alert_key']}: close {a['close_wr']:.0%} vs MFE {a['mfe_wr']:.0%} "
+                f"(gap {a['gap_mfe_vs_close']:+.0%}, n={a['n']})"
+                for a in big_gap_alerts[:5]
+            ]
+            recommendations.append({
+                "type": "close_vs_mfe_gap",
+                "severity": "medium",
+                "message": (
+                    f"🔍 Alerts where MFE WR >> Close WR (take-profit would have captured "
+                    f"these wins but the point-in-time check misses them):\n"
+                    + "\n".join(gap_lines)
+                ),
+            })
 
-                if big_gap_alerts:
-                    gap_lines = [
-                        f"  • {a['alert_key']}: close {a['close_wr']:.0%} vs MFE {a['mfe_wr']:.0%} "
-                        f"(gap {a['gap_mfe_vs_close']:+.0%}, n={a['n']})"
-                        for a in big_gap_alerts[:5]
-                    ]
-                    recommendations.append({
-                        "type": "close_vs_mfe_gap",
-                        "severity": "medium",
-                        "message": (
-                            f"🔍 Alerts where MFE WR >> Close WR (take-profit would have captured "
-                            f"these wins but the point-in-time check misses them):\n"
-                            + "\n".join(gap_lines)
-                        ),
-                    })
+        # ── R:R and Bonus Analysis ──
+        if real_rows:
+            bonus_wins = sum(1 for r in real_rows if r.get("bonus_win"))
+            total_wins = sum(1 for r in real_rows if r["win"])
+            rr_values = [r.get("rr_achieved", 0) for r in real_rows if r.get("rr_achieved", 0) > 0]
+            avg_rr = statistics.mean(rr_values) if rr_values else 0.0
+            total_weight = sum(r.get("win_weight", 1.0 if r["win"] else 0.0) for r in real_rows)
+            effective_n = len(real_rows)
+            weighted_wr_bonus = min(total_weight / effective_n, 1.0) if effective_n else 0.0
+            recommendations.append({
+                "type": "rr_analysis",
+                "severity": "low",
+                "message": (
+                    f"📐 R:R Analysis (target=1:{cfg.OUTCOME_RR_TARGET:.0f}, "
+                    f"bonus≥{cfg.OUTCOME_BONUS_RR:.0f}R):\n"
+                    f"  • Wins: {total_wins}/{len(real_rows)} | "
+                    f"Bonus wins: {bonus_wins} ({bonus_wins/max(total_wins,1):.0%} of wins)\n"
+                    f"  • Avg R-multiple achieved: {avg_rr:.2f}R\n"
+                    f"  • Effective WR (bonus-weighted): {weighted_wr_bonus:.1%} "
+                    f"(raw: {total_wins/len(real_rows):.1%})"
+                ),
+            })
 
-                # ── R:R and Bonus Analysis ──
-                if real_rows:
-                    bonus_wins = sum(1 for r in real_rows if r.get("bonus_win"))
-                    total_wins = sum(1 for r in real_rows if r["win"])
-                    rr_values = [r.get("rr_achieved", 0) for r in real_rows if r.get("rr_achieved", 0) > 0]
-                    avg_rr = statistics.mean(rr_values) if rr_values else 0.0
+        if rec.get("overlapping_toxic"):
+            worst = max(rec["overlapping_toxic"], key=lambda t: t[1])
+            recommendations.append({
+                "type": "toxic_zone_note", "severity": "low",
+                "message": (
+                    f"Note: a toxic bucket (score {worst[0]:.1f}-{worst[1]:.1f}, {worst[2]:.0%} WR) "
+                    f"exists at or above the recommended threshold. Cumulative stats already price "
+                    f"this in — worth checking the per-alert breakdown below for what's firing there."
+                ),
+            })
 
-                    # Weighted WR: bonus wins count for more
-                    total_weight = sum(r.get("win_weight", 1.0 if r["win"] else 0.0) for r in real_rows)
-                    effective_n = len(real_rows)
-                    weighted_wr_bonus = min(total_weight / effective_n, 1.0) if effective_n else 0.0
-
-                    recommendations.append({
-                        "type": "rr_analysis",
-                        "severity": "low",
-                        "message": (
-                            f"📐 R:R Analysis (target=1:{cfg.OUTCOME_RR_TARGET:.0f}, "
-                            f"bonus≥{cfg.OUTCOME_BONUS_RR:.0f}R):\n"
-                            f"  • Wins: {total_wins}/{len(real_rows)} | "
-                            f"Bonus wins: {bonus_wins} ({bonus_wins/max(total_wins,1):.0%} of wins)\n"
-                            f"  • Avg R-multiple achieved: {avg_rr:.2f}R\n"
-                            f"  • Effective WR (bonus-weighted): {weighted_wr_bonus:.1%} "
-                            f"(raw: {total_wins/len(real_rows):.1%})"
-                        ),
-                    })        
-            if rec.get("overlapping_toxic"):
-                worst = max(rec["overlapping_toxic"], key=lambda t: t[1])
-                recommendations.append({
-                    "type": "toxic_zone_note", "severity": "low",
-                    "message": (
-                        f"Note: a toxic bucket (score {worst[0]:.1f}-{worst[1]:.1f}, {worst[2]:.0%} WR) "
-                        f"exists at or above the recommended threshold. Cumulative stats already price "
-                        f"this in — worth checking the per-alert breakdown below for what's firing there."
-                    ),
-                })
-
-        # ── Temporal drift (from the same recommend_threshold() call —
-        #    no separate computation, no risk of disagreeing with the CLI) ──
+        # ── Temporal drift ──
         if rec.get("valid") and rec.get("drift_recent_wr") is not None:
             drift = rec["drift_recent_wr"] - rec["drift_older_wr"]
             if drift < -0.05:
@@ -844,7 +846,7 @@ class BrainEngine:
                     ),
                 })
 
-        # ── Per-pair breakdown (worst pairs only, keeps report short) ──
+        # ── Per-pair breakdown ──
         pair_stats = engine.per_pair_breakdown(real_rows, min_sample=min_sample)
         weak_pairs = [p for p in pair_stats if p[1] < disable_wr]
         if weak_pairs:
@@ -856,7 +858,7 @@ class BrainEngine:
                 ),
             })
 
-        # ── Per-pair session breakdown (informational) ──────────────────
+        # ── Per-pair session breakdown ──
         if getattr(cfg, "ENABLE_SESSION_FILTER", False):
             session_stats = engine.per_pair_session_breakdown(real_rows, min_sample=min_sample)
             weak_sessions = [s for s in session_stats if s[2] < disable_wr]
@@ -872,7 +874,7 @@ class BrainEngine:
                     ),
                 })
 
-        # ── Pain-Adjusted Win Rate (MAE/MFE-aware) ───────────────────────
+        # ── Pain-Adjusted Win Rate ──
         pawr_stats = engine.pain_adjusted_win_rate(real_rows, min_sample=min_sample)
         if pawr_stats:
             worst_pain = sorted(
@@ -889,8 +891,8 @@ class BrainEngine:
                         )
                     ),
                 })
-       
-        # ── Per-pair confluence thresholds ──────────────────────────────
+
+        # ── Per-pair confluence thresholds ──
         if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
             pair_min_sample = getattr(cfg, "BRAIN_PAIR_THRESHOLD_MIN_SAMPLE", 30)
             pair_recs = engine.per_pair_thresholds(
@@ -936,7 +938,8 @@ class BrainEngine:
                         "for these pairs only):\n" + "\n".join(pair_threshold_lines)
                     ),
                 })
-        # ── Vote importance (top lift / top drag only) ──
+
+        # ── Vote importance ──
         vote_imp = engine.vote_importance(real_rows, min_sample=min_sample)
         if vote_imp:
             best = [v for v in vote_imp if v[5] > 0.05][:3]
@@ -952,7 +955,7 @@ class BrainEngine:
                     "message": "Vote signal quality — " + "; ".join(parts),
                 })
 
-        # ── Shadow-mode insight: rejected alerts that would have won ──
+        # ── Shadow-mode insight ──
         shadow_summary: Dict[str, Any] = {}
         if shadow_rows:
             shadow_wins = sum(1 for r in shadow_rows if r["win"])
@@ -978,7 +981,7 @@ class BrainEngine:
                         ),
                     })
 
-        # ── Vote-Count OOD summary ─────────────────────────────────────────
+        # ── Vote-Count OOD summary ──
         ood_status = "Normal"
         if real_rows:
             latest_by_alert: Dict[str, engine.Row] = {}
@@ -986,9 +989,8 @@ class BrainEngine:
                 ak = r["alert_key"]
                 if ak not in latest_by_alert and r.get("votes"):
                     latest_by_alert[ak] = r
-                    if len(latest_by_alert) >= 5:
-                        break
-
+                if len(latest_by_alert) >= 5:
+                    break
             ood_passes = 0
             ood_total = 0
             for ak, r in latest_by_alert.items():
@@ -996,7 +998,6 @@ class BrainEngine:
                 ood_total += 1
                 if not is_ood:
                     ood_passes += 1
-
             if ood_total > 0:
                 ood_status = (
                     "PASS" if ood_passes == ood_total
@@ -1189,7 +1190,6 @@ class BrainEngine:
     async def _generate_and_send(self, pairs: List[str], telegram_queue: Any, logger_run: logging.Logger) -> bool:
         logger_run.info("Brain generating analysis report...")
         recs = await self.generate_recommendations()
-
         cc = recs.get("current_config", {})
         min_sample = getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
 
@@ -1215,6 +1215,7 @@ class BrainEngine:
         lines.append(escape_markdown_v2(
             f"Gate threshold: Score≥{cc.get('CONFLUENCE_MIN_ABS_SCORE')} Pct≥{cc.get('CONFLUENCE_MIN_PCT')}%"
         ))
+
         size_bits = []
         if ai.get("net_ev") is not None:
             size_bits.append(f"EV {ai['net_ev']:+.3f}%/trade")
@@ -1274,7 +1275,7 @@ class BrainEngine:
         # ── WEAK / AVOID: disable candidates + harmful vote combos ──
         disable_alerts = [r for r in recs["recommendations"] if r["type"] == "disable_alert"]
         poison_combos = [r for r in recs["recommendations"]
-                          if r["type"] == "vote_interaction" and r.get("kind") == "poison"]
+                         if r["type"] == "vote_interaction" and r.get("kind") == "poison"]
         if disable_alerts or poison_combos:
             lines.append("*📉 WEAK / AVOID*")
             for r in disable_alerts[:3]:
@@ -1291,7 +1292,7 @@ class BrainEngine:
             for p in patch:
                 note = (p.get("note") or "").lower()
                 if "informational" in note:
-                    continue  # derived/non-binding entry, not an action item
+                    continue
                 path = p["path"]
                 suggested = p.get("suggested")
                 if isinstance(suggested, dict):
@@ -1310,6 +1311,7 @@ class BrainEngine:
                 else:
                     line = f"• {path}: {p.get('current')} → {suggested}"
                 action_lines.append(escape_markdown_v2(line))
+
         shown_patch = len(action_lines)
 
         counterfactuals = [r for r in recs["recommendations"] if r["type"] == "counterfactual"]
@@ -1317,7 +1319,7 @@ class BrainEngine:
             action_lines.append(f"• {escape_markdown_v2(r['message'][:200])}")
 
         synergy_combos = [r for r in recs["recommendations"]
-                           if r["type"] == "vote_interaction" and r.get("kind") == "synergy"]
+                          if r["type"] == "vote_interaction" and r.get("kind") == "synergy"]
         for r in synergy_combos[:2]:
             action_lines.append(f"• {escape_markdown_v2(r['message'][:180])}")
 
@@ -1336,7 +1338,7 @@ class BrainEngine:
                 lines.append(f"{icon} {escape_markdown_v2(r['message'][:150])}")
             lines.append("")
 
-        # ── FYI: CUSUM drift + any leftover findings — informational, goes last ──
+        # ── FYI: CUSUM drift + any leftover findings ──
         skip_types = patch_derived_types | {
             "dynamic_weights_applied", "dynamic_weights_shadow",
             "dynamic_weights_persist_failed", "auto_disabled", "auto_reenabled",
@@ -1348,8 +1350,8 @@ class BrainEngine:
         ]
         cusum_items = [r for r in others if r["type"] == "cusum_drift"]
         others = [r for r in others if r["type"] != "cusum_drift"]
-
         shown_others = 0
+
         if cusum_items or others:
             lines.append("*ℹ️ FYI*")
             if cusum_items:
@@ -1362,7 +1364,7 @@ class BrainEngine:
             for r in others[:5]:
                 first_line = r["message"].split("\n")[0]
                 lines.append(f"• {escape_markdown_v2(first_line[:180])}")
-            shown_others += min(len(others), 5)
+                shown_others += 1
             lines.append("")
 
         total_recs = recs["recommendation_count"]
@@ -1371,6 +1373,7 @@ class BrainEngine:
             + len(disable_alerts[:3]) + len(poison_combos[:3])
             + len(auto_disabled[:3]) + len(auto_reenabled[:3]) + shown_others
         )
+
         if total_recs == 0:
             lines.append("No actionable signal yet — still accumulating samples.")
         elif total_recs > shown:
@@ -1396,12 +1399,11 @@ class BrainEngine:
             logger_run.info(f"🧠 Full brain report written to {report_path}")
         except Exception as e:
             logger_run.warning(f"Failed to write full markdown brain report: {e}")
-            
+
         send_ok = False
         if telegram_queue:
             try:
                 result = await telegram_queue.send(msg)
-
                 if result:
                     send_ok = True
                 else:
@@ -1410,7 +1412,6 @@ class BrainEngine:
                         f"report is still persisted at {report_key}. "
                         f"Check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID and MarkdownV2 formatting."
                     )
-
             except Exception as e:
                 logger_run.warning(
                     f"Brain report Telegram send failed ({e}) — report is still persisted at {report_key}."
@@ -1421,5 +1422,4 @@ class BrainEngine:
             f"{shown_patch} patch item(s), {len(others)} other finding(s), "
             f"{total_recs} total recommendations"
         )
-
         return send_ok
