@@ -156,8 +156,7 @@ jobs:
               FILES=(
                 "/app/src/macd_unified.py"
                 "/app/src/aot_bridge.py"
-                "/app/src/aot_version.py"
-                "/app/src/aot_function_registry.py"
+                "/app/src/aot_meta.py"
                 "/app/src/numba_functions_shared.py"
                 "/app/src/numeric_selftest.py"
                 "/app/src/bot_config.py"
