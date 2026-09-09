@@ -268,6 +268,7 @@ class BrainEngine:
                     "mfe_win": mfe_win_val,
                     "mae_loss": mae_loss_val,
                     "tp_first": tp_first_val,
+                    "outcome_reason": f.get("outcome_reason", "unknown"),
                     # ── R:R and Bonus fields ──
                     "bonus_win": bonus_win_val,
                     "rr_achieved": rr_achieved_val,

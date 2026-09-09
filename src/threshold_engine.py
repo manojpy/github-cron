@@ -43,11 +43,10 @@ def recency_weight(entry_ts: Optional[float], now_ts: float, decay_days: float =
 def weighted_win_rate(
     rows: List[Row], now_ts: Optional[float] = None, decay_days: float = 7.0,
 ) -> Tuple[Optional[float], float, float, float]:
-    """Recency-weighted win rate + a weighted Wilson-CI band.
-
-    Bonus-aware: each win is additionally scaled by its win_weight
-    (default 1.0; bonus wins carry up to cfg.OUTCOME_BONUS_WEIGHT),
-    so bonus wins contribute proportionally more.
+    """Recency-weighted win rate + a weighted Wilson-CI band. Plain recency
+    weighting only — every win counts as exactly 1.0 regardless of size.
+    For bonus-adjusted weighting (overshoot wins count for more), use
+    weighted_win_rate_with_bonus instead.
 
     Returns (weighted_wr, n_eff, wilson_lo, wilson_hi).
     """
@@ -61,7 +60,7 @@ def weighted_win_rate(
         sum_w += w
         sum_w2 += w * w
         if r["win"]:
-            sum_ww += w * r.get("win_weight", 1.0)
+            sum_ww += w
     if sum_w <= 0:
         return None, 0.0, 0.0, 0.0
     weighted_wr = min(sum_ww / sum_w, 1.0)

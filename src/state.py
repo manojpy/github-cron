@@ -989,12 +989,30 @@ class RedisStateStore:
                 elif sl_hit_idx < tp_hit_idx:
                     tp_first = False
                 else:
-                    tp_first = None  # Same candle — can't determine intra-candle order
+                    # Same candle — can't determine intra-candle order.
+                    # Resolved optimistically: target assumed first.
+                    tp_first = True
             elif tp_hit_idx is not None:
                 tp_first = True   # Only TP hit
             elif sl_hit_idx is not None:
                 tp_first = False  # Only SL hit
             # else: neither hit → tp_first stays None
+
+        # ── OUTCOME REASON: human-readable label mirroring tp_first/mfe_win/
+        # mae_loss, kept for archive_reader.py and any reporting that wants
+        # a single descriptive field instead of the boolean trio ──
+        if tp_first is True:
+            outcome_reason = "target_hit"
+        elif tp_first is False:
+            outcome_reason = "stop_hit"
+        elif mfe_win and mae_loss:
+            outcome_reason = "both_hit"
+        elif mfe_win:
+            outcome_reason = "target_hit_ever"
+        elif mae_loss:
+            outcome_reason = "stop_hit_ever"
+        else:
+            outcome_reason = "no_hit"
 
         # ── PRIMARY WIN: configurable ──
         primary_metric = getattr(cfg, "OUTCOME_PRIMARY_METRIC", "mfe")
@@ -1027,6 +1045,7 @@ class RedisStateStore:
             "mfe_win": mfe_win,
             "mae_loss": mae_loss,
             "tp_first": tp_first,
+            "outcome_reason": outcome_reason,
             "mae": mae,
             "mfe": mfe,
             # ── R:R and Bonus fields ──
@@ -1141,6 +1160,7 @@ class RedisStateStore:
                                     else "0" if result.get("tp_first") is False
                                     else ""
                                 ),
+                                "outcome_reason": result.get("outcome_reason", "unknown"),
                                 # ── R:R and Bonus fields ──
                                 "bonus_win": "1" if result.get("bonus_win", False) else "0",
                                 "rr_achieved": f"{result.get('rr_achieved', 0):.2f}",
@@ -1186,6 +1206,7 @@ class RedisStateStore:
                                 "mfe_win": result.get("mfe_win", False),
                                 "mae_loss": result.get("mae_loss", False),
                                 "tp_first": result.get("tp_first"),
+                                "outcome_reason": result.get("outcome_reason", "unknown"),
                                 # ── R:R and Bonus fields ──
                                 "bonus_win": result.get("bonus_win", False),
                                 "rr_achieved": result.get("rr_achieved", 0.0),
@@ -1322,6 +1343,7 @@ class RedisStateStore:
                                             else "0" if result.get("tp_first") is False
                                             else ""
                                         ),
+                                        "outcome_reason": result.get("outcome_reason", "unknown"),
                                         "votes": json_dumps(conf_votes)
                                         if conf_votes is not None
                                         else "",
@@ -1358,11 +1380,12 @@ class RedisStateStore:
                                 "session": _get_session_from_ts(entry_ts) if entry_ts else "dead",
                                 "votes": conf_votes,
                                 "shadow": True,
-                                # ── Three-metric fields ──
+                                # ─ Three-metric fields ──
                                 "close_win": result.get("close_win", win),
                                 "mfe_win": result.get("mfe_win", False),
                                 "mae_loss": result.get("mae_loss", False),
                                 "tp_first": result.get("tp_first"),
+                                "outcome_reason": result.get("outcome_reason", "unknown"),
                                 # ── R:R and Bonus fields ──
                                 "bonus_win": result.get("bonus_win", False),
                                 "rr_achieved": result.get("rr_achieved", 0.0),

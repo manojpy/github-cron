@@ -545,10 +545,10 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             for k in keys:
                 pair = k[prefix_len:].split(":", 1)[0]
                 shadow_by_pair.setdefault(pair, []).append(k)
+            
             state_db._shadow_pending_outcome_keys_by_pair = shadow_by_pair
             total = sum(len(v) for v in shadow_by_pair.values())
-            if total:
-                logger_main.info(f"👻 Pre-scanned {total} shadow pending outcome(s) across {len(shadow_by_pair)} pair(s)")
+            logger_main.info(f"👻 Pre-scanned {total} shadow pending outcome(s) across {len(shadow_by_pair)} pair(s)")
         except Exception as e:
             logger_main.warning(f"Shadow pending outcome pre-scan failed: {e}")
             state_db._shadow_pending_outcome_keys_by_pair = None
