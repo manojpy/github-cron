@@ -2577,3 +2577,344 @@ def repair_shop_diagnosis(
     severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     repairs.sort(key=lambda x: severity_order.get(x["severity"], 4))
     return repairs
+
+# ══════════════════════════════════════════════════════════════════════
+#  CALIBRATION GATE (live): per-alert conf_pct → observed WR curve
+# ══════════════════════════════════════════════════════════════════════
+
+def build_calibration_curves(
+    rows: List[Row],
+    bucket_pct: float = 5.0,
+    min_sample: int = 15,
+) -> Dict[str, Any]:
+    """Per-alert-key calibration: bucketed confluence % → observed win rate.
+
+    A raw confluence score is a weighted vote total, not a probability.
+    This maps what the score DISPLAYS (conf_pct, treated as the implied
+    probability claim /100) to what actually HAPPENED, per alert key, so
+    the live gate can filter on calibrated probability instead of face
+    value. ECE = standard expected calibration error over buckets.
+    """
+    by_ak: Dict[str, List[Row]] = defaultdict(list)
+    for r in rows:
+        by_ak[r["alert_key"]].append(r)
+
+    curves: Dict[str, Any] = {}
+    for ak, ak_rows in by_ak.items():
+        if len(ak_rows) < min_sample:
+            continue
+        buckets: Dict[int, List[Row]] = defaultdict(list)
+        for r in ak_rows:
+            buckets[int(r["conf_pct"] // bucket_pct)].append(r)
+        out = []
+        for b in sorted(buckets):
+            chunk = buckets[b]
+            n = len(chunk)
+            wins = sum(r["win"] for r in chunk)
+            wr = wins / n
+            lo, hi, _ = wilson_ci(wins, n)
+            pred = statistics.mean(r["conf_pct"] for r in chunk) / 100.0
+            out.append({
+                "lo": b * bucket_pct, "hi": (b + 1) * bucket_pct,
+                "predicted": round(pred, 4), "observed": round(wr, 4),
+                "n": n, "trusted": n >= min_sample,
+                "wilson_lo": round(lo, 4), "wilson_hi": round(hi, 4),
+            })
+        total = len(ak_rows)
+        ece = sum((bk["n"] / total) * abs(bk["observed"] - bk["predicted"]) for bk in out)
+        curves[ak] = {"buckets": out, "ece": round(ece, 4), "n": total}
+
+    ece_values = [c["ece"] for c in curves.values()]
+    return {
+        "curves": curves,
+        "ece_mean": round(statistics.fmean(ece_values), 4) if ece_values else None,
+        "built_at": int(time.time()),
+    }
+
+def calibration_gate_decision(
+    curve: Dict[str, Any],
+    conf_pct: float,
+    target_wr: float,
+    min_sample: int = 15,
+    slack: float = 0.05,
+) -> Tuple[bool, Optional[float], str]:
+    """(pass, calibrated_wr, reason) for one alert at one conf_pct.
+
+    Blocks only when the trusted bucket is CONFIDENTLY below target
+    (observed < target−slack AND wilson_hi < target) — a calibration
+    gate must never block on its own uncertainty, only on evidence of
+    miscalibration. Fail-open on thin/missing buckets.
+    """
+    buckets = curve.get("buckets", [])
+    if not buckets:
+        return True, None, "no_curve"
+    chosen = None
+    for bk in buckets:
+        if bk["lo"] <= conf_pct < bk["hi"]:
+            chosen = bk
+            break
+    if chosen is None:  # conf_pct outside covered range → nearest bucket
+        chosen = min(buckets, key=lambda bk: min(abs(conf_pct - bk["lo"]), abs(conf_pct - bk["hi"])))
+    if not chosen.get("trusted") or chosen["n"] < min_sample:
+        return True, chosen["observed"], "thin_bucket_fail_open"
+    cal_wr = chosen["observed"]
+    if cal_wr < target_wr - slack and chosen["wilson_hi"] < target_wr:
+        return False, cal_wr, (
+            f"calibrated WR {cal_wr:.0%} "
+            f"[{chosen['wilson_lo']:.0%}-{chosen['wilson_hi']:.0%}] below "
+            f"{target_wr:.0%} target at conf {conf_pct:.0f}%"
+        )
+    return True, cal_wr, "ok"
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  PORTFOLIO HEAT — hard exposure caps, independent of confluence math
+# ══════════════════════════════════════════════════════════════════════
+
+def portfolio_heat_check(
+    open_positions: List[Dict[str, Any]],
+    new_pair: str,
+    new_direction: str,
+    max_concurrent: int = 6,
+    max_net_directional: int = 4,
+    max_same_direction_pct: float = 1.0,
+) -> Dict[str, Any]:
+    """Hard veto on total book exposure.
+
+    ClusterContext penalizes a same-run correlated herd at the SCORE
+    level — soft, and it still lets one alert per pair through. Five
+    pairs firing one at a time over three hours, all effectively
+    long-BTC-beta, pass every pair-level gate. This looks at the book
+    as a whole: how many positions are open, how lopsided they are,
+    and whether the new one makes it worse.
+
+    open_positions: [{"pair": ..., "direction": "buy"|"sell"}, ...]
+    Never raises — a risk gate that crashes must not take dispatch down.
+    """
+    stats: Dict[str, Any] = {"open_count": len(open_positions)}
+    try:
+        open_pairs = {p.get("pair") for p in open_positions}
+        longs = sum(1 for p in open_positions if p.get("direction") == "buy")
+        sells = sum(1 for p in open_positions if p.get("direction") == "sell")
+        stats.update(longs=longs, sells=sells, net=longs - sells)
+
+        if new_pair in open_pairs:
+            return {"blocked": True, "reason": f"{new_pair} already has an open position", **stats}
+        if len(open_positions) >= max_concurrent:
+            return {"blocked": True,
+                    "reason": f"max concurrent positions ({max_concurrent}) reached", **stats}
+
+        new_longs = longs + (1 if new_direction == "buy" else 0)
+        new_sells = sells + (1 if new_direction == "sell" else 0)
+        net = new_longs - new_sells
+        if abs(net) > max_net_directional:
+            return {"blocked": True,
+                    "reason": f"net directional exposure would be {net:+d} (limit ±{max_net_directional})",
+                    **stats}
+
+        same = new_longs if new_direction == "buy" else new_sells
+        total = len(open_positions) + 1
+        if max_same_direction_pct < 1.0 and same / total > max_same_direction_pct:
+            return {"blocked": True,
+                    "reason": f"{same}/{total} positions same direction (> {max_same_direction_pct:.0%})",
+                    **stats}
+        return {"blocked": False, "reason": "ok", **stats}
+    except Exception as e:
+        return {"blocked": False, "reason": f"gate error (fail-open): {e}", **stats}
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  KILL SWITCH — fast-failure halt (streak / rolling drawdown)
+# ══════════════════════════════════════════════════════════════════════
+
+class KillSwitch:
+    """Hard halt on live bleed: N consecutive losses or X% cost-adjusted
+    drawdown inside a rolling window.
+
+    CUSUM watches per-alert-key edge decay and needs samples to
+    accumulate; a correlated wipeout across ten keys in two hours trips
+    nothing per-key but kills the book. This is the circuit breaker for
+    STRATEGY risk (APICircuitBreaker covers API risk).
+
+    Pure function of outcome rows — no hidden state. The brain arms a
+    Redis flag on trip; dispatch polls it. For sub-report latency wire
+    evaluate() into the outcome-resolution path too (see integration
+    notes). PnL convention mirrors ev_and_kelly_for exactly so the
+    drawdown number agrees with the EV numbers in the report.
+    """
+
+    def __init__(
+        self,
+        max_consecutive_losses: int = 6,
+        max_drawdown_pct: float = 3.0,
+        lookback_hours: int = 24,
+        fee_pct: float = 0.0006,
+        slippage_pct: float = 0.0003,
+    ):
+        self.max_consecutive_losses = max_consecutive_losses
+        self.max_drawdown_pct = max_drawdown_pct
+        self.lookback_hours = lookback_hours
+        self.fee_pct = fee_pct
+        self.slippage_pct = slippage_pct
+
+    def evaluate(self, rows: List[Row], now_ts: Optional[float] = None) -> Dict[str, Any]:
+        if now_ts is None:
+            now_ts = time.time()
+        result: Dict[str, Any] = {
+            "tripped": False, "reason": None,
+            "consecutive_losses": 0, "drawdown_pct": 0.0,
+            "pnl_pct": 0.0, "n_window": 0,
+        }
+        if not rows:
+            return result
+
+        ordered = sorted(
+            (r for r in rows if r.get("entry_ts", 0) > 0),
+            key=lambda r: r["entry_ts"],
+        )
+        cutoff = now_ts - self.lookback_hours * 3600
+
+        # Losing streak, counted from the tail, freshness-gated to the
+        # lookback window so an old pre-downtime streak can't trip it.
+        streak = 0
+        for r in reversed(ordered):
+            if r["entry_ts"] < cutoff or r["win"]:
+                break
+            streak += 1
+        result["consecutive_losses"] = streak
+
+        # Rolling cost-adjusted PnL (same convention as ev_and_kelly_for).
+        total_cost = (self.fee_pct * 2) + (self.slippage_pct * 2)
+        window = [r for r in ordered if r["entry_ts"] >= cutoff]
+        pnl = 0.0
+        for r in window:
+            mag = abs(r.get("pct_move", 0.0))
+            pnl += (mag - total_cost) if r["win"] else -(mag + total_cost)
+        result.update(
+            pnl_pct=round(pnl, 4),
+            drawdown_pct=round(-pnl, 4) if pnl < 0 else 0.0,
+            n_window=len(window),
+        )
+
+        reasons = []
+        if streak >= self.max_consecutive_losses:
+            reasons.append(f"{streak} consecutive losses (limit {self.max_consecutive_losses})")
+        if pnl <= -self.max_drawdown_pct:
+            reasons.append(
+                f"{pnl:+.2f}% PnL over last {self.lookback_hours}h "
+                f"(limit -{self.max_drawdown_pct}%)"
+            )
+        if reasons:
+            result["tripped"] = True
+            result["reason"] = " and ".join(reasons)
+        return result
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  FILL RECONCILIATION — assumed vs realized execution cost
+# ══════════════════════════════════════════════════════════════════════
+
+def fill_reconciliation(
+    rows: List[Row],
+    assumed_fee_pct: float = 0.0006,
+    assumed_slippage_pct: float = 0.0003,
+    rr_target: float = 2.0,
+    stop_pct: float = 0.5,
+    min_sample: int = 10,
+) -> Dict[str, Any]:
+    """Compare ASSUMED execution cost (the fixed fee+slippage baked into
+    every EV/Kelly number) against REALIZED cost.
+
+    Two evidence tiers:
+    1. MEASURED — rows carrying signal_price/fill_price. Direction-aware
+       slippage: a buy filling above signal, or a sell below, is paying
+       up. This is the ground truth once the outcome writer records fills.
+    2. ESTIMATED — no fill data yet: realized |pct_move| on wins vs the
+       theoretical TP distance (rr_target × stop_pct). A systematic
+       shortfall is execution leakage — labeled an estimate because
+       outcome resolution is not a fill feed.
+
+    Liquidity varies a lot across a ~30-pair universe, so the per-pair
+    breakdown is first-class output, not an afterthought.
+    """
+    measured = [r for r in rows if r.get("signal_price") and r.get("fill_price")]
+
+    # ── Tier 1: measured fills ─────────────────────────────────────
+    if len(measured) >= min_sample:
+        slips: List[float] = []
+        per_pair: Dict[str, List[float]] = defaultdict(list)
+        fees: List[float] = []
+        for r in measured:
+            sig, fill = r["signal_price"], r["fill_price"]
+            if sig <= 0:
+                continue
+            slip = (fill - sig) / sig if r["direction"] == "buy" else (sig - fill) / sig
+            slips.append(slip)
+            per_pair[r["pair"]].append(slip)
+            if r.get("fees_paid_pct") is not None:
+                fees.append(r["fees_paid_pct"])
+        if len(slips) >= min_sample:
+            mean_slip = statistics.fmean(slips)
+            realized = max(0.0, mean_slip)
+            pair_rows = []
+            for pair, ps in per_pair.items():
+                if len(ps) < max(3, min_sample // 2):
+                    continue
+                pm = statistics.fmean(ps)
+                pair_rows.append({
+                    "pair": pair, "n": len(ps),
+                    "realized_slippage_per_side": round(max(0.0, pm), 6),
+                    "gap_bps": round((pm - assumed_slippage_pct) * 10000, 1),
+                })
+            pair_rows.sort(key=lambda x: -x["gap_bps"])
+            result: Dict[str, Any] = {
+                "valid": True, "measured": True, "n": len(slips),
+                "realized_slippage_per_side": round(realized, 6),
+                "assumed_slippage_per_side": assumed_slippage_pct,
+                "gap_bps": round((mean_slip - assumed_slippage_pct) * 10000, 2),
+                # two sides per round trip
+                "ev_overstated_pct_per_trade": round(2 * max(0.0, mean_slip - assumed_slippage_pct), 6),
+                "per_pair": pair_rows,
+            }
+            if fees:
+                result["realized_fee_pct"] = round(statistics.fmean(fees), 6)
+                result["fee_gap_bps"] = round((result["realized_fee_pct"] - assumed_fee_pct) * 10000, 2)
+            return result
+
+    # ── Tier 2: estimated from win-move shortfall ──────────────────
+    wins = [abs(r.get("pct_move", 0.0)) for r in rows if r["win"]]
+    if len(wins) < min_sample:
+        return {"valid": False, "measured": False, "error": "insufficient_data", "n": len(wins)}
+    realized_pp = statistics.fmean(wins)
+    expected_pp = rr_target * stop_pct          # theoretical TP distance, same units
+    shortfall_pp = max(0.0, expected_pp - realized_pp)
+    implied_frac = (shortfall_pp / 2.0) / 100.0  # split across entry+exit, pp → fraction
+
+    per_pair = defaultdict(list)
+    for r in rows:
+        if r["win"]:
+            per_pair[r["pair"]].append(abs(r.get("pct_move", 0.0)))
+    pair_rows = []
+    for pair, moves in per_pair.items():
+        if len(moves) < max(3, min_sample // 2):
+            continue
+        implied_p = max(0.0, (expected_pp - statistics.fmean(moves)) / 2.0) / 100.0
+        pair_rows.append({
+            "pair": pair, "n": len(moves),
+            "realized_slippage_per_side": round(implied_p, 6),
+            "gap_bps": round((implied_p - assumed_slippage_pct) * 10000, 1),
+        })
+    pair_rows.sort(key=lambda x: -x["gap_bps"])
+
+    return {
+        "valid": True, "measured": False, "n": len(wins),
+        "realized_move_pct_win": round(realized_pp, 4),
+        "expected_move_pct_win": round(expected_pp, 4),
+        "realized_slippage_per_side": round(implied_frac, 6),
+        "assumed_slippage_per_side": assumed_slippage_pct,
+        "gap_bps": round((implied_frac - assumed_slippage_pct) * 10000, 2),
+        "ev_overstated_pct_per_trade": round(2 * max(0.0, implied_frac - assumed_slippage_pct), 6),
+        "per_pair": pair_rows,
+        "note": "estimated from win-move shortfall; wire fill prices into the "
+                "outcome writer for the measured tier",
+    }

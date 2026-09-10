@@ -41,6 +41,49 @@ class BrainEngineV2(BaseBrainEngine):
         super().__init__(sdb)
         self._phase_samples = _PHASE_MIN_SAMPLES
 
+    @staticmethod
+    def _shadow_weight_check(
+        shadow_rows, current_weights, suggested_weights,
+        threshold, min_n=15, max_wr_drop=0.05,
+    ):
+        """Out-of-sample veto on proposed weight changes. Shadow rows are
+        alerts the live system REJECTED — an independent sample from the
+        same window. Score them under current vs suggested weights (same
+        scoring rule both times, so the comparison is apples-to-apples
+        even though this reconstruction omits gate-level score
+        components) and veto if the proposal materially degrades WR."""
+        def _wr_at(rows, weights):
+            kept = [
+                r for r in rows
+                if r.get("votes") and
+                sum(w for vn, w in weights.items() if r["votes"].get(vn)) >= threshold
+            ]
+            if len(kept) < min_n:
+                return None, len(kept)
+            return sum(r["win"] for r in kept) / len(kept), len(kept)
+
+        cur_wr, cur_n = _wr_at(shadow_rows, current_weights)
+        new_wr, new_n = _wr_at(shadow_rows, suggested_weights)
+        if cur_wr is None or new_wr is None:
+            return True, f"shadow too thin to veto (cur n={cur_n}, new n={new_n})"
+        if new_wr < cur_wr - max_wr_drop:
+            return False, f"suggested weights degrade shadow WR {cur_wr:.0%}→{new_wr:.0%} (n={new_n})"
+        return True, f"shadow WR stable {cur_wr:.0%}→{new_wr:.0%} (n={new_n})"
+
+    @staticmethod
+    def _match_shadow_regime(rpo_shadow, rng):
+        """Shadow regime overlapping a real regime's ADX range (≥50% span overlap)."""
+        if not rpo_shadow or not rpo_shadow.get("valid"):
+            return None
+        lo, hi = rng
+        for sreg in rpo_shadow.get("regimes", []):
+            slo, shi = sreg["range"]
+            inter = min(hi, shi) - max(lo, slo)
+            span = min(hi - lo, shi - slo)
+            if span > 0 and inter >= 0.5 * span:
+                return sreg
+        return None
+
     async def _get_rows(self) -> tuple:
         """Override base class: read from file archive first, fall back to Redis."""
         return await self._load_rows()
@@ -145,13 +188,27 @@ class BrainEngineV2(BaseBrainEngine):
                         "wilson_hi": min(1.0, 0.5 + conf_score * 0.2),
                     })
 
-                    # Only emit config patch if walk-forward passed AND confidence is decent
-                    if wopt.get("walk_forward_passed") and conf_score >= 0.4:
+                    # ── Shadow out-of-sample veto ──────────────────────
+                    shadow_weight_ok, shadow_weight_note = True, ""
+                    if (wopt.get("walk_forward_passed") and conf_score >= 0.4
+                            and len(shadow_rows) >= 15):
+                        shadow_weight_ok, shadow_weight_note = self._shadow_weight_check(
+                            shadow_rows, CONFLUENCE_WEIGHTS,
+                            wopt["suggested_weights"], cfg.CONFLUENCE_MIN_ABS_SCORE,
+                        )
+
+                    # Only emit config patch if walk-forward passed AND
+                    # confidence is decent AND shadow sample doesn't veto.
+                    if (wopt.get("walk_forward_passed") and conf_score >= 0.4
+                            and shadow_weight_ok):
                         config_patch.append({
                             "path": "CONFLUENCE_WEIGHTS",
                             "current": dict(CONFLUENCE_WEIGHTS),
                             "suggested": wopt["suggested_weights"],
-                            "reason": f"Logistic-regression optimal weights ({wf_status}, conf={conf_score:.2f})",
+                            "reason": (
+                                f"Logistic-regression optimal weights ({wf_status}, "
+                                f"conf={conf_score:.2f}, {shadow_weight_note})"
+                            ),
                         })
                         if getattr(cfg, "BRAIN_AUTO_APPLY_DYNAMIC_WEIGHTS", False):
                             saved = await self.sdb.set_dynamic_weights(wopt["suggested_weights"])
@@ -162,7 +219,12 @@ class BrainEngineV2(BaseBrainEngine):
                                     "message": f"💾 Dynamic weights persisted ({len(changed)} votes updated).",
                                 })
                     else:
-                        reason = "walk-forward FAILED" if not wopt.get("walk_forward_passed") else f"confidence too low ({conf_score:.2f})"
+                        if not wopt.get("walk_forward_passed"):
+                            reason = "walk-forward FAILED"
+                        elif conf_score < 0.4:
+                            reason = f"confidence too low ({conf_score:.2f})"
+                        else:
+                            reason = f"shadow-sample veto — {shadow_weight_note}"
                         recommendations.append({
                             "type": "weight_optimizer_blocked",
                             "severity": "low",
@@ -171,7 +233,7 @@ class BrainEngineV2(BaseBrainEngine):
                                 f"Keeping current weights. "
                                 f"Accumulate more data or reduce max_weight_delta."
                             ),
-                        })
+                        })                
                 else:
                     recommendations.append({
                         "type": "weight_optimizer",
@@ -350,53 +412,129 @@ class BrainEngineV2(BaseBrainEngine):
                         "p_value": inter.get("p_value"),
                     })
 
-        # ── Phase 5: Counterfactual Simulator ────────────────────────────
+        # ── Phase 5: Counterfactual Simulator (shadow-validated) ──────
         baseline_ev = ai_metrics.get("net_ev") or 0.0
-        if real_rows and len(real_rows) >= self._phase_samples["counterfactual"]:
+        min_cf = self._phase_samples["counterfactual"]
+        if real_rows and len(real_rows) >= min_cf:
+            shadow_usable = len(shadow_rows) >= min_cf
+            shadow_baseline_ev = 0.0
+            if shadow_usable:
+                shadow_baseline_ev, _hk, _swr = engine.ev_and_kelly_for(shadow_rows)
+
+            rsi_cap_ok = any(
+                "context" in r and r["context"].get("rsi_adaptive_buy") for r in real_rows
+            )
+            rsi_cap = getattr(cfg, "RSI_ADAPTIVE_BUY_VOLATILE", 70.0) - 3
+            specs: List[Dict[str, Any]] = [
+                {"label": f"Threshold +1 ({cfg.CONFLUENCE_MIN_ABS_SCORE + 1.0})",
+                 "new_threshold": cfg.CONFLUENCE_MIN_ABS_SCORE + 1.0, "new_params": None},
+            ]
+            if rsi_cap_ok:
+                specs.append({"label": "RSI buy cap -3",
+                              "new_threshold": None, "new_params": {"rsi_curr": rsi_cap}})
+                specs.append({"label": "Threshold +1 + RSI cap -3",
+                              "new_threshold": cfg.CONFLUENCE_MIN_ABS_SCORE + 1.0,
+                              "new_params": {"rsi_curr": rsi_cap}})
+
             scenarios: List[Dict[str, Any]] = []
-            s1 = simulate_config_change(real_rows, baseline_ev,
-                                        new_threshold=cfg.CONFLUENCE_MIN_ABS_SCORE + 1.0)
-            if s1:
-                scenarios.append({"label": f"Threshold +1 ({cfg.CONFLUENCE_MIN_ABS_SCORE+1.0})", **s1})
-            if any("context" in r and r["context"].get("rsi_adaptive_buy") for r in real_rows):
-                rsi_buy_cap = getattr(cfg, "RSI_ADAPTIVE_BUY_VOLATILE", 70.0)
-                s2 = simulate_config_change(real_rows, baseline_ev,
-                                            new_params={"rsi_curr": rsi_buy_cap - 3})
-                if s2:
-                    scenarios.append({"label": "RSI buy cap -3", **s2})
-            if s1 and any("context" in r for r in real_rows):
-                s3 = simulate_config_change(real_rows, baseline_ev,
-                                            new_threshold=cfg.CONFLUENCE_MIN_ABS_SCORE + 1.0,
-                                            new_params={"rsi_curr": getattr(cfg, "RSI_ADAPTIVE_BUY_VOLATILE", 70.0) - 3})
-                if s3:
-                    scenarios.append({"label": "Threshold +1 + RSI cap -3", **s3})
+            for spec in specs:
+                real_sim = simulate_config_change(
+                    real_rows, baseline_ev,
+                    new_threshold=spec["new_threshold"], new_params=spec["new_params"],
+                )
+                if not real_sim:
+                    continue
+                scenario = {"label": spec["label"], **real_sim}
+                # ── Shadow out-of-sample check: same change, second sample ──
+                if shadow_usable:
+                    shadow_sim = simulate_config_change(
+                        shadow_rows, shadow_baseline_ev,
+                        new_threshold=spec["new_threshold"], new_params=spec["new_params"],
+                    )
+                    if shadow_sim and shadow_sim["n"] >= 5:
+                        scenario["shadow_n"] = shadow_sim["n"]
+                        scenario["shadow_delta_ev"] = shadow_sim["delta_ev"]
+                        scenario["shadow_wr"] = shadow_sim["wr"]
+                        # Agreement test: two samples from the same window
+                        # must point the same way, or the "improvement" is
+                        # one split, one distribution, one luck draw.
+                        scenario["shadow_validated"] = (
+                            (real_sim["delta_ev"] >= 0) == (shadow_sim["delta_ev"] >= 0)
+                        )
+                    else:
+                        scenario["shadow_validated"] = None
+                else:
+                    scenario["shadow_validated"] = None
+                scenarios.append(scenario)
+
             if scenarios:
                 best = max(scenarios, key=lambda x: x["ev"])
+                sv = best.get("shadow_validated")
+                if sv is True:
+                    shadow_note = (
+                        f"\n   Shadow-confirmed: Δ{best['shadow_delta_ev']:+.3f}% "
+                        f"on {best['shadow_n']} rejected-path samples."
+                    )
+                elif sv is False:
+                    shadow_note = (
+                        f"\n   ⚠️ Shadow DISAGREES: Δ{best['shadow_delta_ev']:+.3f}% "
+                        f"on {best['shadow_n']} samples — treat as curve-fit."
+                    )
+                else:
+                    shadow_note = "\n   Shadow sample too thin to validate."
                 recommendations.append({
                     "type": "counterfactual",
-                    "severity": "high" if best["delta_ev"] > 0.05 else "low",
+                    # "high" now REQUIRES the out-of-sample shadow check to
+                    # agree — real-data-only wins stay medium/low.
+                    "severity": (
+                        "high" if best["delta_ev"] > 0.05 and sv is True
+                        else "medium" if best["delta_ev"] > 0.05 and sv is None
+                        else "low"
+                    ),
+                    "shadow_validated": sv,
                     "message": (
                         f"🔮 Best scenario: '{best['label']}' → "
                         f"EV {best['ev']:+.3f}%/trade (Δ{best['delta_ev']:+.3f}%), "
-                        f"WR {best['wr']:.0%}, n={best['n']}."
+                        f"WR {best['wr']:.0%}, n={best['n']}.{shadow_note}"
                     ),
                     "delta_ev": best["delta_ev"],
                 })
                 ai_metrics["counterfactual_scenarios"] = scenarios
 
-        # ── Phase 6: Regime Profiles ─────────────────────��───────────────
+        # ── Phase 6: Regime Profiles (shadow-validated) ───────────────
         if len(real_rows) >= self._phase_samples["regime_profiles"]:
-            rpo = regime_profile_optimizer(real_rows, regime_field="adx_val",
-                                           min_sample=self._phase_samples["regime_profiles"])
+            rpo = regime_profile_optimizer(
+                real_rows, regime_field="adx_val",
+                min_sample=self._phase_samples["regime_profiles"],
+            )
+            rpo_shadow = None
+            if len(shadow_rows) >= self._phase_samples["regime_profiles"]:
+                rpo_shadow = regime_profile_optimizer(
+                    shadow_rows, regime_field="adx_val",
+                    min_sample=self._phase_samples["regime_profiles"],
+                )
             if rpo.get("valid") and len(rpo.get("regimes", [])) >= 2:
-                lines = [
-                    f"  Regime {reg['regime_id']} (ADX {reg['range'][0]}-{reg['range'][1]}): "
-                    f"thr={reg['recommended_threshold']:.1f}, WR={reg['wr']:.0%}"
-                    for reg in rpo["regimes"]
-                ]
+                lines = []
+                for reg in rpo["regimes"]:
+                    sreg = self._match_shadow_regime(rpo_shadow, reg["range"])
+                    if sreg is not None:
+                        gap = abs(sreg["recommended_threshold"] - reg["recommended_threshold"])
+                        tag = (
+                            f"shadow✅ thr={sreg['recommended_threshold']:.1f}"
+                            if gap <= 3.0 else
+                            f"shadow⚠️ thr diverges {gap:.1f}pts"
+                        ) + f" (n={sreg['n']})"
+                    elif rpo_shadow is None:
+                        tag = "shadow: insufficient data"
+                    else:
+                        tag = "shadow: no overlapping regime"
+                    lines.append(
+                        f"  Regime {reg['regime_id']} (ADX {reg['range'][0]}-{reg['range'][1]}): "
+                        f"thr={reg['recommended_threshold']:.1f}, WR={reg['wr']:.0%} | {tag}"
+                    )
                 recommendations.append({
                     "type": "dynamic_regime_profile", "severity": "low",
-                    "message": f"📊 Regime thresholds:\n" + "\n".join(lines),
+                    "message": "📊 Regime thresholds:\n" + "\n".join(lines),
                 })
 
         # ── Config Version Regression ────────────────────────────────────
@@ -528,6 +666,11 @@ class BrainEngineV2(BaseBrainEngine):
             ai_metrics["avg_rr_achieved"] = round(sum(rr_vals) / len(rr_vals), 2) if rr_vals else 0.0
             total_win_weight = sum(r.get("win_weight", 1.0 if r["win"] else 0.0) for r in real_rows)
             ai_metrics["weighted_wr"] = round(min(total_win_weight / len(real_rows), 1.0), 4) if real_rows else 0.0
+
+        if shadow_rows:
+            ai_metrics["shadow_win_rate"] = round(
+                sum(1 for r in shadow_rows if r["win"]) / len(shadow_rows), 4
+            )
 
         # ── Re-assemble ──────────────────────────────────────────────────
         result = dict(base_recs)

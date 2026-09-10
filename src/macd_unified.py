@@ -40,6 +40,8 @@ from state import (
 
 from gates import compute_confluence_score, _eval_gate
 
+import threshold_engine as engine
+
 from alerts import (
     TelegramQueue, ALERT_KEYS, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
 ) 
@@ -659,6 +661,36 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     )
     eval_elapsed = time.time() - eval_start
     logger_main.debug(f"Evaluation complete: {eval_elapsed:.1f}s")
+
+    if cfg.ENABLE_KILL_SWITCH and state_db and not state_db.degraded and state_db._redis:
+        try:
+            from outcome_storage import load_recent_outcomes
+            recent = load_recent_outcomes(hours=cfg.KILL_SWITCH_LOOKBACK_HOURS)
+            ks_state = engine.KillSwitch(
+                max_consecutive_losses=cfg.KILL_SWITCH_MAX_CONSECUTIVE_LOSSES,
+                max_drawdown_pct=cfg.KILL_SWITCH_MAX_DRAWDOWN_PCT,
+                lookback_hours=cfg.KILL_SWITCH_LOOKBACK_HOURS,
+                fee_pct=cfg.BRAIN_FEE_PCT,
+                slippage_pct=cfg.BRAIN_SLIPPAGE_PCT,
+            ).evaluate(recent)
+            if ks_state["tripped"]:
+                ttl = int(cfg.KILL_SWITCH_COOLDOWN_HOURS * 3600)
+                await state_db._safe_redis_op(
+                    lambda: state_db._redis.set(
+                        "brain:kill_switch_active", json_dumps(ks_state), ex=ttl,
+                    ),
+                    2.0, "kill_switch_set",
+                )
+                logger_main.critical(f"🛑 KILL SWITCH: {ks_state['reason']}")
+                try:
+                    await telegram_queue.send(escape_markdown_v2(
+                        f"🛑 KILL SWITCH TRIPPED: {ks_state['reason']}\n"
+                        f"Dispatch blocked for {ttl // 3600}h."
+                    ))
+                except Exception:
+                    pass
+        except Exception as e:
+            logger_main.warning(f"Kill switch evaluation failed (fail-open): {e}")
 
     valid_results = []
     batched_payloads = []

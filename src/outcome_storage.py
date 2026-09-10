@@ -76,11 +76,15 @@ def append_outcome_batch(records: List[Dict[str, Any]], shadow: bool = False) ->
             for record in records:
                 f.write(json.dumps(_stamp_schema(record), default=str) + "\n")
 
-def load_recent_outcomes(days: int = 30, shadow: bool = False) -> List[Dict[str, Any]]:
-    """Read last N days of outcome lines (newest first)."""
+def load_recent_outcomes(days: int = 30, shadow: bool = False,
+                          hours: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Read last N days (or N hours) of outcome lines (newest first)."""
     subdir = "shadow" if shadow else "outcomes"
     rows: List[Dict[str, Any]] = []
-    cutoff = time.time() - (days * 86400)
+    if hours is not None:
+        cutoff = time.time() - (hours * 3600)
+    else:
+        cutoff = time.time() - (days * 86400)
     pattern = os.path.join(_OUTCOME_DIR, subdir, "*.jsonl")
     files = sorted(glob.glob(pattern), reverse=True)
     for path in files:

@@ -735,6 +735,9 @@ class RedisStateStore:
         confluence_votes: Optional[Dict[str, bool]] = None,
         adx_val: Optional[float] = None,
         context: Optional[Dict[str, Any]] = None,
+        signal_price: Optional[float] = None,
+        fill_price: Optional[float] = None,
+        fees_paid_pct: Optional[float] = None,
     ) -> None:
 
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
@@ -752,6 +755,9 @@ class RedisStateStore:
                 "confluence_votes": confluence_votes,
                 "adx_val": adx_val,
                 "context": context,
+                "signal_price": signal_price,
+                "fill_price": fill_price,
+                "fees_paid_pct": fees_paid_pct,
             })
         except Exception as e:
             logger.warning(
@@ -1057,6 +1063,9 @@ class RedisStateStore:
             "conf_votes": conf_votes,
             "adx_val": adx_val,
             "context": data.get("context"),
+            "signal_price": data.get("signal_price"),
+            "fill_price": data.get("fill_price"),
+            "fees_paid_pct": data.get("fees_paid_pct"),
         }, ""
 
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
@@ -1131,6 +1140,9 @@ class RedisStateStore:
                         conf_votes = result["conf_votes"]
                         adx_val = result["adx_val"]
                         row_context = result.get("context")
+                        signal_price = result.get("signal_price")
+                        fill_price = result.get("fill_price")
+                        fees_paid_pct = result.get("fees_paid_pct")
                         stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
                         write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
                         write_pipe.expire(stats_key, stats_ttl)
@@ -1165,6 +1177,9 @@ class RedisStateStore:
                                 "bonus_win": "1" if result.get("bonus_win", False) else "0",
                                 "rr_achieved": f"{result.get('rr_achieved', 0):.2f}",
                                 "win_weight": f"{result.get('win_weight', 1.0):.2f}",
+                                "signal_price": f"{signal_price:.8f}" if signal_price is not None else "",
+                                "fill_price": f"{fill_price:.8f}" if fill_price is not None else "",
+                                "fees_paid_pct": f"{fees_paid_pct:.6f}" if fees_paid_pct is not None else "",
                                 "votes": json_dumps(conf_votes) if conf_votes is not None else "",
                                 "adx_val": str(adx_val) if adx_val is not None else "",
                                 "context": json_dumps(row_context) if row_context is not None else "",
@@ -1211,6 +1226,9 @@ class RedisStateStore:
                                 "bonus_win": result.get("bonus_win", False),
                                 "rr_achieved": result.get("rr_achieved", 0.0),
                                 "win_weight": result.get("win_weight", 1.0),
+                                "signal_price": signal_price,
+                                "fill_price": fill_price,
+                                "fees_paid_pct": fees_paid_pct,
                             })
                     except Exception as e:
                         logger_pair.debug(f"Failed to resolve pending outcome {key}: {e}")

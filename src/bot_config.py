@@ -460,7 +460,23 @@ class BotConfig(BaseModel):
     OOD_RELAXED_MODE: bool = Field(default=True, description="If True, use margin-based OOD check (tolerant of small deviations); if False, use strict percentile check")
     OOD_P5: int = Field(default=5, ge=1, le=50, description="Lower percentile for OOD range (5th)")
     OOD_P95: int = Field(default=95, ge=50, le=99, description="Upper percentile for OOD range (95th)")
+    ENABLE_CALIBRATION_GATE: bool = Field(default=False) 
+    CALIBRATION_BUCKET_PCT: float = Field(default=5.0, ge=1.0, le=20.0)
+    CALIBRATION_MIN_SAMPLE: int = Field(default=15, ge=5, le=200)
+    CALIBRATION_SLACK: float = Field(default=0.05, ge=0.0, le=0.20) 
+
     
+    ENABLE_PORTFOLIO_HEAT_GATE: bool = Field(default=False) 
+    MAX_CONCURRENT_POSITIONS: int = Field(default=6, ge=1, le=50)
+    MAX_NET_DIRECTIONAL_POSITIONS: int = Field(default=4, ge=1, le=50) 
+    PORTFOLIO_MAX_SAME_DIRECTION_PCT: float = Field(default=1.0, ge=0.10, le=1.0) 
+    ENABLE_KILL_SWITCH: bool = Field(default=False) 
+    KILL_SWITCH_MAX_CONSECUTIVE_LOSSES: int = Field(default=6, ge=2, le=20)
+    KILL_SWITCH_MAX_DRAWDOWN_PCT: float = Field(default=3.0, ge=0.5, le=20.0) 
+    KILL_SWITCH_LOOKBACK_HOURS: int = Field(default=24, ge=1, le=168)
+    KILL_SWITCH_COOLDOWN_HOURS: int = Field(default=12, ge=1, le=168) 
+    ENABLE_FILL_RECONCILIATION: bool = Field(default=False) 
+
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
         if not re.match(r'^\d+:[A-Za-z0-9_-]+$', v):

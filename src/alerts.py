@@ -824,7 +824,6 @@ def validate_alert_definitions() -> None:
 
 validate_alert_definitions()
 
-
 async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[Dict[str, np.ndarray]],
     reference_time: int, sdb: RedisStateStore, correlation_id: str, logger_pair: logging.Logger
 ) -> Union[Tuple[Dict[str, Any], Dict[str, bool], List[Tuple[str, str, str]]], Tuple[str, Dict[str, Any]], None]:
@@ -1410,7 +1409,50 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
     pair_name = gr.pair_name
     i15, ts_curr, reference_time = gr.i15, gr.ts_curr, gr.reference_time
-    
+
+    if cfg.ENABLE_KILL_SWITCH and sdb and not sdb.degraded and sdb._redis:
+        try:
+            if await sdb._safe_redis_op(
+                lambda: sdb._redis.exists("brain:kill_switch_active"),
+                2.0, "kill_switch_poll",
+            ):
+                logger_pair.warning(f"[{pair_name}] Kill switch active — dispatch blocked")
+                return pair_name, {
+                    "state": "KILL_SWITCH",
+                    "ts": int(time.time()),
+                    "summary": {"alerts": 0, "future_cloud": "neutral",
+                                "hist_rma": 0.0, "suppression": "kill switch active"},
+                }, None
+        except Exception:
+            pass
+
+    if cfg.ENABLE_PORTFOLIO_HEAT_GATE and sdb and not sdb.degraded and sdb._redis:
+        try:
+            raw = await sdb._safe_redis_op(
+                lambda: sdb._redis.get("open_positions"),
+                2.0, "open_positions_get",
+            )
+            open_positions = json_loads(raw) if raw else []
+        except Exception:
+            open_positions = []
+        direction = "buy" if gr.buy_common else ("sell" if gr.sell_common else None)
+        if direction:
+            verdict = engine.portfolio_heat_check(
+                open_positions, pair_name, direction,
+                max_concurrent=cfg.MAX_CONCURRENT_POSITIONS,
+                max_net_directional=cfg.MAX_NET_DIRECTIONAL_POSITIONS,
+                max_same_direction_pct=cfg.PORTFOLIO_MAX_SAME_DIRECTION_PCT,
+            )
+            if verdict["blocked"]:
+                logger_pair.info(f"[{pair_name}] portfolio_heat: {verdict['reason']}")
+                return pair_name, {
+                    "state": "PORTFOLIO_HEAT",
+                    "ts": int(time.time()),
+                    "summary": {"alerts": 0, "future_cloud": "neutral",
+                                "hist_rma": 0.0,
+                                "suppression": f"portfolio_heat: {verdict['reason']}"},
+                }, None
+
     # ── CRITICAL FIX: Skip if this exact candle was already processed ──
     last_processed = await sdb.get_last_processed_candle_ts(pair_name)
     if last_processed == ts_curr:
@@ -1674,6 +1716,23 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         surviving_alerts.append((alert_title, alert_extra, alert_key))
                         continue
 
+                    if (alerts_to_send and cfg.ENABLE_CALIBRATION_GATE
+                            and confluence_total and confluence_total > 0):
+                        from brain import BrainEngine
+                        _brain = BrainEngine(sdb)
+                        survivors = []
+                        for alert_title, alert_extra, alert_key in alerts_to_send:
+                            conf_pct = (confluence_score or 0.0) / confluence_total * 100.0
+                            ok, cal_wr = await _brain.check_calibration_gate(alert_key, conf_pct)
+                            if ok:
+                                survivors.append((alert_title, alert_extra, alert_key))
+                            else:
+                                logger_pair.info(
+                                    f"[{pair_name}] calibration gate dropped {alert_key}: "
+                                    f"calibrated WR {cal_wr:.0%} below floor"
+                                )
+                        alerts_to_send = survivors
+
                     if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
                         shadow_context = {
                             "rsi_curr": context.get("rsi_curr"),
@@ -1784,8 +1843,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     confluence_score=s, confluence_total=t, confluence_votes=v,
                     adx_val=adx_val,
                     context=trigger_context,
+                    signal_price=close_curr,
+
                 )
-             
             await asyncio.gather(*(_record_one(alert_key) for _, _, alert_key in alerts_to_send))
 
         if batch_mode and alerts_to_send:
@@ -1907,9 +1967,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 }
             }, payload
 
-        # ══════════════════════════════════════��══════════════════════════════
+        # ════════════════════════════════════════════════════════════════════
         # IMMEDIATE MODE  →  legacy per-pair Telegram send (unchanged logic)
-        # ══════��══════════════════════════════════════════════════════════════
+        # ════════════════════════════════════════════════════════════════════
         async def _refund_alert_budget(n: int) -> None:
             """Undo the optimistic budget reservation when a send does not go out."""
             if n > 0 and alerts_sent_ref is not None and alerts_sent_lock is not None:

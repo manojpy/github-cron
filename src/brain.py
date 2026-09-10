@@ -63,6 +63,8 @@ _ALERT_CONFIG_PREFIX_MAP = {
 }
 
 _OVERRIDE_COOLDOWN_PREFIX = "brain_override_cooldown:"
+CALIBRATION_CURVES_KEY = "brain:calibration_curves"
+KILL_SWITCH_KEY = "brain:kill_switch_active"
 
 def _resolve_config_path(alert_key: str) -> Optional[str]:
     path = _ALERT_CONFIG_MAP.get(alert_key)
@@ -85,6 +87,15 @@ def _hget_int(data: dict, key: str, default: int = 0) -> int:
         return int(value)
     except Exception:
         return default
+
+def _to_opt_float(f: Dict[str, str], key: str) -> Optional[float]:
+    raw = f.get(key)
+    if raw in (None, ""):
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
 
 def _extract_p_value_for_fdr(
     rec: Dict[str, Any],
@@ -208,6 +219,8 @@ class BrainEngine:
             max_jump=getattr(cfg, "BRAIN_STABILITY_MAX_JUMP", 2.0),
         )
         self._cusum_detectors: Dict[str, CUSUMDetector] = {}
+        self._calib_cache: Optional[Dict[str, Any]] = None
+        self._calib_cache_ts = 0.0
 
     # ── Rewardable override ─────────────────────────────────────────────────
 
@@ -264,6 +277,88 @@ class BrainEngine:
             return None
 
         return f"{conf_pct:.0f}% confluence, shadow WR {wr:.0%} over {total} tracked rejections"
+
+    # ── Calibration live gate ────────────────────────────────────────────
+
+    async def _persist_calibration_curves(self, calib: Dict[str, Any]) -> None:
+        if self.sdb.degraded or not self.sdb._redis:
+            return
+        try:
+            await self.sdb._safe_redis_op(
+                lambda: self.sdb._redis.set(
+                    CALIBRATION_CURVES_KEY, json_dumps(calib),
+                    ex=int(getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30) * 86400),
+                ),
+                2.0, "calibration_persist",
+            )
+        except Exception:
+            pass
+
+    async def _load_calibration_curve(self, alert_key: str) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        if self._calib_cache is None or now - self._calib_cache_ts > 300:
+            if self.sdb.degraded or not self.sdb._redis:
+                return None
+            raw = await self.sdb._safe_redis_op(
+                lambda: self.sdb._redis.get(CALIBRATION_CURVES_KEY),
+                2.0, "calibration_load",
+            )
+            if not raw:
+                return None
+            try:
+                self._calib_cache = json.loads(raw).get("curves", {})
+            except Exception:
+                return None
+            self._calib_cache_ts = now
+        return self._calib_cache.get(alert_key) if self._calib_cache else None
+
+    async def check_calibration_gate(
+        self, alert_key: str, conf_pct: float,
+    ) -> Tuple[bool, Optional[float]]:
+        """Dispatch hook: (pass, calibrated_wr). Fail-open on any
+        missing/thin data — this gate blocks on evidence of
+        miscalibration, never on its own absence."""
+        if not getattr(cfg, "ENABLE_CALIBRATION_GATE", False):
+            return True, None
+        curve = await self._load_calibration_curve(alert_key)
+        if not curve:
+            return True, None
+        ok, cal_wr, _reason = engine.calibration_gate_decision(
+            curve, conf_pct, cfg.MIN_WIN_RATE,
+            min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
+            slack=getattr(cfg, "CALIBRATION_SLACK", 0.05),
+        )
+        return ok, cal_wr
+
+    # ── Kill switch ──────────────────────────────────────────────────────
+    async def is_kill_switch_active(self) -> bool:
+        """Dispatch hook: poll every cycle. Fail-open on Redis outage is
+        consistent with the rest of the system — dispatch already cannot
+        function without Redis."""
+        if not getattr(cfg, "ENABLE_KILL_SWITCH", False):
+            return False
+        if self.sdb.degraded or not self.sdb._redis:
+            return False
+        try:
+            return bool(await self.sdb._safe_redis_op(
+                lambda: self.sdb._redis.exists(KILL_SWITCH_KEY),
+                2.0, "kill_switch_poll",
+            ))
+        except Exception:
+            return False
+
+    async def clear_kill_switch(self) -> bool:
+        """Manual reset after human review."""
+        if self.sdb.degraded or not self.sdb._redis:
+            return False
+        try:
+            await self.sdb._safe_redis_op(
+                lambda: self.sdb._redis.delete(KILL_SWITCH_KEY),
+                2.0, "kill_switch_clear",
+            )
+            return True
+        except Exception:
+            return False
 
     # ── Stream reading helpers ──────────────────────────────────────────────
 
@@ -386,6 +481,9 @@ class BrainEngine:
                     "bonus_win": bonus_win_val,
                     "rr_achieved": rr_achieved_val,
                     "win_weight": win_weight_val,
+                    "signal_price": _to_opt_float(f, "signal_price"),
+                    "fill_price": _to_opt_float(f, "fill_price"),
+                    "fees_paid_pct": _to_opt_float(f, "fees_paid_pct"),
                 })
             except (KeyError, ValueError) as e:
                 logging.getLogger("macd_bot").debug(f"Brain: dropping malformed outcome row: {e}")
@@ -483,6 +581,7 @@ class BrainEngine:
         real_rows, shadow_rows = await self._get_rows()
         recommendations: List[Dict[str, Any]] = []
         config_patch: List[Dict[str, Any]] = []
+        ai_metrics: Dict[str, Any] = {}
         seen_paths = set()
         min_sample = getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
         target_wr = cfg.MIN_WIN_RATE
@@ -1115,7 +1214,6 @@ class BrainEngine:
                             f"the rewardable-override gate is active and finding real edge."
                         ),
                     })
-
         # ── Vote-Count OOD summary ──
         ood_status = "Normal"
         if real_rows:
@@ -1139,6 +1237,95 @@ class BrainEngine:
                     else f"{ood_passes}/{ood_total} PASS"
                 )
         
+        # ── Calibration LIVE gate: build + persist per-alert curves ──
+        calib = engine.build_calibration_curves(
+            real_rows,
+            bucket_pct=getattr(cfg, "CALIBRATION_BUCKET_PCT", 5.0),
+            min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
+        )
+        if calib.get("curves"):
+            await self._persist_calibration_curves(calib)
+            ai_metrics["calibration_ece_mean"] = calib.get("ece_mean")
+            if getattr(cfg, "ENABLE_CALIBRATION_GATE", False):
+                miscal = sorted(
+                    ((ak, c["ece"], c["n"]) for ak, c in calib["curves"].items()
+                     if c["ece"] > 0.12 and c["n"] >= 30),
+                    key=lambda t: -t[1],
+                )
+                recommendations.append({
+                    "type": "calibration_gate_active",
+                    "severity": "medium" if miscal else "low",
+                    "message": (
+                        f"🎯 Calibration gate armed: dispatch filters on calibrated WR, "
+                        f"not raw confluence %. Mean ECE {calib.get('ece_mean', 0):.3f}."
+                        + (
+                            " Most miscalibrated: "
+                            + ", ".join(f"{ak} (ECE {ece:.2f}, n={n})" for ak, ece, n in miscal[:5])
+                            if miscal else ""
+                        )
+                    ),
+                })
+
+        # ── Kill switch: fast-failure stop (streak / rolling drawdown) ──
+        if getattr(cfg, "ENABLE_KILL_SWITCH", False):
+            ks = engine.KillSwitch(
+                max_consecutive_losses=getattr(cfg, "KILL_SWITCH_MAX_CONSECUTIVE_LOSSES", 6),
+                max_drawdown_pct=getattr(cfg, "KILL_SWITCH_MAX_DRAWDOWN_PCT", 3.0),
+                lookback_hours=getattr(cfg, "KILL_SWITCH_LOOKBACK_HOURS", 24),
+                fee_pct=getattr(cfg, "BRAIN_FEE_PCT", 0.0006),
+                slippage_pct=getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003),
+            )
+            ks_state = ks.evaluate(real_rows)
+            ai_metrics["kill_switch"] = ks_state
+            if ks_state["tripped"]:
+                ttl = int(getattr(cfg, "KILL_SWITCH_COOLDOWN_HOURS", 12) * 3600)
+                if self.sdb._redis and not self.sdb.degraded:
+                    await self.sdb._safe_redis_op(
+                        lambda: self.sdb._redis.set(KILL_SWITCH_KEY, json_dumps(ks_state), ex=ttl),
+                        2.0, "kill_switch_set",
+                    )
+                recommendations.append({
+                    "type": "kill_switch",
+                    "severity": "critical",
+                    "message": (
+                        f"🛑 KILL SWITCH TRIPPED: {ks_state['reason']}. "
+                        f"Dispatch blocked for {ttl // 3600}h or until cleared. "
+                        f"CUSUM catches slow per-key decay; this catches the fast "
+                        f"cross-key bleed it can't see."
+                    ),
+                })
+
+        # ── Fill reconciliation: assumed vs realized execution cost ──
+        if getattr(cfg, "ENABLE_FILL_RECONCILIATION", False) and real_rows:
+            fr = engine.fill_reconciliation(
+                real_rows,
+                assumed_fee_pct=getattr(cfg, "BRAIN_FEE_PCT", 0.0006),
+                assumed_slippage_pct=getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003),
+                rr_target=cfg.OUTCOME_RR_TARGET,
+                stop_pct=cfg.OUTCOME_MAE_LOSS_PCT,
+                min_sample=min_sample,
+            )
+            if fr.get("valid"):
+                tier = "measured from fills" if fr.get("measured") else "ESTIMATED from outcome moves"
+                worst = ", ".join(
+                    f"{p['pair']} {p['gap_bps']:+.1f}bps (n={p['n']})"
+                    for p in fr.get("per_pair", [])[:3]
+                )
+                gap = fr.get("gap_bps", 0)
+                recommendations.append({
+                    "type": "fill_reconciliation",
+                    "severity": "medium" if gap > 1.0 else "low",
+                    "message": (
+                        f"🧾 Execution cost ({tier}): realized slippage "
+                        f"{fr['realized_slippage_per_side'] * 10000:.1f}bps/side vs assumed "
+                        f"{getattr(cfg, 'BRAIN_SLIPPAGE_PCT', 0.0003) * 10000:.1f}bps/side "
+                        f"(Δ{gap:+.1f}bps). "
+                        + (f"EV overstated ~{fr.get('ev_overstated_pct_per_trade', 0):.4f}%/trade. " if gap > 0 else "")
+                        + (f"Worst pairs: {worst}." if worst else "")
+                    ),
+                    "delta_ev": -fr.get("ev_overstated_pct_per_trade", 0.0),
+                })
+
         severity_order = {"high": 0, "medium": 1, "low": 2}
         recommendations.sort(key=lambda x: severity_order.get(x["severity"], 3))
         
@@ -1156,6 +1343,7 @@ class BrainEngine:
                 "CONFLUENCE_MIN_PCT": cfg.CONFLUENCE_MIN_PCT,
             },  
             "ai_metrics": {
+                **ai_metrics,
                 "brier_score": round(brier, 4) if has_calibration_data else None,
                 "brier_status": brier_status,
                 "net_ev": round(net_ev, 4) if net_ev is not None else None,
