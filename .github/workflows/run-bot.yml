@@ -1,4 +1,3 @@
-name: 🤖 Run MACD Unified Bot (Hybrid)
 on:
   workflow_dispatch:
     inputs:
@@ -12,6 +11,11 @@ on:
           - 'true'
       clear_redis:
         description: '🧹 Clear ALL Redis keys'
+        required: false
+        default: false
+        type: boolean
+      clear_kill_switch:
+        description: '🛑 Clear Kill Switch (resume dispatch immediately)'
         required: false
         default: false
         type: boolean
@@ -61,6 +65,26 @@ jobs:
           fi
 
           echo "✅ All required secrets configured"
+
+      - name: 🛑 Clear Kill Switch (if requested)
+        if: ${{ inputs.clear_kill_switch }}
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+        run: |
+          echo "🛑 Clearing kill switch key (brain:kill_switch_active)..."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq redis-tools
+
+          COUNT=$(redis-cli -u "$REDIS_URL" DEL "brain:kill_switch_active")
+
+          if [ "$COUNT" = "1" ]; then
+            echo "✅ Kill switch cleared — key existed and was removed"
+            echo "### 🛑 Kill Switch Cleared" >> $GITHUB_STEP_SUMMARY
+            echo "Dispatch will resume on this run." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "ℹ️ No kill switch key present (already clear)"
+            echo "### ℹ️ Kill Switch Was Already Clear" >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: 🔨 Create Config
         env:
