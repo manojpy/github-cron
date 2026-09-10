@@ -1175,7 +1175,6 @@ class BrainEngine:
                 "threshold_history": await self.sdb.load_threshold_history(),
                 "ood_status": ood_status,
             },
-
     # ── Report generation / delivery ─────────────────────���──────────────────
 
     async def _next_run_count(self) -> Optional[int]:
