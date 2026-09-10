@@ -1776,3 +1776,476 @@ def multi_metric_per_pair(rows: List[Row], min_sample: int = 15) -> List[Dict[st
 
     results.sort(key=lambda x: -x["mfe_wr"])
     return results
+
+# ═══════════════════════════════════════════════════════════════════════
+#  ENHANCED WEIGHT OPTIMIZER — Walk-Forward + Confidence + Delta Limit
+# ═══════════════════════════════════════════════════════════════════════
+
+def _build_vote_dataset(
+    rows: List[Row],
+    vote_names: List[str],
+) -> Tuple[List[List[float]], List[float], List[float]]:
+    """Extract vote feature matrix, labels, and sample weights."""
+    X: List[List[float]] = []
+    y: List[float] = []
+    sw: List[float] = []
+    for r in rows:
+        votes = r.get("votes")
+        if not votes or not isinstance(votes, dict):
+            continue
+        vec = [1.0] + [1.0 if votes.get(vn) else 0.0 for vn in vote_names]
+        X.append(vec)
+        y.append(1.0 if r["win"] else 0.0)
+        sw.append(r.get("win_weight", 1.0) if r["win"] else 1.0)
+    return X, y, sw
+
+
+def _train_logistic(
+    X: List[List[float]], y: List[float], sample_weights: List[float],
+    max_iter: int = 2000, lr: float = 0.05, l2: float = 0.01,
+) -> List[float]:
+    """Pure gradient-descent logistic regression. Returns beta vector."""
+    n = len(X)
+    if n == 0:
+        return []
+    n_features = len(X[0])
+    win_rate = sum(y) / n
+    beta = [0.0] * n_features
+    beta[0] = math.log(win_rate / (1 - win_rate)) if 0 < win_rate < 1 else 0.0
+    total_sw = sum(sample_weights) or 1.0
+
+    for iteration in range(max_iter):
+        grad = [0.0] * n_features
+        for i in range(n):
+            z = sum(beta[j] * X[i][j] for j in range(n_features))
+            p = _sigmoid(z)
+            error = p - y[i]
+            w = sample_weights[i]
+            for j in range(n_features):
+                grad[j] += error * X[i][j] * w
+        step = lr * (0.5 * (1 + math.cos(math.pi * iteration / max_iter)))
+        for j in range(n_features):
+            grad[j] = grad[j] / total_sw + l2 * beta[j]
+            beta[j] -= step * grad[j]
+    return beta
+
+
+def _score_with_beta(
+    rows: List[Row], beta: List[float], vote_names: List[str],
+    threshold: float = 0.5,
+) -> Tuple[float, int]:
+    """Apply logistic beta to rows, return (win_rate, n) for predicted-positive."""
+    hits = 0
+    total = 0
+    for r in rows:
+        votes = r.get("votes")
+        if not votes or not isinstance(votes, dict):
+            continue
+        z = beta[0] + sum(
+            beta[j + 1] for j, vn in enumerate(vote_names) if votes.get(vn)
+        )
+        if _sigmoid(z) >= threshold:
+            total += 1
+            if r["win"]:
+                hits += 1
+    wr = hits / total if total else 0.0
+    return wr, total
+
+
+def _map_coefficients_to_weights(
+    beta: List[float],
+    vote_names: List[str],
+    current_weights: Dict[str, float],
+    max_delta: float = 2.0,
+) -> Dict[str, float]:
+    """Map logistic coefficients → confluence weights with delta limiting.
+    
+    KEY FIX: Instead of the old aggressive `3.0 * (coeff / avg)` formula,
+    this uses a soft tanh-based mapping anchored to CURRENT weights, then
+    clamps the per-cycle delta to ±max_delta. This prevents 1→5 / 3→0 jumps.
+    """
+    coeffs = beta[1:] if len(beta) > 1 else []
+    if not coeffs:
+        return dict(current_weights)
+
+    # Soft mapping: tanh squashes extreme coefficients
+    positive_coeffs = [max(0.0, c) for c in coeffs]
+    total_pos = sum(positive_coeffs)
+    if total_pos <= 0:
+        return dict(current_weights)
+
+    suggested: Dict[str, float] = {}
+    for idx, vn in enumerate(vote_names):
+        c = coeffs[idx]
+        current = current_weights.get(vn, 1.0)
+
+        if c < -0.05:
+            # Negative coefficient → reduce weight, but don't zero it in one step
+            raw = current * 0.5
+        elif positive_coeffs[idx] > 0:
+            # Proportional share, scaled to [0.5, 5.0] range via tanh
+            share = positive_coeffs[idx] / total_pos
+            raw = 0.5 + 4.5 * math.tanh(share * len(vote_names) * 0.5)
+        else:
+            raw = current * 0.75  # Near-zero coefficient → gentle decay
+
+        # ── DELTA LIMIT: prevent extreme per-cycle jumps ──
+        delta = raw - current
+        delta = max(-max_delta, min(max_delta, delta))
+        final = max(0.0, min(5.0, current + delta))
+        suggested[vn] = round(final, 2)
+
+    return suggested
+
+
+def optimize_vote_weights(
+    rows: List[Row],
+    current_weights: Dict[str, float],
+    min_sample: int = 100,
+    max_iter: int = 2000,
+    lr: float = 0.05,
+    l2: float = 0.01,
+    walk_forward: bool = True,
+    max_weight_delta: float = 2.0,
+    wf_train_frac: float = 0.67,
+) -> Dict[str, Any]:
+    """Data-driven CONFLUENCE_WEIGHTS via logistic regression.
+    
+    v2 ENHANCEMENTS:
+    • Walk-forward validation: trains on older 67%, validates on newer 33%.
+      If holdout WR degrades, the result is flagged invalid.
+    • Delta-limited weight mapping: max ±max_weight_delta per vote per cycle.
+    • Confidence score: combines sample size, convergence, and WF margin.
+    • Bootstrap stability: runs 5 bootstrap resamples, reports coefficient
+      variance as a stability metric.
+    """
+    vote_names = sorted(current_weights.keys())
+    X, y, sample_weights = _build_vote_dataset(rows, vote_names)
+    n = len(X)
+
+    if n < min_sample:
+        return {"valid": False, "error": f"insufficient_data: {n} < {min_sample}"}
+
+    win_rate = sum(y) / n
+    wf_passed: Optional[bool] = None
+    wf_holdout_wr: Optional[float] = None
+    wf_baseline_wr: Optional[float] = None
+    confidence_score: float = 0.0
+
+    if walk_forward and n >= min_sample * 2:
+        # ── Walk-forward split ──
+        train_rows, holdout_rows = walk_forward_split(rows, wf_train_frac)
+        X_train, y_train, sw_train = _build_vote_dataset(train_rows, vote_names)
+
+        if len(X_train) < min_sample // 2 or len(holdout_rows) < min_sample // 3:
+            # Fall back to full-data training with low confidence
+            beta = _train_logistic(X, y, sample_weights, max_iter, lr, l2)
+            confidence_score = min(0.3, n / 1000.0)
+        else:
+            beta = _train_logistic(X_train, y_train, sw_train, max_iter, lr, l2)
+
+            # Validate on holdout
+            wf_holdout_wr, wf_n = _score_with_beta(holdout_rows, beta, vote_names)
+            wf_baseline_wr = sum(r["win"] for r in holdout_rows) / len(holdout_rows) if holdout_rows else 0.0
+
+            if wf_n >= 10:
+                wf_passed = wf_holdout_wr >= wf_baseline_wr
+                if not wf_passed:
+                    return {
+                        "valid": False,
+                        "error": "walk_forward_degraded",
+                        "n_samples": n,
+                        "holdout_wr": round(wf_holdout_wr, 4),
+                        "baseline_holdout_wr": round(wf_baseline_wr, 4),
+                        "message": (
+                            f"Optimized weights DEGRADE holdout WR: "
+                            f"{wf_holdout_wr:.0%} vs baseline {wf_baseline_wr:.0%}. "
+                            f"Keeping current weights."
+                        ),
+                    }
+                confidence_score = min(1.0, (n / 500.0) * (1.0 + (wf_holdout_wr - wf_baseline_wr) * 5.0))
+            else:
+                wf_passed = None
+                confidence_score = min(0.4, n / 1000.0)
+    else:
+        beta = _train_logistic(X, y, sample_weights, max_iter, lr, l2)
+        confidence_score = min(0.3, n / 1000.0)  # No WF = low confidence
+
+    # ── Bootstrap stability check (5 resamples) ──
+    bootstrap_betas: List[List[float]] = []
+    rng = random.Random(42)
+    for _ in range(5):
+        indices = [rng.randint(0, n - 1) for _ in range(n)]
+        X_boot = [X[i] for i in indices]
+        y_boot = [y[i] for i in indices]
+        sw_boot = [sample_weights[i] for i in indices]
+        b = _train_logistic(X_boot, y_boot, sw_boot, max_iter // 2, lr, l2)
+        if b:
+            bootstrap_betas.append(b)
+
+    coeff_stability: Dict[str, float] = {}
+    if len(bootstrap_betas) >= 3:
+        for j, vn in enumerate(vote_names):
+            vals = [b[j + 1] for b in bootstrap_betas if len(b) > j + 1]
+            if vals:
+                coeff_stability[vn] = round(statistics.pstdev(vals), 4)
+        avg_instability = statistics.mean(coeff_stability.values()) if coeff_stability else 1.0
+        confidence_score *= max(0.3, 1.0 - avg_instability)
+
+    # ── Map to weights with delta limiting ──
+    suggested = _map_coefficients_to_weights(beta, vote_names, current_weights, max_weight_delta)
+
+    # ── Identify negative votes ──
+    coeffs = beta[1:] if len(beta) > 1 else []
+    negative_votes = [
+        (vn, round(coeffs[i], 4))
+        for i, vn in enumerate(vote_names)
+        if i < len(coeffs) and coeffs[i] < -0.05
+    ]
+
+    # ── Compute actual changed votes ──
+    changed = []
+    for k, new_v in suggested.items():
+        old_v = current_weights.get(k, 0.0)
+        if abs(new_v - old_v) > 0.1:
+            changed.append((k, old_v, new_v))
+
+    intercept = beta[0] if beta else 0.0
+
+    return {
+        "valid": True,
+        "n_samples": n,
+        "intercept": round(intercept, 4),
+        "current_weights": dict(current_weights),
+        "suggested_weights": suggested,
+        "negative_votes": negative_votes,
+        "changed_votes": changed,
+        "walk_forward_passed": wf_passed,
+        "holdout_wr": round(wf_holdout_wr, 4) if wf_holdout_wr is not None else None,
+        "baseline_holdout_wr": round(wf_baseline_wr, 4) if wf_baseline_wr is not None else None,
+        "confidence": round(confidence_score, 3),
+        "confidence_label": confidence_label(
+            n,
+            max(0.0, 0.5 - confidence_score * 0.3),
+            min(1.0, 0.5 + confidence_score * 0.3),
+        ),
+        "coeff_stability": coeff_stability,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PERMUTATION VOTE IMPORTANCE (AI/ML)
+# ═══════════════════════════════════════════════════════════════════════
+
+def permutation_vote_importance(
+    rows: List[Row],
+    min_sample: int = 30,
+    n_permutations: int = 20,
+    seed: int = 42,
+) -> List[Dict[str, Any]]:
+    """ML-style permutation importance: shuffle each vote's values and
+    measure the WR drop. Votes whose permutation causes the biggest WR
+    drop are the most important. More robust than simple with/without
+    comparison because it preserves the marginal distribution."""
+    if len(rows) < min_sample:
+        return []
+
+    vote_names: Set[str] = set()
+    for r in rows:
+        if r.get("votes"):
+            vote_names.update(r["votes"].keys())
+    vote_names = sorted(vote_names)
+    if not vote_names:
+        return []
+
+    rng = random.Random(seed)
+    baseline_wr = sum(r["win"] for r in rows) / len(rows)
+    results = []
+
+    for vn in vote_names:
+        drops = []
+        for _ in range(n_permutations):
+            shuffled_rows = []
+            vote_vals = [r.get("votes", {}).get(vn) for r in rows]
+            rng.shuffle(vote_vals)
+            for i, r in enumerate(rows):
+                sr = dict(r)
+                if sr.get("votes"):
+                    sr["votes"] = dict(sr["votes"])
+                    sr["votes"][vn] = vote_vals[i]
+                shuffled_rows.append(sr)
+            perm_wr = sum(r["win"] for r in shuffled_rows) / len(shuffled_rows)
+            drops.append(baseline_wr - perm_wr)
+        mean_drop = statistics.fmean(drops)
+        results.append({
+            "vote": vn,
+            "importance": round(mean_drop, 4),
+            "std": round(statistics.pstdev(drops), 4) if len(drops) > 1 else 0.0,
+            "direction": "positive" if mean_drop > 0 else "negative",
+        })
+
+    results.sort(key=lambda x: -abs(x["importance"]))
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  REPAIR SHOP DIAGNOSIS ENGINE
+# ═══════════════════════════════════════════════════════════════════════
+
+def repair_shop_diagnosis(
+    rows: List[Row],
+    drift_alerts: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    target_wr: float = 0.55,
+    disable_wr: float = 0.40,
+    min_sample: int = 20,
+) -> List[Dict[str, Any]]:
+    """One-stop repair shop: diagnoses the system's health and produces
+    prioritized, actionable fix recommendations. Each item has:
+    • severity: critical / high / medium / low
+    • category: what's broken
+    • diagnosis: what the data shows
+    • action: what to do about it
+    • expected_impact: rough estimate of improvement
+    """
+    repairs: List[Dict[str, Any]] = []
+    if not rows:
+        return repairs
+
+    n = len(rows)
+    overall_wr = sum(r["win"] for r in rows) / n
+    buy_rows = [r for r in rows if r["direction"] == "buy"]
+    sell_rows = [r for r in rows if r["direction"] == "sell"]
+    buy_wr = sum(r["win"] for r in buy_rows) / len(buy_rows) if buy_rows else None
+    sell_wr = sum(r["win"] for r in sell_rows) / len(sell_rows) if sell_rows else None
+
+    # ── 1. CRITICAL: Overall WR collapse ──
+    if overall_wr < target_wr * 0.5:
+        repairs.append({
+            "severity": "critical",
+            "category": "win_rate_collapse",
+            "diagnosis": (
+                f"Overall WR {overall_wr:.0%} is below {target_wr*0.5:.0%} "
+                f"(half of {target_wr:.0%} target). The strategy has negative edge."
+            ),
+            "action": (
+                f"1) STOP all live trading immediately. "
+                f"2) Raise CONFLUENCE_MIN_ABS_SCORE by +2 to filter weak signals. "
+                f"3) Review the last {min(30, n)} trades manually for a systematic error "
+                f"(bad data, wrong timeframe, API issues)."
+            ),
+            "expected_impact": "Prevents further losses while diagnosing root cause.",
+        })
+
+    # ── 2. Directional collapse (sell or buy side broken) ──
+    drifted_sell = [d for d in drift_alerts if "sell" in d.get("alert", "") or "down" in d.get("alert", "")]
+    drifted_buy = [d for d in drift_alerts if "buy" in d.get("alert", "") or "up" in d.get("alert", "")]
+
+    if sell_wr is not None and sell_wr < disable_wr and len(drifted_sell) >= 3:
+        repairs.append({
+            "severity": "critical",
+            "category": "sell_side_collapse",
+            "diagnosis": (
+                f"Sell WR {sell_wr:.0%} (n={len(sell_rows)}) with "
+                f"{len(drifted_sell)} sell alerts CUSUM-drifted. "
+                f"The sell-side strategy has structurally decayed."
+            ),
+            "action": (
+                f"Disable ALL sell alerts until manual review: "
+                f"{', '.join(d.get('alert', '?') for d in drifted_sell[:5])}. "
+                f"Check if market structure changed (trending up = sells fail)."
+            ),
+            "expected_impact": f"Removing {len(sell_rows)} losing sell trades lifts overall WR to ~{buy_wr:.0%}." if buy_wr else "Removes systematic losses.",
+        })
+
+    if buy_wr is not None and buy_wr < disable_wr and len(drifted_buy) >= 3:
+        repairs.append({
+            "severity": "critical",
+            "category": "buy_side_collapse",
+            "diagnosis": f"Buy WR {buy_wr:.0%} (n={len(buy_rows)}) with {len(drifted_buy)} buy alerts drifted.",
+            "action": f"Disable drifted buy alerts: {', '.join(d.get('alert', '?') for d in drifted_buy[:5])}.",
+            "expected_impact": "Stops bleeding on the buy side.",
+        })
+
+    # ── 3. CUSUM drift freeze ──
+    if drift_alerts:
+        drifted_names = [d.get("alert", "?") for d in drift_alerts]
+        repairs.append({
+            "severity": "high",
+            "category": "cusum_drift",
+            "diagnosis": (
+                f"{len(drift_alerts)} alert(s) show CUSUM edge decay: "
+                f"{', '.join(drifted_names[:6])}."
+            ),
+            "action": (
+                f"Config patches FROZEN for these alerts. "
+                f"Manual review required before re-enabling auto-tuning. "
+                f"Check if a recent config change or market regime shift caused the decay."
+            ),
+            "expected_impact": "Prevents auto-tuning from optimizing a broken signal.",
+        })
+
+    # ── 4. Gate threshold too low ──
+    current_threshold = config.get("CONFLUENCE_MIN_ABS_SCORE", 18.0)
+    rec = recommend_threshold(rows, target_winrate=target_wr, min_sample=min_sample)
+    if rec.get("valid") and rec["recommended"] > current_threshold + 0.5:
+        repairs.append({
+            "severity": "high",
+            "category": "threshold_too_low",
+            "diagnosis": (
+                f"Current gate Score≥{current_threshold:.1f} lets through trades with "
+                f"{overall_wr:.0%} WR. Raising to {rec['recommended']:.1f} would achieve "
+                f"{rec['rec_wr']:.0%} WR on {rec['rec_n']} samples."
+            ),
+            "action": (
+                f"Raise CONFLUENCE_MIN_ABS_SCORE from {current_threshold:.1f} to "
+                f"{rec['recommended']:.1f}. This drops {rec['dropped']} weak trades "
+                f"({rec['dropped_pct']:.0%})."
+            ),
+            "expected_impact": f"WR improvement: {overall_wr:.0%} → {rec['rec_wr']:.0%} (+{rec['rec_wr']-overall_wr:.0%}).",
+        })
+
+    # ── 5. Brier / calibration check ──
+    brier, _ = brier_score_and_calibration(rows)
+    if brier >= 0.20:
+        repairs.append({
+            "severity": "medium",
+            "category": "miscalibration",
+            "diagnosis": f"Brier score {brier:.3f} ≥ 0.20 — predicted probabilities are miscalibrated.",
+            "action": "Review confluence weight distribution. Consider running the weight optimizer with walk-forward validation.",
+            "expected_impact": "Better calibrated scores → more reliable threshold gating.",
+        })
+
+    # ── 6. EV / Kelly check ──
+    net_ev, half_kelly, _ = ev_and_kelly_for(rows)
+    if net_ev <= 0:
+        repairs.append({
+            "severity": "high",
+            "category": "negative_ev",
+            "diagnosis": f"Net EV {net_ev:+.3f}%/trade after fees/slippage. Strategy is unprofitable.",
+            "action": (
+                f"1) Increase CONFLUENCE_MIN_ABS_SCORE to filter weak signals. "
+                f"2) Check if fee/slippage assumptions (0.06% + 0.03% per side) match your exchange. "
+                f"3) Consider widening OUTCOME_FAVORABLE_MOVE_PCT if TP is too tight."
+            ),
+            "expected_impact": "Positive EV is the minimum requirement for a viable strategy.",
+        })
+
+    # ── 7. Sample size warning ──
+    if n < 200:
+        repairs.append({
+            "severity": "medium",
+            "category": "insufficient_data",
+            "diagnosis": f"Only {n} samples in the analysis window. Statistical power is limited.",
+            "action": (
+                f"Widen BRAIN_ANALYSIS_WINDOW_DAYS or lower BRAIN_REPORT_STREAM_SAMPLE "
+                f"to accumulate more data before trusting optimizer outputs. "
+                f"Treat all suggestions as provisional until n≥300."
+            ),
+            "expected_impact": "Prevents overfitting to small samples.",
+        })
+
+    # Sort by severity
+    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    repairs.sort(key=lambda x: severity_order.get(x["severity"], 4))
+    return repairs

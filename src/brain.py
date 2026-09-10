@@ -512,10 +512,9 @@ class BrainEngine:
                         f"_ALERT_CONFIG_MAP — no config_patch was emitted. Add a mapping or disable manually."
                     ),
                 })
+
         threshold_rec: Dict[str, Any] = {}
         net_ev = half_kelly = kelly_wr = None
-        ev_ci = None
-
         rec = engine.recommend_threshold(
             real_rows, target_winrate=target_wr, min_sample=min_sample,
         ) if real_rows else {"valid": False}
@@ -626,22 +625,13 @@ class BrainEngine:
                 net_ev, half_kelly, kelly_wr = engine.ev_and_kelly_for(rec_subset_kelly)
                 kelly_maes = [r["mae"] for r in rec_subset_kelly if r.get("mae") is not None]
                 mae_note = f" | Mean MAE: {statistics.mean(kelly_maes):.2%}" if kelly_maes else ""
-
-                ev_ci = engine.bootstrap_ev_ci(rec_subset_kelly)
-                ci_note = ""
-                if ev_ci.get("valid"):
-                    ci_note = (
-                        f" | EV 90% CI: [{ev_ci['ev_p5']:+.3f}%, {ev_ci['ev_p95']:+.3f}%]"
-                        f"{' ⚠️ worst-case unprofitable' if ev_ci['ev_p5'] <= 0 else ''}"
-                    )
-
                 recommendations.append({
                     "type": "kelly_sizing",
-                    "severity": "low" if not (ev_ci.get("valid") and ev_ci["ev_p5"] <= 0) else "medium",
+                    "severity": "low",
                     "message": (
                         f"Net EV (after fees/slippage): {net_ev:+.3f}%/trade | "
                         f"Half-Kelly position size: {half_kelly:.1%} | "
-                        f"WR: {kelly_wr:.0%}{mae_note}{ci_note}"
+                        f"WR: {kelly_wr:.0%}{mae_note}"
                     ),
                 })
 
@@ -1036,8 +1026,6 @@ class BrainEngine:
                 "brier_status": brier_status,
                 "net_ev": round(net_ev, 4) if net_ev is not None else None,
                 "half_kelly": round(half_kelly, 4) if half_kelly is not None else None,
-                "ev_p5": round(ev_ci["ev_p5"], 4) if ev_ci and ev_ci.get("valid") else None,
-                "ev_p95": round(ev_ci["ev_p95"], 4) if ev_ci and ev_ci.get("valid") else None,
                 "cusum_drifts": len(drift_alerts),
                 "threshold_history": await self.sdb.load_threshold_history(),
                 "ood_status": ood_status,
@@ -1204,207 +1192,220 @@ class BrainEngine:
         logger_run.info("Brain generating analysis report...")
         recs = await self.generate_recommendations()
         cc = recs.get("current_config", {})
-        min_sample = getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
-
-        lines = [
-            "🧠 *BRAIN REPORT*",
-            escape_markdown_v2(format_ist_time()),
-            escape_markdown_v2(f"{recs['real_sample_size']} real samples, {recs['shadow_sample_size']} shadow"),
-            "",
-        ]
-
-        # ── WIN RATE: the headline number, vs your own target ──
         ai = recs.get("ai_metrics", {})
         overall_wr = recs.get("overall_win_rate")
         target_wr = cfg.MIN_WIN_RATE
-        lines.append("*📊 WIN RATE*")
-        if overall_wr is not None:
-            status = "✅" if overall_wr >= target_wr else "⚠️"
-            lines.append(escape_markdown_v2(
-                f"Overall: {overall_wr:.0%} vs min target {target_wr:.0%}  ({status})"
-            ))
-        else:
-            lines.append(escape_markdown_v2("Overall: not enough samples yet"))
+
+        lines: List[str] = []
+
+        # ── HEADER ──
+        lines.append("🧠 *BRAIN REPORT*")
+        lines.append(escape_markdown_v2(format_ist_time()))
         lines.append(escape_markdown_v2(
-            f"Gate threshold: Score≥{cc.get('CONFLUENCE_MIN_ABS_SCORE')} Pct≥{cc.get('CONFLUENCE_MIN_PCT')}%"
+            f"{recs['real_sample_size']} real | {recs['shadow_sample_size']} shadow"
+        ))
+        lines.append("")
+
+        # ── 📊 HEALTH (compact) ──
+        wr_icon = "✅" if (overall_wr or 0) >= target_wr else "⚠️"
+        lines.append(escape_markdown_v2(
+            f"📊 WR: {overall_wr:.0%} vs {target_wr:.0%} target {wr_icon} | "
+            f"Gate: ≥{cc.get('CONFLUENCE_MIN_ABS_SCORE')} / ≥{cc.get('CONFLUENCE_MIN_PCT')}%"
         ))
 
-        size_bits = []
+        health_bits = []
         if ai.get("net_ev") is not None:
-            size_bits.append(f"EV {ai['net_ev']:+.3f}%/trade")
+            health_bits.append(f"EV {ai['net_ev']:+.3f}%")
         if ai.get("half_kelly") is not None:
-            size_bits.append(f"Half-Kelly {ai['half_kelly']:.1%}")
-        if ai.get("brier_score") is not None and ai.get("brier_status") not in (None, "OK"):
-            size_bits.append(f"Brier {ai['brier_score']:.3f} ({ai['brier_status']})")
-        if size_bits:
-            lines.append(escape_markdown_v2("💰 " + " | ".join(size_bits)))
+            health_bits.append(f"Kelly {ai['half_kelly']:.1%}")
+        if ai.get("brier_score") is not None:
+            health_bits.append(f"Brier {ai['brier_score']:.3f}")
+        if health_bits:
+            lines.append(escape_markdown_v2("   " + " | ".join(health_bits)))
 
-        # ── Three-metric inline display ──
-        mm = next(
-            (r for r in recs["recommendations"] if r["type"] == "three_metric_evaluation"),
-            None,
-        )
+        mm = next((r for r in recs["recommendations"] if r["type"] == "three_metric_evaluation"), None)
         if mm:
             lines.append(escape_markdown_v2(
-                f"  Close: {mm['close_wr']:.0%} | MFE(TP): {mm['mfe_wr']:.0%} | "
-                f"MAE(SL): {mm['mae_loss_rate']:.0%} | Clean: {mm['clean_win_rate']:.0%}"
+                f"   Close {mm['close_wr']:.0%} | MFE {mm['mfe_wr']:.0%} | "
+                f"SL {mm['mae_loss_rate']:.0%} | Clean {mm['clean_win_rate']:.0%}"
             ))
             if mm.get("bonus_rate") is not None:
                 lines.append(escape_markdown_v2(
-                    f"  Bonus(≥{cfg.OUTCOME_BONUS_RR:.0f}R): {mm['bonus_rate']:.0%} of trades | "
-                    f"Avg RR: {mm['avg_rr_achieved']:.2f}R | "
-                    f"Bonus-wtd WR: {mm.get('weighted_wr', 0):.1%}"
+                    f"   Bonus {mm['bonus_rate']:.0%} | RR {mm['avg_rr_achieved']:.2f}R | "
+                    f"Wtd WR {mm.get('weighted_wr', 0):.1%}"
                 ))
-            if mm.get("gap", 0) > 0.10:
-                lines.append(escape_markdown_v2(
-                    f"  🔴 +{mm['gap']:.0%} HIDDEN WINS — hit TP then reversed before the "
-                    f"candle-{cfg.OUTCOME_LOOKAHEAD_CANDLES} close. "
-                    f"Close-WR understates true edge."
-                ))
-            elif mm.get("gap", 0) > 0.05:
-                lines.append(escape_markdown_v2(
-                    f"  ⚠️ +{mm['gap']:.0%} hidden wins (hit TP, reversed before close)"
-                ))
+        lines.append("")
+
+        # ── 🔧 REPAIR SHOP ──
+        repairs = [r for r in recs["recommendations"] if r["type"] == "repair_shop"]
+        if repairs:
+            lines.append(f"*🔧 REPAIR SHOP* ({len(repairs)} issues)")
+            for i, r in enumerate(repairs[:5], 1):
+                sev_icon = {"critical": "🚨", "high": "🔴", "medium": "⚠️", "low": "ℹ️"}.get(r["severity"], "•")
+                # Compact: first 2 lines only
+                msg_lines = r["message"].split("\n")
+                compact = msg_lines[0][:120]
+                if len(msg_lines) > 1:
+                    compact += "\n   " + msg_lines[1].strip()[:100]
+                lines.append(f"{escape_markdown_v2(f'{sev_icon} #{i} {compact}')}")
+            if len(repairs) > 5:
+                lines.append(escape_markdown_v2(f"   +{len(repairs)-5} more"))
             lines.append("")
 
-        # ── TOP ALERTS: best buy / best sell, ranked by win rate ──
-        perf = next((r for r in recs["recommendations"] if r["type"] == "per_alert_breakdown"), None)
-        alert_data = perf.get("data") if perf else None
-        if alert_data:
-            buy_ranked = sorted((t for t in alert_data if t[0] in BUY_ALERT_KEYS), key=lambda t: -t[1])
-            sell_ranked = sorted((t for t in alert_data if t[0] in SELL_ALERT_KEYS), key=lambda t: -t[1])
-            if buy_ranked or sell_ranked:
-                lines.append(escape_markdown_v2(f"🏆 TOP ALERTS (min {min_sample} trades)"))
-                if buy_ranked:
-                    lines.append("Buy:")
-                    for ak, wr, n, _ in buy_ranked[:2]:
-                        lines.append(escape_markdown_v2(f" • {ak}: {wr:.0%} ({n} trades)"))
-                if sell_ranked:
-                    lines.append("Sell:")
-                    for ak, wr, n, _ in sell_ranked[:2]:
-                        lines.append(escape_markdown_v2(f" • {ak}: {wr:.0%} ({n} trades)"))
-                lines.append("")
-
-        # ── WEAK / AVOID: disable candidates + harmful vote combos ──
-        disable_alerts = [r for r in recs["recommendations"] if r["type"] == "disable_alert"]
-        poison_combos = [r for r in recs["recommendations"]
-                         if r["type"] == "vote_interaction" and r.get("kind") == "poison"]
-        if disable_alerts or poison_combos:
-            lines.append("*📉 WEAK / AVOID*")
-            for r in disable_alerts[:3]:
-                lines.append(f"• {escape_markdown_v2(r['message'][:180])}")
-            for r in poison_combos[:3]:
-                lines.append(f"• {escape_markdown_v2(r['message'][:180])}")
-            lines.append("")
-
-        # ── DO THIS NOW: config patch + best counterfactual + synergy combos ──
-        patch = recs["config_patch"]
-        patch_derived_types = {"parameter_autopsy", "weight_optimizer"}
+        # ── 🎯 DO THIS NOW (validated changes only) ──
+        patch = recs.get("config_patch") or []
         action_lines = []
-        if patch:
-            for p in patch:
-                note = (p.get("note") or "").lower()
-                if "informational" in note:
+
+        for p in patch:
+            note = (p.get("note") or "").lower()
+            if "informational" in note:
+                continue
+            path = p["path"]
+            suggested = p.get("suggested")
+            if isinstance(suggested, dict):
+                cur = p.get("current") or {}
+                changed = [(k, cur.get(k, 0), v) for k, v in suggested.items()
+                           if abs(v - cur.get(k, 0)) > 0.01]
+                if not changed:
                     continue
-                path = p["path"]
-                suggested = p.get("suggested")
-                if isinstance(suggested, dict):
-                    cur = p.get("current") or {}
-                    deltas = sorted(
-                        ((k, cur.get(k, 0), v) for k, v in suggested.items()),
-                        key=lambda t: abs(t[2] - t[1]), reverse=True,
-                    )
-                    changed = [(k, c, s) for k, c, s in deltas if abs(s - c) > 0.01]
-                    if not changed:
-                        continue
-                    top = ", ".join(f"{k} {c:g}→{s:g}" for k, c, s in changed[:6])
-                    line = f"• {path}: {top}"
-                    if len(changed) > 6:
-                        line += f" (+{len(changed) - 6} more)"
-                else:
-                    line = f"• {path}: {p.get('current')} → {suggested}"
-                action_lines.append(escape_markdown_v2(line))
+                changed.sort(key=lambda t: abs(t[2] - t[1]), reverse=True)
+                top = ", ".join(f"{k} {c:g}→{s:g}" for k, c, s in changed[:4])
+                extra = f" +{len(changed)-4}" if len(changed) > 4 else ""
+                action_lines.append(f"• {path}: {top}{extra}")
+            else:
+                action_lines.append(f"• {path}: {p.get('current')} → {suggested}")
 
-        shown_patch = len(action_lines)
-
+        # Counterfactual best
         counterfactuals = [r for r in recs["recommendations"] if r["type"] == "counterfactual"]
         for r in counterfactuals[:1]:
-            action_lines.append(f"• {escape_markdown_v2(r['message'][:200])}")
+            action_lines.append(f"• {r['message'][:150]}")
 
-        synergy_combos = [r for r in recs["recommendations"]
-                          if r["type"] == "vote_interaction" and r.get("kind") == "synergy"]
-        for r in synergy_combos[:2]:
-            action_lines.append(f"• {escape_markdown_v2(r['message'][:180])}")
+        # Weight optimizer blocked?
+        wf_blocked = [r for r in recs["recommendations"] if r["type"] == "weight_optimizer_blocked"]
+        for r in wf_blocked[:1]:
+            action_lines.append(f"• {r['message'][:150]}")
 
         if action_lines:
             lines.append("*🎯 DO THIS NOW*")
-            lines.extend(action_lines)
+            for al in action_lines[:6]:
+                lines.append(escape_markdown_v2(al))
             lines.append("")
 
-        # ── AUTO-BLOCK: actual state changes made this run ──
+        # ── 🏆 TOP ALERTS ──
+        perf = next((r for r in recs["recommendations"] if r["type"] == "per_alert_breakdown"), None)
+        alert_data = perf.get("data") if perf else None
+        if alert_data:
+            from alerts import BUY_ALERT_KEYS, SELL_ALERT_KEYS
+            buy_ranked = sorted((t for t in alert_data if t[0] in BUY_ALERT_KEYS), key=lambda t: -t[1])
+            sell_ranked = sorted((t for t in alert_data if t[0] in SELL_ALERT_KEYS), key=lambda t: -t[1])
+            if buy_ranked or sell_ranked:
+                lines.append(escape_markdown_v2(f"🏆 TOP ALERTS (min {getattr(cfg, 'MIN_WIN_RATE_SAMPLE', 20)} trades)"))
+                if buy_ranked:
+                    lines.append(escape_markdown_v2(
+                        "Buy: " + " | ".join(f"{ak} {wr:.0%}({n})" for ak, wr, n, _ in buy_ranked[:2])
+                    ))
+                if sell_ranked:
+                    lines.append(escape_markdown_v2(
+                        "Sell: " + " | ".join(f"{ak} {wr:.0%}({n})" for ak, wr, n, _ in sell_ranked[:2])
+                    ))
+                lines.append("")
+
+        # ── 🤖 AI INSIGHTS ──
+        ai_lines = []
+
+        # Synergy / Poison
+        synergies = [r for r in recs["recommendations"]
+                     if r["type"] == "vote_interaction" and r.get("kind") == "synergy"]
+        poisons = [r for r in recs["recommendations"]
+                   if r["type"] == "vote_interaction" and r.get("kind") == "poison"]
+        for s in synergies[:1]:
+            ai_lines.append(f"🔗 {s['message'][:120]}")
+        for p in poisons[:1]:
+            ai_lines.append(f"☠️ {p['message'][:120]}")
+
+        # Permutation importance
+        perm = next((r for r in recs["recommendations"] if r["type"] == "permutation_importance"), None)
+        if perm:
+            ai_lines.append(f"🤖 {perm['message'][:130]}")
+
+        # Regime
+        regime = next((r for r in recs["recommendations"] if r["type"] == "regime_breakdown"), None)
+        if regime:
+            first_line = regime["message"].split("\n")[0][:130]
+            ai_lines.append(f"📊 {first_line}")
+
+        # Weight optimizer confidence
+        wopt_rec = next((r for r in recs["recommendations"] if r["type"] == "weight_optimizer"), None)
+        if wopt_rec:
+            ai_lines.append(f"🧮 {wopt_rec['message'].split(chr(10))[0][:130]}")
+
+        if ai_lines:
+            lines.append("*🤖 AI INSIGHTS*")
+            for al in ai_lines[:5]:
+                lines.append(escape_markdown_v2(al))
+            lines.append("")
+
+        # ── ⚠️ CUSUM / FROZEN ──
+        cusum_items = [r for r in recs["recommendations"] if r["type"] == "cusum_drift"]
+        if cusum_items:
+            names = ", ".join(r.get("alert", "?") for r in cusum_items[:7])
+            lines.append(escape_markdown_v2(
+                f"⚠️ FROZEN (CUSUM drift): {names}. Auto-tuning paused."
+            ))
+            lines.append("")
+
+        # ── 📉 WEAK / AVOID ──
+        disable_alerts = [r for r in recs["recommendations"] if r["type"] == "disable_alert"]
+        if disable_alerts:
+            lines.append("*📉 WEAK / AVOID*")
+            for r in disable_alerts[:3]:
+                lines.append(escape_markdown_v2(f"• {r['message'][:130]}"))
+            lines.append("")
+
+        # ── AUTO-BLOCK ──
         auto_disabled = [r for r in recs["recommendations"] if r["type"] == "auto_disabled"]
         auto_reenabled = [r for r in recs["recommendations"] if r["type"] == "auto_reenabled"]
         if auto_disabled or auto_reenabled:
             lines.append("*🔒 AUTO-BLOCK*")
             for r in (auto_disabled + auto_reenabled)[:3]:
                 icon = "🔴" if r["type"] == "auto_disabled" else "🟢"
-                lines.append(f"{icon} {escape_markdown_v2(r['message'][:150])}")
+                lines.append(f"{icon} {escape_markdown_v2(r['message'][:120])}")
             lines.append("")
 
-        # ── FYI: CUSUM drift + any leftover findings ──
-        skip_types = patch_derived_types | {
+        # ── REMAINING FYI (compact, one line each) ──
+        shown_types = {
+            "repair_shop", "weight_optimizer", "weight_optimizer_blocked",
+            "per_alert_breakdown", "vote_interaction", "counterfactual",
+            "cusum_drift", "disable_alert", "auto_disabled", "auto_reenabled",
+            "three_metric_evaluation", "permutation_importance",
             "dynamic_weights_applied", "dynamic_weights_shadow",
-            "dynamic_weights_persist_failed", "auto_disabled", "auto_reenabled",
-            "disable_alert", "vote_interaction", "counterfactual", "per_alert_breakdown",
+            "dynamic_weights_persist_failed", "parameter_autopsy",
+            "config_regression", "config_improvement",
         }
         others = [
             r for r in recs["recommendations"]
-            if r["severity"] in ("high", "medium") and r["type"] not in skip_types
+            if r["severity"] in ("high", "medium") and r["type"] not in shown_types
         ]
-        cusum_items = [r for r in others if r["type"] == "cusum_drift"]
-        others = [r for r in others if r["type"] != "cusum_drift"]
-        shown_others = 0
-
-        if cusum_items or others:
+        if others:
             lines.append("*ℹ️ FYI*")
-            if cusum_items:
-                names = ", ".join(f"{r['alert']} ({r.get('n', '?')} trades)" for r in cusum_items)
-                lines.append(escape_markdown_v2(
-                    f"📉 Win-rate drifting down on {len(cusum_items)} alert(s) — "
-                    f"auto-tuning paused for these, needs your review: {names}"
-                ))
-                shown_others += len(cusum_items)
-            for r in others[:5]:
-                first_line = r["message"].split("\n")[0]
-                lines.append(f"• {escape_markdown_v2(first_line[:180])}")
-                shown_others += 1
+            for r in others[:6]:
+                first_line = r["message"].split("\n")[0][:130]
+                lines.append(f"• {escape_markdown_v2(first_line)}")
             lines.append("")
 
         total_recs = recs["recommendation_count"]
-        shown = (
-            shown_patch + len(counterfactuals[:1]) + len(synergy_combos[:2])
-            + len(disable_alerts[:3]) + len(poison_combos[:3])
-            + len(auto_disabled[:3]) + len(auto_reenabled[:3]) + shown_others
-        )
-
         if total_recs == 0:
-            lines.append("No actionable signal yet — still accumulating samples.")
-        elif total_recs > shown:
-            lines.append(escape_markdown_v2(
-                f"+{total_recs - shown} more items — full detail in outcome-data/reports/."
-            ))
+            lines.append("No actionable signal yet — accumulating samples.")
 
         msg = self._truncate_telegram(lines)
 
-        # Persist BEFORE attempting the Telegram send
+        # Persist BEFORE attempting send
         report_key = f"brain_report:{int(time.time())}"
         if self.sdb._redis and not self.sdb.degraded:
-            result = await self.sdb._safe_redis_op(
+            await self.sdb._safe_redis_op(
                 lambda: self.sdb._redis.set(report_key, json_dumps(recs), ex=30 * 86400),
                 2.0, f"brain_report_persist:{report_key}",
             )
-            if result is None:
-                logger_run.warning(f"Failed to persist brain report {report_key}")
 
         try:
             from outcome_storage import save_report
@@ -1420,19 +1421,12 @@ class BrainEngine:
                 if result:
                     send_ok = True
                 else:
-                    logger_run.warning(
-                        f"Brain report Telegram send returned False (likely API rejection) — "
-                        f"report is still persisted at {report_key}. "
-                        f"Check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID and MarkdownV2 formatting."
-                    )
+                    logger_run.warning(f"Brain report Telegram send returned False — persisted at {report_key}.")
             except Exception as e:
-                logger_run.warning(
-                    f"Brain report Telegram send failed ({e}) — report is still persisted at {report_key}."
-                )
+                logger_run.warning(f"Brain report Telegram send failed ({e}) — persisted at {report_key}.")
 
         logger_run.info(
             f"🧠 Brain report {'sent' if send_ok else 'persisted (send failed)'} | "
-            f"{shown_patch} patch item(s), {len(others)} other finding(s), "
-            f"{total_recs} total recommendations"
+            f"{len(patch)} patch item(s), {total_recs} total recommendations"
         )
         return send_ok
