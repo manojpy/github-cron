@@ -1655,18 +1655,17 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 f"{session_win_rate:.0%} in {current_session} session over "
                                 f"{session_sample} samples (need >= {cfg.MIN_WIN_RATE:.0%})"
                             )
-
                 if failing_rate is not None:
+                    alert_score, alert_total, alert_votes = _confluence_for(alert_key)
+
                     override_reason = None
                     if brain_engine:
                         try:
-                            alert_score, alert_total, _ = _confluence_for(alert_key)
                             override_reason = await brain_engine.check_rewardable_override(
                                 alert_key, alert_score, alert_total
                             )
                         except Exception as e:
                             logger_pair.debug(f"Brain override check failed for {alert_key}: {e}")
-
                     if override_reason:
                         logger_pair.info(
                             f"[{pair_name}] 🧠 Rewardable override for {alert_key}: "
@@ -1677,7 +1676,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         continue
 
                     if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
-                        alert_score, alert_total, alert_votes = _confluence_for(alert_key)
                         shadow_context = {
                             "rsi_curr": context.get("rsi_curr"),
                             "rsi_adaptive_buy": gr.rsi_adaptive_buy,
@@ -1697,7 +1695,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             confluence_votes=alert_votes,
                             context=shadow_context,
                         )
-
                     if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                         from outcome_storage import append_outcome
                         append_outcome({
@@ -1789,20 +1786,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     adx_val=adx_val,
                     context=trigger_context,
                 )
-                if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
-                    from outcome_storage import append_outcome
-                    append_outcome({
-                        "pair": pair_name,
-                        "alert_key": alert_key,
-                        "direction": "buy" if alert_key in BUY_ALERT_KEYS else "sell",
-                        "entry_ts": ts_curr,
-                        "price": close_curr,
-                        "score": s,
-                        "total": t,
-                        "votes": v,
-                        "adx_val": adx_val,
-                        "context": trigger_context,
-                    })
+             
             await asyncio.gather(*(_record_one(alert_key) for _, _, alert_key in alerts_to_send))
 
         if batch_mode and alerts_to_send:
