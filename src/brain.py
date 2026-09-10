@@ -9,6 +9,7 @@ import json
 import logging
 import statistics
 import time
+import math
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -84,6 +85,129 @@ def _hget_int(data: dict, key: str, default: int = 0) -> int:
         return int(value)
     except Exception:
         return default
+
+def _extract_p_value_for_fdr(
+    rec: Dict[str, Any],
+    real_rows: List[Dict[str, Any]],
+    min_sample: int,
+) -> Optional[float]:
+    """Best-effort p-value for a recommendation.
+
+    Returns None for recs that don't make an explicit statistical claim
+    (informational, repair_shop, three_metric summaries that were never
+    paired-tested, etc.). Returning None excludes the rec from the BH
+    pass rather than contributing a fabricated 0.5 or 1.0 that would
+    pollute the correction's m count.
+
+    Every branch guards against missing or malformed fields — the extractor
+    runs inside the report loop, and a KeyError here would take down the
+    whole report for one malformed rec.
+    """
+    rtype = rec.get("type")
+
+    # ── Interactions: p_value already stamped by the miner ──
+    # The miner is the only place that knows which arm is the correct null
+    # for each of the three branches (synergy, v2-poison-v1, v1-poison-v2),
+    # so we read rather than reconstruct.
+    if rtype == "vote_interaction":
+        p = rec.get("p_value")
+        return float(p) if isinstance(p, (int, float)) else None
+
+    # ── Calibration: one-sample against the train-split prediction ──
+    # `predicted` is a fixed reference from the train split, not a second
+    # sample from the same population, so this is a one-sample test. The
+    # earlier two_proportion form incorrectly treated a fixed proportion
+    # as if it were n i.i.d. Bernoulli draws, inflating the effective
+    # sample size and shrinking the p-value.
+    if rtype == "calibration_divergence":
+        n = rec.get("n")
+        pred = rec.get("predicted")
+        obs = rec.get("observed")
+        if all(isinstance(v, (int, float)) for v in (n, pred, obs)) and n > 0:
+            wins_obs = int(round(obs * n))
+            return engine.one_proportion_p_value(wins_obs, int(n), float(pred))
+        return None
+
+    # ── Parameter autopsy: one-sample against MIN_WIN_RATE ──
+    # Claim: the worst bucket's WR is inconsistent with the target.
+    if rtype == "parameter_autopsy":
+        n = rec.get("n")
+        wr = rec.get("wr")
+        if isinstance(n, int) and isinstance(wr, (int, float)) and n > 0:
+            wins = int(round(wr * n))
+            return engine.one_proportion_p_value(wins, n, cfg.MIN_WIN_RATE)
+        return None
+
+    # ── Conditional gating: two-proportion, above-threshold vs below ──
+    # Claim: WR differs materially depending on which side of the
+    # condition the row falls on.
+    if rtype == "conditional_gating":
+        a_n, a_wr = rec.get("above_n"), rec.get("above_wr")
+        b_n, b_wr = rec.get("below_n"), rec.get("below_wr")
+        if (isinstance(a_n, int) and isinstance(b_n, int)
+                and isinstance(a_wr, (int, float)) and isinstance(b_wr, (int, float))
+                and a_n > 0 and b_n > 0):
+            wins_a = int(round(a_wr * a_n))
+            wins_b = int(round(b_wr * b_n))
+            return engine.two_proportion_p_value(wins_a, a_n, wins_b, b_n)
+        return None
+
+    # ── Disable alert: one-sample against BRAIN_ALERT_DISABLE_THRESHOLD_WR ──
+    # Claim: this alert's pooled WR is below the disable threshold. The
+    # gate at emission time is `hi < disable_wr` (Wilson upper bound), so
+    # the rec is already directional; the p-value is a second look.
+    if rtype == "disable_alert":
+        n = rec.get("sample_size")
+        wr = rec.get("win_rate")
+        if isinstance(n, int) and isinstance(wr, (int, float)) and n > 0:
+            wins = int(round(wr * n))
+            p0 = getattr(cfg, "BRAIN_ALERT_DISABLE_THRESHOLD_WR", 0.40)
+            return engine.one_proportion_p_value(wins, n, p0)
+        return None
+
+    # ── Recovered alert: one-sample against MIN_WIN_RATE ──
+    if rtype == "recovered_alert":
+        n = rec.get("sample_size")
+        wr = rec.get("win_rate")
+        if isinstance(n, int) and isinstance(wr, (int, float)) and n > 0:
+            wins = int(round(wr * n))
+            return engine.one_proportion_p_value(wins, n, cfg.MIN_WIN_RATE)
+        return None
+
+    # ── Config regression: two-proportion, prev vs current ──
+    if rtype in ("config_regression", "config_improvement"):
+        prev_n, cur_n = rec.get("prev_n"), rec.get("cur_n")
+        prev_wr, cur_wr = rec.get("prev_wr"), rec.get("cur_wr")
+        if (isinstance(prev_n, int) and isinstance(cur_n, int)
+                and isinstance(prev_wr, (int, float)) and isinstance(cur_wr, (int, float))
+                and prev_n > 0 and cur_n > 0):
+            wins_prev = int(round(prev_wr * prev_n))
+            wins_cur = int(round(cur_wr * cur_n))
+            return engine.two_proportion_p_value(wins_cur, cur_n, wins_prev, prev_n)
+        return None
+
+    # ── Three-metric close-vs-MFE gap: exact McNemar (paired) ──
+    if rtype == "three_metric_evaluation":
+        mfe_only = rec.get("mfe_only")
+        close_only = rec.get("close_only")
+        if isinstance(mfe_only, int) and isinstance(close_only, int):
+            return engine.mcnemar_exact_p(mfe_only, close_only)
+        return None
+
+    # ── Permutation importance: top-signal t-test against 0 ──
+    # Approximate: the shuffle distribution gives a standard error for the
+    if rtype == "permutation_importance":
+        mean = rec.get("top_importance")
+        std = rec.get("top_std")
+        n_perm = rec.get("n_permutations")
+        if (isinstance(mean, (int, float)) and isinstance(std, (int, float))
+                and isinstance(n_perm, int) and n_perm > 1 and std > 0.0):
+            z = abs(mean) / (std / math.sqrt(n_perm))
+            return math.erfc(z / math.sqrt(2.0))
+        return None
+
+    # ── Fallthrough: no clean single-hypothesis claim ──
+    return None
 
 class BrainEngine:
     """Analysis layer over the bot's existing win-rate infrastructure."""
@@ -547,6 +671,11 @@ class BrainEngine:
                         f"predicted {ca['predicted']:.0%} vs observed "
                         f"{ca['observed']:.0%} (n={ca['n']})"
                     ),
+                    # ── FDR: one-sample test, observed rate vs fixed
+                    # predicted reference from the train split ──
+                    "n": ca["n"],
+                    "predicted": ca["predicted"],
+                    "observed": ca["observed"],
                 })
 
         if rec.get("valid") and abs(rec["recommended"] - cfg.CONFLUENCE_MIN_ABS_SCORE) >= 0.5:
@@ -652,10 +781,20 @@ class BrainEngine:
                 })
 
         if cfg.BRAIN_MC_SIMULATIONS > 0:
+            _mc_seed = int(
+                engine.hash_config_state(
+                    CONFLUENCE_WEIGHTS,
+                    cfg.CONFLUENCE_MIN_ABS_SCORE,
+                    cfg.CONFLUENCE_MIN_PCT,
+                ),
+                16,
+            ) & 0xFFFFFFFF
             mc = engine.monte_carlo_walk_forward(
                 real_rows, n_simulations=cfg.BRAIN_MC_SIMULATIONS,
                 min_sample=min_sample, target_winrate=target_wr,
+                seed=_mc_seed,
             )
+
             if mc["valid"]:
                 robust_icon = "✅ ROBUST" if mc["robustness_score"] > 2.0 else "⚠️ FRAGILE"
                 recommendations.append({
@@ -778,6 +917,11 @@ class BrainEngine:
                 "bonus_rate": round(mm_summary.get("bonus_rate", 0.0), 4),
                 "avg_rr_achieved": round(mm_summary.get("avg_rr_achieved", 0.0), 2),
                 "weighted_wr": round(mm_summary.get("weighted_wr", 0.0), 4),
+                # ── FDR: exact McNemar on the discordant 2×2 cells ──
+                # Not a two-proportion test — see mcnemar_exact_p docstring.
+                "n": mm_summary["n"],
+                "mfe_only": mm_summary.get("mfe_only", 0),
+                "close_only": mm_summary.get("close_only", 0),
                 "message": summary_msg,
             })
 
@@ -1004,10 +1148,10 @@ class BrainEngine:
                     "PASS" if ood_passes == ood_total
                     else f"{ood_passes}/{ood_total} PASS"
                 )
-
+        
         severity_order = {"high": 0, "medium": 1, "low": 2}
         recommendations.sort(key=lambda x: severity_order.get(x["severity"], 3))
-
+        
         return {
             "generated_at": int(time.time()),
             "real_sample_size": len(real_rows),
@@ -1032,7 +1176,7 @@ class BrainEngine:
             },
         }
 
-    # ── Report generation / delivery ────────────────────────────────────────
+    # ── Report generation / delivery ─────────────────────���──────────────────
 
     async def _next_run_count(self) -> Optional[int]:
         """Persisted run counter (Redis INCR) — safe across cron restarts."""

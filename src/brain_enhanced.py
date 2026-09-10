@@ -13,7 +13,8 @@ from archive_reader import load_archived_outcomes
 
 from bot_config import cfg, CONFLUENCE_WEIGHTS
 from state import RedisKeyPrefix, RedisStateStore
-from brain import BrainEngine as BaseBrainEngine
+
+from brain import BrainEngine as BaseBrainEngine, _extract_p_value_for_fdr
 import threshold_engine as engine
 
 from threshold_engine import (
@@ -259,6 +260,9 @@ class BrainEngineV2(BaseBrainEngine):
                         "delta_ev": max(0.0, cfg.MIN_WIN_RATE - last_bucket["wr"]),
                         "wilson_lo": last_bucket["wilson_lo"],
                         "wilson_hi": last_bucket["wilson_hi"],
+                        # ── FDR: one-sample test against MIN_WIN_RATE ──
+                        "n": last_bucket["n"],
+                        "wr": last_bucket["wr"],
                     })
                     config_path = None
                     if param == "ppo_adaptive_threshold":
@@ -299,6 +303,11 @@ class BrainEngineV2(BaseBrainEngine):
                             "delta_ev": abs(cp["gap"]),
                             "wilson_lo": min(cp["above"]["wilson_lo"], cp["below"]["wilson_lo"]),
                             "wilson_hi": max(cp["above"]["wilson_hi"], cp["below"]["wilson_hi"]),
+                            # ── FDR: two-proportion test, above vs below ──
+                            "above_n": cp["above"]["n"],
+                            "above_wr": cp["above"]["wr"],
+                            "below_n": cp["below"]["n"],
+                            "below_wr": cp["below"]["wr"],
                         })
 
         # ── Phase 4: Vote Interaction Miner ──────────────────────────────
@@ -307,14 +316,25 @@ class BrainEngineV2(BaseBrainEngine):
             for inter in interactions[:5]:
                 v1, v2 = inter["pair"]
                 if inter["type"] == "synergy":
+                    # wr_only_v2 may be absent when the v2-alone arm was too
+                    # thin to clear min_sample — the corrected miner drops
+                    # the key entirely rather than fabricating a 0.0. Format
+                    # the message defensively so a missing key doesn't crash
+                    # the report.
+                    _v2_alone_str = (
+                        f", {v2}={inter['wr_only_v2']:.0%}"
+                        if "wr_only_v2" in inter else ""
+                    )
                     recommendations.append({
                         "type": "vote_interaction", "kind": "synergy", "severity": "low",
                         "message": (
                             f"🔗 Synergy: {v1}+{v2} = {inter['wr_both']:.0%} WR "
-                            f"(n={inter['n_both']}). Alone: {v1}={inter['wr_only_v1']:.0%}, "
-                            f"{v2}={inter['wr_only_v2']:.0%}."
+                            f"(n={inter['n_both']}). Alone: {v1}={inter['wr_only_v1']:.0%}"
+                            f"{_v2_alone_str}."
                         ),
                         "delta_ev": abs(inter["delta"]),
+                        # ── FDR: p_value stamped by the miner directly ──
+                        "p_value": inter.get("p_value"),
                     })
                 else:
                     poisoner, victim = inter["poisoner"], inter["victim"]
@@ -326,6 +346,8 @@ class BrainEngineV2(BaseBrainEngine):
                             f"Together={inter['wr_both']:.0%}, {victim} alone={wr_victim_alone:.0%}."
                         ),
                         "delta_ev": abs(inter["delta"]),
+                        # ── FDR: p_value stamped by the miner directly ──
+                        "p_value": inter.get("p_value"),
                     })
 
         # ── Phase 5: Counterfactual Simulator ────────────────────────────
@@ -362,7 +384,7 @@ class BrainEngineV2(BaseBrainEngine):
                 })
                 ai_metrics["counterfactual_scenarios"] = scenarios
 
-        # ── Phase 6: Regime Profiles ─────────────────────────────────────
+        # ── Phase 6: Regime Profiles ─────────────────────��───────────────
         if len(real_rows) >= self._phase_samples["regime_profiles"]:
             rpo = regime_profile_optimizer(real_rows, regime_field="adx_val",
                                            min_sample=self._phase_samples["regime_profiles"])
@@ -382,28 +404,44 @@ class BrainEngineV2(BaseBrainEngine):
             real_rows, min_sample=self._phase_samples["config_regression"]
         )
         for comp in version_comparisons:
+            _comp_shared = {
+                "prev_version": comp["prev_version"],
+                "cur_version": comp["cur_version"],
+                "prev_n": comp["prev_n"],
+                "cur_n": comp["cur_n"],
+                "prev_wr": comp["prev_wr"],
+                "cur_wr": comp["cur_wr"],
+            }
             if comp["regression"]:
-                recommendations.append({
+                rec_entry = {
                     "type": "config_regression", "severity": "high",
                     "message": (
                         f"🚨 Config regression: WR {comp['prev_wr']:.0%}→{comp['cur_wr']:.0%} "
                         f"({comp['prev_version']}→{comp['cur_version']}). Consider reverting."
                     ),
                     "delta_ev": abs(comp["delta_wr"]),
-                })
+                }
+                rec_entry.update(_comp_shared)
+                recommendations.append(rec_entry)
             elif comp["improvement"]:
-                recommendations.append({
+                rec_entry = {
                     "type": "config_improvement", "severity": "low",
                     "message": (
                         f"✅ Config improved WR: {comp['prev_wr']:.0%}→{comp['cur_wr']:.0%} "
                         f"({comp['prev_version']}→{comp['cur_version']})."
                     ),
-                })
+                }
+                rec_entry.update(_comp_shared)
+                recommendations.append(rec_entry)
+
         ai_metrics["config_comparisons"] = version_comparisons
 
         # ── AI/ML: Permutation Vote Importance ───────────────────────────
         if len(real_rows) >= 30:
-            perm_imp = engine.permutation_vote_importance(real_rows, min_sample=30, n_permutations=15)
+            _perm_n = 15
+            perm_imp = engine.permutation_vote_importance(
+                real_rows, min_sample=30, n_permutations=_perm_n
+            )
             if perm_imp:
                 top_positive = [p for p in perm_imp if p["direction"] == "positive"][:3]
                 top_negative = [p for p in perm_imp if p["direction"] == "negative"][:3]
@@ -414,9 +452,55 @@ class BrainEngineV2(BaseBrainEngine):
                 if top_negative:
                     parts.append("harmful: " + ", ".join(
                         f"{p['vote']}({p['importance']:+.3f})" for p in top_negative))
-                recommendations.append({
+
+                # FDR tests the single strongest signal. If the top signal
+                _top = (top_positive + top_negative)[:1]
+                _top_rec = _top[0] if _top else None
+
+                _rec = {
                     "type": "permutation_importance", "severity": "low",
                     "message": f"🤖 Permutation importance — {'; '.join(parts)}",
+                }
+                if _top_rec is not None:
+                    _rec["top_vote"] = _top_rec["vote"]
+                    _rec["top_importance"] = _top_rec["importance"]
+                    _rec["top_std"] = _top_rec.get("std", 0.0)
+                    _rec["n_permutations"] = _perm_n
+                recommendations.append(_rec)
+
+        # ── Benjamini-Hochberg FDR correction ────────────────────────────
+       
+        p_val_indices: List[int] = []
+        p_vals: List[float] = []
+        for idx, r in enumerate(recommendations):
+            p = _extract_p_value_for_fdr(r, real_rows, min_sample)
+            if p is not None:
+                p_val_indices.append(idx)
+                p_vals.append(p)
+        if p_vals:
+            keep_mask = engine.benjamini_hochberg(p_vals, alpha=0.10)
+            n_survived = sum(keep_mask)
+            n_tested = len(p_vals)
+            for flag, idx in zip(keep_mask, p_val_indices):
+                recommendations[idx]["fdr_passed"] = bool(flag)
+            for flag, idx in zip(keep_mask, p_val_indices):
+                if not flag and recommendations[idx]["severity"] in ("high", "medium"):
+                    recommendations[idx]["severity"] = "low"
+                    recommendations[idx]["message"] = (
+                        f"{recommendations[idx]['message']}\n"
+                        f"[FDR: not significant after BH correction across "
+                        f"{n_tested} tests at α=0.10]"
+                    )
+            if n_tested > 3:
+                recommendations.append({
+                    "type": "fdr_summary",
+                    "severity": "low",
+                    "message": (
+                        f"📊 FDR (Benjamini-Hochberg, α=0.10): {n_survived}/{n_tested} "
+                        f"statistical claims survived correction across the report. "
+                        f"Surviving claims are marked `fdr_passed=True`; demoted "
+                        f"claims are downgraded to low severity."
+                    ),
                 })
 
         # ── Actionability scoring (FIXED confidence) ─────────────────────
@@ -448,6 +532,7 @@ class BrainEngineV2(BaseBrainEngine):
         # ── Re-assemble ──────────────────────────────────────────────────
         result = dict(base_recs)
         result["recommendations"] = recommendations
+        result["recommendation_count"] = len(recommendations)
         result["config_patch"] = config_patch
         result["ai_metrics"] = ai_metrics
         return result

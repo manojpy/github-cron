@@ -28,6 +28,128 @@ def wilson_ci(wins: int, n: int, z: float = 1.96) -> Tuple[float, float, float]:
     margin = (z / denom) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
     return max(0.0, centre - margin), min(1.0, centre + margin), p
 
+def two_proportion_p_value(wins_a: int, n_a: int, wins_b: int, n_b: int) -> float:
+    """Two-sided two-proportion z-test p-value (no SciPy).
+
+    Uses the pooled-variance test statistic:
+        z = (p_a - p_b) / sqrt(p_pool * (1 - p_pool) * (1/n_a + 1/n_b))
+    then two-sided normal tail via the error function.
+
+    Returns 1.0 when either sample is empty or the pooled rate is
+    degenerate (0 or 1) — "no evidence" is the correct conservative
+    answer there and keeps BH from rejecting on noise.
+    """
+    if n_a <= 0 or n_b <= 0:
+        return 1.0
+    p_a = wins_a / n_a
+    p_b = wins_b / n_b
+    p_pool = (wins_a + wins_b) / (n_a + n_b)
+    if p_pool <= 0.0 or p_pool >= 1.0:
+        return 1.0
+    se = math.sqrt(p_pool * (1.0 - p_pool) * (1.0 / n_a + 1.0 / n_b))
+    if se <= 0.0:
+        return 1.0
+    z = abs(p_a - p_b) / se
+    # Two-sided normal tail: p = 2 * (1 - Phi(z)) = erfc(z / sqrt(2))
+    return math.erfc(z / math.sqrt(2.0))
+
+def one_proportion_p_value(wins: int, n: int, p0: float) -> float:
+    """Two-sided one-sample proportion z-test against a fixed reference rate p0.
+
+    Used for claims of the form "the observed win rate at X is (or is not)
+    consistent with a target/policy rate" — disable_alert, recovered_alert,
+    parameter_autopsy. Two-sided (not one-sided) is deliberate: the BH
+    correction downstream assumes all p-values are valid under their
+    respective nulls, and using a mix of one- and two-sided tests skews
+    the ordering that BH depends on. The claim is directional, but the
+    Wilson-upper/lower gate at emission time already enforced the
+    direction; the p-value is a secondary confirmation.
+
+    Returns 1.0 when the test is degenerate (empty sample, p0 outside the
+    open unit interval, or zero standard error) — conservative, and it
+    keeps BH from rejecting on a computation artifact.
+    """
+    if n <= 0 or not (0.0 < p0 < 1.0):
+        return 1.0
+    p_hat = wins / n
+    se = math.sqrt(p0 * (1.0 - p0) / n)
+    if se <= 0.0:
+        return 1.0
+    z = abs(p_hat - p0) / se
+    return math.erfc(z / math.sqrt(2.0))
+
+def mcnemar_exact_p(b: int, c: int) -> float:
+    """Two-sided exact McNemar test on the discordant pair counts (b, c).
+
+    Applies when two classifiers are run on the same rows and we want to
+    know whether they disagree systematically — e.g. close_win vs mfe_win
+    in three_metric_evaluation. This is NOT a two-proportion test: the
+    concordant pairs (both-win and neither-win) carry no information about
+    which classifier is better, only the discordant b/c cells do. Running
+    a two-proportion test on the marginal rates would overstate the
+    sample size by treating concordant pairs as evidence, which is the
+    error the earlier wiring made.
+
+    Exact for n_discordant <= 200 via math.comb (0.5**n_d underflows
+    beyond ~1000, but by then p is already effectively 0). Normal
+    approximation with continuity correction above that threshold.
+
+    Returns 1.0 when there are no discordant pairs.
+    """
+    if b < 0 or c < 0:
+        return 1.0
+    n_d = b + c
+    if n_d == 0:
+        return 1.0
+    k_min = min(b, c)
+
+    if n_d > 200:
+        # Continuity-corrected normal approximation:
+        # z = (|b - n_d/2| - 0.5) / sqrt(n_d)/2
+        z = (abs(b - n_d / 2) - 0.5) / (math.sqrt(n_d) / 2)
+        z = max(0.0, z)
+        return math.erfc(z / math.sqrt(2.0))
+
+    tail = sum(math.comb(n_d, i) for i in range(k_min + 1)) * (0.5 ** n_d)
+    return min(1.0, 2.0 * tail)
+
+def benjamini_hochberg(p_values: List[float], alpha: float = 0.10) -> List[bool]:
+    """Benjamini-Hochberg FDR control.
+
+    Given a list of p-values (one per hypothesis tested), returns a parallel
+    boolean list where True = "reject the null" at the target FDR level.
+
+    The BH procedure: sort p-values ascending, find the largest rank k such
+    that p_(k) <= (k/m) * alpha, then reject every hypothesis with
+    p <= p_(k). Under independence (or PRDS), the expected proportion of
+    false discoveries among rejections is <= alpha.
+
+    Why this matters here: the brain evaluates hundreds of hypotheses per
+    report. Without correction, the "disable alert", "poison pair", and
+    "calibration divergence" recommendations are dominated by chance hits
+    as the search space grows.
+
+    Interpretation note: alpha=0.10 (not 0.05) is deliberate. FDR at 10%
+    says "at most 1 in 10 of my flags is noise", which is a reasonable
+    tolerance for a human-reviewed report where acting on a false positive
+    is cheap compared to missing a real signal.
+    """
+    m = len(p_values)
+    if m == 0:
+        return []
+    indexed = sorted(enumerate(p_values), key=lambda t: t[1])
+    reject = [False] * m
+    cutoff_rank = 0
+    for rank, (_, p) in enumerate(indexed, start=1):
+        if p <= alpha * rank / m:
+            cutoff_rank = rank
+    if cutoff_rank > 0:
+        cutoff_p = indexed[cutoff_rank - 1][1]
+        for orig_idx, p in indexed:
+            if p <= cutoff_p:
+                reject[orig_idx] = True
+    return reject
+
 def recency_weight(entry_ts: Optional[float], now_ts: float, decay_days: float = 7.0) -> float:
     """Exponential recency weight: exp(-age_days / decay_days). ... NOTE:
     decay_days is an exponential time constant, not a strict half-life —
@@ -72,35 +194,67 @@ def weighted_win_rate_with_bonus(
     rows: List[Row],
     now_ts: Optional[float] = None,
     decay_days: float = 7.0,
+    n_boot: int = 400,
+    seed: int = 42,
 ) -> Tuple[Optional[float], float, float, float]:
-    """Win rate where bonus wins (exceeded 1:2 target) count for more.
-    A bonus win with weight 1.5 counts as 1.5 wins out of 1.5 total weight.
-    Returns (weighted_wr, n_eff, wilson_lo, wilson_hi)."""
+    """Win rate where bonus wins (exceeded 1:2 target) count for more,
+    with a proper bootstrap CI instead of a re-parameterized Wilson.
+
+    The old approach plugged weighted_wr * n_eff into wilson_ci() as if it
+    were an integer count of Bernoulli trials. That formula's derivation
+    assumes i.i.d. Bernoulli observations; real-valued weights violate it,
+    so the resulting "CI" had no coverage guarantee and was typically too
+    narrow — every consumer that gates on it (auto-disable, auto-reinstate,
+    rewardable pool) was systematically overconfident.
+
+    Bootstrap: resample rows with replacement n_boot times, recompute the
+    weighted statistic on each resample, take the 2.5/97.5 percentiles.
+    This is honest about effective sample size because the variance of
+    n_eff is baked into the resampled statistic, not injected post-hoc.
+
+    n_boot=400 is the default: enough to stabilize the 2.5th percentile
+    estimate for realistic n (200-5000 rows) without adding meaningful
+    runtime to a report that already runs a 50-sim Monte Carlo.
+    """
     if now_ts is None:
         now_ts = time.time()
     if not rows:
         return None, 0.0, 0.0, 0.0
 
-    sum_w = 0.0       # total weight denominator (recency only)
-    sum_ww = 0.0      # weighted wins (recency × win_weight)
-    sum_w2 = 0.0      # for n_eff
+    def _weighted_once(sample: List[Row]) -> Tuple[float, float]:
+        sum_w = sum_w2 = sum_ww = 0.0
+        for r in sample:
+            rw = recency_weight(r.get("entry_ts"), now_ts, decay_days)
+            ww = r.get("win_weight", 1.0 if r["win"] else 0.0)
+            sum_w += rw
+            sum_w2 += rw * rw
+            if r["win"]:
+                sum_ww += rw * ww
+        if sum_w <= 0:
+            return 0.0, 0.0
+        wr = min(sum_ww / sum_w, 1.0)
+        n_eff_local = (sum_w ** 2) / sum_w2 if sum_w2 > 0 else 0.0
+        return wr, n_eff_local
 
-    for r in rows:
-        recency_w = recency_weight(r.get("entry_ts"), now_ts, decay_days)
-        win_w = r.get("win_weight", 1.0 if r["win"] else 0.0)
+    point_wr, point_n_eff = _weighted_once(rows)
 
-        sum_w += recency_w
-        sum_w2 += recency_w * recency_w
-        if r["win"]:
-            sum_ww += recency_w * win_w
+    if len(rows) < 10 or n_boot <= 0:
+        # Not enough rows for a meaningful bootstrap — return a conservatively
+        # wide [0, 1] interval so downstream CI-gated callers stay closed
+        # rather than firing on a spuriously tight band.
+        return point_wr, point_n_eff, 0.0, 1.0
 
-    if sum_w <= 0:
-        return None, 0.0, 0.0, 0.0
-
-    weighted_wr = min(sum_ww / sum_w, 1.0)
-    n_eff = (sum_w ** 2) / sum_w2 if sum_w2 > 0 else 0.0
-    lo, hi, _ = wilson_ci(round(weighted_wr * n_eff), max(1, round(n_eff)))
-    return weighted_wr, n_eff, lo, hi
+    rng = random.Random(seed)
+    n = len(rows)
+    boots: List[float] = []
+    for _ in range(n_boot):
+        sample = [rows[rng.randrange(n)] for _ in range(n)]
+        wr, _ = _weighted_once(sample)
+        boots.append(wr)
+    boots.sort()
+    lo_idx = max(0, int(0.025 * (len(boots) - 1)))
+    hi_idx = min(len(boots) - 1, int(0.975 * (len(boots) - 1)))
+    return point_wr, point_n_eff, boots[lo_idx], boots[hi_idx]
 
 def favourable_move(row: Row) -> float:
     """pct_move is signed by price direction, not by trade outcome — a
@@ -229,13 +383,49 @@ def build_caps_data(rows: List[Row], min_sample: int = 20) -> Tuple[List[float],
     caps_data.reverse()  # back to ascending order
     return candidate_caps, caps_data
  
-def walk_forward_split(rows: List[Row], train_frac: float = 0.67) -> Tuple[List[Row], List[Row]]:
-    """Chronological split by entry_ts (not random) — a threshold has to
-    survive time moving forward, not just a random resample of the same
-    period. Rows missing entry_ts (0) sort first, into the train side."""
+def walk_forward_split(
+    rows: List[Row],
+    train_frac: float = 0.67,
+    lookahead_sec: int = 8 * 900,   # OUTCOME_LOOKAHEAD_CANDLES * 900
+    embargo_sec: int = 900,          # one candle of buffer
+) -> Tuple[List[Row], List[Row]]:
+    """Chronological split by entry_ts with purge + embargo.
+
+    A row at entry_ts=T has its forward outcome window extend to T+lookahead_sec.
+    Without purging, the last lookahead_sec/second worth of train rows leak
+    their outcome windows into the first holdout rows — a well-known CV
+    leakage bug (López de Prado, "Advances in Financial ML", ch. 7).
+
+    Purge: drop train rows whose outcome window overlaps the holdout.
+    Embargo: drop holdout rows within embargo_sec of the cut so residual
+    autocorrelation decays before scoring starts.
+
+    Rows missing entry_ts (0) sort first, into the train side (unchanged).
+    """
     ordered = sorted(rows, key=lambda r: r.get("entry_ts", 0))
+    if not ordered:
+        return [], []
+
     split_idx = int(len(ordered) * train_frac)
-    return ordered[:split_idx], ordered[split_idx:]
+    if split_idx <= 0 or split_idx >= len(ordered):
+        return ordered[:split_idx], ordered[split_idx:]
+
+    cut_ts = ordered[split_idx].get("entry_ts", 0)
+
+    # Purge train rows whose forward outcome window spills past the cut.
+    # The train row's label would otherwise be partially determined by
+    # prices the holdout set is about to see.
+    train = [
+        r for r in ordered[:split_idx]
+        if r.get("entry_ts", 0) + lookahead_sec < cut_ts - embargo_sec
+    ]
+    # Embargo: skip the first embargo_sec of the holdout so the very first
+    # scored rows aren't still statistically coupled to the train tail.
+    holdout = [
+        r for r in ordered[split_idx:]
+        if r.get("entry_ts", 0) >= cut_ts + embargo_sec
+    ]
+    return train, holdout
 
 def validate_threshold_walk_forward(
     rows: List[Row],
@@ -698,7 +888,6 @@ def direction_split(rows: List[Row]) -> Tuple[Optional[float], int, Optional[flo
     sell_wr = sum(r["win"] for r in sells) / len(sells) if sells else None
     return buy_wr, len(buys), sell_wr, len(sells)
 
-
 def detect_temporal_drift(rows: List[Row], window_days: int = 14):
     """Compare win rate of recent outcomes vs older ones. Uses wall-clock
     time (time.time()) as "now" — NOT the last trade's timestamp, which
@@ -833,7 +1022,7 @@ def recommend_threshold(
 
 # ══════════════════════════════════════════════════════════════════════
 #  NEW: Cost-Aware EV + Kelly Sizing  (Recommended.txt §5)
-# ═══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 
 def ev_and_kelly_for(
     rows: List[Row],
@@ -864,7 +1053,7 @@ def ev_and_kelly_for(
     return ev, half_kelly, wr
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════���══
 #  FIXED: Brier Score & Calibration Curve  (Recommended.txt §2)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1212,7 +1401,6 @@ def _sigmoid(z: float) -> float:
     ez = math.exp(z)
     return ez / (1.0 + ez)
 
-
 def optimize_vote_weights(
     rows: List[Row],
     current_weights: Dict[str, float],
@@ -1287,7 +1475,6 @@ def optimize_vote_weights(
         "suggested_weights": suggested,
         "negative_votes": negative_votes,
     }
-
 
 # ═══════════════════════════════════════════════════════════════════════
 #  PHASE 2 — PARAMETER AUTOPSY ENGINE
@@ -1414,6 +1601,20 @@ def interaction_miner(
     rows: List[Row],
     min_sample: int = 20,
 ) -> List[Dict[str, Any]]:
+    """Mine pairwise vote interactions (synergy + poison).
+
+    Each emitted dict carries the raw counts (n_both, n_only_v1, n_only_v2,
+    n_neither) and a precomputed two-proportion p_value alongside the win-
+    rate point estimates. Downstream consumers — notably the Benjamini-
+    Hochberg FDR pass in brain.py — read p_value directly rather than
+    reconstructing it from partial rates; the previous version emitted
+    only rates, so every interaction was treated as equally trustworthy
+    regardless of the sample size behind it.
+
+    p_value is None when the miner cannot form a valid comparison (e.g.
+    the reference arm is too thin to pass min_sample); the FDR pass
+    treats None as "not tested" and leaves the recommendation alone.
+    """
     vote_names: Set[str] = set()
     for r in rows:
         if r.get("votes"):
@@ -1428,59 +1629,137 @@ def interaction_miner(
             only_v2 = [r for r in rows if r.get("votes") and r["votes"].get(v2) and not r["votes"].get(v1)]
             neither = [r for r in rows if r.get("votes") and not r["votes"].get(v1) and not r["votes"].get(v2)]
 
-            if len(both) < min_sample or len(only_v1) < min_sample:
+            n_both = len(both)
+            n_only_v1 = len(only_v1)
+            n_only_v2 = len(only_v2)
+            n_neither = len(neither)
+
+            # Outer gate unchanged: we need a valid "together" arm AND a
+            # valid "v1 alone" arm. Both are load-bearing; without either,
+            # any signal we detect would be a comparison against noise.
+            if n_both < min_sample or n_only_v1 < min_sample:
                 continue
 
-            has_v2_sample = len(only_v2) >= min_sample
-            wr_both = sum(r["win"] for r in both) / len(both)
-            wr_only_v1 = sum(r["win"] for r in only_v1) / len(only_v1)
-            wr_only_v2 = sum(r["win"] for r in only_v2) / len(only_v2) if has_v2_sample else 0.0
-            wr_neither = sum(r["win"] for r in neither) / len(neither) if neither else 0.0
+            has_v2_sample = n_only_v2 >= min_sample
+            has_neither_sample = n_neither >= min_sample
 
-            synergy = wr_both - max(wr_only_v1, wr_only_v2, wr_neither)
+            wins_both = sum(r["win"] for r in both)
+            wins_only_v1 = sum(r["win"] for r in only_v1)
+
+            wr_both = wins_both / n_both
+            wr_only_v1 = wins_only_v1 / n_only_v1
+
+            # Only compute the v2-alone and neither rates when their sample
+            # actually clears min_sample. Falling back to a fabricated 0.0
+            # (the old behavior) silently produced a hypothetical "0% WR"
+            # comparison arm that no data supported — fine when some other
+            # arm was higher in max(), wrong when it wasn't.
+            wr_only_v2 = (
+                sum(r["win"] for r in only_v2) / n_only_v2
+                if has_v2_sample else None
+            )
+            wr_neither = (
+                sum(r["win"] for r in neither) / n_neither
+                if has_neither_sample else None
+            )
+
+            # ── Synergy ─────────────────────────────────────────────────
+            # Baseline = the strongest of whichever comparison arms have
+            # sufficient data. v1-alone always qualifies (outer gate), so
+            # valid_baselines is never empty.
+            valid_baselines = [wr_only_v1]
+            if wr_only_v2 is not None:
+                valid_baselines.append(wr_only_v2)
+            if wr_neither is not None:
+                valid_baselines.append(wr_neither)
+            synergy_baseline = max(valid_baselines)
+
+            synergy = wr_both - synergy_baseline
             if synergy > 0.10:
-                interactions.append({
+                # Significance test: together vs v1-alone. v1-alone is the
+                # one arm guaranteed valid by the outer gate, so the test
+                # is always computable.
+                p = two_proportion_p_value(
+                    wins_both, n_both, wins_only_v1, n_only_v1
+                )
+                entry: Dict[str, Any] = {
                     "pair": (v1, v2),
                     "type": "synergy",
                     "delta": round(synergy, 4),
                     "wr_both": round(wr_both, 4),
                     "wr_only_v1": round(wr_only_v1, 4),
-                    "wr_only_v2": round(wr_only_v2, 4),
-                    "n_both": len(both),
-                })
+                    "n_both": n_both,
+                    "n_only_v1": n_only_v1,
+                    "p_value": round(p, 6),
+                }
+                if wr_only_v2 is not None:
+                    entry["wr_only_v2"] = round(wr_only_v2, 4)
+                    entry["n_only_v2"] = n_only_v2
+                if wr_neither is not None:
+                    entry["wr_neither"] = round(wr_neither, 4)
+                    entry["n_neither"] = n_neither
+                interactions.append(entry)
 
-            # v2 poisons v1: adding v2 drags a good v1 down
+            # ── v2 poisons v1 ───────────────────────────────────────────
+            # Reference arm is v1-alone (guaranteed valid). Test: does
+            # adding v2 drag v1's win rate down?
             poison_v1 = wr_only_v1 - wr_both
-            if poison_v1 > 0.15 and len(both) >= min_sample:
-                interactions.append({
+            if poison_v1 > 0.15 and n_both >= min_sample:
+                p = two_proportion_p_value(
+                    wins_both, n_both, wins_only_v1, n_only_v1
+                )
+                entry = {
                     "pair": (v1, v2),
                     "type": "poison",
                     "delta": round(-poison_v1, 4),
                     "wr_both": round(wr_both, 4),
                     "wr_only_v1": round(wr_only_v1, 4),
-                    "wr_only_v2": round(wr_only_v2, 4),
-                    "n_both": len(both),
+                    "n_both": n_both,
+                    "n_only_v1": n_only_v1,
                     "poisoner": v2,
                     "victim": v1,
                     "note": f"{v2} poisons {v1}",
-                })
+                    "p_value": round(p, 6),
+                }
+                if wr_only_v2 is not None:
+                    entry["wr_only_v2"] = round(wr_only_v2, 4)
+                    entry["n_only_v2"] = n_only_v2
+                if wr_neither is not None:
+                    entry["wr_neither"] = round(wr_neither, 4)
+                    entry["n_neither"] = n_neither
+                interactions.append(entry)
 
-            # v1 poisons v2: adding v1 drags a good v2 down
+            # ── v1 poisons v2 ───────────────────────────────────────────
+            # Reference arm here is v2-alone, which is only valid when
+            # has_v2_sample is True. The gate is load-bearing: without it,
+            # wr_only_v2 would be None (not 0.0 anymore), and any v1-heavy
+            # pair where v2 is rarely seen alone would be skipped.
             if has_v2_sample:
                 poison_v2 = wr_only_v2 - wr_both
-                if poison_v2 > 0.15 and len(both) >= min_sample:
-                    interactions.append({
+                if poison_v2 > 0.15 and n_both >= min_sample:
+                    wins_only_v2 = sum(r["win"] for r in only_v2)
+                    p = two_proportion_p_value(
+                        wins_both, n_both, wins_only_v2, n_only_v2
+                    )
+                    entry = {
                         "pair": (v1, v2),
                         "type": "poison",
                         "delta": round(-poison_v2, 4),
                         "wr_both": round(wr_both, 4),
                         "wr_only_v1": round(wr_only_v1, 4),
                         "wr_only_v2": round(wr_only_v2, 4),
-                        "n_both": len(both),
+                        "n_both": n_both,
+                        "n_only_v1": n_only_v1,
+                        "n_only_v2": n_only_v2,
                         "poisoner": v1,
                         "victim": v2,
                         "note": f"{v1} poisons {v2}",
-                    })
+                        "p_value": round(p, 6),
+                    }
+                    if wr_neither is not None:
+                        entry["wr_neither"] = round(wr_neither, 4)
+                        entry["n_neither"] = n_neither
+                    interactions.append(entry)
 
     interactions.sort(key=lambda x: -abs(x["delta"]))
     return interactions
@@ -1574,7 +1853,7 @@ def regime_profile_optimizer(
             })
     return {"valid": True, "regime_field": regime_field, "regimes": regimes}
 
-# ════════════��══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 #  RISK FLAGS — Config Version Hash & Actionability
 # ═══════════════════════════════════════════════════════════════════════
 def compare_config_versions(
@@ -1632,9 +1911,91 @@ def compare_config_versions(
 
     return comparisons
 
-def hash_config_state(weights: Dict[str, float], threshold: float, min_pct: float) -> str:
-    payload = json.dumps({"w": weights, "t": threshold, "p": min_pct}, sort_keys=True)
-    return hashlib.md5(payload.encode()).hexdigest()[:12]
+# Fields whose value change materially alters the feature distribution and
+# therefore invalidates comparison of outcomes across a hash boundary.
+# Kept as an explicit list rather than hashing all of cfg so unrelated
+# operational knobs (timeouts, retries, chat IDs) don't cause a version
+# bump that silently fragments the comparison sample.
+_STRUCTURAL_CONFIG_FIELDS: Tuple[str, ...] = (
+    # ── gate periods ──
+    "PPO_FAST", "PPO_SLOW", "PPO_SIGNAL",
+    "PPO_GATE_FAST", "PPO_GATE_SLOW", "PPO_GATE_SIGNAL",
+    "RMA_50_PERIOD", "RMA_200_PERIOD", "RMA_CLOUD_FAST_PERIOD",
+    "RSI_GUARD_RSI_LEN", "RSI_GUARD_KALMAN_LEN", "RSI_GUARD_EMA_LEN",
+    "SRSI_RSI_LEN", "SRSI_KALMAN_LEN", "SRSI_EMA_LEN",
+    "HIST_RMA_FAST", "HIST_RMA_SLOW",
+    "ATR_SHORT", "ATR_LONG",
+    "ADX_DI_LENGTH", "ADX_SMOOTHING_LENGTH",
+    "ICHIMOKU_CONVERSION_PERIODS", "ICHIMOKU_BASE_PERIODS",
+    "ICHIMOKU_SPANB_PERIODS", "ICHIMOKU_DISPLACEMENT",
+    "ICHIMOKU_TK_CONVERSION_PERIODS", "ICHIMOKU_TK_BASE_PERIODS",
+    "DYNAMIC_FLOW_FACTOR", "DYNAMIC_FLOW_BASIS_LENGTH", "DYNAMIC_FLOW_DIST_LENGTH",
+    # ── lookback windows that reshape the feature set ──
+    "OB_LOOKBACK_CANDLES", "OB_IMPULSE_LOOKAHEAD", "OB_CONFIRM_LOOKAHEAD_CANDLES",
+    "OB_PERSISTENCE_CANDLES", "OB_MIN_PENETRATION_ATR_MULT",
+    "CHOCH_SWING_LEN", "CHOCH_LOOKBACK_CANDLES", "CHOCH_CONFIRM_WINDOW_CANDLES",
+    "FIB_REVERSAL_SWING_LENGTH", "FIB_REVERSAL_SWING_LOOKBACK_CANDLES",
+    "ATR_PCTL_LOOKBACK", "VOLUME_PCTL_LOOKBACK",
+    "PIVOT_LOOKBACK_PERIOD",
+    # ── adaptive thresholds carried on each alert ──
+    "PPO_ADAPTIVE_CALM", "PPO_ADAPTIVE_VOLATILE",
+    "RSI_ADAPTIVE_BUY_CALM", "RSI_ADAPTIVE_BUY_VOLATILE",
+    "RSI_ADAPTIVE_SELL_CALM", "RSI_ADAPTIVE_SELL_VOLATILE",
+    "ADX_ADAPTIVE_TARGET_PCTL", "ADX_STRENGTH_PCTL",
+    "ATR_PCTL_VOTE_MIN", "VOLUME_PCTL_VOTE_MIN",
+    "RVOL_THRESHOLD", "ADAPTIVE_MULT_CALM", "ADAPTIVE_MULT_VOLATILE",
+    # ── flags that toggle which votes exist at all ──
+    "ENABLE_PPO_GATE", "RSI_GUARD_ENABLED",
+    "RMA_CLOUD_ENABLED", "ICHIMOKU_CLOUD_ENABLED", "DYNAMIC_FLOW_RIBBON_ENABLED",
+    "ICHIMOKU_TK_GUARD_ENABLED",
+    "ENABLE_ADX_STRENGTH_VOTE", "ENABLE_ATR_PCTL_VOTE", "ENABLE_VOLUME_PCTL_VOTE",
+    "ENABLE_PPO_GATE_MOMENTUM_VOTE", "ENABLE_RSI_GUARD_MOMENTUM_VOTE",
+    "ENABLE_RMA_CLOUD_MOMENTUM_VOTE", "ENABLE_VWAP_MOMENTUM_VOTE",
+    "ENABLE_OB_GATE", "ENABLE_OI_FUNDING_FILTER", "ENABLE_CPR",
+    "OB_MIN_OTHER_SCORE",
+)
+
+def hash_config_state(
+    weights: Dict[str, float],
+    threshold: float,
+    min_pct: float,
+    extra_fields: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Stable fingerprint of the config knobs that actually change the
+    feature/outcome distribution.
+
+    The original only hashed weights + threshold + min_pct. That misses
+    every tunable that reshapes the input features — e.g. flipping
+    ICHIMOKU_CLOUD_ENABLED, changing OB_LOOKBACK_CANDLES, or swapping
+    PPO_GATE_FAST changes the vote set/values without changing any of the
+    three hashed fields. Rows tagged with the same hash but generated
+    under different structural settings then get compared as if they were
+    the same version, quietly corrupting compare_config_versions().
+
+    extra_fields: callers that already have a subset of cfg values handy
+    can pass them in. When None, we pull from the live cfg via the
+    imported reference. `default=str` on json.dumps is a defensive
+    fallback so any unexpected non-serializable straggler doesn't crash
+    the entire report.
+    """
+    if extra_fields is None:
+        extra_fields = {}
+        for field in _STRUCTURAL_CONFIG_FIELDS:
+            try:
+                extra_fields[field] = getattr(cfg, field, None)
+            except Exception:
+                pass
+    payload = json.dumps(
+        {
+            "w": weights,
+            "t": threshold,
+            "p": min_pct,
+            "x": extra_fields,
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.md5(payload.encode()).hexdigest()[:12] 
 
 def score_actionability(rec: Dict[str, Any]) -> float:
     impact = abs(rec.get("delta_ev", 0)) * 100.0
@@ -1665,6 +2026,26 @@ def multi_metric_summary(rows: List[Row], min_sample: int = 10) -> Dict[str, Any
     mfe_wins = sum(1 for r in rows if r.get("mfe_win") is True)
     mae_losses = sum(1 for r in rows if r.get("mae_loss") is True)
 
+    # ── McNemar 2×2 table for close_win vs mfe_win ────────────────────
+    paired_rows = [r for r in rows if r.get("mfe_win") is not None]
+    n_paired = len(paired_rows)
+    if n_paired >= 1:
+        both_wins = sum(
+            1 for r in paired_rows
+            if r.get("close_win", r["win"]) and r["mfe_win"] is True
+        )
+        mfe_only = sum(
+            1 for r in paired_rows
+            if r.get("close_win", r["win"]) is False and r["mfe_win"] is True
+        )
+        close_only = sum(
+            1 for r in paired_rows
+            if r.get("close_win", r["win"]) and r["mfe_win"] is False
+        )
+        neither_wins = n_paired - both_wins - mfe_only - close_only
+    else:
+        both_wins = mfe_only = close_only = neither_wins = 0
+
     # tp_first: True means TP was hit before SL (the "realistic" win)
     tp_first_rows = [r for r in rows if r.get("tp_first") is not None]
     tp_before_sl = sum(1 for r in tp_first_rows if r["tp_first"] is True)
@@ -1681,7 +2062,6 @@ def multi_metric_summary(rows: List[Row], min_sample: int = 10) -> Dict[str, Any
         1 for r in rows
         if r.get("mfe_win") is True and r.get("mae_loss") is not True
     )
-
     result: Dict[str, Any] = {
         "valid": True,
         "n": n,
@@ -1690,8 +2070,13 @@ def multi_metric_summary(rows: List[Row], min_sample: int = 10) -> Dict[str, Any
         "mae_loss_rate": mae_losses / n,
         "clean_win_rate": clean_wins / n,
         "both_hit_rate": both_hit / n,
+        # ── McNemar inputs (see mcnemar_exact_p) ──
+        "mfe_only": mfe_only,
+        "close_only": close_only,
+        "both_wins": both_wins,
+        "neither_wins": neither_wins,
+        "n_paired": n_paired,
     }
-
     if tp_first_rows:
         result["tp_before_sl_rate"] = tp_before_sl / len(tp_first_rows)
         result["sl_before_tp_rate"] = sl_before_tp / len(tp_first_rows)
@@ -1896,7 +2281,6 @@ def _map_coefficients_to_weights(
         suggested[vn] = round(final, 2)
 
     return suggested
-
 
 def optimize_vote_weights(
     rows: List[Row],
