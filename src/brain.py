@@ -636,9 +636,9 @@ class BrainEngine:
                         f"_ALERT_CONFIG_MAP — no config_patch was emitted. Add a mapping or disable manually."
                     ),
                 })
-
         threshold_rec: Dict[str, Any] = {}
         net_ev = half_kelly = kelly_wr = None
+        target_floor: Optional[float] = None
         rec = engine.recommend_threshold(
             real_rows, target_winrate=target_wr, min_sample=min_sample,
         ) if real_rows else {"valid": False}
@@ -728,7 +728,6 @@ class BrainEngine:
                     f"{wf_note}"
                 ),
             }
-
             # ── Stability Gate check on threshold recommendation ─────────────
             if emit_patch:
                 history = await self.sdb.load_threshold_history()
@@ -826,31 +825,30 @@ class BrainEngine:
                     f"Diagnostic only — no regime-specific threshold applied yet."
                 ),
             })
-
-        attribution = engine.outcome_attribution(
-            real_rows, CONFLUENCE_WEIGHTS, threshold=target_floor, min_sample=min_sample,
-        )
-        flagged = [
-            e for e in attribution
-            if e.get("rescued_valid") and e["n_rescued"] >= min_sample and e["rescued_wr"] < target_wr - 0.10
-        ]
-        if flagged:
-            lines = [
-                f"  • {e['vote']}: rescues {e['n_rescued']} trades ({e['rescued_pct']:.0%} of its True cases) "
-                f"at only {e['rescued_wr']:.0%} WR [{e['rescued_wilson_lo']:.0%}-{e['rescued_wilson_hi']:.0%}]"
-                for e in flagged[:5]
+        if target_floor is not None:
+            attribution = engine.outcome_attribution(
+                real_rows, CONFLUENCE_WEIGHTS, threshold=target_floor, min_sample=min_sample,
+            )
+            flagged = [
+                e for e in attribution
+                if e.get("rescued_valid") and e["n_rescued"] >= min_sample and e["rescued_wr"] < target_wr - 0.10
             ]
-            recommendations.append({
-                "type": "outcome_attribution", "severity": "medium",
-                "message": (
-                    f"Outcome attribution at threshold {target_floor:.1f}: {len(flagged)} vote(s) are "
-                    f"propping up trades that clear the bar only because of that vote's weight, and "
-                    "those specific trades underperform target WR:\n" + "\n".join(lines) + "\n"
-                    "Consider re-checking these votes' weights — this is diagnostic, no config "
-                    "patch is auto-applied."
-                ),
-            })
-
+            if flagged:
+                lines = [
+                    f"  • {e['vote']}: rescues {e['n_rescued']} trades ({e['rescued_pct']:.0%} of its True cases) "
+                    f"at only {e['rescued_wr']:.0%} WR [{e['rescued_wilson_lo']:.0%}-{e['rescued_wilson_hi']:.0%}]"
+                    for e in flagged[:5]
+                ]
+                recommendations.append({
+                    "type": "outcome_attribution", "severity": "medium",
+                    "message": (
+                        f"Outcome attribution at threshold {target_floor:.1f}: {len(flagged)} vote(s) are "
+                        f"propping up trades that clear the bar only because of that vote's weight, and "
+                        f"those specific trades underperform target WR:\n" + "\n".join(lines) + "\n"
+                        "Consider re-checking these votes' weights — this is diagnostic, no config "
+                        "patch is auto-applied."
+                    ),
+                })
         anomalies_check = engine.flag_anomalous_rows(real_rows, min_sample=min_sample)
         if anomalies_check["valid"] and anomalies_check["n_flagged"] > 0:
             top = anomalies_check["flagged"][:5]
