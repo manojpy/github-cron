@@ -512,9 +512,10 @@ class BrainEngine:
                         f"_ALERT_CONFIG_MAP — no config_patch was emitted. Add a mapping or disable manually."
                     ),
                 })
-
         threshold_rec: Dict[str, Any] = {}
         net_ev = half_kelly = kelly_wr = None
+        ev_ci = None
+
         rec = engine.recommend_threshold(
             real_rows, target_winrate=target_wr, min_sample=min_sample,
         ) if real_rows else {"valid": False}
@@ -625,13 +626,22 @@ class BrainEngine:
                 net_ev, half_kelly, kelly_wr = engine.ev_and_kelly_for(rec_subset_kelly)
                 kelly_maes = [r["mae"] for r in rec_subset_kelly if r.get("mae") is not None]
                 mae_note = f" | Mean MAE: {statistics.mean(kelly_maes):.2%}" if kelly_maes else ""
+
+                ev_ci = engine.bootstrap_ev_ci(rec_subset_kelly)
+                ci_note = ""
+                if ev_ci.get("valid"):
+                    ci_note = (
+                        f" | EV 90% CI: [{ev_ci['ev_p5']:+.3f}%, {ev_ci['ev_p95']:+.3f}%]"
+                        f"{' ⚠️ worst-case unprofitable' if ev_ci['ev_p5'] <= 0 else ''}"
+                    )
+
                 recommendations.append({
                     "type": "kelly_sizing",
-                    "severity": "low",
+                    "severity": "low" if not (ev_ci.get("valid") and ev_ci["ev_p5"] <= 0) else "medium",
                     "message": (
                         f"Net EV (after fees/slippage): {net_ev:+.3f}%/trade | "
                         f"Half-Kelly position size: {half_kelly:.1%} | "
-                        f"WR: {kelly_wr:.0%}{mae_note}"
+                        f"WR: {kelly_wr:.0%}{mae_note}{ci_note}"
                     ),
                 })
 
@@ -1026,6 +1036,8 @@ class BrainEngine:
                 "brier_status": brier_status,
                 "net_ev": round(net_ev, 4) if net_ev is not None else None,
                 "half_kelly": round(half_kelly, 4) if half_kelly is not None else None,
+                "ev_p5": round(ev_ci["ev_p5"], 4) if ev_ci and ev_ci.get("valid") else None,
+                "ev_p95": round(ev_ci["ev_p95"], 4) if ev_ci and ev_ci.get("valid") else None,
                 "cusum_drifts": len(drift_alerts),
                 "threshold_history": await self.sdb.load_threshold_history(),
                 "ood_status": ood_status,
