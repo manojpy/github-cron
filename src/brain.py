@@ -1383,7 +1383,7 @@ class BrainEngine:
         # ── 🔧 REPAIR SHOP ──
         repairs = [r for r in recs["recommendations"] if r["type"] == "repair_shop"]
         if repairs:
-            lines.append(f"*🔧 REPAIR SHOP* ({len(repairs)} issues)")
+            lines.append(f"*🔧 REPAIR SHOP* {escape_markdown_v2(f'({len(repairs)} issues)')}")
             for i, r in enumerate(repairs[:5], 1):
                 sev_icon = {"critical": "🚨", "high": "🔴", "medium": "⚠️", "low": "ℹ️"}.get(r["severity"], "•")
                 # Compact: first 2 lines only
