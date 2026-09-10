@@ -1,3 +1,5 @@
+name: 🤖 Run MACD Unified Bot (Hybrid)
+
 on:
   workflow_dispatch:
     inputs:
