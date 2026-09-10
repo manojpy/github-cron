@@ -26,10 +26,9 @@ class AlertPayload:
     alert_keys: List[str] = field(default_factory=list)
     record_win_rate: Optional[Callable[[], Awaitable[None]]] = None
 
-
 from bot_config import (
     cfg, logger, Constants, CompiledPatterns, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
-    shutdown_event, format_ist_time, json_dumps, CONFLUENCE_WEIGHTS, BtcMacroContext,
+    shutdown_event, format_ist_time, json_dumps, json_loads, CONFLUENCE_WEIGHTS, BtcMacroContext,
     ClusterContext, BiasContext, _get_session_from_ts,
 )
 from fetcher import (
