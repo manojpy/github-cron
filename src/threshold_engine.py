@@ -2162,7 +2162,6 @@ def _score_with_beta(
     wr = hits / total if total else 0.0
     return wr, total
 
-
 def _map_coefficients_to_weights(
     beta: List[float],
     vote_names: List[str],
@@ -2423,6 +2422,25 @@ def repair_shop_diagnosis(
         return repairs
 
     n = len(rows)
+    if n < min_sample:
+        return [{
+            "severity": "medium",
+            "category": "insufficient_data",
+            "diagnosis": (
+                f"Only {n} outcome rows in the analysis window — below the "
+                f"minimum {min_sample} needed for any other diagnostic to be "
+                f"statistically meaningful."
+            ),
+            "action": (
+                f"Wait for the archive to accumulate at least {min_sample} "
+                f"resolved outcomes before acting on any Brain advisory. At "
+                f"current resolution rates this typically takes a few days."
+            ),
+            "expected_impact": (
+                "Prevents acting on sample noise as if it were a real signal."
+            ),
+        }]
+
     overall_wr = sum(r["win"] for r in rows) / n
     buy_rows = [r for r in rows if r["direction"] == "buy"]
     sell_rows = [r for r in rows if r["direction"] == "sell"]

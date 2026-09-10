@@ -646,21 +646,22 @@ class BrainEngine:
         # ── Brier Score / Calibration ────────────────────────────────────
         brier, cal_curve = engine.brier_score_and_calibration(real_rows)
         cal_alerts = engine.calibration_alert(real_rows)
-        brier_status = "Healthy" if brier < 0.20 else "MISALIBRATED"
-        recommendations.append({
-            "type": "calibration",
-            "severity": "medium" if brier >= 0.20 or cal_alerts else "low",
-            "brier_score": round(brier, 4),
-            "brier_status": brier_status,
-            "message": (
-                f"Model Calibration (Brier): {brier:.3f} ({brier_status})"
-                + (
-                    f" | {len(cal_alerts)} bucket(s) show predicted-vs-observed "
-                    f"divergence >10%"
-                    if cal_alerts else ""
-                )
-            ),
-        })
+        if cal_curve or cal_alerts:
+            brier_status = "Healthy" if brier < 0.20 else "MISALIBRATED"
+            recommendations.append({
+                "type": "calibration",
+                "severity": "medium" if brier >= 0.20 or cal_alerts else "low",
+                "brier_score": round(brier, 4),
+                "brier_status": brier_status,
+                "message": (
+                    f"Model Calibration (Brier): {brier:.3f} ({brier_status})"
+                    + (
+                        f" | {len(cal_alerts)} bucket(s) show predicted-vs-observed "
+                        f"divergence >10%"
+                        if cal_alerts else ""
+                    )
+                ),
+            })
         if cal_alerts:
             for ca in cal_alerts[:3]:
                 recommendations.append({
