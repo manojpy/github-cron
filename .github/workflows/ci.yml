@@ -1,0 +1,43 @@
+name: ci
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install linters
+        run: pip install pyflakes==3.2.0 mypy==1.11.0
+      - name: Syntax gate (py_compile everything)
+        run: python -m compileall -q .
+      - name: Pyflakes (BLOCKING)
+        # F-codes: undefined names, unused imports, redefined-unused —
+        # exactly the class of bug that shipped the logger regression.
+        run: pyflakes .
+      - name: Mypy (advisory until the baseline is clean, then make blocking)
+        continue-on-error: true
+        run: |
+          python -m mypy --ignore-missing-imports --no-error-summary \
+            threshold_engine.py archive_reader.py brain.py brain_enhanced.py
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # bot_config.load_config() hard-exits without these; CI dummies are fine
+      TELEGRAM_BOT_TOKEN: "123456:CI_DUMMY_TOKEN_FOR_TESTS"
+      TELEGRAM_CHAT_ID: "12345"
+      REDIS_URL: "redis://localhost:6379/0"
+      DELTA_API_BASE: "https://api.example.com"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pytest numpy pydantic orjson
+      - run: python -m pytest tests/ -q
