@@ -1165,7 +1165,7 @@ class BrainEngine:
             "current_config": {
                 "CONFLUENCE_MIN_ABS_SCORE": cfg.CONFLUENCE_MIN_ABS_SCORE,
                 "CONFLUENCE_MIN_PCT": cfg.CONFLUENCE_MIN_PCT,
-            },
+            },  
             "ai_metrics": {
                 "brier_score": round(brier, 4) if has_calibration_data else None,
                 "brier_status": brier_status,
@@ -1175,6 +1175,7 @@ class BrainEngine:
                 "threshold_history": await self.sdb.load_threshold_history(),
                 "ood_status": ood_status,
             },
+        }
     # ── Report generation / delivery ─────────────────────���──────────────────
 
     async def _next_run_count(self) -> Optional[int]:
