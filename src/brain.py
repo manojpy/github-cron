@@ -646,7 +646,9 @@ class BrainEngine:
         # ── Brier Score / Calibration ────────────────────────────────────
         brier, cal_curve = engine.brier_score_and_calibration(real_rows)
         cal_alerts = engine.calibration_alert(real_rows)
-        if cal_curve or cal_alerts:
+        has_calibration_data = bool(cal_curve or cal_alerts)
+        brier_status: Optional[str] = None
+        if has_calibration_data:
             brier_status = "Healthy" if brier < 0.20 else "MISALIBRATED"
             recommendations.append({
                 "type": "calibration",
@@ -1165,7 +1167,7 @@ class BrainEngine:
                 "CONFLUENCE_MIN_PCT": cfg.CONFLUENCE_MIN_PCT,
             },
             "ai_metrics": {
-                "brier_score": round(brier, 4),
+                "brier_score": round(brier, 4) if has_calibration_data else None,
                 "brier_status": brier_status,
                 "net_ev": round(net_ev, 4) if net_ev is not None else None,
                 "half_kelly": round(half_kelly, 4) if half_kelly is not None else None,
@@ -1173,7 +1175,6 @@ class BrainEngine:
                 "threshold_history": await self.sdb.load_threshold_history(),
                 "ood_status": ood_status,
             },
-        }
 
     # ── Report generation / delivery ─────────────────────���──────────────────
 
