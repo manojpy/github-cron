@@ -13,6 +13,7 @@ import random
 import statistics
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
+from bot_config import cfg
 
 Row = Dict[str, Any]
 CapRow = Tuple[float, int, float, float]  # (cap, n, wr, wilson_lower_bound)
@@ -1400,81 +1401,6 @@ def _sigmoid(z: float) -> float:
         return 1.0 / (1.0 + math.exp(-z))
     ez = math.exp(z)
     return ez / (1.0 + ez)
-
-def optimize_vote_weights(
-    rows: List[Row],
-    current_weights: Dict[str, float],
-    min_sample: int = 100,
-    max_iter: int = 2000,
-    lr: float = 0.05,
-    l2: float = 0.01,
-) -> Dict[str, Any]:
-    """Data-driven CONFLUENCE_WEIGHTS via gradient-descent logistic regression."""
-    vote_names = sorted(current_weights.keys())
-    X: List[List[float]] = []
-    y: List[float] = []
-    sample_weights: List[float] = []
-    for r in rows:
-        votes = r.get("votes")
-        if not votes or not isinstance(votes, dict):
-            continue
-        vec = [1.0] + [1.0 if votes.get(vn) else 0.0 for vn in vote_names]
-        X.append(vec)
-        y.append(1.0 if r["win"] else 0.0)
-        sample_weights.append(r.get("win_weight", 1.0) if r["win"] else 1.0)
-
-    n = len(X)
-    if n < min_sample:
-        return {"valid": False, "error": f"insufficient_data: {n} < {min_sample}"}
-
-    win_rate = sum(y) / n
-    beta = [0.0] * (len(vote_names) + 1)
-    beta[0] = math.log(win_rate / (1 - win_rate)) if 0 < win_rate < 1 else 0.0
-
-    total_sw = sum(sample_weights)
-    for iteration in range(max_iter):
-        grad = [0.0] * len(beta)
-        for i in range(n):
-            z = sum(beta[j] * X[i][j] for j in range(len(beta)))
-            p = _sigmoid(z)
-            error = p - y[i]
-            sw = sample_weights[i]
-            for j in range(len(beta)):
-                grad[j] += error * X[i][j] * sw
-        # Normalize by total sample weight (not n), add L2 regularization
-        for j in range(len(beta)):
-            grad[j] = grad[j] / total_sw + l2 * beta[j]
-
-        # Use cosine-annealed learning rate (0.05 → 0.001)
-        step = lr * (0.5 * (1 + math.cos(math.pi * iteration / max_iter)))
-        for j in range(len(beta)):
-            beta[j] -= step * grad[j]
-
-    intercept = beta[0]
-    coeffs = beta[1:]
-    positive_coeffs = [max(0.0, c) for c in coeffs]
-    total_pos = sum(positive_coeffs)
-
-    suggested: Dict[str, float] = {}
-    negative_votes: List[Tuple[str, float]] = []
-    for idx, vn in enumerate(vote_names):
-        c = coeffs[idx]
-        if c < -0.05:
-            negative_votes.append((vn, round(c, 4)))
-        if total_pos > 0 and positive_coeffs[idx] > 0:
-            raw = 3.0 * (positive_coeffs[idx] / (total_pos / len(vote_names)))
-            suggested[vn] = round(min(5.0, max(0.5, raw)), 2)
-        else:
-            suggested[vn] = 0.0
-
-    return {
-        "valid": True,
-        "n_samples": n,
-        "intercept": round(intercept, 4),
-        "current_weights": dict(current_weights),
-        "suggested_weights": suggested,
-        "negative_votes": negative_votes,
-    }
 
 # ═══════════════════════════════════════════════════════════════════════
 #  PHASE 2 — PARAMETER AUTOPSY ENGINE
