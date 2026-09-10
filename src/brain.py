@@ -106,19 +106,11 @@ def _extract_p_value_for_fdr(
     rtype = rec.get("type")
 
     # ── Interactions: p_value already stamped by the miner ──
-    # The miner is the only place that knows which arm is the correct null
-    # for each of the three branches (synergy, v2-poison-v1, v1-poison-v2),
-    # so we read rather than reconstruct.
     if rtype == "vote_interaction":
         p = rec.get("p_value")
         return float(p) if isinstance(p, (int, float)) else None
 
-    # ── Calibration: one-sample against the train-split prediction ──
-    # `predicted` is a fixed reference from the train split, not a second
-    # sample from the same population, so this is a one-sample test. The
-    # earlier two_proportion form incorrectly treated a fixed proportion
-    # as if it were n i.i.d. Bernoulli draws, inflating the effective
-    # sample size and shrinking the p-value.
+    # ── Calibration: one-sample against the train-split prediction ─
     if rtype == "calibration_divergence":
         n = rec.get("n")
         pred = rec.get("predicted")
@@ -153,9 +145,6 @@ def _extract_p_value_for_fdr(
         return None
 
     # ── Disable alert: one-sample against BRAIN_ALERT_DISABLE_THRESHOLD_WR ──
-    # Claim: this alert's pooled WR is below the disable threshold. The
-    # gate at emission time is `hi < disable_wr` (Wilson upper bound), so
-    # the rec is already directional; the p-value is a second look.
     if rtype == "disable_alert":
         n = rec.get("sample_size")
         wr = rec.get("win_rate")
@@ -1176,12 +1165,11 @@ class BrainEngine:
                 "ood_status": ood_status,
             },
         }
-    # ── Report generation / delivery ─────────────────────���──────────────────
-
+    # ── Report generation / delivery ───────────────────────────────────────
     async def _next_run_count(self) -> Optional[int]:
         """Persisted run counter (Redis INCR) — safe across cron restarts."""
         if self.sdb.degraded or not self.sdb._redis:
-            logger.warning(
+            logging.getLogger("macd_bot").warning(
                 "Brain run counter skipped: Redis is degraded or unavailable "
                 "— brain report will not fire this run."
             )
@@ -1191,14 +1179,16 @@ class BrainEngine:
                 lambda: self.sdb._redis.incr(RedisKeyPrefix.BRAIN_RUN_COUNTER),
                 2.0, "brain_run_counter",
             )
+
             if result is None:
-                logger.warning(
+                logging.getLogger("macd_bot").warning(
                     "Brain run counter INCR returned None (Redis op likely timed out) "
                     "— brain report will not fire this run."
                 )
             return result
+
         except Exception as e:
-            logger.warning(f"Brain run counter INCR failed: {e} — brain report will not fire this run.")
+            logging.getLogger("macd_bot").warning(f"Brain run counter INCR failed: {e} — brain report will not fire this run.")
             return None
 
     async def _rollback_run_count(self) -> None:
