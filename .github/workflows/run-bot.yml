@@ -1,5 +1,4 @@
 name: 🤖 Run MACD Unified Bot (Hybrid)
-
 on:
   workflow_dispatch:
     inputs:
@@ -16,13 +15,13 @@ on:
         required: false
         default: false
         type: boolean
-      clear_kill_switch:
-        description: '🛑 Clear Kill Switch (resume dispatch immediately)'
+      brain_report:
+        description: '🧠 Send Brain Report'
         required: false
         default: false
         type: boolean
-      brain_report:
-        description: '🧠 Send Brain Report'
+      clear_kill_switch:
+        description: '🔓 Clear Kill Switch (manual override after review)'
         required: false
         default: false
         type: boolean
@@ -38,6 +37,7 @@ env:
   BOT_TIMEOUT: 660
   CLEAR_REDIS: ${{ inputs.clear_redis }}
   BRAIN_REPORT_ON_DEMAND: ${{ inputs.brain_report }}
+  CLEAR_KILL_SWITCH: ${{ inputs.clear_kill_switch }}
 
 jobs:
   run-bot:
@@ -67,26 +67,6 @@ jobs:
           fi
 
           echo "✅ All required secrets configured"
-
-      - name: 🛑 Clear Kill Switch (if requested)
-        if: ${{ inputs.clear_kill_switch }}
-        env:
-          REDIS_URL: ${{ secrets.REDIS_URL }}
-        run: |
-          echo "🛑 Clearing kill switch key (brain:kill_switch_active)..."
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq redis-tools
-
-          COUNT=$(redis-cli -u "$REDIS_URL" DEL "brain:kill_switch_active")
-
-          if [ "$COUNT" = "1" ]; then
-            echo "✅ Kill switch cleared — key existed and was removed"
-            echo "### 🛑 Kill Switch Cleared" >> $GITHUB_STEP_SUMMARY
-            echo "Dispatch will resume on this run." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "ℹ️ No kill switch key present (already clear)"
-            echo "### ℹ️ Kill Switch Was Already Clear" >> $GITHUB_STEP_SUMMARY
-          fi
 
       - name: 🔨 Create Config
         env:
@@ -176,6 +156,7 @@ jobs:
           echo "🧪 Dry Run: $DRY_RUN"
           echo "🧹 Clear Redis: $CLEAR_REDIS"
           echo "🧠 Brain Report: $BRAIN_REPORT_ON_DEMAND"
+          echo "🔓 Clear Kill Switch: $CLEAR_KILL_SWITCH"
           echo "::endgroup::"  
 
           START_TIME=$(date +%s)
@@ -192,6 +173,7 @@ jobs:
           TRIGGER_TIMESTAMP=$START_TIME
           CLEAR_REDIS=$CLEAR_REDIS
           BRAIN_REPORT_ON_DEMAND=$BRAIN_REPORT_ON_DEMAND
+          CLEAR_KILL_SWITCH=$CLEAR_KILL_SWITCH
           EOF
 
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run             --rm             --name "macd_bot_${{ github.run_id }}"             --platform linux/amd64             --memory="900m"             --memory-swap="1800m"             --cpus="2.0"             --security-opt=no-new-privileges             --read-only             --tmpfs /tmp:rw,noexec,nosuid,size=64m             --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m             --env-file "$ENV_FILE"             -e TZ=Asia/Kolkata             -e PYTHONPATH=/app/src             -e PYTHONUNBUFFERED=1             -e NUMBA_NUM_THREADS=2             -e OMP_NUM_THREADS=2             -e OUTCOME_DATA_DIR=/tmp/data-repo             -v "/tmp/data-repo:/tmp/data-repo:rw"             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro"             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>&1 | tee logs/bot_output.log
