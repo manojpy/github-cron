@@ -43,15 +43,13 @@ except ImportError:
 
 METADATA_PREFIX = "metadata:"
 CONFIG_OVERRIDE_KEY = "config_override"
-# Kept in sync with bot_config.py:CONFIG_OVERRIDE_ALLOWED_FIELDS by hand —
-# duplicated here rather than imported so this script stays runnable
-# without the rest of the bot's dependency stack. If you add a field to
-# the safelist in bot_config.py, add it here too.
 ALLOWED_FIELDS = {
     "CONFLUENCE_MIN_ABS_SCORE",
     "CONFLUENCE_MIN_PCT",
+    "RSI_ADAPTIVE_BUY_VOLATILE",
+    "RSI_ADAPTIVE_SELL_VOLATILE",
+    "PPO_ADAPTIVE_VOLATILE",
 }
-
 
 def parse_kv(s: str):
     if "=" not in s:

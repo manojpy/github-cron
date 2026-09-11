@@ -105,10 +105,12 @@ CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "rma_cloud_momentum": 1.0,
     "vwap_momentum": 1.0,
 }
-
 CONFIG_OVERRIDE_ALLOWED_FIELDS: Set[str] = {
     "CONFLUENCE_MIN_ABS_SCORE",
     "CONFLUENCE_MIN_PCT",
+    "RSI_ADAPTIVE_BUY_VOLATILE",
+    "RSI_ADAPTIVE_SELL_VOLATILE",
+    "PPO_ADAPTIVE_VOLATILE",
 }
 
 BRAIN_DISABLED_KEYS_METADATA_KEY = "brain_disabled_alert_keys"

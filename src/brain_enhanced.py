@@ -208,7 +208,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
             cur = (cur + "\n\n" + s) if cur else s
     if cur:
         msgs.append(cur)
-    return [_tg(m) for m in msgs]
+    return [escape_markdown_v2(m) for m in msgs]
 
 class BrainEngineV2(BaseBrainEngine):
     """Drop-in replacement for BrainEngine. Inherits the original and adds

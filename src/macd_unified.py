@@ -1301,27 +1301,18 @@ if __name__ == "__main__":
             sdb = RedisStateStore(cfg.REDIS_URL)
             await sdb.connect()
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
-            
-            try:
-                brain = BrainEngineV2(sdb)
-                success = await brain.apply_pending_plan(telegram_queue, logger_main)
-                sys.exit(0 if success else 1)
-            except Exception as e:
-                logger_main.critical(f"Apply brain failed: {e}")
-                sys.exit(1)
-            finally:
-                await sdb.close()
-        
-        asyncio.run(apply_brain_and_exit())
-        sys.exit(0)
+         
+         try:
+             brain = BrainEngineV2(sdb)
+             return await brain.apply_pending_plan(telegram_queue, logger_main)
+         except Exception as e:
+             logger_main.critical(f"Apply brain failed: {e}")
+             return False
+         finally:
+             await sdb.close()
+     success = asyncio.run(apply_brain_and_exit())
+     sys.exit(0 if success else 1)
     
-    if args.validate_only:
-        logger.info("Configuration validation passed - exiting (--validate-only mode)")
-        sys.exit(0)
-
-
-
-
     if args.validate_only:
         logger.info("Configuration validation passed - exiting (--validate-only mode)")
         sys.exit(0)
