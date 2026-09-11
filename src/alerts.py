@@ -993,7 +993,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
 
         if not has_valid_hist_rma and cfg.DEBUG_MODE and cfg.ENABLE_HIST_RMA:
             skip_reason = (
-                f"Hist RMA warmup" if i15 < MIN_HIST_RMA_BARS_VALID
+                "Hist RMA warmup" if i15 < MIN_HIST_RMA_BARS_VALID
                 else f"Hist RMA NaN (idx={i15})"
             )
             logger_pair.debug(f"Skipping Hist RMA alerts: {skip_reason}")

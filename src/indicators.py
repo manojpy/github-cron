@@ -269,7 +269,7 @@ def calculate_volume_ema_numpy(volume: np.ndarray, length: int) -> np.ndarray:
 def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
     try:
         if close is None or len(close) < max(fast, slow):
-            logger.warning(f"PPO: Insufficient data")
+            logger.warning("PPO: Insufficient data")
             default_len = len(close) if close is not None else 1
             return np.full(default_len, np.nan, dtype=np.float64), np.full(default_len, np.nan, dtype=np.float64)
 

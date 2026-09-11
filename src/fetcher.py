@@ -702,11 +702,12 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
     if any(np.isnan([o, h, l, c])) or any(np.isinf([o, h, l, c])):
         return False, False, None, f"Invalid OHLC: contains NaN or Inf"
     
+
     if any(x <= 0 for x in [o, h, l, c]):
-        return False, False, None, f"Invalid OHLC: non-positive values"
+        return False, False, None, "Invalid OHLC: non-positive values"
     
     if not (l <= o <= h and l <= c <= h):
-        return False, False, None, f"Invalid OHLC: relationships broken (O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f})"
+        return False, False, None, "Invalid OHLC: relationships broken (O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f})"
     
     if vol <= 0:
         return False, False, None, "Zero volume candle — likely exchange placeholder or maintenance window"

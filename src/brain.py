@@ -1026,8 +1026,8 @@ class BrainEngine:
                 "type": "close_vs_mfe_gap",
                 "severity": "medium",
                 "message": (
-                    f"🔍 Alerts where MFE WR >> Close WR (take-profit would have captured "
-                    f"these wins but the point-in-time check misses them):\n"
+                    "🔍 Alerts where MFE WR >> Close WR (take-profit would have captured "
+                    "these wins but the point-in-time check misses them):\n"
                     + "\n".join(gap_lines)
                 ),
             })

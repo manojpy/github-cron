@@ -1833,11 +1833,6 @@ def compare_config_versions(
 
     return comparisons
 
-# Fields whose value change materially alters the feature distribution and
-# therefore invalidates comparison of outcomes across a hash boundary.
-# Kept as an explicit list rather than hashing all of cfg so unrelated
-# operational knobs (timeouts, retries, chat IDs) don't cause a version
-# bump that silently fragments the comparison sample.
 _STRUCTURAL_CONFIG_FIELDS: Tuple[str, ...] = (
     # ── gate periods ──
     "PPO_FAST", "PPO_SLOW", "PPO_SIGNAL",
@@ -2136,7 +2131,6 @@ def _train_logistic(
             beta[j] -= step * grad[j]
     return beta
 
-
 def _score_with_beta(
     rows: List[Row], beta: List[float], vote_names: List[str],
     threshold: float = 0.5,
@@ -2394,7 +2388,7 @@ def permutation_vote_importance(
 
 # ═══════════════════════════════════════════════════════════════════════
 #  REPAIR SHOP DIAGNOSIS ENGINE
-# ═══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 
 def repair_shop_diagnosis(
     rows: List[Row],
@@ -2452,10 +2446,10 @@ def repair_shop_diagnosis(
                 f"(half of {target_wr:.0%} target). The strategy has negative edge."
             ),
             "action": (
-                f"1) STOP all live trading immediately. "
-                f"2) Raise CONFLUENCE_MIN_ABS_SCORE by +2 to filter weak signals. "
+                "1) STOP all live trading immediately. "
+                "2) Raise CONFLUENCE_MIN_ABS_SCORE by +2 to filter weak signals. "
                 f"3) Review the last {min(30, n)} trades manually for a systematic error "
-                f"(bad data, wrong timeframe, API issues)."
+                "(bad data, wrong timeframe, API issues)."
             ),
             "expected_impact": "Prevents further losses while diagnosing root cause.",
         })
@@ -2501,9 +2495,9 @@ def repair_shop_diagnosis(
                 f"{', '.join(drifted_names[:6])}."
             ),
             "action": (
-                f"Config patches FROZEN for these alerts. "
-                f"Manual review required before re-enabling auto-tuning. "
-                f"Check if a recent config change or market regime shift caused the decay."
+                "Config patches FROZEN for these alerts. "
+                "Manual review required before re-enabling auto-tuning. "
+                "Check if a recent config change or market regime shift caused the decay."
             ),
             "expected_impact": "Prevents auto-tuning from optimizing a broken signal.",
         })
@@ -2547,9 +2541,9 @@ def repair_shop_diagnosis(
             "category": "negative_ev",
             "diagnosis": f"Net EV {net_ev:+.3f}%/trade after fees/slippage. Strategy is unprofitable.",
             "action": (
-                f"1) Increase CONFLUENCE_MIN_ABS_SCORE to filter weak signals. "
-                f"2) Check if fee/slippage assumptions (0.06% + 0.03% per side) match your exchange. "
-                f"3) Consider widening OUTCOME_FAVORABLE_MOVE_PCT if TP is too tight."
+                "1) Increase CONFLUENCE_MIN_ABS_SCORE to filter weak signals. "
+                "2) Check if fee/slippage assumptions (0.06% + 0.03% per side) match your exchange. "
+                "3) Consider widening OUTCOME_FAVORABLE_MOVE_PCT if TP is too tight."
             ),
             "expected_impact": "Positive EV is the minimum requirement for a viable strategy.",
         })
@@ -2561,9 +2555,9 @@ def repair_shop_diagnosis(
             "category": "insufficient_data",
             "diagnosis": f"Only {n} samples in the analysis window. Statistical power is limited.",
             "action": (
-                f"Widen BRAIN_ANALYSIS_WINDOW_DAYS or lower BRAIN_REPORT_STREAM_SAMPLE "
-                f"to accumulate more data before trusting optimizer outputs. "
-                f"Treat all suggestions as provisional until n≥300."
+                "Widen BRAIN_ANALYSIS_WINDOW_DAYS or lower BRAIN_REPORT_STREAM_SAMPLE "
+                "to accumulate more data before trusting optimizer outputs. "
+                "Treat all suggestions as provisional until n≥300."
             ),
             "expected_impact": "Prevents overfitting to small samples.",
         })
