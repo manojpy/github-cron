@@ -1018,3 +1018,56 @@ class BrainEngineV2(BaseBrainEngine):
             except Exception as fallback_e:
                 logger_run.error(f"Fallback report also failed: {fallback_e}")
                 return None
+
+    async def maybe_generate_report(
+        self,
+        pairs: List[str],
+        telegram_queue: Any,
+        logger_run: logging.Logger,
+    ) -> None:
+        """Override: same run-count/interval gating as the base class, but
+        route the actual send through generate_report() (Profit Action Plan)
+        instead of BrainEngine._generate_and_send() (old jargon report)."""
+        interval = getattr(cfg, "BRAIN_REPORT_INTERVAL_RUNS", 48)
+        if interval <= 0:
+            logger_run.warning("BRAIN_REPORT_INTERVAL_RUNS is <= 0, disabling brain reports.")
+            return
+        if not getattr(cfg, "ENABLE_BRAIN", True):
+            return
+        if not cfg.ENABLE_WIN_RATE_FILTER:
+            logger_run.warning(
+                "ENABLE_BRAIN is on but ENABLE_WIN_RATE_FILTER is off — brain has no data source, skipping report."
+            )
+            return
+        if getattr(cfg, "DRY_RUN_MODE", False):
+            logger_run.info("DRY_RUN_MODE is on — skipping brain report (outcome data would be synthetic).")
+            return
+
+        run_count = await self._next_run_count()
+        if run_count is None or run_count % interval != 0:
+            return
+
+        try:
+            await self.generate_report(pairs, telegram_queue, logger_run)
+        except Exception:
+            await self._rollback_run_count()
+            raise
+
+    async def send_report_now(self, pairs: List[str], telegram_queue: Any, logger_run: logging.Logger) -> bool:
+        """Override: on-demand path also goes through generate_report() (Profit
+        Action Plan) instead of BrainEngine._generate_and_send()."""
+        if not getattr(cfg, "ENABLE_BRAIN", True):
+            logger_run.warning("ENABLE_BRAIN is off — skipping on-demand brain report.")
+            return True
+        if not cfg.ENABLE_WIN_RATE_FILTER:
+            logger_run.warning(
+                "ENABLE_BRAIN is on but ENABLE_WIN_RATE_FILTER is off — "
+                "brain has no data source, skipping report."
+            )
+            return True
+        if getattr(cfg, "DRY_RUN_MODE", False):
+            logger_run.info("DRY_RUN_MODE is on — skipping brain report (outcome data would be synthetic).")
+            return True
+
+        result = await self.generate_report(pairs, telegram_queue, logger_run)
+        return result is not None
