@@ -411,6 +411,8 @@ _ALERT_DEFINITIONS_RAW: List[Dict[str, Any]] = [
     {"key":"fib_reversal_sell","title":"🔴🌀 Fib Pivot Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("fib_reversal_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('fib_reversal_reason') or 'Fibonacci zone reversal'}","requires":["fib_reversal"]},
     {"key":"dynamic_flow_cross_buy","title":"🌊🟢 Dynamic Flow Cross BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("dynamic_flow_cross_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('dynamic_flow_cross_reason') or 'Dynamic Flow Ribbon flipped bullish'}","requires":["dynamic_flow_cross"]},
     {"key":"dynamic_flow_cross_sell","title":"🌊🔴 Dynamic Flow Cross SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("dynamic_flow_cross_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('dynamic_flow_cross_reason') or 'Dynamic Flow Ribbon flipped bearish'}","requires":["dynamic_flow_cross"]},
+    {"key":"equilibrium_cross_up","title":"⚖️🟢 Equilibrium Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_strict_wick",False) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Equilibrium {ctx.get('equilibrium_curr',0) or 0:.2f} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"equilibrium_cross_down","title":"⚖️🔴 Equilibrium Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_strict_wick",False) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Equilibrium {ctx.get('equilibrium_curr',0) or 0:.2f} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
 ]
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
     pivots = ctx.get("pivots")
@@ -510,6 +512,7 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
     for up_k, down_k, conv, conv_p in (
         (AlertKey.TK_CONVERSION_UP, AlertKey.TK_CONVERSION_DOWN, "tk_conversion_curr", "tk_conversion_prev"),
         (AlertKey.KIJUN_CROSS_UP,   AlertKey.KIJUN_CROSS_DOWN,   "tk_base_curr",       "tk_base_prev"),
+        (AlertKey.EQUILIBRIUM_CROSS_UP, AlertKey.EQUILIBRIUM_CROSS_DOWN, "equilibrium_curr", "equilibrium_prev"),
     ):
         c_c, c_p = context.get(conv), context.get(conv_p)
         if c_c is not None and c_p is not None and not np.isnan(c_c) and not np.isnan(c_p):
@@ -620,15 +623,16 @@ logger.debug("Alert keys initialized: %s mappings", len(ALERT_KEYS))
 BUY_ALERT_KEYS: Set[str] = {
     "ppo_signal_up", "ppo_zero_up", "ppo_adaptive_up",
     "rsi_ema5_up", "rsi_cross_adaptive_up", "vwap_up", "hist_rma_buy", "ppohist_buy",
-    "cloud_cross_up", "tk_conversion_up", "kijun_cross_up", "ob_reversal_buy", 
+    "cloud_cross_up", "tk_conversion_up", "kijun_cross_up", "equilibrium_cross_up", "ob_reversal_buy", 
     "strong_reversal_buy", "choch_buy", "dynamic_flow_cross_buy", "fib_reversal_buy",
 }
+
 BUY_ALERT_KEYS.update(f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY)
 
 SELL_ALERT_KEYS: Set[str] = {
     "ppo_signal_down", "ppo_zero_down", "ppo_adaptive_down",
     "rsi_ema5_down", "rsi_cross_adaptive_down", "vwap_down", "hist_rma_sell", "ppohist_sell",
-    "cloud_cross_down", "tk_conversion_down", "kijun_cross_down", "ob_reversal_sell",
+    "cloud_cross_down", "tk_conversion_down", "kijun_cross_down", "equilibrium_cross_down", "ob_reversal_sell",
     "strong_reversal_sell", "choch_sell", "dynamic_flow_cross_sell", "fib_reversal_sell",
 }
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
@@ -858,6 +862,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
     cloud_group_ok_buy, cloud_group_ok_sell = gr.cloud_group_ok_buy, gr.cloud_group_ok_sell
     tk_conversion_curr, tk_conversion_prev = gr.tk_conversion_curr, gr.tk_conversion_prev
     tk_base_curr, tk_base_prev = gr.tk_base_curr, gr.tk_base_prev
+    equilibrium_curr, equilibrium_prev = gr.equilibrium_curr, gr.equilibrium_prev
     tk_guard_ok_buy, tk_guard_ok_sell = gr.tk_guard_ok_buy, gr.tk_guard_ok_sell
     oscillator_group_ok_buy, oscillator_group_ok_sell = gr.oscillator_group_ok_buy, gr.oscillator_group_ok_sell
     ppo_gate_arr, ppo_gate_signal_arr = gr.ppo_gate_arr, gr.ppo_gate_signal_arr
@@ -1044,8 +1049,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
         dynamic_flow_cross_buy, dynamic_flow_cross_sell = False, False
         dynamic_flow_cross_reason = None
         if cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT:
-            dynamic_flow_cross_buy = bool(buy_common_wick and dynamic_flow_cross_up)
-            dynamic_flow_cross_sell = bool(sell_common_wick and dynamic_flow_cross_down)
+            dynamic_flow_cross_buy = bool(buy_common_relaxed_wick and dynamic_flow_cross_up)
+            dynamic_flow_cross_sell = bool(sell_common_relaxed_wick and dynamic_flow_cross_down)
 
             if dynamic_flow_cross_buy:
                 dynamic_flow_cross_reason = "Price reclaimed Dynamic Flow line (bullish)"
@@ -1107,6 +1112,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "cloud_lower_curr": cloud_lower_val, "cloud_lower_prev": cloud_lower_prev,
             "tk_guard_ok_buy": tk_guard_ok_buy, "tk_guard_ok_sell": tk_guard_ok_sell,
             "tk_conversion_curr": tk_conversion_curr, "tk_conversion_prev": tk_conversion_prev, "tk_base_curr": tk_base_curr, "tk_base_prev": tk_base_prev,
+            "equilibrium_curr": equilibrium_curr, "equilibrium_prev": equilibrium_prev,
             "rma_cloud_ok_buy": rma_cloud_ok_buy, "rma_cloud_ok_sell": rma_cloud_ok_sell,
             "rma_cloud_fast_curr": rma_cloud_fast_curr, "rma_cloud_slow_curr": rma50_15_val,
             "ichimoku_gate_ok_buy": ichimoku_gate_ok_buy, "ichimoku_gate_ok_sell": ichimoku_gate_ok_sell, 
@@ -1222,8 +1228,13 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 "validator": validate_conversion_cross,
                 "ctx_args": ("close_prev", "close_curr", "tk_base_prev", "tk_base_curr"),
             },
+            "equilibrium_cross": {
+                "keys": {"equilibrium_cross_up", "equilibrium_cross_down"},
+                "enabled": cfg.ENABLE_EQUILIBRIUM_CROSS,
+                "validator": validate_conversion_cross,
+                "ctx_args": ("close_prev", "close_curr", "equilibrium_prev", "equilibrium_curr"),
+            },
         }
-
         for alert_key in alert_keys_to_check:
             def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
             if not def_:

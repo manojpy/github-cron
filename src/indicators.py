@@ -1055,6 +1055,18 @@ def calculate_pine_order_blocks(o, h, l, c, atr200, ob_filter: str = 'Atr', swin
     final_obs  = active_obs[-ob_showlast:]   if ob_showlast  > 0 else []
     return final_iobs, final_obs
 
+def calculate_ob_equilibrium(h: np.ndarray, l: np.ndarray, i: int, lookback: int) -> float:
+    """SMC dealing-range equilibrium: the 50% midpoint of the high/low range over
+    the trailing `lookback` closed candles before index i. Same definition already
+    used by the OB premium/discount filter — factored out so other callers (e.g.
+    the equilibrium-cross alert) share one source of truth. NaN if not enough
+    history yet."""
+    if i <= lookback:
+        return float("nan")
+    range_high = np.max(h[i - lookback:i])
+    range_low = np.min(l[i - lookback:i])
+    return (range_high + range_low) / 2.0
+
 def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
     atr200 = calculate_atr_rma(h[:i15+1], l[:i15+1], c[:i15+1], 200)
     active_iobs, active_obs = calculate_pine_order_blocks(
@@ -1068,11 +1080,11 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
     zones = active_obs + active_iobs
     equilibrium = None
     lookback = cfg_obj.OB_LOOKBACK_CANDLES
-    if cfg_obj.ENABLE_OB_PREMIUM_DISCOUNT_FILTER and i15 > lookback:
-        range_high = np.max(h[i15 - lookback:i15])
-        range_low  = np.min(l[i15 - lookback:i15])
-        equilibrium = (range_high + range_low) / 2.0
-        
+    if cfg_obj.ENABLE_OB_PREMIUM_DISCOUNT_FILTER:
+        eq_val = calculate_ob_equilibrium(h, l, i15, lookback)
+        if not np.isnan(eq_val):
+            equilibrium = eq_val
+ 
     ob_ok_buy = ob_ok_sell = None
     reason_buy = reason_sell = None
     grace = cfg_obj.OB_CONFIRM_LOOKAHEAD_CANDLES

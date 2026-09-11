@@ -15,7 +15,7 @@ from indicators import (
     get_volume_percentile, get_adaptive_rvol_threshold, get_adaptive_ppo_threshold,
     get_adaptive_rsi_thresholds, get_adaptive_cpr_threshold, _order_block_gate_reason,
     _oi_funding_gate_reason, get_adaptive_adx_threshold_smoothed, _get_smoothed_pctl,
-    _choch_gate_reason,
+    _choch_gate_reason, calculate_ob_equilibrium, 
 )
 
 @dataclass(slots=True)
@@ -153,11 +153,15 @@ class GateResult:
     oi_funding_ok_buy: Optional[bool] = None
     oi_funding_ok_sell: Optional[bool] = None
     oi_funding_reason: Optional[str] = None
-
-    # -- order block / supply-demand (optional confluence vote) --
+    
+# -- order block / supply-demand (optional confluence vote) --
     ob_gate_ok_buy: Optional[bool] = None
     ob_gate_ok_sell: Optional[bool] = None
     ob_gate_reason: Optional[str] = None
+
+    # -- SMC dealing-range equilibrium (50% of OB_LOOKBACK_CANDLES range), for equilibrium-cross alert --
+    equilibrium_curr: Optional[float] = None
+    equilibrium_prev: Optional[float] = None
     
     # -- CHoCH liquidity-sweep reversal (optional confluence vote) --
     choch_gate_ok_buy: Optional[bool] = None
@@ -1005,6 +1009,15 @@ async def _eval_gate(
             if ob_gate_reason:
                 logger_pair.debug(f"[{pair_name}] OB gate: {ob_gate_reason}")
 
+        equilibrium_curr = equilibrium_prev = None
+        if cfg.ENABLE_EQUILIBRIUM_CROSS:
+            equilibrium_curr = calculate_ob_equilibrium(
+                data_15m.high, data_15m.low, i15, cfg.OB_LOOKBACK_CANDLES
+            )
+            equilibrium_prev = calculate_ob_equilibrium(
+                data_15m.high, data_15m.low, i15 - 1, cfg.OB_LOOKBACK_CANDLES
+            )
+
         choch_gate_ok_buy = choch_gate_ok_sell = None
         choch_reason = None
         choch_fvg_buy = choch_fvg_sell = False
@@ -1069,6 +1082,7 @@ async def _eval_gate(
             oi_funding_reason=oi_funding_reason,
             ob_gate_ok_buy=ob_gate_ok_buy, ob_gate_ok_sell=ob_gate_ok_sell,
             ob_gate_reason=ob_gate_reason,
+            equilibrium_curr=equilibrium_curr, equilibrium_prev=equilibrium_prev,
             choch_gate_ok_buy=choch_gate_ok_buy, choch_gate_ok_sell=choch_gate_ok_sell,
             choch_reason=choch_reason,
             choch_fvg_buy=choch_fvg_buy, choch_fvg_sell=choch_fvg_sell,
