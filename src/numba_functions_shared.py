@@ -640,6 +640,6 @@ if _exported_names != _registry_names:
         f"{_missing_from_export}."
     )
 
-__all__ = list(EXPORT_CONFIG.keys())
+__all__ = list(EXPORT_CONFIG.keys()) + ["SOURCE_VERSION"]
 
 logger.info(f"✅ Exported {len(__all__)}/{len(AOT_FUNCTION_NAMES)} Numba-compiled functions for AOT")
