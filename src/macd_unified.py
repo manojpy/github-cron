@@ -97,12 +97,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     cluster_context: Optional[ClusterContext] = None,
     bias_context: Optional[BiasContext] = None,
     gate_cache: Optional[Dict[str, Any]] = None) -> Optional[Tuple[str, Dict[str, Any], Optional[Any]]]:
-     
-    try:                                                       
-        logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
-        pair_oi = (oi_gate_data or {}).get(pair_name)
+                                                     
+    logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
+    pair_oi = (oi_gate_data or {}).get(pair_name)
 
-        cached = gate_cache.get(pair_name, _CLUSTER_CACHE_MISS) if gate_cache is not None else _CLUSTER_CACHE_MISS
+    cached = gate_cache.get(pair_name, _CLUSTER_CACHE_MISS) if gate_cache is not None else _CLUSTER_CACHE_MISS
 
     if cached is not _CLUSTER_CACHE_MISS:
         # Cluster pre-pass already ran _eval_gate for this pair with

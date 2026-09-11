@@ -365,8 +365,8 @@ async def _eval_gate(
         if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
             return None
 
-    if resolve_outcomes:
-        await _resolve_pair_outcomes(pair_name, data_15m, i15, sdb, logger_pair)
+        if resolve_outcomes:
+            await _resolve_pair_outcomes(pair_name, data_15m, i15, sdb, logger_pair)
 
         is_valid_for_buy, is_valid_for_sell, candle_info, error_msg = validate_candle_for_alerts(
             data_15m=data_15m.as_dict(),
