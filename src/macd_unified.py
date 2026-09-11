@@ -1278,6 +1278,7 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
     parser.add_argument("--validate-only", action="store_true", help="Validate config and exit")
     parser.add_argument("--skip-warmup", action="store_true", help="Skip Numba JIT warmup")
+    parser.add_argument("--apply-brain", action="store_true", help="Apply the last Brain action plan and exit")
     args = parser.parse_args()
 
     if args.debug:
@@ -1291,6 +1292,35 @@ if __name__ == "__main__":
     except ValueError as e:
         logger.critical(f"Configuration validation failed: {e}")
         sys.exit(1)
+
+    if args.apply_brain:
+        async def apply_brain_and_exit():
+            from brain_enhanced import BrainEngineV2
+            from alerts import TelegramQueue
+            
+            sdb = RedisStateStore(cfg.REDIS_URL)
+            await sdb.connect()
+            telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+            
+            try:
+                brain = BrainEngineV2(sdb)
+                success = await brain.apply_pending_plan(telegram_queue, logger_main)
+                sys.exit(0 if success else 1)
+            except Exception as e:
+                logger_main.critical(f"Apply brain failed: {e}")
+                sys.exit(1)
+            finally:
+                await sdb.close()
+        
+        asyncio.run(apply_brain_and_exit())
+        sys.exit(0)
+    
+    if args.validate_only:
+        logger.info("Configuration validation passed - exiting (--validate-only mode)")
+        sys.exit(0)
+
+
+
 
     if args.validate_only:
         logger.info("Configuration validation passed - exiting (--validate-only mode)")

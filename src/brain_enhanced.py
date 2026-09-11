@@ -2,25 +2,26 @@
 """brain_enhanced.py — Prescriptive Brain (Roadmap Phases 1.5-6)"""
 
 from __future__ import annotations
-import asyncio 
+import asyncio
+import json
 import logging
+import time
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import os
 from pathlib import Path
+
 from archive_reader import load_archived_outcomes
-
-from bot_config import cfg, CONFLUENCE_WEIGHTS
+from bot_config import cfg, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS, json_dumps, json_loads
 from state import RedisKeyPrefix, RedisStateStore
-
 from brain import BrainEngine as BaseBrainEngine, _extract_p_value_for_fdr
 import threshold_engine as engine
-
 from threshold_engine import (
     optimize_vote_weights, conditional_performance,
     interaction_miner, simulate_config_change, regime_profile_optimizer,
     hash_config_state, score_actionability, compare_config_versions,
 )
+from alerts import escape_markdown_v2
 
 _PHASE_MIN_SAMPLES = {
     "weight_optimizer": 100,
@@ -32,6 +33,182 @@ _PHASE_MIN_SAMPLES = {
     "config_regression": 20,
 }
 
+# ══════════════════════════════════════════════════════════════════════
+#  PLAIN-ENGLISH PROFIT ACTION PLAN (layman-friendly report layer)
+# ══════════════════════════════════════════════════════════════════════
+_TG_ESCAPE = re.compile(r'[_*\[\]()~`>#+\-=|{}.!]')
+
+
+def _tg(x: Any) -> str:
+    """MarkdownV2-escape so TelegramQueue.send() never rejects the message."""
+    return _TG_ESCAPE.sub(r'\\\g<0>', str(x))
+
+def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
+    """Translate Brain findings into a plain-English, copy-paste action plan.
+    Returns a list of Telegram-ready messages (each within the 4096-char limit)."""
+    rows = recs.get("_real_rows", []) or []
+    cfg_patch = recs.get("config_patch", []) or []
+    ai = recs.get("ai_metrics", {}) or {}
+    sections: List[str] = []
+
+    n = len(rows)
+    wins = sum(1 for r in rows if r["win"])
+    wr = wins / n if n else 0.0
+    target = getattr(cfg, "MIN_WIN_RATE", 0.55)
+    star = getattr(cfg, "BRAIN_STAR_ALERT_WR", 0.70)
+    kill_thr = getattr(cfg, "BRAIN_ALERT_DISABLE_THRESHOLD_WR", 0.40)
+    net_ev = ai.get("net_ev", 0.0) or 0.0
+
+    # ── BOTTOM LINE ────────────────────────────────────────────────────
+    try:
+        buy_wr, buy_n, sell_wr, sell_n = engine.direction_split(rows)
+        if wr >= target:
+            verdict = f"✅ You're WINNING at {wr:.0%} (target {target:.0%}). Keep what works; tweaks below push it higher."
+        else:
+            verdict = f"⚠️ You're LOSING at {wr:.0%} (target {target:.0%})."
+        dir_note = ""
+        if None not in (buy_wr, sell_wr) and buy_n >= 5 and sell_n >= 5:
+            if sell_wr < buy_wr - 0.15:
+                dir_note = f"Your SELL alerts win only {sell_wr:.0%} vs BUY {buy_wr:.0%} — the sell side is dragging you down."
+            elif buy_wr < sell_wr - 0.15:
+                dir_note = f"Your BUY alerts win only {buy_wr:.0%} vs SELL {sell_wr:.0%} — the buy side is dragging you down."
+        ev_note = f"Net per trade: {net_ev:+.2f}% after fees" + (" — negative ❌." if net_ev < 0 else " — positive ✅.")
+        low_data = f"\nℹ️ Only {n} trades so far — treat these as strong hints, not certainties." if n < 100 else ""
+        sections.append(
+            f"🧠 PROFIT ACTION PLAN\n📊 Based on {n} trades\n\n🎯 BOTTOM LINE\n{verdict}"
+            + (f"\n{dir_note}" if dir_note else "")
+            + f"\n{ev_note}{low_data}"
+        )
+    except Exception:
+        pass
+
+    # ── PER-ALERT HEALTH ───────────────────────────────────────────────
+    try:
+        stats = engine.per_alert_breakdown(rows, min_sample=1)  # (ak, wr, n, avg_score)
+        groups: Dict[str, List[str]] = {"🔴": [], "🟡": [], "🟢": [], "⚪": []}
+        for ak, awr, cnt, _avg in stats:
+            if cnt < 10:
+                groups["⚪"].append(f"⚪ {ak}: {awr:.0%} WR (n={cnt}) — not enough trades yet to judge")
+            elif awr >= star:
+                groups["🟢"].append(f"🟢 {ak}: {awr:.0%} WR (n={cnt}) — star performer, keep it")
+            elif awr >= target:
+                groups["🟢"].append(f"🟢 {ak}: {awr:.0%} WR (n={cnt}) — profitable, keep it")
+            elif awr >= kill_thr:
+                groups["🟡"].append(f"🟡 {ak}: {awr:.0%} WR (n={cnt}) — below {target:.0%} target; raise its required score or tighten its filter")
+            else:
+                groups["🔴"].append(f"🔴 {ak}: {awr:.0%} WR (n={cnt}) — losing money, disable it now")
+        titles = {"🔴": "DISABLE THESE NOW", "🟡": "IMPROVE THESE", "🟢": "KEEP THESE", "⚪": "NEED MORE DATA"}
+        block = "🚦 YOUR ALERTS — WHAT TO DO WITH EACH"
+        for e in ("🔴", "🟡", "🟢", "⚪"):
+            if groups[e]:
+                block += f"\n\n{titles[e]}:\n" + "\n".join(groups[e])
+        sections.append(block)
+    except Exception:
+        pass
+
+    # ── CONFLUENCE WEIGHT CHANGES ──────────────────────────────────────
+    try:
+        weight_lines: List[str] = []
+        for p in cfg_patch:
+            if p.get("path") != "CONFLUENCE_WEIGHTS":
+                continue
+            cur = p.get("current", {}) or {}
+            sug = p.get("suggested", {}) or {}
+            for vote, new_w in sug.items():
+                old_w = cur.get(vote, CONFLUENCE_WEIGHTS.get(vote, 0.0))
+                if abs(new_w - old_w) < 0.05:
+                    continue
+                if new_w > old_w:
+                    weight_lines.append(f"⬆️ {vote}: {old_w:.1f} → {new_w:.1f}  (this vote predicts wins — give it more power)")
+                else:
+                    weight_lines.append(f"⬇️ {vote}: {old_w:.1f} → {new_w:.1f}  (this vote hurts accuracy — reduce its power)")
+        if weight_lines:
+            sections.append(
+                "⚖️ CONFLUENCE WEIGHTS — CHANGE THESE\n"
+                "(How much each signal counts toward the entry gate)\n\n" + "\n".join(weight_lines)
+            )
+        else:
+            sections.append("⚖️ CONFLUENCE WEIGHTS\nNo safe weight changes yet — need more trade history before the Brain will move them.")
+    except Exception:
+        pass
+
+    # ── INDICATOR SETTING CHANGES ──────────────────────────────────────
+    try:
+        setting_lines: List[str] = []
+        for p in cfg_patch:
+            if p.get("path") == "CONFLUENCE_WEIGHTS":
+                continue
+            cur, sug = p.get("current"), p.get("suggested")
+            if cur is None or sug is None:
+                continue
+            setting_lines.append(f"🔧 {p['path']}: {cur} → {sug}\n   Why: {p.get('reason', 'data-driven optimum')}")
+        if setting_lines:
+            sections.append("🎚️ INDICATOR SETTINGS — CHANGE THESE\n\n" + "\n".join(setting_lines))
+    except Exception:
+        pass
+
+    # ── ENTRY GATE THRESHOLD ───────────────────────────────────────────
+    gate_rec = None
+    try:
+        rec_thr = engine.recommend_threshold(rows, target_winrate=target, min_sample=getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20))
+        if rec_thr.get("valid") and rec_thr.get("recommended") and rec_thr["recommended"] > cfg.CONFLUENCE_MIN_ABS_SCORE:
+            gate_rec = rec_thr
+            sections.append(
+                f"🚪 ENTRY BAR — RAISE IT\n"
+                f"CONFLUENCE_MIN_ABS_SCORE: {cfg.CONFLUENCE_MIN_ABS_SCORE:.1f} → {rec_thr['recommended']:.1f}\n"
+                f"   This alone filters out {rec_thr.get('dropped', 0)} weak trades "
+                f"({rec_thr.get('dropped_pct', 0):.0%}) and lifts expected WR to ~{rec_thr.get('rec_wr', 0):.0%}."
+            )
+    except Exception:
+        pass
+
+    # ── COPY-PASTE CONFIG BLOCK ────────────────────────────────────────
+    try:
+        json_changes: Dict[str, Any] = {}
+        for p in cfg_patch:
+            if p.get("path") == "CONFLUENCE_WEIGHTS":
+                json_changes["CONFLUENCE_WEIGHTS"] = p.get("suggested", {})
+            elif p.get("current") is not None and p.get("suggested") is not None:
+                json_changes[p["path"]] = p["suggested"]
+        if gate_rec is not None:
+            json_changes["CONFLUENCE_MIN_ABS_SCORE"] = round(gate_rec["recommended"], 1)
+        if json_changes:
+            sections.append("📋 COPY-PASTE INTO config_macd.json\n" + json.dumps(json_changes, indent=1))
+    except Exception:
+        pass
+
+    # ── BEST / WORST CONDITIONS ────────────────────────────────────────
+    try:
+        pair_stats = engine.per_pair_breakdown(rows, min_sample=5)  # worst-first
+        if len(pair_stats) >= 2:
+            worst, best = pair_stats[0], pair_stats[-1]
+            line = (f"🌍 WHERE YOU WIN & LOSE\n"
+                    f"🏆 Best: {best[0]} at {best[1]:.0%} WR (n={best[2]})\n"
+                    f"💀 Worst: {worst[0]} at {worst[1]:.0%} WR (n={worst[2]}) — consider removing this pair")
+            sess = engine.per_pair_session_breakdown(rows, min_sample=5)
+            if len(sess) >= 2:
+                line += f"\n⏰ Best session: {sess[-1][1]} ({sess[-1][2]:.0%}) | Worst: {sess[0][1]} ({sess[0][2]:.0%})"
+            sections.append(line)
+    except Exception:
+        pass
+
+    if not sections:
+        return []
+
+    # ── Pack sections into <4096-char messages ─────────────────────────
+    msgs: List[str] = []
+    cur = ""
+    for s in sections:
+        if len(cur) + len(s) + 2 > 3500:
+            if cur:
+                msgs.append(cur)
+            cur = s
+        else:
+            cur = (cur + "\n\n" + s) if cur else s
+    if cur:
+        msgs.append(cur)
+    return [_tg(m) for m in msgs]
+
 class BrainEngineV2(BaseBrainEngine):
     """Drop-in replacement for BrainEngine. Inherits the original and adds
     prescriptive phases 1.5-6 plus actionability scoring."""
@@ -39,6 +216,8 @@ class BrainEngineV2(BaseBrainEngine):
     def __init__(self, sdb: RedisStateStore):
         super().__init__(sdb)
         self._phase_samples = _PHASE_MIN_SAMPLES
+        self._recs_cache: Optional[Dict[str, Any]] = None
+        self._recs_cache_ts: float = 0.0
 
     @staticmethod
     def _shadow_weight_check(
@@ -116,6 +295,16 @@ class BrainEngineV2(BaseBrainEngine):
         return real_rows, shadow_rows
 
     async def generate_recommendations(self) -> Dict[str, Any]:
+        """Caching wrapper so the action plan + technical report share one compute."""
+        now = time.time()
+        if self._recs_cache is not None and (now - self._recs_cache_ts) < 120:
+            return self._recs_cache
+        result = await self._generate_recommendations_full()
+        self._recs_cache = result
+        self._recs_cache_ts = now
+        return result
+
+    async def _generate_recommendations_full(self) -> Dict[str, Any]:
         # ── 0. Baseline (original brain logic) ───────────────────────────
         base_recs = await self._generate_baseline_recommendations()
         real_rows = base_recs.get("_real_rows", [])
@@ -686,6 +875,145 @@ class BrainEngineV2(BaseBrainEngine):
         base["_real_rows"] = real_rows
         base["_shadow_rows"] = shadow_rows
         return base
-    
+
+    async def _store_pending_plan(self, recs: Dict[str, Any]) -> None:
+        """Store the current recommendations for later application."""
+        try:
+            # Extract actionable items
+            config_patches = []
+            disable_alerts = []
+            reinstate_alerts = []
+            
+            for rec in recs.get("recommendations", []):
+                rec_type = rec.get("type")
+                if rec_type == "disable_alert":
+                    ak = rec.get("alert_key")
+                    if ak:
+                        disable_alerts.append(ak)
+                elif rec_type == "reinstate_alert":
+                    ak = rec.get("alert_key")
+                    if ak:
+                        reinstate_alerts.append(ak)
+            
+            # Only store safe config patches
+            for patch in recs.get("config_patch", []):
+                field = patch.get("path")
+                suggested = patch.get("suggested")
+                if field in CONFIG_OVERRIDE_ALLOWED_FIELDS and suggested is not None:
+                    config_patches.append({
+                        "path": field,
+                        "current": patch.get("current"),
+                        "suggested": suggested,
+                        "reason": patch.get("reason", "")
+                    })
+            
+            plan_data = {
+                "generated_at": int(time.time()),
+                "config_patch": config_patches,
+                "disable_alerts": disable_alerts,
+                "reinstate_alerts": reinstate_alerts,
+            }
+            await self.sdb.set_metadata(
+                "brain_pending_plan",
+                json_dumps(plan_data),
+                ttl=7 * 86400  # 7 days
+            )
+        except Exception as e:
+            logging.getLogger("macd_bot").warning(f"Failed to store pending plan: {e}")
+
+    async def apply_pending_plan(self, telegram_queue, logger_run) -> bool:
+        """Apply the last generated action plan. Returns True if any changes were applied."""
+        try:
+            raw = await self.sdb.get_metadata("brain_pending_plan")
+            if not raw:
+                await telegram_queue.send(escape_markdown_v2(
+                    "⚠️ No pending brain plan found\\.\n"
+                    "Run a report first with `BRAIN_REPORT_ON_DEMAND=true`\\."
+                ))
+                return False
+            
+            plan = json_loads(raw)
+            applied = []
+            
+            # Apply config changes
+            for patch in plan.get("config_patch", []):
+                field = patch.get("path")
+                value = patch.get("suggested")
+                if field in CONFIG_OVERRIDE_ALLOWED_FIELDS:
+                    ok = await self.sdb.write_config_override(field, value)
+                    if ok:
+                        applied.append(f"✅ {field}: {value}")
+                        logger_run.info(f"Applied brain config: {field} = {value}")
+            
+            # Apply alert disables
+            for ak in plan.get("disable_alerts", []):
+                ok = await self.sdb.set_alert_key_disabled(ak, True)
+                if ok:
+                    applied.append(f"🔴 Disabled: {ak}")
+                    logger_run.info(f"Applied brain disable: {ak}")
+            
+            # Apply alert reinstates
+            for ak in plan.get("reinstate_alerts", []):
+                ok = await self.sdb.set_alert_key_disabled(ak, False)
+                if ok:
+                    applied.append(f"🟢 Reinstated: {ak}")
+                    logger_run.info(f"Applied brain reinstate: {ak}")
+            
+            if applied:
+                msg = (
+                    f"✅ APPLIED BRAIN PLAN\n"
+                    f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    + "\n".join(applied)
+                    + "\n\nRestart the bot for changes to take effect\\."
+                )
+                await telegram_queue.send(escape_markdown_v2(msg))
+                # Clear the pending plan
+                await self.sdb.set_metadata("brain_pending_plan", "{}", ttl=60)
+                return True
+            else:
+                await telegram_queue.send(escape_markdown_v2(
+                    "⚠️ No applicable changes in the plan\\.\n"
+                    "All recommended changes may already be applied\\."
+                ))
+                return False
+                
+        except Exception as e:
+            logger_run.error(f"Apply plan failed: {e}")
+            await telegram_queue.send(escape_markdown_v2(
+                f"❌ Failed to apply brain plan: {str(e)[:100]}"
+            ))
+            return False
+
     async def generate_report(self, pairs, telegram_queue, logger_run):
-        return await self._generate_and_send(pairs, telegram_queue, logger_run)
+        """Override: send ONLY the plain-English action plan (no jargon), then store for application."""
+        try:
+            recs = await self.generate_recommendations()
+            
+            # Build and send the plain-English action plan
+            plan_messages = build_profit_action_plan(recs, cfg)
+            for msg in plan_messages:
+                await telegram_queue.send(msg)
+            
+            # Add a footer explaining how to apply
+            apply_hint = (
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "📝 TO APPLY THESE CHANGES:\n"
+                "Run: `python macd_unified.py --apply-brain`\n"
+                "Or manually edit config_macd.json with the values above\\."
+            )
+            await telegram_queue.send(escape_markdown_v2(apply_hint))
+            
+            # Store the plan for later application
+            await self._store_pending_plan(recs)
+            
+            logger_run.info(f"Brain report sent ({len(plan_messages)} messages) and stored for application")
+            return recs
+            
+        except Exception as e:
+            logger_run.warning(f"Report generation failed: {e}")
+            # Fall back to the old technical report if the new one fails
+            try:
+                return await self._generate_and_send(pairs, telegram_queue, logger_run)
+            except Exception as fallback_e:
+                logger_run.error(f"Fallback report also failed: {fallback_e}")
+                return None
