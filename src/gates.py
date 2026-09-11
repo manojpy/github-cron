@@ -341,6 +341,16 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, flo
 
     return score, total, votes
 
+async def _resolve_pair_outcomes(pair_name, data_15m, i15, sdb, logger_pair):
+    """Run pending-outcome resolution for a pair. Split out of _eval_gate so the
+    cluster pre-pass can skip it (resolve_outcomes=False) and Phase 3 can re-run
+    it against a cached GateResult without re-running the whole gate pipeline."""
+    if not cfg.ENABLE_WIN_RATE_FILTER:
+        return
+    await sdb.resolve_pending_outcomes(pair_name, data_15m, i15, logger_pair)
+    if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
+        await sdb.resolve_shadow_pending_outcomes(pair_name, data_15m, i15, logger_pair)
+
 async def _eval_gate(
     pair_name: str, data_15m: PriceData, data_5m: PriceData, data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, correlation_id: str,
     reference_time: int, pair_oi: Optional[Dict[str, Any]] = None, resolve_outcomes: bool = True) -> Union[GateResult, Tuple[str, Dict[str, Any]], None]:
@@ -350,15 +360,12 @@ async def _eval_gate(
     rma50_15 = None
     rma200_5 = None
 
-    try:
-        i15 = get_last_closed_index_from_array(data_15m.ts, 15, reference_time, pair_name)
-        if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
-            return None
+    i15 = get_last_closed_index_from_array(data_15m.ts, 15, reference_time, pair_name)
+    if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
+        return None
 
-        if resolve_outcomes and cfg.ENABLE_WIN_RATE_FILTER:
-            await sdb.resolve_pending_outcomes(pair_name, data_15m, i15, logger_pair)
-            if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
-                await sdb.resolve_shadow_pending_outcomes(pair_name, data_15m, i15, logger_pair)
+    if resolve_outcomes:
+        await _resolve_pair_outcomes(pair_name, data_15m, i15, sdb, logger_pair)
 
         is_valid_for_buy, is_valid_for_sell, candle_info, error_msg = validate_candle_for_alerts(
             data_15m=data_15m.as_dict(),
