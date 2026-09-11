@@ -38,7 +38,7 @@ from state import (
     RedisKeyPrefix, RedisStateStore, RedisLock,
 )
 
-from gates import compute_confluence_score, _eval_gate, _resolve_pair_outcomes
+from gates import compute_confluence_score, _eval_gate
 
 import threshold_engine as engine
 
@@ -47,7 +47,6 @@ from alerts import (
 ) 
 
 _pair_eval_counter = 0
-_CLUSTER_CACHE_MISS = object()
 
 def _sync_signal_handler(sig: int, frame: Any) -> None:
     logger.warning(f"Received signal {sig}, initiating async shutdown...")
@@ -95,36 +94,16 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None,
     macro_context: Optional[BtcMacroContext] = None,
     cluster_context: Optional[ClusterContext] = None,
-    bias_context: Optional[BiasContext] = None,
-    gate_cache: Optional[Dict[str, Any]] = None) -> Optional[Tuple[str, Dict[str, Any], Optional[Any]]]:
+    bias_context: Optional[BiasContext] = None) -> Optional[Tuple[str, Dict[str, Any], Optional[Any]]]:
                                                              
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     pair_oi = (oi_gate_data or {}).get(pair_name)
+    gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time, pair_oi)
+    if gr is None:
+        return None
+    if isinstance(gr, tuple):
+        return gr  # hard reject / wick reject / gate blocked -- already final
 
-    cached = gate_cache.get(pair_name, _CLUSTER_CACHE_MISS) if gate_cache is not None else _CLUSTER_CACHE_MISS
-
-    if cached is not _CLUSTER_CACHE_MISS:
-        # Cluster pre-pass already ran _eval_gate for this pair with
-        # resolve_outcomes=False. Outcome resolution was deliberately skipped
-        # there, so re-run it here — Phase 3 is the only place it happens.
-        if cached is not None:
-            i15 = get_last_closed_index_from_array(data_15m.ts, 15, reference_time, pair_name)
-            if i15 is not None and i15 >= Constants.MIN_CLOSED_CANDLES_15M:
-                await _resolve_pair_outcomes(pair_name, data_15m, i15, sdb, logger_pair)
-        if isinstance(cached, tuple):
-            return cached  # hard reject / wick reject / gate blocked -- already final
-        if cached is None:
-            return None
-        gr = cached
-    else:
-        # No cache entry — pre-pass skipped this pair or errored before caching.
-        # Fall back to a full _eval_gate call (its own resolve_outcomes=True
-        # path handles outcome resolution internally).
-        gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time, pair_oi)
-        if gr is None:
-            return None
-        if isinstance(gr, tuple):
-            return gr  # hard reject / wick reject / gate blocked -- already final
     reversal_eligible = (
         (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE)
         and (gr.buy_trend_common_relaxed or gr.sell_trend_common_relaxed)
@@ -250,8 +229,7 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
                        oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None,
                        macro_context: Optional[BtcMacroContext] = None,
                        cluster_context: Optional[ClusterContext] = None,
-                       bias_context: Optional[BiasContext] = None,
-                       gate_cache: Optional[Dict[str, Any]] = None):
+                       bias_context: Optional[BiasContext] = None):
     p_name, symbol, candles = task_data
     try:
         pd_15m = parse_candles_to_numpy(candles.get("15"))
@@ -277,7 +255,6 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
             macro_context=macro_context,
             cluster_context=cluster_context,
             bias_context=bias_context,
-            gate_cache=gate_cache, 
         )
         return result
 
@@ -296,12 +273,8 @@ async def _compute_directional_cluster(
     prepared_tasks: List[Tuple[str, str, Dict[str, Any]]],
     state_db: RedisStateStore, correlation_id: str, reference_time: int,
     oi_gate_data: Optional[Dict[str, Dict[str, Any]]],
-) -> Tuple[Optional[ClusterContext], Dict[str, Any]]:
-    """Pre-pass that returns both a ClusterContext and a gate cache mapping
-    pair_name -> the full _eval_gate return value (GateResult | tuple | None)
-    for every pair whose pre-pass ran cleanly. Phase 3 reuses the cache instead
-    of recomputing the identical gate result. Pairs that errored out during
-    parse/eval are omitted from the cache and re-evaluated in Phase 3."""
+) -> Optional[ClusterContext]:
+    """..."""
     semaphore = asyncio.Semaphore(cfg.EVAL_CONCURRENCY_LIMIT)
 
     async def _lean(task):
@@ -311,7 +284,7 @@ async def _compute_directional_cluster(
                 pd_15m = parse_candles_to_numpy(candles.get("15"))
                 pd_5m = parse_candles_to_numpy(candles.get("5"))
                 if pd_15m is None or pd_5m is None:
-                    return (None, p_name, _CLUSTER_CACHE_MISS)
+                    return None
                 pd_daily = (
                     parse_candles_to_numpy(candles.get("D"))
                     if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else None
@@ -323,35 +296,26 @@ async def _compute_directional_cluster(
                     resolve_outcomes=False,
                 )
                 if gr is None or isinstance(gr, tuple):
-                    lean = None
-                elif gr.confirmation_buy and gr.adx_ok:
-                    lean = "buy"
-                elif gr.confirmation_sell and gr.adx_ok:
-                    lean = "sell"
-                else:
-                    lean = None
-                return (lean, p_name, gr)
+                    return None
+                if gr.confirmation_buy and gr.adx_ok:
+                    return "buy"
+                if gr.confirmation_sell and gr.adx_ok:
+                    return "sell"
+                return None
             except Exception as e:
                 logger_main.debug(f"Cluster pre-pass eval failed for {p_name}: {e}")
-                return (None, p_name, _CLUSTER_CACHE_MISS)
+                return None
 
     total = len(prepared_tasks)
     if total == 0:
-        return None, {}
-    results = await asyncio.gather(*[_lean(t) for t in prepared_tasks])
-    gate_cache: Dict[str, Any] = {}
-    buy_count = sell_count = 0
-    for lean, p_name, gr in results:
-        if gr is not _CLUSTER_CACHE_MISS:
-            gate_cache[p_name] = gr
-        if lean == "buy":
-            buy_count += 1
-        elif lean == "sell":
-            sell_count += 1
+        return None
+    leans = await asyncio.gather(*[_lean(t) for t in prepared_tasks])
+    buy_count = sum(1 for l in leans if l == "buy")
+    sell_count = sum(1 for l in leans if l == "sell")
     return ClusterContext(
         buy_count=buy_count, sell_count=sell_count, total_pairs=total,
         buy_pct=buy_count / total, sell_pct=sell_count / total,
-    ), gate_cache
+    )
 
 async def _compute_bias_context(
     prepared_tasks: List[Tuple[str, str, Dict[str, Any]]],
@@ -646,23 +610,20 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     # ── Correlation Cluster Detection (LIVE — see ClusterContext docstring) ──
     cluster_context: Optional[ClusterContext] = None
-    gate_cache: Dict[str, Any] = {}
     if cfg.ENABLE_CLUSTER_GATE:
         try:
-            cluster_context, gate_cache = await _compute_directional_cluster(
+            cluster_context = await _compute_directional_cluster(
                 prepared_tasks, state_db, correlation_id, reference_time, oi_gate_data,
             )
             if cluster_context:
                 logger_main.info(
                     f"📊 Directional cluster: buy={cluster_context.buy_count}/{cluster_context.total_pairs} "
                     f"({cluster_context.buy_pct:.0%}), sell={cluster_context.sell_count}/{cluster_context.total_pairs} "
-                    f"({cluster_context.sell_pct:.0%}) | "
-                    f"gate-cache: {len(gate_cache)}/{len(prepared_tasks)} pairs"
+                    f"({cluster_context.sell_pct:.0%})"
                 )
         except Exception as e:
             logger_main.warning(f"Cluster pre-pass failed, disabling cluster gate this run: {e}")
             cluster_context = None
-            gate_cache = {}
 
     # ── Pair-Universe Ichimoku Bias Header (cosmetic only — see BiasContext docstring) ──
     bias_context: Optional[BiasContext] = None
@@ -693,10 +654,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 macro_context=btc_context,
                 cluster_context=cluster_context,
                 bias_context=bias_context,
-                gate_cache=gate_cache,
             )
-
-
     results = await asyncio.gather(
         *[_bounded_eval(t) for t in prepared_tasks],
         return_exceptions=True,
