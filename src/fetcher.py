@@ -700,7 +700,7 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
         return False, False, None, f"Data access error: {e}"
     
     if any(np.isnan([o, h, l, c])) or any(np.isinf([o, h, l, c])):
-        return False, False, None, f"Invalid OHLC: contains NaN or Inf"
+        return False, False, None, "Invalid OHLC: contains NaN or Inf"
     
 
     if any(x <= 0 for x in [o, h, l, c]):
