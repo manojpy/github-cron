@@ -1407,7 +1407,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         return confluence_score_sell, confluence_total_sell, confluence_votes_sell
 
     pair_name = gr.pair_name
-    i15, ts_curr, reference_time = gr.i15, gr.ts_curr, gr.reference_time
+    _, ts_curr, reference_time = gr.i15, gr.ts_curr, gr.reference_time
+
 
     if cfg.ENABLE_KILL_SWITCH and sdb and not sdb.degraded and sdb._redis:
         try:
@@ -2341,9 +2342,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     reasons.append(f"OB sell: {gr.ob_gate_reason or 'zone touched, no reversal confirmed'}")
             if cfg.ICHIMOKU_CLOUD_ENABLED:
                 if not ichimoku_gate_ok_buy:
-                    reasons.append(f"Ichimoku Cloud buy: price not above cloud / future not green (vote)")
+                    reasons.append("Ichimoku Cloud buy: price not above cloud / future not green (vote)")
                 if not ichimoku_gate_ok_sell:
-                    reasons.append(f"Ichimoku Cloud sell: price not below cloud / future not red (vote)")
+                    reasons.append("Ichimoku Cloud sell: price not below cloud / future not red (vote)")
 
             if not cloud_group_ok_buy:
                 reasons.append("Cloud group buy: need ANY enabled vote true (Ichimoku/RMA cloud) — all disagree or abstain")

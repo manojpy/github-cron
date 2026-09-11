@@ -622,7 +622,7 @@ EXPORT_CONFIG = {
     'dynamic_flow_direction_loop': SIG_DFR_DIRECTION,
 }
 
-from aot_meta import AOT_FUNCTION_NAMES  # noqa: E402
+from aot_meta import SOURCE_VERSION as SOURCE_VERSION  # noqa: E402
 
 _exported_names = set(EXPORT_CONFIG.keys())
 _registry_names = set(AOT_FUNCTION_NAMES)

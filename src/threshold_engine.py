@@ -1656,10 +1656,6 @@ def interaction_miner(
                 interactions.append(entry)
 
             # ── v1 poisons v2 ───────────────────────────────────────────
-            # Reference arm here is v2-alone, which is only valid when
-            # has_v2_sample is True. The gate is load-bearing: without it,
-            # wr_only_v2 would be None (not 0.0 anymore), and any v1-heavy
-            # pair where v2 is rarely seen alone would be skipped.
             if has_v2_sample:
                 poison_v2 = wr_only_v2 - wr_both
                 if poison_v2 > 0.15 and n_both >= min_sample:
@@ -2235,7 +2231,6 @@ def optimize_vote_weights(
     if n < min_sample:
         return {"valid": False, "error": f"insufficient_data: {n} < {min_sample}"}
 
-    win_rate = sum(y) / n
     wf_passed: Optional[bool] = None
     wf_holdout_wr: Optional[float] = None
     wf_baseline_wr: Optional[float] = None

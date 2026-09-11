@@ -45,9 +45,6 @@ def compile_module(cc: CC, output_dir: Path, module_name: str) -> Path:
         print(f"🧹 Removing stale artifact: {old_file.name}")
         old_file.unlink()
     
-    # Set the target filename (Numba handles extensions based on platform)
-    output_base = output_dir / module_name
-    
     original_cwd = Path.cwd()
     try:
         os.chdir(output_dir)
@@ -141,13 +138,12 @@ def main():
         
         return 0
         
-    except Exception as e:
-        print(f"\n💥 FATAL ERROR during compilation:")
+    except Exception:
+        print("\n💥 FATAL ERROR during compilation:")
         print("-" * 40)
         traceback.print_exc()
         print("-" * 40)
         return 1
-
 
 if __name__ == "__main__":
     sys.exit(main())

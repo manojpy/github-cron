@@ -13,8 +13,7 @@ import math
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
-from alerts import escape_markdown_v2, BUY_ALERT_KEYS, SELL_ALERT_KEYS
-
+from alerts import escape_markdown_v2
 from bot_config import cfg, json_dumps, format_ist_time, CONFLUENCE_WEIGHTS
 from state import RedisKeyPrefix, RedisStateStore
 import threshold_engine as engine

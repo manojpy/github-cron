@@ -564,7 +564,6 @@ class BotConfig(BaseModel):
                 f'CPR_ADAPTIVE_CALM ({self.CPR_ADAPTIVE_CALM}) must be < '
                 f'CPR_ADAPTIVE_VOLATILE ({self.CPR_ADAPTIVE_VOLATILE})'
             )
-
         if self.ADX_ADAPTIVE_BAND_WIDTH > 0:
             lo = self.ADX_ADAPTIVE_TARGET_PCTL - self.ADX_ADAPTIVE_BAND_WIDTH / 2.0
             hi = self.ADX_ADAPTIVE_TARGET_PCTL + self.ADX_ADAPTIVE_BAND_WIDTH / 2.0
@@ -759,12 +758,12 @@ def load_config() -> BotConfig:
         val = data.get(key, "")
         if not val or val.startswith("__SET_IN_"):
             print(f"❌ ERROR: Missing required config: {key}", file=sys.stderr)
-            print(f"❌ Set this in your CI/CD secrets (GitHub Actions → Secrets, GitLab → Variables)", file=sys.stderr)
+            print("❌ Set this in your CI/CD secrets (GitHub Actions → Secrets, GitLab → Variables)", file=sys.stderr)
             sys.exit(1)
     try:
         return BotConfig(**data)
     except Exception as exc:
-        print(f"❌ ERROR: Pydantic validation failed", file=sys.stderr)
+        print("❌ ERROR: Pydantic validation failed", file=sys.stderr)
         print(f"❌ Details: {exc}", file=sys.stderr)
         sys.exit(1)
 
