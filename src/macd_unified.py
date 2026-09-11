@@ -1295,7 +1295,22 @@ if __name__ == "__main__":
 
     if args.apply_brain:
         async def apply_brain_and_exit():
-            # ...
+            from brain_enhanced import BrainEngineV2
+            from alerts import TelegramQueue
+
+            sdb = RedisStateStore(cfg.REDIS_URL)
+            await sdb.connect()
+            telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+
+            try:
+                brain = BrainEngineV2(sdb)
+                return await brain.apply_pending_plan(telegram_queue, logger_main)
+            except Exception as e:
+                logger_main.critical(f"Apply brain failed: {e}")
+                return False
+            finally:
+                await sdb.close()
+
         success = asyncio.run(apply_brain_and_exit())
         sys.exit(0 if success else 1)
 
