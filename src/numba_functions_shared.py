@@ -598,8 +598,6 @@ def dynamic_flow_direction_loop(src, basis, dist, factor):
 
     return direction_out, line_out
 
-from aot_meta import SOURCE_VERSION as SOURCE_VERSION  # noqa: E402
-
 #=====================================================
 # AOT EXPORT CONFIGURATION
 #=====================================================
@@ -622,10 +620,14 @@ EXPORT_CONFIG = {
     'dynamic_flow_direction_loop': SIG_DFR_DIRECTION,
 }
 
-from aot_meta import AOT_FUNCTION_NAMES  # noqa: E402
+from aot_meta import (  # noqa: E402
+    SOURCE_VERSION as SOURCE_VERSION,
+    AOT_FUNCTION_NAMES,
+)
 
 _exported_names = set(EXPORT_CONFIG.keys())
 _registry_names = set(AOT_FUNCTION_NAMES)
+
 if _exported_names != _registry_names:
     _missing_from_registry = sorted(_exported_names - _registry_names)
     _missing_from_export   = sorted(_registry_names - _exported_names)
