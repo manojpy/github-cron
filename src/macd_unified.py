@@ -100,6 +100,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                                                      
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     pair_oi = (oi_gate_data or {}).get(pair_name)
+    PAIR_ID.set(pair_name)
 
     cached = gate_cache.get(pair_name, _CLUSTER_CACHE_MISS) if gate_cache is not None else _CLUSTER_CACHE_MISS
 
