@@ -898,6 +898,33 @@ async def run_once() -> Optional[bool]:
             else:
                 logger_run.error("CLEAR_REDIS=true but Redis is unavailable/degraded")
 
+        if os.getenv("CLEAR_KILL_SWITCH", "false").lower() == "true":
+            if sdb and not sdb.degraded:
+                logger_run.warning("🔓 CLEAR_KILL_SWITCH requested — manually clearing kill switch...")
+                try:
+                    from brain_enhanced import BrainEngineV2
+                    brain_for_clear = BrainEngineV2(sdb)
+                    cleared = await brain_for_clear.clear_kill_switch()
+                except Exception as e:
+                    logger_run.error(f"Kill switch clear raised an exception: {e}")
+                    cleared = False
+
+                if telegram_queue is None:
+                    telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+                if cleared:
+                    await telegram_queue.send(escape_markdown_v2(
+                        f"🔓 {cfg.BOT_NAME} Kill switch manually cleared\n"
+                        f"Time: {format_ist_time()}"
+                    ))
+                else:
+                    logger_run.error("CLEAR_KILL_SWITCH=true but clear failed (see logs above)")
+                    await telegram_queue.send(escape_markdown_v2(
+                        f"⚠️ {cfg.BOT_NAME} Kill switch clear FAILED — check Redis/logs\n"
+                        f"Time: {format_ist_time()}"
+                    ))
+            else:
+                logger_run.error("CLEAR_KILL_SWITCH=true but Redis is unavailable/degraded")
+
         if sdb.degraded and not sdb.degraded_alerted:
             logger_run.critical(
                 "🚨 Redis is in degraded mode – alert deduplication disabled!"
