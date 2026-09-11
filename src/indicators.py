@@ -156,6 +156,31 @@ def validate_conversion_cross(close_prev: float, close_curr: float,
             return False, "No bearish conversion-line cross"
         return True, None
 
+def validate_equilibrium_cross(close_prev: float, close_curr: float,
+                              eq_prev: float, eq_curr: float, is_buy: bool,
+                              min_deviation: float = 0.001) -> Tuple[bool, Optional[str]]:
+    vals = [close_prev, close_curr, eq_prev, eq_curr]
+    if any(np.isnan(v) for v in vals):
+        return False, "NaN in inputs"
+    if any(v <= 0 for v in vals):
+        return False, "Non-positive values"
+    if is_buy:
+        crossed = (close_prev <= eq_prev) and (close_curr > eq_curr)
+        if not crossed:
+            return False, "No bullish equilibrium cross"
+        sep = (close_curr - eq_curr) / eq_curr
+        if sep < min_deviation:
+            return False, f"Separation {sep*100:.3f}% < {min_deviation*100:.1f}% — still hugging equilibrium"
+        return True, None
+    else:
+        crossed = (close_prev >= eq_prev) and (close_curr < eq_curr)
+        if not crossed:
+            return False, "No bearish equilibrium cross"
+        sep = (eq_curr - close_curr) / eq_curr
+        if sep < min_deviation:
+            return False, f"Separation {sep*100:.3f}% < {min_deviation*100:.1f}% — still hugging equilibrium"
+        return True, None
+
 def validate_cloud_cross(close_prev: float, close_curr: float,
     cloud_upper_prev: float, cloud_upper_curr: float,
     cloud_lower_prev: float, cloud_lower_curr: float, is_buy: bool) -> Tuple[bool, Optional[str]]:
@@ -1061,7 +1086,7 @@ def calculate_ob_equilibrium(h: np.ndarray, l: np.ndarray, i: int, lookback: int
     used by the OB premium/discount filter — factored out so other callers (e.g.
     the equilibrium-cross alert) share one source of truth. NaN if not enough
     history yet."""
-    if i <= lookback:
+    if i < lookback:
         return float("nan")
     range_high = np.max(h[i - lookback:i])
     range_low = np.min(l[i - lookback:i])

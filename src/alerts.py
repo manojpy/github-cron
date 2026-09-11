@@ -42,9 +42,10 @@ import threshold_engine as engine
 
 from indicators import (
     calculate_alert_indicators_numpy, validate_indicators_dict, validate_vwap_cross,
-    validate_cloud_cross, validate_conversion_cross,
+    validate_cloud_cross, validate_conversion_cross, validate_equilibrium_cross,
     _fib_reversal_confluence_vote,
 )
+
 from threshold_engine import hash_config_state
 
 # Runtime override for CONFLUENCE_WEIGHTS (loaded from Redis at startup)
@@ -1228,10 +1229,11 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 "validator": validate_conversion_cross,
                 "ctx_args": ("close_prev", "close_curr", "tk_base_prev", "tk_base_curr"),
             },
+   
             "equilibrium_cross": {
                 "keys": {"equilibrium_cross_up", "equilibrium_cross_down"},
                 "enabled": cfg.ENABLE_EQUILIBRIUM_CROSS,
-                "validator": validate_conversion_cross,
+                "validator": validate_equilibrium_cross,
                 "ctx_args": ("close_prev", "close_curr", "equilibrium_prev", "equilibrium_curr"),
             },
         }
@@ -1494,6 +1496,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     tk_conversion_curr, tk_conversion_prev = gr.tk_conversion_curr, gr.tk_conversion_prev
     tk_base_curr, tk_base_prev = gr.tk_base_curr, gr.tk_base_prev
     oscillator_group_ok_buy, oscillator_group_ok_sell = gr.oscillator_group_ok_buy, gr.oscillator_group_ok_sell
+    equilibrium_curr, equilibrium_prev = gr.equilibrium_curr, gr.equilibrium_prev
     ppo_gate_curr, ppo_gate_sig_curr = gr.ppo_gate_curr, gr.ppo_gate_sig_curr
     ppo_gate_ok_buy, ppo_gate_ok_sell = gr.ppo_gate_ok_buy, gr.ppo_gate_ok_sell
     rsi_guard_smooth_curr, rsi_guard_ema_curr = gr.rsi_guard_smooth_curr, gr.rsi_guard_ema_curr
@@ -2311,6 +2314,34 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     else:
                         reasons.append(
                             f"Kijun down-cross blocked: market filter "
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
+                            f"rvol_ok={rvol_ok})"
+                        )
+
+            if cfg.ENABLE_EQUILIBRIUM_CROSS and equilibrium_curr is not None and equilibrium_prev is not None:
+                if close_prev <= equilibrium_prev and close_curr > equilibrium_curr and not buy_common:
+                    if not base_buy_trend:
+                        reasons.append("Equilibrium up-cross blocked: base_buy_trend=False")
+                    elif not confirmation_buy:
+                        reasons.append("Equilibrium up-cross blocked: confirmation_buy=False")
+                    elif not is_valid_for_buy:
+                        reasons.append("Equilibrium up-cross blocked: Knox rejected candle")
+                    else:
+                        reasons.append(
+                            f"Equilibrium up-cross blocked: market filter "
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
+                            f"rvol_ok={rvol_ok})"
+                        )
+                if close_prev >= equilibrium_prev and close_curr < equilibrium_curr and not sell_common:
+                    if not base_sell_trend:
+                        reasons.append("Equilibrium down-cross blocked: base_sell_trend=False")
+                    elif not confirmation_sell:
+                        reasons.append("Equilibrium down-cross blocked: confirmation_sell=False")
+                    elif not is_valid_for_sell:
+                        reasons.append("Equilibrium down-cross blocked: Knox rejected candle")
+                    else:
+                        reasons.append(
+                            f"Equilibrium down-cross blocked: market filter "
                             f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
                             f"rvol_ok={rvol_ok})"
                         )
