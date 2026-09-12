@@ -136,7 +136,23 @@ jobs:
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
-          git clone --depth=7             "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git"             /tmp/data-repo
+          git clone --depth=1 --filter=blob:none --no-checkout \
+            "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" \
+            /tmp/data-repo
+          cd /tmp/data-repo
+          git sparse-checkout init --no-cone
+
+          {
+            echo "reports/*.md"
+            for i in $(seq 0 39); do
+              D=$(date -u -d "-${i} days" +%Y-%m-%d)
+              echo "outcomes/${D}.jsonl"
+              echo "shadow/${D}.jsonl"
+            done
+          } > .git/info/sparse-checkout
+
+          git checkout main
+          cd -
 
           # Fix permissions so the Docker container's non-root user can write
           chmod -R 777 /tmp/data-repo
