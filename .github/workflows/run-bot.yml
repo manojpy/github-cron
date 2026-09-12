@@ -50,7 +50,7 @@ jobs:
     steps:
       # PHASE 1: VALIDATION & SETUP
       - name: 🔥 Checkout repository (for config_macd.json)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Only pull the config file — no need to clone the whole repo
           sparse-checkout: |
