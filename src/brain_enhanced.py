@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import time
 import re
 from collections import defaultdict
@@ -21,10 +22,8 @@ import threshold_engine as engine
 from threshold_engine import (
     optimize_vote_weights, conditional_performance,
     interaction_miner, simulate_config_change, regime_profile_optimizer,
-    hash_config_state, score_actionability, learned_actionability,
-    compare_config_versions,
+    hash_config_state, learned_actionability, compare_config_versions,
 )
-
 from repair_ledger import (
     record_repair_issued, mark_plan_applied,
     evaluate_pending_repairs, repair_success_rates, ledger_stats,
@@ -194,7 +193,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     except Exception:
         pass
 
-    # ── BEST / WORST CONDITIONS ────────────────────────────────────────
+    # ── BEST / WORST CONDITIONS ───────────────────────���────────────────
     try:
         pair_stats = engine.per_pair_breakdown(rows, min_sample=5)  # worst-first
         if len(pair_stats) >= 2:
