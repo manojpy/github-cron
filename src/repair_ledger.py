@@ -128,7 +128,9 @@ async def evaluate_pending_repairs(sdb, current_rows: List[dict],
             continue
         post_wins = sum(1 for r in post if r["win"])
         post_wr = post_wins / len(post)
-        pre_wr = e["snapshot_before"].get("overall_wr", post_wr)
+        pre_wr = e["snapshot_before"].get("overall_wr")
+        if pre_wr is None:
+            pre_wr = post_wr
         delta = post_wr - pre_wr
         lo, hi, _ = wilson_ci(post_wins, len(post))
         if delta > 0.03 and lo > pre_wr:
@@ -183,3 +185,10 @@ async def ledger_stats(sdb) -> Dict[str, Any]:
         "helped": sum(1 for e in entries if e["verdict"] == "helped"),
         "hurt": sum(1 for e in entries if e["verdict"] == "hurt"),
     }
+
+async def load_ledger_entries(sdb) -> List[dict]:
+    """Public accessor for the raw ledger — used by the contextual
+    repair-effectiveness model (threshold_engine.learn_repair_effectiveness).
+    Kept separate from repair_success_rates() because the model needs the
+    per-entry snapshot_before + verdict, not just the aggregated rates."""
+    return await _load_ledger(sdb)

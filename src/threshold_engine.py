@@ -13,7 +13,7 @@ import random
 import statistics
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
-from bot_config import cfg
+from bot_config import cfg, format_ist_time
 
 Row = Dict[str, Any]
 CapRow = Tuple[float, int, float, float]  # (cap, n, wr, wilson_lower_bound)
@@ -1673,7 +1673,7 @@ def interaction_miner(
                     entry["n_neither"] = n_neither
                 interactions.append(entry)
 
-            # ── v1 poisons v2 ───────────────────────���───────────────────
+            # ── v1 poisons v2 ───────────────────────����───────────────────
             if has_v2_sample:
                 poison_v2 = wr_only_v2 - wr_both
                 if poison_v2 > 0.15 and n_both >= min_sample:
@@ -2473,6 +2473,291 @@ def _prob_ev_negative(rows: List[Row], n_sims: int = 400) -> float:
     z = (0.0 - ev_mean) / ev_std
     return 0.5 * math.erfc(-z / math.sqrt(2.0))
 
+
+# ═══════════════════════════════════════════════════════════════════════
+#  ML DIAGNOSTICS — Root Cause, Drift, Change-Point, Repair Learning
+# ═══════════════════════════════════════════════════════════════════════
+
+def _flatten_row_features(row: Row) -> Dict[str, float]:
+    """Flatten a row's votes + numeric context into a flat feature dict.
+    Vote booleans become 0/1 under 'vote:<name>'; numeric context values
+    under 'ctx:<key>'. Used by the decision-stump root-cause scanner and
+    the PSI drift detector."""
+    feats: Dict[str, float] = {}
+    votes = row.get("votes") or {}
+    if isinstance(votes, dict):
+        for vn, v in votes.items():
+            feats[f"vote:{vn}"] = 1.0 if v else 0.0
+    ctx = row.get("context") or {}
+    if isinstance(ctx, dict):
+        for k, v in ctx.items():
+            if isinstance(v, bool):
+                feats[f"ctx:{k}"] = 1.0 if v else 0.0
+            elif isinstance(v, (int, float)):
+                feats[f"ctx:{k}"] = float(v)
+    return feats
+
+
+def diagnose_root_cause(
+    rows: List[Row],
+    target_wr: float = 0.55,
+    min_segment: int = 15,
+    n_quantiles: int = 5,
+    top_k: int = 3,
+) -> Dict[str, Any]:
+    """Decision-stump root-cause attribution.
+
+    Scans every numeric context feature and boolean vote, finds the single
+    threshold split that isolates the worst-performing segment of trades,
+    and returns ranked 'toxic segment' rules. Converts the repair shop's
+    'review trades manually' guidance into an automated, ML-driven answer
+    to *why* the system is losing.
+
+    Pure Python, no external deps. Segments are Wilson-gated so tiny noisy
+    slices are never reported as confident causes, and each segment carries
+    a two-proportion p-value for the downstream BH/FDR pass.
+    """
+    n = len(rows)
+    if n < min_segment * 2:
+        return {"valid": False, "error": "insufficient_data", "n": n}
+
+    overall_wins = sum(r["win"] for r in rows)
+    overall_wr = overall_wins / n
+
+    feats_per_row = [_flatten_row_features(r) for r in rows]
+    feature_names = sorted({f for d in feats_per_row for f in d})
+    if not feature_names:
+        return {"valid": False, "error": "no_features", "n": n}
+
+    candidates: List[Dict[str, Any]] = []
+    for feat in feature_names:
+        pairs = [
+            (feats_per_row[i][feat], rows[i]["win"])
+            for i in range(n) if feat in feats_per_row[i]
+        ]
+        if len(pairs) < min_segment * 2:
+            continue
+        values = sorted(p[0] for p in pairs)
+        q_thr = sorted({
+            values[min(len(values) - 1, int(len(values) * q / n_quantiles))]
+            for q in range(1, n_quantiles)
+        })
+        for thr in q_thr:
+            left = [p for p in pairs if p[0] <= thr]
+            right = [p for p in pairs if p[0] > thr]
+            for side_vals, side_rule in ((left, "<="), (right, ">")):
+
+                seg_n = len(side_vals)
+                if seg_n < min_segment or seg_n > len(pairs) - min_segment:
+                    continue
+                seg_wins = sum(w for _, w in side_vals)
+                seg_wr = seg_wins / seg_n
+                lo, hi, _ = wilson_ci(seg_wins, seg_n)
+                lift = overall_wr - seg_wr
+                # Only interested in segments confidently WORSE than average.
+                if lift <= 0 or hi >= overall_wr:
+                    continue
+                p = two_proportion_p_value(
+                    seg_wins, seg_n, overall_wins - seg_wins, n - seg_n,
+                )
+                candidates.append({
+                    "feature": feat,
+                    "rule": f"{feat} {side_rule} {thr:.3f}",
+                    "segment_wr": seg_wr,
+                    "segment_n": seg_n,
+                    "lift_vs_overall": lift,
+                    "coverage": seg_n / n,
+                    "wilson_lo": lo,
+                    "wilson_hi": hi,
+                    "isolation_score": lift * (seg_n / n),
+                    "confident": hi < target_wr,
+                    "p_value": p,
+                })
+
+    candidates.sort(key=lambda c: -c["isolation_score"])
+    seen: Set[str] = set()
+    deduped: List[Dict[str, Any]] = []
+    for c in candidates:
+        if c["feature"] in seen:
+            continue
+        seen.add(c["feature"])
+        deduped.append(c)
+
+    return {
+        "valid": bool(deduped),
+        "overall_wr": overall_wr,
+        "n": n,
+        "segments": deduped[:top_k],
+    }
+
+
+def population_stability_index(
+    baseline: List[float],
+    recent: List[float],
+    bins: int = 10,
+    eps: float = 1e-4,
+) -> Optional[float]:
+    """PSI between two samples. <0.1 stable, 0.1-0.25 moderate shift,
+    >0.25 large shift. The classic 'why did my model stop working' metric."""
+    if len(baseline) < 30 or len(recent) < 30:
+        return None
+    lo = min(min(baseline), min(recent))
+    hi = max(max(baseline), max(recent))
+    if hi - lo < 1e-12:
+        return 0.0
+
+    def _bucket_pcts(vals: List[float]) -> List[float]:
+        counts = [0] * bins
+        for v in vals:
+            idx = min(bins - 1, max(0, int((v - lo) / (hi - lo) * bins)))
+            counts[idx] += 1
+        n = len(vals)
+        return [max(c / n, eps) for c in counts]
+
+    b = _bucket_pcts(baseline)
+    r = _bucket_pcts(recent)
+    return sum((rb - bb) * math.log(rb / bb) for bb, rb in zip(b, r))
+
+def detect_feature_drift(
+    rows: List[Row],
+    recent_n: int = 100,
+    psi_threshold: float = 0.25,
+) -> Dict[str, Any]:
+    """Compare context-feature distributions between the most recent
+    `recent_n` rows and the older baseline. Large PSI = regime/feature
+    drift — the market changed under the strategy's feet."""
+    if len(rows) < recent_n + 60:
+        return {"valid": False, "error": "insufficient_data"}
+    ordered = sorted(rows, key=lambda r: r.get("entry_ts", 0))
+    feats = [_flatten_row_features(r) for r in ordered]
+    recent_feats, base_feats = feats[-recent_n:], feats[:-recent_n]
+    feature_names = sorted({f for d in feats for f in d})
+
+    drifted: List[Dict[str, Any]] = []
+    for feat in feature_names:
+        base_vals = [d[feat] for d in base_feats if feat in d]
+        rec_vals = [d[feat] for d in recent_feats if feat in d]
+        psi = population_stability_index(base_vals, rec_vals)
+        if psi is not None and psi >= psi_threshold:
+            drifted.append({"feature": feat, "psi": round(psi, 3)})
+    drifted.sort(key=lambda d: -d["psi"])
+    return {"valid": True, "drifted_features": drifted, "n_recent": recent_n}
+
+def find_wr_change_point(
+    rows: List[Row],
+    min_side: int = 25,
+    min_delta: float = 0.08,
+) -> Dict[str, Any]:
+    """Locate the timestamp where win rate shifted most, via an O(n)
+    two-sample scan using prefix sums. Returns change point + before/after
+    WR + the dominant config_version on each side, so a regression can be
+    attributed to a specific config patch."""
+    ordered = sorted(
+        (r for r in rows if r.get("entry_ts", 0) > 0),
+        key=lambda r: r["entry_ts"],
+    )
+    n = len(ordered)
+    if n < min_side * 2:
+        return {"valid": False, "error": "insufficient_data"}
+
+    pref = [0] * (n + 1)
+    for i, r in enumerate(ordered):
+        pref[i + 1] = pref[i] + (1 if r["win"] else 0)
+
+    best: Optional[Dict[str, Any]] = None
+    for i in range(min_side, n - min_side):
+        wl = pref[i]
+        wr_ = pref[n] - pref[i]
+        p = two_proportion_p_value(wl, i, wr_, n - i)
+        delta = wr_ / (n - i) - wl / i
+        score = abs(delta) * (1.0 - p)
+        if best is None or score > best["score"]:
+            best = {
+                "score": score,
+                "index": i,
+                "change_ts": ordered[i]["entry_ts"],
+                "wr_before": wl / i,
+                "wr_after": wr_ / (n - i),
+                "delta": delta,
+                "p_value": p,
+            }
+
+    if best is None or abs(best["delta"]) < min_delta:
+        return {"valid": False, "error": "no_significant_change_point"}
+
+    def _dominant_version(chunk: List[Row]) -> Optional[str]:
+        counts: Dict[str, int] = defaultdict(int)
+        for r in chunk:
+            cv = (r.get("context") or {}).get("config_version")
+            if cv:
+                counts[cv] += 1
+        return max(counts, key=counts.get) if counts else None
+
+    best["version_before"] = _dominant_version(ordered[:best["index"]])
+    best["version_after"] = _dominant_version(ordered[best["index"]:])
+    best["valid"] = True
+    return best
+
+
+def learn_repair_effectiveness(
+    ledger_records: List[Dict[str, Any]],
+    current_state: Dict[str, Any],
+    min_records: int = 30,
+) -> Dict[str, Any]:
+    """Contextual logistic model: P(repair helps | system state).
+
+    Trains on resolved repair-ledger entries (snapshot_before + verdict)
+    and predicts, for the CURRENT system state, how likely each repair
+    category is to actually help. Reuses the same pure-Python logistic
+    trainer as the vote-weight optimizer — no external deps.
+    """
+    resolved = [
+        r for r in ledger_records
+        if r.get("verdict") in ("helped", "hurt")
+    ]
+    if len(resolved) < min_records:
+        return {"valid": False, "error": "insufficient_ledger_data"}
+
+    categories = sorted({
+        r.get("category") or r.get("type") or "unknown" for r in resolved
+    })
+    state_keys = ["overall_wr", "n", "net_ev", "brier"]
+
+    def _feats(state: Dict[str, Any], cat: str) -> List[float]:
+        base = []
+        for k in state_keys:
+            v = state.get(k)
+            v = float(v) if isinstance(v, (int, float)) else 0.0
+            if k == "n":
+                v = math.log1p(v)  # compress sample-size scale
+            base.append(v)
+        onehot = [1.0 if cat == c else 0.0 for c in categories]
+        return base + onehot
+
+    X: List[List[float]] = []
+    y: List[float] = []
+    for rec in resolved:
+        cat = rec.get("category") or rec.get("type") or "unknown"
+        X.append([1.0] + _feats(rec.get("snapshot_before") or {}, cat))
+        y.append(1.0 if rec["verdict"] == "helped" else 0.0)
+
+    beta = _train_logistic(X, y, [1.0] * len(X),
+                           max_iter=1500, lr=0.05, l2=0.02)
+    if not beta:
+        return {"valid": False, "error": "logistic_train_failed"}
+
+    preds: Dict[str, float] = {}
+    for cat in categories:
+        vec = [1.0] + _feats(current_state, cat)
+        z = sum(b * x for b, x in zip(beta, vec))
+        preds[cat] = round(_sigmoid(z), 4)
+
+    return {
+        "valid": True,
+        "n_records": len(resolved),
+        "p_help_by_category": preds,
+    }
+
 # ═══════════════════════════════════════════════════════════════════════
 #  REPAIR SHOP DIAGNOSIS ENGINE
 # ═════════════════════════════════════════════════════════════════════
@@ -2553,7 +2838,7 @@ def repair_shop_diagnosis(
 
     if sell_wr is not None:
         sell_wins = sum(1 for r in sell_rows if r["win"])
-        p_sell_broken = _prob_edge_broken(sell_wins, len(sell_rows), target_wr)
+        p_sell_broken = _prob_edge_broken(sell_wins, len(sell_rows), disable_wr)
         if p_sell_broken > 0.90 and len(drifted_sell) >= 2:
             severity = "critical" if p_sell_broken > 0.97 else "high"
             repairs.append({
@@ -2562,7 +2847,7 @@ def repair_shop_diagnosis(
                 "diagnosis": (
                     f"Sell WR {sell_wr:.0%} (n={len(sell_rows)}) with "
                     f"{len(drifted_sell)} sell alerts CUSUM-drifted. "
-                    f"Posterior P(true_sell_wr < {target_wr:.0%}) = {p_sell_broken:.2%}."
+                    f"Posterior P(true_sell_wr < {disable_wr:.0%}) = {p_sell_broken:.2%}."
                 ),
                 "action": (
                     f"Disable ALL sell alerts until manual review: "
@@ -2575,7 +2860,7 @@ def repair_shop_diagnosis(
 
     if buy_wr is not None:
         buy_wins = sum(1 for r in buy_rows if r["win"])
-        p_buy_broken = _prob_edge_broken(buy_wins, len(buy_rows), target_wr)
+        p_buy_broken = _prob_edge_broken(buy_wins, len(buy_rows), disable_wr)
         if p_buy_broken > 0.90 and len(drifted_buy) >= 2:
             severity = "critical" if p_buy_broken > 0.97 else "high"
             repairs.append({
@@ -2583,7 +2868,7 @@ def repair_shop_diagnosis(
                 "category": "buy_side_collapse",
                 "diagnosis": (
                     f"Buy WR {buy_wr:.0%} (n={len(buy_rows)}) with {len(drifted_buy)} buy alerts drifted. "
-                    f"Posterior P(true_buy_wr < {target_wr:.0%}) = {p_buy_broken:.2%}."
+                    f"Posterior P(true_buy_wr < {disable_wr:.0%}) = {p_buy_broken:.2%}."
                 ),
                 "action": f"Disable drifted buy alerts: {', '.join(d.get('alert', '?') for d in drifted_buy[:5])}.",
                 "expected_impact": "Stops bleeding on the buy side.",
@@ -2642,15 +2927,24 @@ def repair_shop_diagnosis(
     # ── 6. EV / Kelly check ──
     net_ev, half_kelly, _ = ev_and_kelly_for(rows)
     p_ev_negative = _prob_ev_negative(rows)
-    if p_ev_negative > 0.80:
-        severity = "critical" if p_ev_negative > 0.95 else "high"
+    # The bootstrap behind _prob_ev_negative needs n>=60; below that it always
+    # returns 0.5 (neutral) and this check would never fire. Fall back to the
+    # point estimate for that window so an early bad EV isn't silently missed.
+    bootstrap_ready = n >= 60
+    ev_triggered = (p_ev_negative > 0.80) if bootstrap_ready else (net_ev <= 0)
+    if ev_triggered:
+        severity = "critical" if (bootstrap_ready and p_ev_negative > 0.95) else "high"
+        diag_stat = (
+            f"posterior P(true EV <= 0) = {p_ev_negative:.1%}."
+            if bootstrap_ready else
+            "(n<60 — point estimate; too small for the posterior test)."
+        )
         repairs.append({
             "severity": severity,
             "category": "negative_ev",
             "diagnosis": (
                 f"Net EV {net_ev:+.3f}%/trade after fees/slippage (n={n}) — "
-                f"posterior P(true EV <= 0) = {p_ev_negative:.1%}. "
-                f"Strategy is unprofitable."
+                f"{diag_stat} Strategy is unprofitable."
             ),
             "action": (
                 "1) Increase CONFLUENCE_MIN_ABS_SCORE to filter weak signals. "
@@ -2673,6 +2967,87 @@ def repair_shop_diagnosis(
                 "Treat all suggestions as provisional until n≥300."
             ),
             "expected_impact": "Prevents overfitting to small samples.",
+        })
+
+    # ── 8. ML: Automated root-cause attribution ──
+    rc = diagnose_root_cause(
+        rows, target_wr=target_wr,
+        min_segment=max(15, min_sample // 2),
+    )
+    if rc.get("valid") and rc["segments"]:
+        seg = rc["segments"][0]
+        repairs.append({
+            "severity": "high",
+            "category": "root_cause",
+            "diagnosis": (
+                f"Losses concentrate where `{seg['rule']}`: that segment wins "
+                f"only {seg['segment_wr']:.0%} (n={seg['segment_n']}) vs overall "
+                f"{rc['overall_wr']:.0%}, covering {seg['coverage']:.0%} of trades."
+            ),
+            "action": (
+                f"Add a guard blocking trades when {seg['rule']}, or reduce the "
+                f"weight of the offending vote/feature."
+            ),
+            "expected_impact": (
+                f"Removing this segment lifts overall WR by "
+                f"~{seg['lift_vs_overall']:.0%}."
+            ),
+            "p_value": seg["p_value"],
+        })
+
+    # ── 9. ML: Feature / regime drift (PSI) ──
+    drift = detect_feature_drift(rows)
+    if drift.get("valid") and drift["drifted_features"]:
+        top = ", ".join(
+            f"{d['feature']} (PSI {d['psi']:.2f})"
+            for d in drift["drifted_features"][:4]
+        )
+        repairs.append({
+            "severity": "medium",
+            "category": "regime_shift",
+            "diagnosis": (
+                f"Feature distributions shifted recently: {top}. The market "
+                f"regime this config was tuned on has changed."
+            ),
+            "action": (
+                "Re-run the weight optimizer on recent-only data, and treat "
+                "older-window recommendations as stale until the regime settles."
+            ),
+            "expected_impact": (
+                "Re-tunes gates to the current regime instead of a stale one."
+            ),
+        })
+
+    # ── 10. ML: Change-point + config attribution ──
+    cp = find_wr_change_point(rows)
+    if cp.get("valid"):
+        direction = "dropped" if cp["delta"] < 0 else "improved"
+        version_note = ""
+        if (cp.get("version_before") and cp.get("version_after")
+                and cp["version_before"] != cp["version_after"]):
+            version_note = (
+                f" Config version changed at the break: "
+                f"{cp['version_before']} → {cp['version_after']}."
+            )
+        repairs.append({
+            "severity": "high" if cp["delta"] < 0 else "low",
+            "category": "config_regression_pinpoint",
+            "diagnosis": (
+                f"Win rate {direction} from {cp['wr_before']:.0%} to "
+                f"{cp['wr_after']:.0%} (Δ{cp['delta']:+.0%}) at "
+                f"{format_ist_time(cp['change_ts'])}.{version_note}"
+            ),
+            "action": (
+                "Review what changed at that timestamp. If a config patch "
+                "landed then, consider reverting it."
+                if cp["delta"] < 0 else
+                "Note the improvement and the change that caused it."
+            ),
+            "expected_impact": (
+                "Pinpoints exactly when the edge broke, instead of a vague "
+                "'recently' window."
+            ),
+            "p_value": cp["p_value"],
         })
 
     # Sort by severity

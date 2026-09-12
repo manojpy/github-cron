@@ -27,7 +27,9 @@ from threshold_engine import (
 from repair_ledger import (
     record_repair_issued, mark_plan_applied,
     evaluate_pending_repairs, repair_success_rates, ledger_stats,
+    load_ledger_entries,
 )
+
 from alerts import escape_markdown_v2
 
 _PHASE_MIN_SAMPLES = {
@@ -193,7 +195,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     except Exception:
         pass
 
-    # ── BEST / WORST CONDITIONS ───────────────────────���────────────────
+    # ── BEST / WORST CONDITIONS ──────────────────���────���─���──────────────
     try:
         pair_stats = engine.per_pair_breakdown(rows, min_sample=5)  # worst-first
         if len(pair_stats) >= 2:
@@ -237,6 +239,7 @@ class BrainEngineV2(BaseBrainEngine):
         self._recs_cache_ts: float = 0.0
         self._repair_success_rates: Dict[str, Dict[str, float]] = {}
         self._ledger_stats: Dict[str, Any] = {}
+        self._repair_help_preds: Dict[str, float] = {}
 
     @staticmethod
     def _shadow_weight_check(
@@ -326,6 +329,7 @@ class BrainEngineV2(BaseBrainEngine):
     async def _generate_recommendations_full(self) -> Dict[str, Any]:
         # ── 0. Baseline (original brain logic) ───────────────────────────
         base_recs = await self._generate_baseline_recommendations()
+        logger = logging.getLogger("macd_bot")
         real_rows = base_recs.get("_real_rows", [])
         shadow_rows = base_recs.get("_shadow_rows", [])
         recommendations: List[Dict[str, Any]] = list(base_recs.get("recommendations", []))
@@ -344,7 +348,6 @@ class BrainEngineV2(BaseBrainEngine):
                 self.sdb, real_rows, horizon_hours=48, min_outcomes=30,
             )
             if fresh:
-                logger = logging.getLogger("macd_bot")
                 logger.info(f"📒 Repair ledger: evaluated {len(fresh)} pending repair(s)")
             self._repair_success_rates = await repair_success_rates(self.sdb)
             self._ledger_stats = await ledger_stats(self.sdb)
@@ -353,6 +356,31 @@ class BrainEngineV2(BaseBrainEngine):
             logging.getLogger("macd_bot").debug(f"Repair ledger eval failed (non-fatal): {e}")
             self._repair_success_rates = {}
             self._ledger_stats = {}
+
+        # ── ML: contextual repair-effectiveness model ────────────────────
+        # Learns P(repair helps | system state) from resolved ledger entries,
+        # then annotates each new repair with that probability below.
+        try:
+            ledger_entries = await load_ledger_entries(self.sdb)
+            current_state = {
+                "overall_wr": (
+                    sum(1 for r in real_rows if r["win"]) / len(real_rows)
+                ) if real_rows else None,
+                "n": len(real_rows),
+                "net_ev": ai_metrics.get("net_ev"),
+                "brier": ai_metrics.get("brier_score"),
+            }
+            rem = engine.learn_repair_effectiveness(
+                ledger_entries, current_state, min_records=30,
+            )
+            if rem.get("valid"):
+                self._repair_help_preds = rem["p_help_by_category"]
+                ai_metrics["repair_effectiveness_model"] = rem
+        except Exception as e:
+            logging.getLogger("macd_bot").debug(
+                f"Repair effectiveness model failed (non-fatal): {e}"
+            )
+            self._repair_help_preds = {}
 
         # ── REPAIR SHOP (runs first — highest priority) ──────────────────
         drift_alerts = [r for r in recommendations if r.get("type") == "cusum_drift"]
@@ -376,7 +404,15 @@ class BrainEngineV2(BaseBrainEngine):
                     f"   → {repair['action']}\n"
                     f"   Impact: {repair['expected_impact']}"
                 ),
+                # ── FDR: carry the p-value through for the BH pass ──
+                "p_value": repair.get("p_value"),
+                "posterior": repair.get("posterior"),
             }
+            # ── ML: annotate with learned P(helps) for this category ──
+            cat = repair.get("category")
+            if cat in self._repair_help_preds:
+                wrapped["p_helps_learned"] = self._repair_help_preds[cat]
+
             # ── Ledger: record the issue with a pre-repair snapshot ──
             try:
                 snapshot = {
@@ -891,6 +927,12 @@ class BrainEngineV2(BaseBrainEngine):
                 if stats.get("n", 0) >= 8:
                     rec["_empirical_help_rate"] = round(stats["help_rate"], 3)
 
+        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        recommendations.sort(key=lambda x: (
+            severity_order.get(x.get("severity"), 4),
+            -x.get("actionability_score", 0),
+        ))
+
         # ── Config version hash ──────────────────────────────────────────
         ai_metrics["config_version"] = hash_config_state(
             CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
@@ -912,7 +954,7 @@ class BrainEngineV2(BaseBrainEngine):
                 sum(1 for r in shadow_rows if r["win"]) / len(shadow_rows), 4
             )
 
-        # ── Re-assemble ──────────────────────────────────────────────────
+        # ─ Re-assemble ──────────────────────────────────────────────────
         result = dict(base_recs)
         result["recommendations"] = recommendations
         result["recommendation_count"] = len(recommendations)
@@ -973,10 +1015,13 @@ class BrainEngineV2(BaseBrainEngine):
                     )
                     scored = []
                     for kind, item in candidates:
-                        cat = kind  # coarse category; refine if you want
-                        s = self._repair_success_rates.get(cat, {"help_rate": 0.5, "n": 0})
-                        a = 1 + s["n"] * s["help_rate"]
-                        b = 1 + s["n"] * (1 - s["help_rate"])
+                        # NOTE: no ledger category maps cleanly onto "config"/
+                        # "disable"/"reinstate" yet, so there is no learned
+                        # help-rate to sample from. Until entries are tracked
+                        # by the specific thing changed, this is an
+                        # intentionally uninformed uniform draw (Beta(1,1)) —
+                        # not a "top by help-rate" selection.
+                        a, b = 1, 1
                         sampled = rng.betavariate(a, b)
                         scored.append((sampled, kind, item))
                     scored.sort(key=lambda t: -t[0])

@@ -120,6 +120,11 @@ def _extract_p_value_for_fdr(
         p = rec.get("p_value")
         return float(p) if isinstance(p, (int, float)) else None
 
+    # ── Repair shop: p_value stamped by the ML diagnostics ──
+    if rtype == "repair_shop":
+        p = rec.get("p_value")
+        return float(p) if isinstance(p, (int, float)) else None
+
     # ── Calibration: one-sample against the train-split prediction ─
     if rtype == "calibration_divergence":
         n = rec.get("n")
