@@ -2826,27 +2826,27 @@ def repair_shop_diagnosis(
     collapse_floor = target_wr * 0.5
     overall_wins = sum(1 for r in rows if r["win"])
     p_overall_broken = _prob_edge_broken(overall_wins, n, collapse_floor)
+
     if p_overall_broken > 0.90:
         severity = "critical" if p_overall_broken > 0.97 else "high"
-
-    repairs.append({
-        "severity": severity,
-        "category": "win_rate_collapse",
-        "diagnosis": (
-            f"Overall WR {overall_wr:.0%} (n={n}) — posterior "
-            f"P(true WR < {collapse_floor:.0%}) = {p_overall_broken:.1%}. "
-            f"The strategy has negative edge."
-         ),
-        "action": (
-            "1) STOP all live trading immediately. "
-            "2) Raise CONFLUENCE_MIN_ABS_SCORE by +2 to filter weak signals. "
-            f"3) Review the last {min(30, n)} trades manually for a systematic error "
-            "(bad data, wrong timeframe, API issues)."
-        ),
-        "expected_impact": "Prevents further losses while diagnosing root cause.",
-        "posterior": round(p_overall_broken, 4),
-        "scope": {"kind": "global"},
-    })
+        repairs.append({
+            "severity": severity,
+            "category": "win_rate_collapse",
+            "diagnosis": (
+                f"Overall WR {overall_wr:.0%} (n={n}) — posterior "
+                f"P(true WR < {collapse_floor:.0%}) = {p_overall_broken:.1%}. "
+                f"The strategy has negative edge."
+            ),
+            "action": (
+                "1) STOP all live trading immediately. "
+                "2) Raise CONFLUENCE_MIN_ABS_SCORE by +2 to filter weak signals. "
+                f"3) Review the last {min(30, n)} trades manually for a systematic error "
+                "(bad data, wrong timeframe, API issues)."
+            ),
+            "expected_impact": "Prevents further losses while diagnosing root cause.",
+            "posterior": round(p_overall_broken, 4),
+            "scope": {"kind": "global"},
+        })
     # ── 2. Directional collapse (sell or buy side broken) ──
     drifted_sell = [d for d in drift_alerts if "sell" in d.get("alert", "") or "down" in d.get("alert", "")]
     drifted_buy = [d for d in drift_alerts if "buy" in d.get("alert", "") or "up" in d.get("alert", "")]
@@ -2913,36 +2913,6 @@ def repair_shop_diagnosis(
     current_threshold = config.get("CONFLUENCE_MIN_ABS_SCORE", 18.0)
     rec = recommend_threshold(rows, target_winrate=target_wr, min_sample=min_sample)
 
-    if rc.get("valid") and rc["segments"]:
-        seg = rc["segments"][0]
-        repairs.append({
-            "severity": "high",
-            "category": "root_cause",
-            "diagnosis": (
-                f"Losses concentrate where `{seg['rule']}`: that segment wins "
-                f"only {seg['segment_wr']:.0%} (n={seg['segment_n']}) vs overall "
-                f"{rc['overall_wr']:.0%}, covering {seg['coverage']:.0%} of trades."
-            ),
-            "action": (
-                f"Add a guard blocking trades when {seg['rule']}, or reduce the "
-                f"weight of the offending vote/feature."
-            ),
-            "expected_impact": (
-                f"Removing this segment lifts overall WR by "
-                f"~{seg['lift_vs_overall']:.0%}."
-            ),
-            "p_value": seg["p_value"],
-            # Scope: the exact subset the segment rule selects — the only
-            # rows this repair can possibly affect.
-            "scope": {
-                "kind": "segment",
-                "value": {
-                    "feature": seg["feature"],
-                    "op": seg["op"],
-                    "threshold": seg["threshold"],
-                },
-            },
-        })
     if rec.get("valid") and rec["recommended"] > current_threshold + 0.5:
         repairs.append({
             "severity": "high",
@@ -3032,7 +3002,7 @@ def repair_shop_diagnosis(
         seg = rc["segments"][0]
         repairs.append({
             "severity": "high",
-            "category": "dominant_segment",
+            "category": "root_cause",
             "diagnosis": (
                 f"Losses concentrate where `{seg['rule']}`: that segment wins "
                 f"only {seg['segment_wr']:.0%} (n={seg['segment_n']}) vs overall "
