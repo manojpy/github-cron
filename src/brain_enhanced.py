@@ -47,7 +47,6 @@ _PHASE_MIN_SAMPLES = {
 # ══════════════════════════════════════════════════════════════════════
 _TG_ESCAPE = re.compile(r'[_*\[\]()~`>#+\-=|{}.!]')
 
-
 def _tg(x: Any) -> str:
     """MarkdownV2-escape so TelegramQueue.send() never rejects the message."""
     return _TG_ESCAPE.sub(r'\\\g<0>', str(x))
@@ -195,7 +194,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     except Exception:
         pass
 
-    # ── BEST / WORST CONDITIONS ──────────────────�����────���─���──────────────
+    # ── BEST / WORST CONDITIONS ──────────────────������────���─���──────────────
     try:
         pair_stats = engine.per_pair_breakdown(rows, min_sample=5)  # worst-first
         if len(pair_stats) >= 2:
@@ -412,6 +411,10 @@ class BrainEngineV2(BaseBrainEngine):
                 "version_before": repair.get("version_before"),
                 "version_after": repair.get("version_after"),
                 "delta_wr": repair.get("delta_wr"),
+                # Wiring #4: mechanical config-patch fields, when present.
+                "config_field": repair.get("config_field"),
+                "config_current": repair.get("config_current"),
+                "config_suggested": repair.get("config_suggested"),
             }
             # ── ML: annotate with learned P(helps) for this category ──
             cat = repair.get("category")
@@ -1042,6 +1045,20 @@ class BrainEngineV2(BaseBrainEngine):
                     adj = self._root_cause_to_weight_adjustment(rec)
                     if adj:
                         weight_adjustments.append(adj)
+                elif rec_type == "repair_shop" and rec.get("category") == "threshold_too_low":
+                    # Wiring #4: this repair is already just "set the field
+                    # to this value" — hand it straight to the patch
+                    # pipeline instead of leaving it prose-only.
+                    field = rec.get("config_field")
+                    suggested = rec.get("config_suggested")
+                    if field in CONFIG_OVERRIDE_ALLOWED_FIELDS and suggested is not None:
+                        config_patches.append({
+                            "path": field,
+                            "current": rec.get("config_current"),
+                            "suggested": suggested,
+                            "reason": rec.get("message", ""),
+                            "_source_category": "threshold_too_low",
+                        })
 
             # Only store safe config patches
             for patch in recs.get("config_patch", []):
@@ -1060,7 +1077,6 @@ class BrainEngineV2(BaseBrainEngine):
                             or self._infer_patch_category(field)
                         ),
                     })
-
             # ── Optional budget: cap total entries per plan ──
             budget = getattr(cfg, "BRAIN_MAX_PLAN_ENTRIES", 0)
             if budget > 0:
@@ -1148,14 +1164,9 @@ class BrainEngineV2(BaseBrainEngine):
         threshold = val.get("threshold")
         if not feature.startswith("vote:") or threshold is None:
             return None
-        # "vote ON is the toxic side": > thr with thr in [0,1), or >= thr
-        # with thr in (0,1].
-        if op == ">" and not (0.0 <= threshold < 1.0):
+        if op != ">" or not (0.0 <= threshold < 1.0):
             return None
-        if op == ">=" and not (0.0 < threshold <= 1.0):
-            return None
-        if op not in (">", ">="):
-            return None
+
         vote = feature.split(":", 1)[1]
         current_w = CONFLUENCE_WEIGHTS.get(vote)
         if current_w is None or current_w <= 0:
@@ -1317,7 +1328,7 @@ class BrainEngineV2(BaseBrainEngine):
             # Build and send the plain-English action plan
             plan_messages = build_profit_action_plan(recs, cfg)
             for msg in plan_messages:
-                await telegram_queue.send(msg)
+                await telegram_queue.send(escape_markdown_v2(msg))
             
             # Add a footer explaining how to apply
             apply_hint = (

@@ -1672,7 +1672,7 @@ def interaction_miner(
                     entry["n_neither"] = n_neither
                 interactions.append(entry)
 
-            # ── v1 poisons v2 ───────────────────────����───────────────────
+            # ── v1 poisons v2 ──────────────────���────����───────────────────
             if has_v2_sample:
                 poison_v2 = wr_only_v2 - wr_both
                 if poison_v2 > 0.15 and n_both >= min_sample:
@@ -2386,7 +2386,7 @@ def optimize_vote_weights(
         "coeff_stability": coeff_stability,
     }
 
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════���═══════════════
 #  PERMUTATION VOTE IMPORTANCE (AI/ML)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -2911,7 +2911,6 @@ def repair_shop_diagnosis(
     # ── 4. Gate threshold too low ──
     current_threshold = config.get("CONFLUENCE_MIN_ABS_SCORE", 18.0)
     rec = recommend_threshold(rows, target_winrate=target_wr, min_sample=min_sample)
-
     if rec.get("valid") and rec["recommended"] > current_threshold + 0.5:
         repairs.append({
             "severity": "high",
@@ -2931,6 +2930,12 @@ def repair_shop_diagnosis(
             # blocked band — those are exactly the ones it says are bad.
             "scope": {"kind": "score_band",
                       "value": [float(current_threshold), float(rec["recommended"])]},
+            # Wiring #4: mechanical config patch — this repair is just
+            # "set the field to this value," so hand it straight to the
+            # patch pipeline instead of leaving it prose-only.
+            "config_field": "CONFLUENCE_MIN_ABS_SCORE",
+            "config_current": float(current_threshold),
+            "config_suggested": float(rec["recommended"]),
         })
 
     # ── 5. Brier / calibration check ──
