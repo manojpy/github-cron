@@ -759,6 +759,24 @@ def per_pair_session_breakdown(rows: List[Row], min_sample: int = 10):
     results.sort(key=lambda x: x[2])
     return results
 
+def session_breakdown(rows: List[Row], min_sample: int = 10):
+    """Groups by session ONLY (asian/london/ny/dead) — for comparing overall
+    session performance, as opposed to per_pair_session_breakdown()'s
+    (pair, session) granularity. Returns (session, win_rate, n) tuples,
+    sorted worst win-rate first."""
+    stats = defaultdict(lambda: {"wins": 0, "n": 0})
+    for r in rows:
+        s = stats[r.get("session", "unknown")]
+        s["wins"] += r["win"]
+        s["n"] += 1
+    results = []
+    for session, s in stats.items():
+        if s["n"] < min_sample:
+            continue
+        results.append((session, s["wins"] / s["n"], s["n"]))
+    results.sort(key=lambda x: x[1])
+    return results
+
 def per_alert_breakdown(rows: List[Row], min_sample: int = 10):
     stats = defaultdict(lambda: {"wins": 0, "n": 0, "scores": []})
     for r in rows:
@@ -2388,7 +2406,7 @@ def permutation_vote_importance(
 
 # ═══════════════════════════════════════════════════════════════════════
 #  REPAIR SHOP DIAGNOSIS ENGINE
-# ══════════════════════════════════════════════════════════════════════
+# ═══════════════��══════════════════════════════════════════════════════
 
 def repair_shop_diagnosis(
     rows: List[Row],

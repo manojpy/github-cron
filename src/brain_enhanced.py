@@ -154,11 +154,20 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
         rec_thr = engine.recommend_threshold(rows, target_winrate=target, min_sample=getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20))
         if rec_thr.get("valid") and rec_thr.get("recommended") and rec_thr["recommended"] > cfg.CONFLUENCE_MIN_ABS_SCORE:
             gate_rec = rec_thr
+            rec_wr_val = rec_thr.get("rec_wr", 0)
+            if rec_wr_val > wr:
+                outcome_line = f"lifts expected WR to ~{rec_wr_val:.0%} (from {wr:.0%})"
+            else:
+                outcome_line = (
+                    f"expected WR is ~{rec_wr_val:.0%} — *below* your current {wr:.0%}. "
+                    f"This trades hit-rate for a better EV/R:R profile, not a higher win rate — "
+                    f"only apply it if that trade-off is what you want"
+                )
             sections.append(
                 f"🚪 ENTRY BAR — RAISE IT\n"
                 f"CONFLUENCE_MIN_ABS_SCORE: {cfg.CONFLUENCE_MIN_ABS_SCORE:.1f} → {rec_thr['recommended']:.1f}\n"
                 f"   This alone filters out {rec_thr.get('dropped', 0)} weak trades "
-                f"({rec_thr.get('dropped_pct', 0):.0%}) and lifts expected WR to ~{rec_thr.get('rec_wr', 0):.0%}."
+                f"({rec_thr.get('dropped_pct', 0):.0%}) and {outcome_line}."
             )
     except Exception:
         pass
@@ -186,9 +195,10 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
             line = (f"🌍 WHERE YOU WIN & LOSE\n"
                     f"🏆 Best: {best[0]} at {best[1]:.0%} WR (n={best[2]})\n"
                     f"💀 Worst: {worst[0]} at {worst[1]:.0%} WR (n={worst[2]}) — consider removing this pair")
-            sess = engine.per_pair_session_breakdown(rows, min_sample=5)
+            sess = engine.session_breakdown(rows, min_sample=5)
             if len(sess) >= 2:
-                line += f"\n⏰ Best session: {sess[-1][1]} ({sess[-1][2]:.0%}) | Worst: {sess[0][1]} ({sess[0][2]:.0%})"
+                line += (f"\n⏰ Best session: {sess[-1][0]} ({sess[-1][1]:.0%}, n={sess[-1][2]}) "
+                         f"| Worst: {sess[0][0]} ({sess[0][1]:.0%}, n={sess[0][2]})")
             sections.append(line)
     except Exception:
         pass
