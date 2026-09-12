@@ -952,7 +952,7 @@ class BrainEngineV2(BaseBrainEngine):
                     "type": "fdr_summary",
                     "severity": "low",
                     "message": (
-                        f"📊 FDR (Benjamini-Hochberg, α=0.10): {n_survived}/{n_tested} "
+                        f"�� FDR (Benjamini-Hochberg, α=0.10): {n_survived}/{n_tested} "
                         f"statistical claims survived correction across the report. "
                         f"Surviving claims are marked `fdr_passed=True`; demoted "
                         f"claims are downgraded to low severity."
@@ -1326,24 +1326,29 @@ class BrainEngineV2(BaseBrainEngine):
             recs = await self.generate_recommendations()
             
             # Build and send the plain-English action plan
-            plan_messages = build_profit_action_plan(recs, cfg)
+            plan_messages = build_profit_action_plan(recs, cfg)  # already MarkdownV2-escaped
+            sent_ok = True
             for msg in plan_messages:
-                await telegram_queue.send(escape_markdown_v2(msg))
+                if not await telegram_queue.send(msg):
+                    sent_ok = False
             
             # Add a footer explaining how to apply
             apply_hint = (
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                 "📝 TO APPLY THESE CHANGES:\n"
                 "Run: `python macd_unified.py --apply-brain`\n"
-                "Or manually edit config_macd.json with the values above\\."
+                "Or manually edit config_macd.json with the values above."
             )
-            await telegram_queue.send(escape_markdown_v2(apply_hint))
+            if not await telegram_queue.send(escape_markdown_v2(apply_hint)):
+                sent_ok = False
             
             # Store the plan for later application
             await self._store_pending_plan(recs)
             
-            logger_run.info(f"Brain report sent ({len(plan_messages)} messages) and stored for application")
-            return recs
+            if sent_ok:
+                logger_run.info(f"Brain report sent ({len(plan_messages)} messages) and stored for application")
+            else:
+                logger_run.error(f"Brain report FAILED to send ({len(plan_messages)} messages attempted) — plan still stored")
             
         except Exception as e:
             logger_run.warning(f"Report generation failed: {e}")
