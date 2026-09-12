@@ -1944,20 +1944,33 @@ def score_actionability(rec: Dict[str, Any]) -> float:
         effort = 2.0
     return impact * confidence / effort
 
+
 def learned_actionability(
     rec: Dict[str, Any],
     success_rates: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> float:
-    """Hand-formula blended with the empirical help-rate for this repair
-    category. Falls back to the formula verbatim when we have < 8 verdicts
-    for the category — no repair category should be penalized for being
-    new.
+    """Hand-formula blended with two learned signals:
 
-    Blend is 50/50 by design. The hand-formula is not wrong; it's just
-    unaware of whether this specific repair class has historically helped
-    this specific bot. Once a category has ~200 verdicts the weight should
-    shift toward the empirical side — flag this for a follow-up."""
+    1. Category-level help-rate from the repair ledger (per-category
+       empirical track record).
+    2. Per-repair P(helps | current state) from the contextual logistic
+       model (`learn_repair_effectiveness`), when available on the rec
+       as `p_helps_learned`.
+
+    Falls back to the hand-formula verbatim when neither signal has
+    enough data — no repair is penalized for being new."""
     base = score_actionability(rec)
+
+    # ── Signal 1: contextual ML prediction for THIS repair ──
+    # Multiplicative modulation in [0.5, 1.5] so a strongly predicted-help
+    # repair gets boosted and a predicted-hurt one gets suppressed, but
+    # neither can zero the base score. Without this, the learned model's
+    # output is written into the rec and read by nothing.
+    p_help = rec.get("p_helps_learned")
+    if isinstance(p_help, (int, float)):
+        base *= (0.5 + float(p_help))
+
+    # ── Signal 2: category-level empirical blend ──
     if not success_rates:
         return base
     cat = rec.get("category") or rec.get("type") or "unknown"
@@ -2374,7 +2387,6 @@ def optimize_vote_weights(
         "coeff_stability": coeff_stability,
     }
 
-
 # ═══════════════════════════════════════════════════════════════════════
 #  PERMUTATION VOTE IMPORTANCE (AI/ML)
 # ═══════════════════════════════════════════════════════════════════════
@@ -2563,6 +2575,8 @@ def diagnose_root_cause(
                 candidates.append({
                     "feature": feat,
                     "rule": f"{feat} {side_rule} {thr:.3f}",
+                    "op": side_rule,
+                    "threshold": thr,
                     "segment_wr": seg_wr,
                     "segment_n": seg_n,
                     "lift_vs_overall": lift,
@@ -2589,7 +2603,6 @@ def diagnose_root_cause(
         "n": n,
         "segments": deduped[:top_k],
     }
-
 
 def population_stability_index(
     baseline: List[float],
@@ -2815,23 +2828,25 @@ def repair_shop_diagnosis(
     p_overall_broken = _prob_edge_broken(overall_wins, n, collapse_floor)
     if p_overall_broken > 0.90:
         severity = "critical" if p_overall_broken > 0.97 else "high"
-        repairs.append({
-            "severity": severity,
-            "category": "win_rate_collapse",
-            "diagnosis": (
-                f"Overall WR {overall_wr:.0%} (n={n}) — posterior "
-                f"P(true WR < {collapse_floor:.0%}) = {p_overall_broken:.1%}. "
-                f"The strategy has negative edge."
-            ),
-            "action": (
-                "1) STOP all live trading immediately. "
-                "2) Raise CONFLUENCE_MIN_ABS_SCORE by +2 to filter weak signals. "
-                f"3) Review the last {min(30, n)} trades manually for a systematic error "
-                "(bad data, wrong timeframe, API issues)."
-            ),
-            "expected_impact": "Prevents further losses while diagnosing root cause.",
-            "posterior": round(p_overall_broken, 4),
-        })
+
+    repairs.append({
+        "severity": severity,
+        "category": "win_rate_collapse",
+        "diagnosis": (
+            f"Overall WR {overall_wr:.0%} (n={n}) — posterior "
+            f"P(true WR < {collapse_floor:.0%}) = {p_overall_broken:.1%}. "
+            f"The strategy has negative edge."
+         ),
+        "action": (
+            "1) STOP all live trading immediately. "
+            "2) Raise CONFLUENCE_MIN_ABS_SCORE by +2 to filter weak signals. "
+            f"3) Review the last {min(30, n)} trades manually for a systematic error "
+            "(bad data, wrong timeframe, API issues)."
+        ),
+        "expected_impact": "Prevents further losses while diagnosing root cause.",
+        "posterior": round(p_overall_broken, 4),
+        "scope": {"kind": "global"},
+    })
     # ── 2. Directional collapse (sell or buy side broken) ──
     drifted_sell = [d for d in drift_alerts if "sell" in d.get("alert", "") or "down" in d.get("alert", "")]
     drifted_buy = [d for d in drift_alerts if "buy" in d.get("alert", "") or "up" in d.get("alert", "")]
@@ -2856,8 +2871,8 @@ def repair_shop_diagnosis(
                 ),
                 "expected_impact": f"Removing {len(sell_rows)} losing sell trades lifts overall WR to ~{buy_wr:.0%}." if buy_wr else "Removes systematic losses.",
                 "posterior": round(p_sell_broken, 4),
+                "scope": {"kind": "direction", "value": "sell"},
             })
-
     if buy_wr is not None:
         buy_wins = sum(1 for r in buy_rows if r["win"])
         p_buy_broken = _prob_edge_broken(buy_wins, len(buy_rows), disable_wr)
@@ -2873,11 +2888,12 @@ def repair_shop_diagnosis(
                 "action": f"Disable drifted buy alerts: {', '.join(d.get('alert', '?') for d in drifted_buy[:5])}.",
                 "expected_impact": "Stops bleeding on the buy side.",
                 "posterior": round(p_buy_broken, 4),
+                "scope": {"kind": "direction", "value": "buy"},
             })
-
     # ── 3. CUSUM drift freeze ──
     if drift_alerts:
         drifted_names = [d.get("alert", "?") for d in drift_alerts]
+        drifted_keys = sorted({d.get("alert") for d in drift_alerts if d.get("alert")})
         repairs.append({
             "severity": "high",
             "category": "cusum_drift",
@@ -2891,11 +2907,42 @@ def repair_shop_diagnosis(
                 "Check if a recent config change or market regime shift caused the decay."
             ),
             "expected_impact": "Prevents auto-tuning from optimizing a broken signal.",
+            "scope": {"kind": "alert_keys", "value": drifted_keys},
         })
-
     # ── 4. Gate threshold too low ──
     current_threshold = config.get("CONFLUENCE_MIN_ABS_SCORE", 18.0)
     rec = recommend_threshold(rows, target_winrate=target_wr, min_sample=min_sample)
+
+    if rc.get("valid") and rc["segments"]:
+        seg = rc["segments"][0]
+        repairs.append({
+            "severity": "high",
+            "category": "root_cause",
+            "diagnosis": (
+                f"Losses concentrate where `{seg['rule']}`: that segment wins "
+                f"only {seg['segment_wr']:.0%} (n={seg['segment_n']}) vs overall "
+                f"{rc['overall_wr']:.0%}, covering {seg['coverage']:.0%} of trades."
+            ),
+            "action": (
+                f"Add a guard blocking trades when {seg['rule']}, or reduce the "
+                f"weight of the offending vote/feature."
+            ),
+            "expected_impact": (
+                f"Removing this segment lifts overall WR by "
+                f"~{seg['lift_vs_overall']:.0%}."
+            ),
+            "p_value": seg["p_value"],
+            # Scope: the exact subset the segment rule selects — the only
+            # rows this repair can possibly affect.
+            "scope": {
+                "kind": "segment",
+                "value": {
+                    "feature": seg["feature"],
+                    "op": seg["op"],
+                    "threshold": seg["threshold"],
+                },
+            },
+        })
     if rec.get("valid") and rec["recommended"] > current_threshold + 0.5:
         repairs.append({
             "severity": "high",
@@ -2911,6 +2958,10 @@ def repair_shop_diagnosis(
                 f"({rec['dropped_pct']:.0%})."
             ),
             "expected_impact": f"WR improvement: {overall_wr:.0%} → {rec['rec_wr']:.0%} (+{rec['rec_wr']-overall_wr:.0%}).",
+            # The repair's effect is confined to trades in the newly-
+            # blocked band — those are exactly the ones it says are bad.
+            "scope": {"kind": "score_band",
+                      "value": [float(current_threshold), float(rec["recommended"])]},
         })
 
     # ── 5. Brier / calibration check ──
@@ -2922,6 +2973,7 @@ def repair_shop_diagnosis(
             "diagnosis": f"Brier score {brier:.3f} ≥ 0.20 — predicted probabilities are miscalibrated.",
             "action": "Review confluence weight distribution. Consider running the weight optimizer with walk-forward validation.",
             "expected_impact": "Better calibrated scores → more reliable threshold gating.",
+            "scope": {"kind": "global"},
         })
 
     # ── 6. EV / Kelly check ──
@@ -2953,6 +3005,7 @@ def repair_shop_diagnosis(
             ),
             "expected_impact": "Positive EV is the minimum requirement for a viable strategy.",
             "posterior": round(p_ev_negative, 4),
+            "scope": {"kind": "global"},
         })
 
     # ── 7. Sample size warning ──
@@ -2967,6 +3020,7 @@ def repair_shop_diagnosis(
                 "Treat all suggestions as provisional until n≥300."
             ),
             "expected_impact": "Prevents overfitting to small samples.",
+            "scope": {"kind": "global"},
         })
 
     # ── 8. ML: Automated root-cause attribution ──
@@ -2978,7 +3032,7 @@ def repair_shop_diagnosis(
         seg = rc["segments"][0]
         repairs.append({
             "severity": "high",
-            "category": "root_cause",
+            "category": "dominant_segment",
             "diagnosis": (
                 f"Losses concentrate where `{seg['rule']}`: that segment wins "
                 f"only {seg['segment_wr']:.0%} (n={seg['segment_n']}) vs overall "
@@ -2993,8 +3047,17 @@ def repair_shop_diagnosis(
                 f"~{seg['lift_vs_overall']:.0%}."
             ),
             "p_value": seg["p_value"],
+            # Scope: the exact subset the segment rule selects — the only
+            # rows this repair can possibly affect.
+            "scope": {
+                "kind": "segment",
+                "value": {
+                    "feature": seg["feature"],
+                    "op": seg["op"],
+                    "threshold": seg["threshold"],
+                },
+            },
         })
-
     # ── 9. ML: Feature / regime drift (PSI) ──
     drift = detect_feature_drift(rows)
     if drift.get("valid") and drift["drifted_features"]:
@@ -3016,6 +3079,7 @@ def repair_shop_diagnosis(
             "expected_impact": (
                 "Re-tunes gates to the current regime instead of a stale one."
             ),
+            "scope": {"kind": "global"},
         })
 
     # ── 10. ML: Change-point + config attribution ──
@@ -3048,11 +3112,18 @@ def repair_shop_diagnosis(
                 "'recently' window."
             ),
             "p_value": cp["p_value"],
+            "scope": (
+                {"kind": "config_version", "value": cp["version_after"]}
+                if cp.get("version_after") else {"kind": "global"}
+            ),
         })
 
     # Sort by severity
     severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     repairs.sort(key=lambda x: severity_order.get(x["severity"], 4))
+    shop_max = getattr(cfg, "BRAIN_REPAIR_SHOP_MAX", 3)
+    if len(repairs) > shop_max:
+        repairs = repairs[:shop_max]
     return repairs
 
 # ══════════════════════════════════════════════════════════════════════

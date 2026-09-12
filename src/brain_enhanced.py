@@ -195,7 +195,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     except Exception:
         pass
 
-    # ── BEST / WORST CONDITIONS ──────────────────���────���─���──────────────
+    # ── BEST / WORST CONDITIONS ──────────────────����────���─���──────────────
     try:
         pair_stats = engine.per_pair_breakdown(rows, min_sample=5)  # worst-first
         if len(pair_stats) >= 2:
@@ -407,13 +407,20 @@ class BrainEngineV2(BaseBrainEngine):
                 # ── FDR: carry the p-value through for the BH pass ──
                 "p_value": repair.get("p_value"),
                 "posterior": repair.get("posterior"),
+                # ── Scope: the subset of trades this repair can affect.
+                # Flows through the ledger and back into the verdict — see
+                # repair_ledger._matches_scope. ──
+                "scope": repair.get("scope"),
             }
             # ── ML: annotate with learned P(helps) for this category ──
             cat = repair.get("category")
             if cat in self._repair_help_preds:
                 wrapped["p_helps_learned"] = self._repair_help_preds[cat]
 
-            # ── Ledger: record the issue with a pre-repair snapshot ──
+            # ── Ledger: record the issue with a pre-repair snapshot.
+            # real_rows lets the ledger compute scope_wr/scope_n so the
+            # verdict later compares like-for-like on the affected subset
+            # rather than the whole book. ──
             try:
                 snapshot = {
                     "overall_wr": (sum(1 for r in real_rows if r["win"]) / len(real_rows))
@@ -422,7 +429,9 @@ class BrainEngineV2(BaseBrainEngine):
                     "net_ev": ai_metrics.get("net_ev"),
                     "brier": ai_metrics.get("brier_score"),
                 }
-                rid = await record_repair_issued(self.sdb, wrapped, snapshot)
+                rid = await record_repair_issued(
+                    self.sdb, wrapped, snapshot, real_rows=real_rows,
+                )
                 if rid:
                     wrapped["_repair_id"] = rid
             except Exception as e:
