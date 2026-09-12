@@ -1277,7 +1277,6 @@ class StabilityGate:
             )
         return True, "ok"
 
-
 # ═══════════════════════════════════════════════════════════════════════
 #  NEW: Vote-Count OOD Gate  (Recommended.txt §8)
 # ══════════════════════════════════════════════════════════════════════
@@ -3063,6 +3062,7 @@ def repair_shop_diagnosis(
                 f" Config version changed at the break: "
                 f"{cp['version_before']} → {cp['version_after']}."
             )
+
         repairs.append({
             "severity": "high" if cp["delta"] < 0 else "low",
             "category": "config_regression_pinpoint",
@@ -3082,6 +3082,11 @@ def repair_shop_diagnosis(
                 "'recently' window."
             ),
             "p_value": cp["p_value"],
+            # Structured so the brain can auto-propose a revert patch,
+            # not just describe the regression in prose.
+            "version_before": cp.get("version_before"),
+            "version_after": cp.get("version_after"),
+            "delta_wr": cp["delta"],
             "scope": (
                 {"kind": "config_version", "value": cp["version_after"]}
                 if cp.get("version_after") else {"kind": "global"}

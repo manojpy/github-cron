@@ -195,7 +195,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     except Exception:
         pass
 
-    # ── BEST / WORST CONDITIONS ──────────────────����────���─���──────────────
+    # ── BEST / WORST CONDITIONS ──────────────────�����────���─���──────────────
     try:
         pair_stats = engine.per_pair_breakdown(rows, min_sample=5)  # worst-first
         if len(pair_stats) >= 2:
@@ -408,9 +408,10 @@ class BrainEngineV2(BaseBrainEngine):
                 "p_value": repair.get("p_value"),
                 "posterior": repair.get("posterior"),
                 # ── Scope: the subset of trades this repair can affect.
-                # Flows through the ledger and back into the verdict — see
-                # repair_ledger._matches_scope. ──
-                "scope": repair.get("scope"),
+                "scope": repair.get("scope"), 
+                "version_before": repair.get("version_before"),
+                "version_after": repair.get("version_after"),
+                "delta_wr": repair.get("delta_wr"),
             }
             # ── ML: annotate with learned P(helps) for this category ──
             cat = repair.get("category")
@@ -439,6 +440,36 @@ class BrainEngineV2(BaseBrainEngine):
 
             recommendations.append(wrapped)
 
+        # ── Wiring #3: change-point regression → concrete revert patch ──
+        for repair in repairs:
+            if repair.get("category") != "config_regression_pinpoint":
+                continue
+            if (repair.get("delta_wr") or 0) >= 0:
+                continue  # only regressions warrant a revert
+            version_before = repair.get("version_before")
+            version_after = repair.get("version_after")
+            if not version_before or version_before == version_after:
+                continue
+            prior = await self._lookup_config_version(version_before)
+            if not prior:
+                continue
+            for field in CONFIG_OVERRIDE_ALLOWED_FIELDS:
+                prior_val = prior.get(field)
+                current_val = getattr(cfg, field, None)
+                if prior_val is None or current_val is None:
+                    continue
+                if prior_val == current_val:
+                    continue
+                config_patch.append({
+                    "path": field,
+                    "current": current_val,
+                    "suggested": prior_val,
+                    "reason": (
+                        f"Revert to config version {version_before}: WR fell "
+                        f"{repair.get('delta_wr', 0):+.0%} at the change point."
+                    ),
+                    "_source_category": "config_regression_pinpoint",
+                })
         # ── Phase 1.5: Vote Weight Optimizer (FIXED) ─────────────────────
         if len(real_rows) >= self._phase_samples["weight_optimizer"]:
             wopt = optimize_vote_weights(
@@ -941,11 +972,13 @@ class BrainEngineV2(BaseBrainEngine):
             severity_order.get(x.get("severity"), 4),
             -x.get("actionability_score", 0),
         ))
-
         # ── Config version hash ──────────────────────────────────────────
         ai_metrics["config_version"] = hash_config_state(
             CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
         )
+        # Wiring #3: persist this version's overridable values so a future
+        # regression can be reverted back to them.
+        await self._remember_config_version(ai_metrics["config_version"])
 
         # ── Bonus-aware metrics ──────────────────────────────────────────
         if real_rows:
@@ -986,18 +1019,30 @@ class BrainEngineV2(BaseBrainEngine):
             config_patches = []
             disable_alerts = []
             reinstate_alerts = []
-            
+            weight_adjustments = []
+
             for rec in recs.get("recommendations", []):
                 rec_type = rec.get("type")
                 if rec_type == "disable_alert":
-                    ak = rec.get("alert_key")
+                    # brain.py emits the alert under the "alert" key, not
+                    # "alert_key" — the old lookup silently dropped every
+                    # disable, so the decision never reached the plan.
+                    ak = rec.get("alert") or rec.get("alert_key")
                     if ak:
                         disable_alerts.append(ak)
-                elif rec_type == "reinstate_alert":
-                    ak = rec.get("alert_key")
+                elif rec_type in ("reinstate_alert", "recovered_alert", "auto_reenabled"):
+                    # brain.py emits recovered alerts as "recovered_alert" /
+                    # "auto_reenabled", not "reinstate_alert".
+                    ak = rec.get("alert") or rec.get("alert_key")
                     if ak:
                         reinstate_alerts.append(ak)
-            
+                elif rec_type == "repair_shop" and rec.get("category") == "root_cause":
+                    # Wiring #1: turn the root-cause segment into an
+                    # actionable weight reduction instead of leaving it prose.
+                    adj = self._root_cause_to_weight_adjustment(rec)
+                    if adj:
+                        weight_adjustments.append(adj)
+
             # Only store safe config patches
             for patch in recs.get("config_patch", []):
                 field = patch.get("path")
@@ -1007,43 +1052,49 @@ class BrainEngineV2(BaseBrainEngine):
                         "path": field,
                         "current": patch.get("current"),
                         "suggested": suggested,
-                        "reason": patch.get("reason", "")
+                        "reason": patch.get("reason", ""),
+                        # Wiring #2: tag with a ledger category so selection
+                        # can sample that category's learned help-rate.
+                        "_source_category": (
+                            patch.get("_source_category")
+                            or self._infer_patch_category(field)
+                        ),
                     })
-            
+
             # ── Optional budget: cap total entries per plan ──
             budget = getattr(cfg, "BRAIN_MAX_PLAN_ENTRIES", 0)
             if budget > 0:
-                total = len(config_patches) + len(disable_alerts) + len(reinstate_alerts)
+                total = (len(config_patches) + len(disable_alerts)
+                         + len(reinstate_alerts) + len(weight_adjustments))
                 if total > budget:
-                    # Thompson-sample the top-`budget` by category help-rate
+                    # Wiring #2: Thompson-sample the top-`budget`, but seed
+                    # each draw with the category's learned P(helps) instead
+                    # of an uninformed uniform prior.
                     rng = random.Random(int(time.time() // 3600))
                     candidates = (
-                        [("config", p) for p in config_patches]
-                        + [("disable", ak) for ak in disable_alerts]
-                        + [("reinstate", ak) for ak in reinstate_alerts]
+                        [("config", p, p.get("_source_category")) for p in config_patches]
+                        + [("weight", w, w.get("category")) for w in weight_adjustments]
+                        + [("disable", ak, None) for ak in disable_alerts]
+                        + [("reinstate", ak, None) for ak in reinstate_alerts]
                     )
                     scored = []
-                    for kind, item in candidates:
-                        # NOTE: no ledger category maps cleanly onto "config"/
-                        # "disable"/"reinstate" yet, so there is no learned
-                        # help-rate to sample from. Until entries are tracked
-                        # by the specific thing changed, this is an
-                        # intentionally uninformed uniform draw (Beta(1,1)) —
-                        # not a "top by help-rate" selection.
-                        a, b = 1, 1
+                    for kind, item, category in candidates:
+                        a, b = self._category_beta_prior(category)
                         sampled = rng.betavariate(a, b)
                         scored.append((sampled, kind, item))
                     scored.sort(key=lambda t: -t[0])
                     keep = scored[:budget]
                     config_patches = [item for _, k, item in keep if k == "config"]
+                    weight_adjustments = [item for _, k, item in keep if k == "weight"]
                     disable_alerts = [item for _, k, item in keep if k == "disable"]
                     reinstate_alerts = [item for _, k, item in keep if k == "reinstate"]
-            
+
             plan_data = {
                 "generated_at": int(time.time()),
                 "config_patch": config_patches,
                 "disable_alerts": disable_alerts,
                 "reinstate_alerts": reinstate_alerts,
+                "weight_adjustments": weight_adjustments,
             }
             await self.sdb.set_metadata(
                 "brain_pending_plan",
@@ -1052,6 +1103,120 @@ class BrainEngineV2(BaseBrainEngine):
             )
         except Exception as e:
             logging.getLogger("macd_bot").warning(f"Failed to store pending plan: {e}")
+
+    @staticmethod
+    def _infer_patch_category(field: str) -> Optional[str]:
+        """Map a config patch to the repair-ledger category that would have
+        produced it, so selection can use that category's track record.
+        Returns None when there is no clean ledger category — those keep a
+        uniform prior rather than borrowing an unrelated one."""
+        if field in ("CONFLUENCE_MIN_ABS_SCORE", "CONFLUENCE_MIN_PCT"):
+            return "threshold_too_low"
+        return None
+
+    def _category_beta_prior(self, category: Optional[str]) -> tuple:
+        """Beta(a, b) prior for Thompson selection, centred on the learned
+        P(repair helps) for this category. Falls back to the empirical
+        ledger help-rate, then to an uninformative Beta(1,1) for anything
+        new — a never-tried action is never penalised."""
+        if not category:
+            return 1.0, 1.0
+        # Prefer the contextual learned model, fall back to the ledger rate.
+        p_help = self._repair_help_preds.get(category)
+        if p_help is None:
+            stats = self._repair_success_rates.get(category)
+            if stats and stats.get("n", 0) >= 3:
+                p_help = stats.get("help_rate")
+        if p_help is None:
+            return 1.0, 1.0
+        p_help = max(0.0, min(1.0, p_help))
+        strength = 2.0  # gentle: learned signal nudges, never dominates
+        return 1.0 + strength * p_help, 1.0 + strength * (1.0 - p_help)
+
+    def _root_cause_to_weight_adjustment(self, rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Convert a root_cause segment into a concrete weight reduction.
+        Only actionable when the toxic condition is a vote being ON — the
+        one case addressable through the existing dynamic-weights mechanism.
+        Context-threshold segments stay prose until a matching override
+        exists."""
+        scope = rec.get("scope") or {}
+        if scope.get("kind") != "segment":
+            return None
+        val = scope.get("value") or {}
+        feature = val.get("feature") or ""
+        op = val.get("op")
+        threshold = val.get("threshold")
+        if not feature.startswith("vote:") or threshold is None:
+            return None
+        # "vote ON is the toxic side": > thr with thr in [0,1), or >= thr
+        # with thr in (0,1].
+        if op == ">" and not (0.0 <= threshold < 1.0):
+            return None
+        if op == ">=" and not (0.0 < threshold <= 1.0):
+            return None
+        if op not in (">", ">="):
+            return None
+        vote = feature.split(":", 1)[1]
+        current_w = CONFLUENCE_WEIGHTS.get(vote)
+        if current_w is None or current_w <= 0:
+            return None
+        return {
+            "vote": vote,
+            "current": current_w,
+            "suggested": round(current_w * 0.5, 2),  # halve, never zero
+            "category": "root_cause",
+            "reason": f"root_cause segment {feature} {op} {threshold}",
+        }
+
+    async def _remember_config_version(self, version_hash: str) -> None:
+        """Persist the overridable config values under this version hash, so
+        a later change-point regression can be reverted to real values — not
+        just pointed at a hash."""
+        try:
+            raw = await self.sdb.get_metadata("brain_config_version_snapshots")
+            snapshots = {}
+            if raw:
+                try:
+                    snapshots = json_loads(raw)
+                except Exception:
+                    snapshots = {}
+            if version_hash in snapshots:
+                return
+            snapshot = {
+                field: getattr(cfg, field, None)
+                for field in CONFIG_OVERRIDE_ALLOWED_FIELDS
+            }
+            snapshot["_seen_at"] = int(time.time())
+            snapshots[version_hash] = snapshot
+            # keep the map bounded
+            if len(snapshots) > 50:
+                ordered = sorted(
+                    snapshots.items(),
+                    key=lambda kv: kv[1].get("_seen_at", 0),
+                    reverse=True,
+                )[:50]
+                snapshots = dict(ordered)
+            await self.sdb.set_metadata(
+                "brain_config_version_snapshots",
+                json_dumps(snapshots),
+                ttl=90 * 86400,
+            )
+        except Exception as e:
+            logging.getLogger("macd_bot").debug(
+                f"Config snapshot store failed (non-fatal): {e}"
+            )
+
+    async def _lookup_config_version(self, version_hash: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not version_hash:
+            return None
+        try:
+            raw = await self.sdb.get_metadata("brain_config_version_snapshots")
+            if not raw:
+                return None
+            snapshots = json_loads(raw)
+            return snapshots.get(version_hash)
+        except Exception:
+            return None
 
     async def apply_pending_plan(self, telegram_queue, logger_run) -> bool:
         """Apply the last generated action plan. Returns True if any changes were applied."""
@@ -1083,13 +1248,32 @@ class BrainEngineV2(BaseBrainEngine):
                 if ok:
                     applied.append(f"🔴 Disabled: {ak}")
                     logger_run.info(f"Applied brain disable: {ak}")
-            
             # Apply alert reinstates
             for ak in plan.get("reinstate_alerts", []):
                 ok = await self.sdb.set_alert_key_disabled(ak, False)
                 if ok:
                     applied.append(f"🟢 Reinstated: {ak}")
                     logger_run.info(f"Applied brain reinstate: {ak}")
+
+            # Apply root-cause weight adjustments via dynamic weights
+            weight_adj = plan.get("weight_adjustments", [])
+            if weight_adj:
+                weights = dict(CONFLUENCE_WEIGHTS)
+                for adj in weight_adj:
+                    vote = adj.get("vote")
+                    suggested = adj.get("suggested")
+                    if vote in weights and suggested is not None:
+                        weights[vote] = suggested
+                if await self.sdb.set_dynamic_weights(weights):
+                    for adj in weight_adj:
+                        applied.append(
+                            f"⚖️ {adj.get('vote')}: "
+                            f"{adj.get('current')} → {adj.get('suggested')}"
+                        )
+                    logger_run.info(
+                        "Applied brain root-cause weight cuts: "
+                        f"{[a.get('vote') for a in weight_adj]}"
+                    )
 
             if applied:
                 # ── Ledger: mark all repairs in this plan as applied ──

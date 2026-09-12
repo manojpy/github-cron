@@ -53,17 +53,24 @@ def cleanup_by_age(data_dir: Path, max_age_days: int, dry_run: bool = False) -> 
     
     return removed
 
-def compress_large_files(data_dir: Path, max_size_mb: int, dry_run: bool = False) -> int:
-    """Compress files that exceed max_size_mb, but aren't old enough to delete."""
+def compress_large_files(data_dir: Path, max_size_mb: int, dry_run: bool = False,
+                          no_compress_within_days: int = 0) -> int:
+    """Compress files that exceed max_size_mb, but aren't old enough to delete —
+    and aren't inside the brain's live analysis window (no_compress_within_days)."""
     compressed = 0
     max_size_bytes = max_size_mb * 1024 * 1024
-    
+    cutoff = datetime.now(timezone.utc) - timedelta(days=no_compress_within_days)
+
     for label in ["outcomes", "shadow"]:
         label_dir = data_dir / label
         if not label_dir.exists():
             continue
         
         for month_file in label_dir.glob("*.jsonl"):
+            if no_compress_within_days > 0:
+                mtime = datetime.fromtimestamp(month_file.stat().st_mtime, tz=timezone.utc)
+                if mtime >= cutoff:
+                    continue  # still inside the live analysis window — leave uncompressed
             if month_file.stat().st_size > max_size_bytes:
                 gz_file = month_file.with_suffix(month_file.suffix + ".gz")
                 if not gz_file.exists():
@@ -133,6 +140,9 @@ def main():
                     help="Compress files larger than this size in MB (default: 100)")
     ap.add_argument("--max-total-mb", type=int, default=400,
                     help="Max total directory size in MB before aggressive cleanup (default: 400)") 
+    ap.add_argument("--no-compress-within-days", type=int, default=0,
+                    help="Never compress files newer than this many days, even if oversized "
+                         "(protects the brain's live analysis window; 0 disables the guard)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Show what would be cleaned without actually deleting")
     ap.add_argument("--wipe-all", action="store_true",
@@ -171,7 +181,10 @@ def main():
         print("No old files to remove")
     
     print(f"\n📋 Checking for files larger than {args.max_size_mb} MB...")
-    compressed = compress_large_files(data_dir, args.max_size_mb, dry_run=args.dry_run)
+    compressed = compress_large_files(
+        data_dir, args.max_size_mb, dry_run=args.dry_run,
+        no_compress_within_days=args.no_compress_within_days,
+    )
     if compressed:
         print(f"✅ {'Would compress' if args.dry_run else 'Compressed'} {compressed} large file(s)")
     else:

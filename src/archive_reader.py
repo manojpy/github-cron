@@ -2,6 +2,7 @@
 """archive_reader.py — Read archived JSONL outcomes for Brain reports."""
 from __future__ import annotations
 import json
+import gzip
 import logging
 import time
 from pathlib import Path
@@ -221,8 +222,8 @@ def load_archived_outcomes(
 
     # Filenames are YYYY-MM-DD.jsonl (per outcome_storage._today_file).
     # Reverse lexicographic = newest date first, which lets the mtime
-    # short-circuit below actually save work.
-    files = sorted(root.glob("*.jsonl"), reverse=True)
+    all_files = list(root.glob("*.jsonl")) + list(root.glob("*.jsonl.gz"))
+    files = sorted(all_files, key=lambda p: p.name.split(".jsonl")[0], reverse=True)
 
     for path in files:
         # Quick mtime check: if the whole file predates the window and
@@ -234,8 +235,9 @@ def load_archived_outcomes(
             pass
 
         stats["files_read"] += 1
+        opener = gzip.open if path.suffix == ".gz" else open
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with opener(path, "rt", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
