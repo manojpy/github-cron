@@ -1673,7 +1673,7 @@ def interaction_miner(
                     entry["n_neither"] = n_neither
                 interactions.append(entry)
 
-            # ── v1 poisons v2 ───────────────────────────────────────────
+            # ── v1 poisons v2 ───────────────────────���───────────────────
             if has_v2_sample:
                 poison_v2 = wr_only_v2 - wr_both
                 if poison_v2 > 0.15 and n_both >= min_sample:
@@ -1944,6 +1944,33 @@ def score_actionability(rec: Dict[str, Any]) -> float:
         effort = 2.0
     return impact * confidence / effort
 
+def learned_actionability(
+    rec: Dict[str, Any],
+    success_rates: Optional[Dict[str, Dict[str, float]]] = None,
+) -> float:
+    """Hand-formula blended with the empirical help-rate for this repair
+    category. Falls back to the formula verbatim when we have < 8 verdicts
+    for the category — no repair category should be penalized for being
+    new.
+
+    Blend is 50/50 by design. The hand-formula is not wrong; it's just
+    unaware of whether this specific repair class has historically helped
+    this specific bot. Once a category has ~200 verdicts the weight should
+    shift toward the empirical side — flag this for a follow-up."""
+    base = score_actionability(rec)
+    if not success_rates:
+        return base
+    cat = rec.get("category") or rec.get("type") or "unknown"
+    stats = success_rates.get(cat)
+    if not stats or stats.get("n", 0) < 8:
+        return base
+    help_rate = stats.get("help_rate", 0.5)
+    hurt_rate = stats.get("hurt_rate", 0.0)
+    # Net empirical value in [0, 1]; 0.5 = neutral
+    learned = max(0.0, min(1.0, help_rate * (1.0 - hurt_rate)))
+    blend = 0.5 * base + 0.5 * (base * learned * 2.0)
+    return blend
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  THREE-METRIC OUTCOME ANALYSIS
@@ -2118,7 +2145,6 @@ def _build_vote_dataset(
         y.append(1.0 if r["win"] else 0.0)
         sw.append(r.get("win_weight", 1.0) if r["win"] else 1.0)
     return X, y, sw
-
 
 def _train_logistic(
     X: List[List[float]], y: List[float], sample_weights: List[float],
@@ -2403,10 +2429,53 @@ def permutation_vote_importance(
     results.sort(key=lambda x: -abs(x["importance"]))
     return results
 
+def _prob_edge_broken(wins: int, n: int, target_wr: float,
+                       prior_strength: float = 10.0) -> float:
+    """Bayesian P(true_wr < target_wr) under a Beta posterior.
+
+    Replaces point-estimate triggers like `wr < disable_wr` with a
+    continuous posterior probability. A trigger of P > 0.90 is roughly
+    equivalent to the old fixed threshold on large samples, but
+    automatically downweights small ones (they shrink toward 0.5 instead
+    of firing on 3 noisy rows)."""
+    if n <= 0:
+        return 0.5
+    a0 = prior_strength * target_wr
+    b0 = prior_strength * (1.0 - target_wr)
+    a = a0 + wins
+    b = b0 + (n - wins)
+    mean = a / (a + b)
+    var = (a * b) / ((a + b) ** 2 * (a + b + 1))
+    if var <= 0:
+        return 0.5
+    z = (target_wr - mean) / math.sqrt(var)
+    return 0.5 * math.erfc(-z / math.sqrt(2.0)) 
+
+
+def _prob_ev_negative(rows: List[Row], n_sims: int = 400) -> float:
+    """Posterior P(true EV <= 0) under a flat prior.
+
+    Block-bootstraps the EV statistic via bootstrap_ev_ci() and applies a
+    normal approximation on the (mean, std) of the bootstrap distribution.
+    Under a flat prior the bootstrap distribution's shape equals the
+    posterior's shape around the sample mean, so Phi(-mean/std) is the
+    posterior probability that the true EV is <= 0.
+
+    Returns 0.5 (maximum uncertainty) when the sample is too thin for a
+    meaningful bootstrap — same convention as _prob_edge_broken()."""
+    bs = bootstrap_ev_ci(rows, n_sims=n_sims)
+    if not bs.get("valid"):
+        return 0.5
+    ev_mean = bs["ev_mean"]
+    ev_std = bs["ev_std"]
+    if ev_std <= 0:
+        return 1.0 if ev_mean <= 0 else 0.0
+    z = (0.0 - ev_mean) / ev_std
+    return 0.5 * math.erfc(-z / math.sqrt(2.0))
 
 # ═══════════════════════════════════════════════════════════════════════
 #  REPAIR SHOP DIAGNOSIS ENGINE
-# ═══════════════��══════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════
 
 def repair_shop_diagnosis(
     rows: List[Row],
@@ -2455,13 +2524,19 @@ def repair_shop_diagnosis(
     sell_wr = sum(r["win"] for r in sell_rows) / len(sell_rows) if sell_rows else None
 
     # ── 1. CRITICAL: Overall WR collapse ──
-    if overall_wr < target_wr * 0.5:
+    
+    collapse_floor = target_wr * 0.5
+    overall_wins = sum(1 for r in rows if r["win"])
+    p_overall_broken = _prob_edge_broken(overall_wins, n, collapse_floor)
+    if p_overall_broken > 0.90:
+        severity = "critical" if p_overall_broken > 0.97 else "high"
         repairs.append({
-            "severity": "critical",
+            "severity": severity,
             "category": "win_rate_collapse",
             "diagnosis": (
-                f"Overall WR {overall_wr:.0%} is below {target_wr*0.5:.0%} "
-                f"(half of {target_wr:.0%} target). The strategy has negative edge."
+                f"Overall WR {overall_wr:.0%} (n={n}) — posterior "
+                f"P(true WR < {collapse_floor:.0%}) = {p_overall_broken:.1%}. "
+                f"The strategy has negative edge."
             ),
             "action": (
                 "1) STOP all live trading immediately. "
@@ -2470,37 +2545,50 @@ def repair_shop_diagnosis(
                 "(bad data, wrong timeframe, API issues)."
             ),
             "expected_impact": "Prevents further losses while diagnosing root cause.",
+            "posterior": round(p_overall_broken, 4),
         })
-
     # ── 2. Directional collapse (sell or buy side broken) ──
     drifted_sell = [d for d in drift_alerts if "sell" in d.get("alert", "") or "down" in d.get("alert", "")]
     drifted_buy = [d for d in drift_alerts if "buy" in d.get("alert", "") or "up" in d.get("alert", "")]
 
-    if sell_wr is not None and sell_wr < disable_wr and len(drifted_sell) >= 3:
-        repairs.append({
-            "severity": "critical",
-            "category": "sell_side_collapse",
-            "diagnosis": (
-                f"Sell WR {sell_wr:.0%} (n={len(sell_rows)}) with "
-                f"{len(drifted_sell)} sell alerts CUSUM-drifted. "
-                f"The sell-side strategy has structurally decayed."
-            ),
-            "action": (
-                f"Disable ALL sell alerts until manual review: "
-                f"{', '.join(d.get('alert', '?') for d in drifted_sell[:5])}. "
-                f"Check if market structure changed (trending up = sells fail)."
-            ),
-            "expected_impact": f"Removing {len(sell_rows)} losing sell trades lifts overall WR to ~{buy_wr:.0%}." if buy_wr else "Removes systematic losses.",
-        })
+    if sell_wr is not None:
+        sell_wins = sum(1 for r in sell_rows if r["win"])
+        p_sell_broken = _prob_edge_broken(sell_wins, len(sell_rows), target_wr)
+        if p_sell_broken > 0.90 and len(drifted_sell) >= 2:
+            severity = "critical" if p_sell_broken > 0.97 else "high"
+            repairs.append({
+                "severity": severity,
+                "category": "sell_side_collapse",
+                "diagnosis": (
+                    f"Sell WR {sell_wr:.0%} (n={len(sell_rows)}) with "
+                    f"{len(drifted_sell)} sell alerts CUSUM-drifted. "
+                    f"Posterior P(true_sell_wr < {target_wr:.0%}) = {p_sell_broken:.2%}."
+                ),
+                "action": (
+                    f"Disable ALL sell alerts until manual review: "
+                    f"{', '.join(d.get('alert', '?') for d in drifted_sell[:5])}. "
+                    f"Check if market structure changed (trending up = sells fail)."
+                ),
+                "expected_impact": f"Removing {len(sell_rows)} losing sell trades lifts overall WR to ~{buy_wr:.0%}." if buy_wr else "Removes systematic losses.",
+                "posterior": round(p_sell_broken, 4),
+            })
 
-    if buy_wr is not None and buy_wr < disable_wr and len(drifted_buy) >= 3:
-        repairs.append({
-            "severity": "critical",
-            "category": "buy_side_collapse",
-            "diagnosis": f"Buy WR {buy_wr:.0%} (n={len(buy_rows)}) with {len(drifted_buy)} buy alerts drifted.",
-            "action": f"Disable drifted buy alerts: {', '.join(d.get('alert', '?') for d in drifted_buy[:5])}.",
-            "expected_impact": "Stops bleeding on the buy side.",
-        })
+    if buy_wr is not None:
+        buy_wins = sum(1 for r in buy_rows if r["win"])
+        p_buy_broken = _prob_edge_broken(buy_wins, len(buy_rows), target_wr)
+        if p_buy_broken > 0.90 and len(drifted_buy) >= 2:
+            severity = "critical" if p_buy_broken > 0.97 else "high"
+            repairs.append({
+                "severity": severity,
+                "category": "buy_side_collapse",
+                "diagnosis": (
+                    f"Buy WR {buy_wr:.0%} (n={len(buy_rows)}) with {len(drifted_buy)} buy alerts drifted. "
+                    f"Posterior P(true_buy_wr < {target_wr:.0%}) = {p_buy_broken:.2%}."
+                ),
+                "action": f"Disable drifted buy alerts: {', '.join(d.get('alert', '?') for d in drifted_buy[:5])}.",
+                "expected_impact": "Stops bleeding on the buy side.",
+                "posterior": round(p_buy_broken, 4),
+            })
 
     # ── 3. CUSUM drift freeze ──
     if drift_alerts:
@@ -2553,17 +2641,24 @@ def repair_shop_diagnosis(
 
     # ── 6. EV / Kelly check ──
     net_ev, half_kelly, _ = ev_and_kelly_for(rows)
-    if net_ev <= 0:
+    p_ev_negative = _prob_ev_negative(rows)
+    if p_ev_negative > 0.80:
+        severity = "critical" if p_ev_negative > 0.95 else "high"
         repairs.append({
-            "severity": "high",
+            "severity": severity,
             "category": "negative_ev",
-            "diagnosis": f"Net EV {net_ev:+.3f}%/trade after fees/slippage. Strategy is unprofitable.",
+            "diagnosis": (
+                f"Net EV {net_ev:+.3f}%/trade after fees/slippage (n={n}) — "
+                f"posterior P(true EV <= 0) = {p_ev_negative:.1%}. "
+                f"Strategy is unprofitable."
+            ),
             "action": (
                 "1) Increase CONFLUENCE_MIN_ABS_SCORE to filter weak signals. "
                 "2) Check if fee/slippage assumptions (0.06% + 0.03% per side) match your exchange. "
                 "3) Consider widening OUTCOME_FAVORABLE_MOVE_PCT if TP is too tight."
             ),
             "expected_impact": "Positive EV is the minimum requirement for a viable strategy.",
+            "posterior": round(p_ev_negative, 4),
         })
 
     # ── 7. Sample size warning ──
@@ -2819,7 +2914,7 @@ class KillSwitch:
 
 # ══════════════════════════════════════════════════════════════════════
 #  FILL RECONCILIATION — assumed vs realized execution cost
-# ══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════���══
 
 def fill_reconciliation(
     rows: List[Row],

@@ -17,10 +17,17 @@ from bot_config import cfg, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS, 
 from state import RedisKeyPrefix, RedisStateStore
 from brain import BrainEngine as BaseBrainEngine, _extract_p_value_for_fdr
 import threshold_engine as engine
+
 from threshold_engine import (
     optimize_vote_weights, conditional_performance,
     interaction_miner, simulate_config_change, regime_profile_optimizer,
-    hash_config_state, score_actionability, compare_config_versions,
+    hash_config_state, score_actionability, learned_actionability,
+    compare_config_versions,
+)
+
+from repair_ledger import (
+    record_repair_issued, mark_plan_applied,
+    evaluate_pending_repairs, repair_success_rates, ledger_stats,
 )
 from alerts import escape_markdown_v2
 
@@ -229,6 +236,8 @@ class BrainEngineV2(BaseBrainEngine):
         self._phase_samples = _PHASE_MIN_SAMPLES
         self._recs_cache: Optional[Dict[str, Any]] = None
         self._recs_cache_ts: float = 0.0
+        self._repair_success_rates: Dict[str, Dict[str, float]] = {}
+        self._ledger_stats: Dict[str, Any] = {}
 
     @staticmethod
     def _shadow_weight_check(
@@ -330,6 +339,22 @@ class BrainEngineV2(BaseBrainEngine):
         max_weight_delta = getattr(cfg, "BRAIN_WEIGHT_OPTIMIZER_MAX_DELTA", 2.0)
         wf_weight_opt = getattr(cfg, "BRAIN_WEIGHT_OPTIMIZER_WALK_FORWARD", True)
 
+        # ── Repair Ledger: close the loop on past repairs ────────────────
+        try:
+            fresh = await evaluate_pending_repairs(
+                self.sdb, real_rows, horizon_hours=48, min_outcomes=30,
+            )
+            if fresh:
+                logger = logging.getLogger("macd_bot")
+                logger.info(f"📒 Repair ledger: evaluated {len(fresh)} pending repair(s)")
+            self._repair_success_rates = await repair_success_rates(self.sdb)
+            self._ledger_stats = await ledger_stats(self.sdb)
+            ai_metrics["repair_ledger"] = dict(self._ledger_stats)
+        except Exception as e:
+            logging.getLogger("macd_bot").debug(f"Repair ledger eval failed (non-fatal): {e}")
+            self._repair_success_rates = {}
+            self._ledger_stats = {}
+
         # ── REPAIR SHOP (runs first — highest priority) ──────────────────
         drift_alerts = [r for r in recommendations if r.get("type") == "cusum_drift"]
         repairs = engine.repair_shop_diagnosis(
@@ -343,7 +368,7 @@ class BrainEngineV2(BaseBrainEngine):
             min_sample=min_sample,
         )
         for repair in repairs:
-            recommendations.append({
+            wrapped = {
                 "type": "repair_shop",
                 "severity": repair["severity"],
                 "category": repair["category"],
@@ -352,7 +377,23 @@ class BrainEngineV2(BaseBrainEngine):
                     f"   → {repair['action']}\n"
                     f"   Impact: {repair['expected_impact']}"
                 ),
-            })
+            }
+            # ── Ledger: record the issue with a pre-repair snapshot ──
+            try:
+                snapshot = {
+                    "overall_wr": (sum(1 for r in real_rows if r["win"]) / len(real_rows))
+                                   if real_rows else None,
+                    "n": len(real_rows),
+                    "net_ev": ai_metrics.get("net_ev"),
+                    "brier": ai_metrics.get("brier_score"),
+                }
+                rid = await record_repair_issued(self.sdb, wrapped, snapshot)
+                if rid:
+                    wrapped["_repair_id"] = rid
+            except Exception as e:
+                logger.debug(f"Repair ledger write failed (non-fatal): {e}")
+
+            recommendations.append(wrapped)
 
         # ── Phase 1.5: Vote Weight Optimizer (FIXED) ─────────────────────
         if len(real_rows) >= self._phase_samples["weight_optimizer"]:
@@ -840,15 +881,16 @@ class BrainEngineV2(BaseBrainEngine):
                     ),
                 })
 
-        # ── Actionability scoring (FIXED confidence) ─────────────────────
+        # ── Actionability scoring (blended with empirical repair outcomes) ──
         for rec in recommendations:
-            rec["actionability_score"] = round(score_actionability(rec), 3)
-
-        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-        recommendations.sort(key=lambda x: (
-            severity_order.get(x.get("severity"), 4),
-            -x.get("actionability_score", 0),
-        ))
+            rec["actionability_score"] = round(
+                learned_actionability(rec, self._repair_success_rates), 3
+            )
+            if rec.get("_repair_id"):
+                cat = rec.get("category") or rec.get("type")
+                stats = (self._repair_success_rates or {}).get(cat, {})
+                if stats.get("n", 0) >= 8:
+                    rec["_empirical_help_rate"] = round(stats["help_rate"], 3)
 
         # ── Config version hash ──────────────────────────────────────────
         ai_metrics["config_version"] = hash_config_state(
@@ -918,6 +960,32 @@ class BrainEngineV2(BaseBrainEngine):
                         "reason": patch.get("reason", "")
                     })
             
+            # ── Optional budget: cap total entries per plan ──
+            budget = getattr(cfg, "BRAIN_MAX_PLAN_ENTRIES", 0)
+            if budget > 0:
+                total = len(config_patches) + len(disable_alerts) + len(reinstate_alerts)
+                if total > budget:
+                    # Thompson-sample the top-`budget` by category help-rate
+                    rng = random.Random(int(time.time() // 3600))
+                    candidates = (
+                        [("config", p) for p in config_patches]
+                        + [("disable", ak) for ak in disable_alerts]
+                        + [("reinstate", ak) for ak in reinstate_alerts]
+                    )
+                    scored = []
+                    for kind, item in candidates:
+                        cat = kind  # coarse category; refine if you want
+                        s = self._repair_success_rates.get(cat, {"help_rate": 0.5, "n": 0})
+                        a = 1 + s["n"] * s["help_rate"]
+                        b = 1 + s["n"] * (1 - s["help_rate"])
+                        sampled = rng.betavariate(a, b)
+                        scored.append((sampled, kind, item))
+                    scored.sort(key=lambda t: -t[0])
+                    keep = scored[:budget]
+                    config_patches = [item for _, k, item in keep if k == "config"]
+                    disable_alerts = [item for _, k, item in keep if k == "disable"]
+                    reinstate_alerts = [item for _, k, item in keep if k == "reinstate"]
+            
             plan_data = {
                 "generated_at": int(time.time()),
                 "config_patch": config_patches,
@@ -969,8 +1037,17 @@ class BrainEngineV2(BaseBrainEngine):
                 if ok:
                     applied.append(f"🟢 Reinstated: {ak}")
                     logger_run.info(f"Applied brain reinstate: {ak}")
-            
+
             if applied:
+                # ── Ledger: mark all repairs in this plan as applied ──
+                plan_ts = plan.get("generated_at", int(time.time()))
+                try:
+                    marked = await mark_plan_applied(self.sdb, plan_ts)
+                    if marked:
+                        logger_run.info(f"📒 Repair ledger: marked {marked} repair(s) applied")
+                except Exception as e:
+                    logger_run.debug(f"Repair ledger apply-mark failed (non-fatal): {e}")
+
                 msg = (
                     f"✅ APPLIED BRAIN PLAN\n"
                     f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"

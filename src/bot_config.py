@@ -422,7 +422,7 @@ class BotConfig(BaseModel):
     ADX_DI_LENGTH: int = Field(default=14, ge=5, le=30)
     ADX_SMOOTHING_LENGTH: int = Field(default=14, ge=5, le=30)
     ADX_ADAPTIVE_TARGET_PCTL: float = Field(default=60.0, ge=1.0, le=99.0, description="ADX threshold = this percentile of the pair's own trailing ADX history")
-    ENABLE_ADX_STRENGTH_VOTE: bool = Field(default=False, description="Confluence vote: ADX in top ADX_STRENGTH_PCTL of its own history �� a stricter secondary bar on top of the existing adx_ok gate, not a duplicate of it")
+    ENABLE_ADX_STRENGTH_VOTE: bool = Field(default=False, description="Confluence vote: ADX in top ADX_STRENGTH_PCTL of its own history  a stricter secondary bar on top of the existing adx_ok gate, not a duplicate of it")
     ADX_STRENGTH_PCTL: float = Field(default=80.0, ge=1.0, le=99.0, description="Percentile threshold for the adx_strength confluence vote. Should be set meaningfully above ADX_ADAPTIVE_TARGET_PCTL so this vote and the base 'adx' vote aren't answering the same question")
     ENABLE_ATR_PCTL_VOTE: bool = Field(default=False, description="Confluence vote: current volatility (ATR) in top ATR_PCTL_VOTE_MIN of its own history — a volatility-regime check, distinct from the existing rvol vote which checks short/long ATR expansion trend")
     ATR_PCTL_VOTE_MIN: float = Field(default=0.60, ge=0.0, le=1.0, description="Min ATR percentile rank (0-1) required for the atr_percentile confluence vote to pass")
@@ -458,6 +458,7 @@ class BotConfig(BaseModel):
     BRAIN_SLIPPAGE_PCT: float = Field(default=0.0003, ge=0.0, le=0.01, description="Estimated slippage per side used in EV/Kelly calculations")
     BRAIN_OOD_ENABLED: bool = Field(default=True, description="Vote-count OOD gate on/off")
     BRAIN_REPORT_ON_DEMAND: bool = Field(default=False, description="If true, force a brain report to be generated and sent on this run regardless of the normal BRAIN_REPORT_INTERVAL_RUNS cadence")
+    BRAIN_MAX_PLAN_ENTRIES: int = Field(default=0, ge=0, le=50) 
     OOD_MIN_HISTORY: int = Field(default=10, ge=5, le=100, description="Min historical samples before OOD gate activates")
     OOD_MARGIN: int = Field(default=2, ge=0, le=10, description="Extra votes allowed beyond 5th-95th percentile before flagging as OOD")
     OOD_RELAXED_MODE: bool = Field(default=True, description="If True, use margin-based OOD check (tolerant of small deviations); if False, use strict percentile check")
@@ -467,8 +468,6 @@ class BotConfig(BaseModel):
     CALIBRATION_BUCKET_PCT: float = Field(default=5.0, ge=1.0, le=20.0)
     CALIBRATION_MIN_SAMPLE: int = Field(default=15, ge=5, le=200)
     CALIBRATION_SLACK: float = Field(default=0.05, ge=0.0, le=0.20) 
-
-    
     ENABLE_PORTFOLIO_HEAT_GATE: bool = Field(default=False) 
     MAX_CONCURRENT_POSITIONS: int = Field(default=6, ge=1, le=50)
     MAX_NET_DIRECTIONAL_POSITIONS: int = Field(default=4, ge=1, le=50) 
