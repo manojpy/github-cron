@@ -294,12 +294,14 @@ async def _compute_directional_cluster(
     prepared_tasks: List[Tuple[str, str, Dict[str, Any]]],
     state_db: RedisStateStore, correlation_id: str, reference_time: int,
     oi_gate_data: Optional[Dict[str, Dict[str, Any]]],
+    parsed_cache: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[ClusterContext], Dict[str, Any]]:
     """Pre-pass that returns both a ClusterContext and a gate cache mapping
     pair_name -> the full _eval_gate return value (GateResult | tuple | None)
     for every pair whose pre-pass ran cleanly. Phase 3 reuses the cache instead
     of recomputing the identical gate result. Pairs that errored out during
     parse/eval are omitted from the cache and re-evaluated in Phase 3."""
+    parsed_cache = parsed_cache or {}
     semaphore = asyncio.Semaphore(cfg.EVAL_CONCURRENCY_LIMIT)
 
     async def _lean(task):
@@ -345,15 +347,17 @@ async def _compute_directional_cluster(
         buy_pct=buy_count / total, sell_pct=sell_count / total,
     ), gate_cache
 
-async def _compute_bias_context(
+async def compute_bias_context(
     prepared_tasks: List[Tuple[str, str, Dict[str, Any]]],
     reference_time: int,
+    parsed_cache: Optional[Dict[str, Any]] = None,
 ) -> Optional[BiasContext]:
     """Pair-universe Ichimoku directional-bias pre-pass (23/65/130/65 on 15m
-    by default — see cfg.BIAS_ICHIMOKU_*). Cosmetic only: feeds the header
+    by default — see cfg.BIAS_ICHIMOKU*). Cosmetic only: feeds the header
     line prepended to every outgoing alert this run (cfg.ENABLE_BIAS_HEADER);
     never gates or filters an alert. See BiasContext docstring for the
     per-pair up/down/neutral classification rule."""
+    parsed_cache = parsed_cache or {}
     up = down = neutral = 0
     counted = 0
 
@@ -650,7 +654,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     if cfg.ENABLE_CLUSTER_GATE:
         try:
             cluster_context, gate_cache = await _compute_directional_cluster(
-                prepared_tasks, state_db, correlation_id, reference_time, oi_gate_data,
+                prepared_tasks, state_db, correlation_id, reference_time, oi_gate_data, parsed_cache, 
             )
             if cluster_context:
                 logger_main.info(
@@ -668,7 +672,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     bias_context: Optional[BiasContext] = None
     if cfg.ENABLE_BIAS_HEADER:
         try:
-            bias_context = await _compute_bias_context(prepared_tasks, reference_time)
+            bias_context = await _compute_bias_context(prepared_tasks, reference_time, parsed_cache)
             if bias_context:
                 logger_main.info(
                     f"🧭 Bias: up={bias_context.up_count}/{bias_context.total_pairs} "
