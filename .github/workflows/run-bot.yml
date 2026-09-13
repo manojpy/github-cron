@@ -309,12 +309,11 @@ jobs:
             echo "⚠️ Data repo not found, skipping persist"
             exit 0
           fi
-
           cd /tmp/data-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add outcomes/ shadow/ reports/
-          [ -f brain_state.json ] && git add brain_state.json
+          git add --sparse outcomes/ shadow/ reports/
+          [ -f brain_state.json ] && git add --sparse brain_state.json
           if ! git diff --cached --quiet; then
             git commit -m "chore: bot outcomes $(date -u +%Y-%m-%d-%H:%M)"
             git push origin main
