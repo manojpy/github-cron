@@ -711,6 +711,33 @@ class RedisStateStore:
             logger.error(f"Dedup check FAILED for {pair}:{alert_key}: {e}")
             return False   # fail-closed, not fail-open
 
+    async def batch_check_recent_alerts(self, pair: str, alert_keys: List[str], ts: int,
+                                          window_sec: Optional[int] = None) -> Dict[str, bool]:
+        """Claim dedup windows for several alert keys on one pair in ONE Redis
+        round-trip (pipeline). Each SET NX EX is still independently atomic —
+        this only batches the network round-trip, not the semantics."""
+        if not alert_keys:
+            return {}
+        if self.degraded:
+            return {k: True for k in alert_keys}
+        if not self._redis:
+            logger.critical(
+                f"batch_check_recent_alerts: degraded=False but _redis is None (state desync) — "
+                f"failing closed for {pair}, these alerts will be blocked"
+            )
+            return {k: False for k in alert_keys}
+        effective_window = window_sec if window_sec is not None else cfg.ALERT_DEDUP_WINDOW_SEC
+        try:
+            async with self._redis.pipeline() as pipe:
+                for alert_key in alert_keys:
+                    recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
+                    pipe.set(recent_key, str(ts), nx=True, ex=effective_window)
+                results = await asyncio.wait_for(pipe.execute(), timeout=3.0)
+            return {k: bool(r) for k, r in zip(alert_keys, results)}
+        except Exception as e:
+            logger.error(f"batch_check_recent_alerts FAILED for {pair} ({alert_keys}): {e}")
+            return {k: False for k in alert_keys}  # fail-closed, same policy as check_recent_alert
+
     async def release_recent_alert(self, pair: str, alert_key: str) -> None:
         """Undo a dedup claim if the message didn't actually get delivered."""
         if self.degraded:

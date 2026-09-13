@@ -1857,12 +1857,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         "suppression": f"Coalesced within {cfg.COALESCE_DEDUP_WINDOW_SEC}s — message suppressed, outcome recorded",
                     },
                 }, None
-
         elif alerts_to_send:
+            keys_to_check = [alert_key for _, _, alert_key in alerts_to_send]
+            claim_results = await sdb.batch_check_recent_alerts(pair_name, keys_to_check, ts_curr)
             deduped_alerts = []
             for alert_title, alert_extra, alert_key in alerts_to_send:
-                should_send = await sdb.check_recent_alert(pair_name, alert_key, ts_curr)
-                if not should_send:
+                if not claim_results.get(alert_key, False):
                     logger_pair.debug(f"Alert {alert_key} skipped (dedup window)")
                     continue
                 deduped_alerts.append((alert_title, alert_extra, alert_key))
