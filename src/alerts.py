@@ -1788,50 +1788,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 surviving_alerts.append((alert_title, alert_extra, alert_key))
             alerts_to_send = surviving_alerts
 
-        coalesced_dedup_key: Optional[str] = None
-        if alerts_to_send and cfg.ENABLE_ALERT_COALESCING:
-            buy_present = any(ak in BUY_ALERT_KEYS for _, _, ak in alerts_to_send)
-            sell_present = any(ak in SELL_ALERT_KEYS for _, _, ak in alerts_to_send)
-            direction = "MIXED" if (buy_present and sell_present) else ("BUY" if buy_present else "SELL")
-            coalesced_dedup_key = f"coalesced_{direction}"
-            should_send = await sdb.check_recent_alert(
-                pair_name, coalesced_dedup_key, ts_curr, window_sec=cfg.COALESCE_DEDUP_WINDOW_SEC
-            )
-            if not should_send:
-                logger_pair.debug(
-                    f"[{pair_name}] Coalesced {direction} alert deduped (within "
-                    f"{cfg.COALESCE_DEDUP_WINDOW_SEC}s) — skipping dispatch"
-                )
-                alerts_to_send = []
-        elif alerts_to_send:
-            deduped_alerts = []
-            for alert_title, alert_extra, alert_key in alerts_to_send:
-                should_send = await sdb.check_recent_alert(pair_name, alert_key, ts_curr)
-                if not should_send:
-                    logger_pair.debug(f"Alert {alert_key} skipped (dedup window)")
-                    continue
-                deduped_alerts.append((alert_title, alert_extra, alert_key))
-            alerts_to_send = deduped_alerts
-
-        async def _release_dedup_claims() -> None:
-            """Releases whichever kind of claim was taken in step 4 above."""
-            if coalesced_dedup_key:
-                await sdb.release_recent_alert(pair_name, coalesced_dedup_key)
-            else:
-                for _, _, alert_key in alerts_to_send:
-                    await sdb.release_recent_alert(pair_name, alert_key)
-
-        new_alert_activations = []
-        for _, _, alert_key in alerts_to_send:
-            new_alert_activations.append(
-                (f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None)
-            )
         async def _record_win_rates() -> None:
-            """Records this pair's fired alerts for later win-rate scoring.
-            Shared by both immediate mode (called right after a successful
-            send) and batch mode (stored on the payload as record_win_rate,
-            called by dispatch_combined_alerts once the real send outcome —
-            combined or fallback — is known)."""
+            """Records this pair's fired alerts for later win-rate scoring. ..."""
+            recorded = [ak for _, _, ak in alerts_to_send]
+            logger_pair.info(
+                f"[{pair_name}] RECORD ts={ts_curr} keys={recorded}"
+            )
             async def _record_one(alert_key: str):
                 s, t, v = _confluence_for(alert_key)
                 trigger_context = {
@@ -1859,9 +1821,66 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     adx_val=adx_val,
                     context=trigger_context,
                     signal_price=close_curr,
-
                 )
             await asyncio.gather(*(_record_one(alert_key) for _, _, alert_key in alerts_to_send))
+
+        coalesced_dedup_key: Optional[str] = None
+        if alerts_to_send and cfg.ENABLE_ALERT_COALESCING:
+            buy_present = any(ak in BUY_ALERT_KEYS for _, _, ak in alerts_to_send)
+            sell_present = any(ak in SELL_ALERT_KEYS for _, _, ak in alerts_to_send)
+            direction = "MIXED" if (buy_present and sell_present) else ("BUY" if buy_present else "SELL")
+            coalesced_dedup_key = f"coalesced_{direction}"
+            should_send = await sdb.check_recent_alert(
+                pair_name, coalesced_dedup_key, ts_curr, window_sec=cfg.COALESCE_DEDUP_WINDOW_SEC
+            )
+            if not should_send:
+                logger_pair.info(
+                    f"[{pair_name}] Coalesced {direction} dedup — "
+                    f"suppressing Telegram send only, recording state+outcome"
+                )
+                coalesced_activations = [
+                    (f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None)
+                    for _, _, alert_key in alerts_to_send
+                ]
+                if coalesced_activations:
+                    await sdb.atomic_batch_update(coalesced_activations)
+                if cfg.ENABLE_WIN_RATE_FILTER and not cfg.DRY_RUN_MODE:
+                    await _record_win_rates()
+                await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
+                return pair_name, {
+                    "state": "COALESCED",
+                    "ts": int(time.time()),
+                    "summary": {
+                        "alerts": 0,
+                        "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                        "hist_rma": round(hist_curr, 4),
+                        "suppression": f"Coalesced within {cfg.COALESCE_DEDUP_WINDOW_SEC}s — message suppressed, outcome recorded",
+                    },
+                }, None
+
+        elif alerts_to_send:
+            deduped_alerts = []
+            for alert_title, alert_extra, alert_key in alerts_to_send:
+                should_send = await sdb.check_recent_alert(pair_name, alert_key, ts_curr)
+                if not should_send:
+                    logger_pair.debug(f"Alert {alert_key} skipped (dedup window)")
+                    continue
+                deduped_alerts.append((alert_title, alert_extra, alert_key))
+            alerts_to_send = deduped_alerts
+
+        async def _release_dedup_claims() -> None:
+            """Releases whichever kind of claim was taken in step 4 above."""
+            if coalesced_dedup_key:
+                await sdb.release_recent_alert(pair_name, coalesced_dedup_key)
+            else:
+                for _, _, alert_key in alerts_to_send:
+                    await sdb.release_recent_alert(pair_name, alert_key)
+
+        new_alert_activations = []
+        for _, _, alert_key in alerts_to_send:
+            new_alert_activations.append(
+                (f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None)
+            )
 
         if batch_mode and alerts_to_send:
             if len(alerts_to_send) == 1:
@@ -1885,71 +1904,48 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 ) if reconfirmed is True else None
 
                 if reconfirmed is None:
-                    # ⚠️ INCONCLUSIVE: Do NOT mark as processed — retry next run
-                    logger_pair.warning(
-                        f"[{pair_name}] Confirmation inconclusive — alert suppressed this run, "
-                        f"dedup key RELEASED so it can retry next run"
-                    )
+                    logger_pair.warning(...)
                     await _release_dedup_claims()
-                    return pair_name, {
-                        "state": "SUPPRESSED", "ts": int(time.time()),
-                        "summary": {"alerts": 0, "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                                    "hist_rma": round(hist_curr, 4), "suppression": "Confirmation inconclusive"}
-                    }, None
+                    return pair_name, {...}, None
                 elif reconfirmed is False:
-                    # Definitive repaint — mark as processed so it doesn't retry
-                    logger_pair.warning(
-                        f"[{pair_name}] 🔁 Confirmed repaint in send-queue window — "
-                        f"alert suppressed, dedup key KEPT to prevent duplicates"
-                    )
-                    await sdb.set_last_processed_candle_ts(pair_name, ts_curr)  # ← MARK AS PROCESSED
-                    return pair_name, {
-                        "state": "SUPPRESSED", "ts": int(time.time()),
-                        "summary": {"alerts": 0, "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                                    "hist_rma": round(hist_curr, 4), "suppression": "Confirmed repaint"}
-                    }, None
+                    logger_pair.warning(...)
+                    await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
+                    return pair_name, {...}, None
                 elif mark_agrees is None:
-                    # ⚠️ INCONCLUSIVE: Do NOT mark as processed — retry next run
-                    logger_pair.warning(
-                        f"[{pair_name}] Mark price check inconclusive — alert suppressed this run, "
-                        f"dedup key RELEASED so it can retry next run"
-                    )
+                    logger_pair.warning(...)
                     await _release_dedup_claims()
-                    return pair_name, {
-                        "state": "SUPPRESSED", "ts": int(time.time()),
-                        "summary": {"alerts": 0, "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                                    "hist_rma": round(hist_curr, 4), "suppression": "Mark price check inconclusive"}
-                    }, None
+                    return pair_name, {...}, None
                 elif mark_agrees is False:
-                    # Definitive disagreement — mark as processed so it doesn't retry
-                    logger_pair.warning(
-                        f"[{pair_name}] Mark price disagreement confirmed — alert suppressed, "
-                        f"dedup key KEPT to prevent duplicates"
-                    )
-                    await sdb.set_last_processed_candle_ts(pair_name, ts_curr)  # ← MARK AS PROCESSED
-                    return pair_name, {
-                        "state": "SUPPRESSED", "ts": int(time.time()),
-                        "summary": {"alerts": 0, "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                                    "hist_rma": round(hist_curr, 4), "suppression": "Mark price disagreement"}
-                    }, None
+                    logger_pair.warning(...)
+                    await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
+                    return pair_name, {...}, None
+
+                # ── Reached only when reconfirm is True AND mark_agrees is True ──
+                # 1. Record the outcome first (survives send failures)
+                if cfg.ENABLE_WIN_RATE_FILTER:
+                    await _record_win_rates()
+
+                # 2. Merge new alert activations into the main state list NOW.
+                if new_alert_activations:
+                    all_state_changes.extend(new_alert_activations)
+
+                # 3. Commit ALL state changes (including new activations) in one batch
+                if all_state_changes:
+                    persist_ok = await sdb.atomic_batch_update(all_state_changes)
+                    if not persist_ok:
+                        logger_pair.error(
+                            f"[{pair_name}] State persistence failed — alert state may be inconsistent this run"
+                        )
+                    # Clear the list to prevent double-writing later
+                    all_state_changes.clear()
 
             logger_pair.info(
                 f"🌐🎯🟢 Queued {len(alerts_to_send)} alert(s) for {pair_name} | "
                 f"Keys: {[ak for _, _, ak in alerts_to_send]} → batch dispatch"
             )
 
-            # ── FIX: record outcomes now, at the gate decision, not after send ──
-            # Reached only after confirm_candle_unchanged/verify_mark_price_agrees
-            # passed above (repaints and inconclusive checks return early and
-            # never reach here), so this can't record a confirmed repaint. A
-            # later Telegram send failure no longer loses the outcome — it's
-            # already in Redis with a TTL and resolves normally either way.
-            if cfg.ENABLE_WIN_RATE_FILTER:
-                await _record_win_rates()
-
             first_key = alerts_to_send[0][2]
             direction = "buy" if first_key in BUY_ALERT_KEYS else "sell"
-
             dedup_keys: List[str] = []
             if coalesced_dedup_key:
                 dedup_keys.append(coalesced_dedup_key)
@@ -1964,23 +1960,16 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 total=confluence_total,
                 msg_body=msg_body,
                 dedup_keys=dedup_keys,
-                state_changes=list(new_alert_activations),
+                state_changes=[],              # already committed above
                 budget_count=len(alerts_to_send),
                 ts=ts_curr,
                 macro_shadow=macro_shadow,
                 alert_keys=[ak for _, _, ak in alerts_to_send],
-                record_win_rate=None,  # already recorded above
+                record_win_rate=None,          # already recorded above
             )
-            if all_state_changes:
-                persist_ok = await sdb.atomic_batch_update(all_state_changes)
-                if not persist_ok:
-                    logger_pair.error(
-                        f"[{pair_name}] State persistence failed — alert state may be inconsistent this run"
-                    )
 
             # ── CRITICAL FIX: Mark as processed on successful batch dispatch ──
             await sdb.set_last_processed_candle_ts(pair_name, ts_curr)  # ← MARK AS PROCESSED
-            
             return pair_name, {
                 "state": "BATCHED",
                 "ts": int(time.time()),
@@ -2033,9 +2022,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         "suppression": f"Global limit {max_alerts_per_run} reached"
                     }
                 }, None
-
         if alerts_to_send:
             budget_refunded = False
+            confirmation_blocked = False   # NEW: distinguishes reconfirm/mark suppression
+                                            # from genuine Telegram send failure
             try:
                 if len(alerts_to_send) == 1:
                     title, extra, _ = alerts_to_send[0]
@@ -2065,6 +2055,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         await _release_dedup_claims()
                         await _refund_alert_budget(len(alerts_to_send))
                         budget_refunded = True
+                        confirmation_blocked = True   # NEW
                         send_success = False
                     elif reconfirmed is False:
                         logger_pair.warning(
@@ -2073,8 +2064,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         )
                         await _refund_alert_budget(len(alerts_to_send))
                         budget_refunded = True
+                        confirmation_blocked = True   # NEW
                         send_success = False
-
                     elif mark_agrees is None:
                         logger_pair.warning(
                             f"[{pair_name}] Mark price check inconclusive — alert suppressed this run, "
@@ -2083,6 +2074,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         await _release_dedup_claims()
                         await _refund_alert_budget(len(alerts_to_send))
                         budget_refunded = True
+                        confirmation_blocked = True   # NEW
                         send_success = False
                     elif mark_agrees is False:
                         logger_pair.warning(
@@ -2091,31 +2083,48 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         )
                         await _refund_alert_budget(len(alerts_to_send))
                         budget_refunded = True
+                        confirmation_blocked = True   # NEW
                         send_success = False
                     else:
                         # ── FIX: record outcome before the send attempt ──
-                        # Reached only when reconfirm/mark-price checks passed
-                        # above, so repaints and inconclusive checks never get
-                        # recorded. A later send failure no longer loses it.
                         if cfg.ENABLE_WIN_RATE_FILTER:
                             await _record_win_rates()
+
+                        # Merge new alert activations into the main state list NOW.
+                        if new_alert_activations:
+                            all_state_changes.extend(new_alert_activations)
+
+                        # Commit ALL state changes BEFORE the network I/O
+                        if all_state_changes:
+                            persist_ok = await sdb.atomic_batch_update(all_state_changes)
+                            if not persist_ok:
+                                logger_pair.error(
+                                    f"[{pair_name}] State persistence failed — alert state may be inconsistent this run"
+                                )
+                            all_state_changes.clear()
+
                         send_success = await telegram_queue.send(msg)
 
                     if send_success:
-                        all_state_changes.extend(new_alert_activations)
-                        # ── CRITICAL FIX: Mark as processed on successful send ──
-                        await sdb.set_last_processed_candle_ts(pair_name, ts_curr)  # ← MARK AS PROCESSED
+                        # State and outcome are already committed. Mark the candle
+                        # as processed so this exact candle is not re-evaluated.
+                        await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
                         logger_pair.info(
                             f"🔔🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
                             f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                         )
+                    elif confirmation_blocked:
+                        logger_pair.info(
+                            f"Alert suppressed by confirmation check | {pair_name} | "
+                            f"Outcome NOT recorded, state NOT committed, candle NOT marked "
+                            f"processed — will retry next run"
+                        )
                     else:
-                        if not budget_refunded:
-                            await _refund_alert_budget(len(alerts_to_send))
+                        await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
                         logger_pair.error(
-                            f"Alert dispatch failed | {pair_name} | "
-                            f"State NOT marked ACTIVE, dedup claim retained for retry next run | "
-                            f"Budget refunded"
+                            f"Alert send failed | {pair_name} | "
+                            f"Outcome already recorded, state ACTIVE, budget consumed | "
+                            f"Dedup claim retained to prevent duplicate Telegram delivery"
                         )
                 else:
                     all_state_changes.extend(new_alert_activations)
@@ -2129,7 +2138,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     f"State NOT marked ACTIVE, dedup key retained, budget refunded — "
                     f"will not retry until window expires"
                 )
-
         if all_state_changes:
             await sdb.atomic_batch_update(all_state_changes)
 

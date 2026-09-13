@@ -104,28 +104,26 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
 
     cached = gate_cache.get(pair_name, _CLUSTER_CACHE_MISS) if gate_cache is not None else _CLUSTER_CACHE_MISS
 
+    # ── Outcome resolution runs for EVERY pair, every run ──
+    # It only needs the candle array and i15 — a GateResult is not required.
+    # Running it before the gate lets a pre-pass failure (or a missing cache
+    # entry) still resolve the pair's pending outcomes instead of starving them.
+    i15_for_resolve = get_last_closed_index_from_array(data_15m.ts, 15, reference_time, pair_name)
+    if i15_for_resolve is not None and i15_for_resolve >= Constants.MIN_CLOSED_CANDLES_15M:
+        await _resolve_pair_outcomes(pair_name, data_15m, i15_for_resolve, sdb, logger_pair)
+
     if cached is not _CLUSTER_CACHE_MISS:
-        # Cluster pre-pass already ran _eval_gate for this pair with
-        # resolve_outcomes=False. Outcome resolution was deliberately skipped
-        # there, so re-run it here — Phase 3 is the only place it happens.
-        if cached is not None:
-            i15 = get_last_closed_index_from_array(data_15m.ts, 15, reference_time, pair_name)
-            if i15 is not None and i15 >= Constants.MIN_CLOSED_CANDLES_15M:
-                await _resolve_pair_outcomes(pair_name, data_15m, i15, sdb, logger_pair)
         if isinstance(cached, tuple):
-            return cached  # hard reject / wick reject / gate blocked -- already final
+            return cached
         if cached is None:
             return None
         gr = cached
     else:
-        # No cache entry — pre-pass skipped this pair or errored before caching.
-        # Fall back to a full _eval_gate call (its own resolve_outcomes=True
-        # path handles outcome resolution internally).
-        gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time, pair_oi)
+        gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time, pair_oi, resolve_outcomes=False)
         if gr is None:
             return None
         if isinstance(gr, tuple):
-            return gr  # hard reject / wick reject / gate blocked -- already final
+            return gr
     reversal_eligible = (
         (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE)
         and (gr.buy_trend_common_relaxed or gr.sell_trend_common_relaxed)

@@ -117,17 +117,43 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     # ── BLOCKED BY WIN-RATE FILTER (shadow, not dispatched) ─────────────
     try:
         shadow_rows = recs.get("_shadow_rows", []) or []
-        if shadow_rows:
+        if not shadow_rows:
+            sections.append(
+                "🚫 BLOCKED BY WIN-RATE FILTER\n"
+                "   Shadow mode is off — no data on what the filter is rejecting.\n"
+                "   Set BRAIN_SHADOW_MODE=true to see whether rejections would have won."
+            )
+        else:
+            target = getattr(cfg, "MIN_WIN_RATE", 0.55)
             shadow_stats = engine.per_alert_breakdown(shadow_rows, min_sample=1)
             dropped_lines = []
+            over_blocking = 0
             for ak, awr, cnt, _avg in shadow_stats:
-                if cnt >= 5:  # only show meaningful shadow counts
-                    dropped_lines.append(f"  👻 {ak}: {cnt} trades blocked (shadow WR {awr:.0%})")
+                if cnt < 5:
+                    continue
+                if awr >= target:
+                    over_blocking += 1
+                    dropped_lines.append(
+                        f"  ⚠️ {ak}: {cnt} blocked, shadow WR {awr:.0%} "
+                        f"(ABOVE {target:.0%} target — filter may be over-blocking)"
+                    )
+                elif awr < target * 0.75:
+                    dropped_lines.append(
+                        f"  ✅ {ak}: {cnt} blocked, shadow WR {awr:.0%} "
+                        f"(filter correctly rejected)"
+                    )
+                else:
+                    dropped_lines.append(
+                        f"  👻 {ak}: {cnt} blocked, shadow WR {awr:.0%}"
+                    )
             if dropped_lines:
-                sections.append(
-                    "🚫 BLOCKED BY WIN-RATE FILTER (sent to shadow, not dispatched)\n"
-                    + "\n".join(dropped_lines[:10])
-                )
+                header = "🚫 BLOCKED BY WIN-RATE FILTER (sent to shadow, not dispatched)"
+                if over_blocking:
+                    header += (
+                        f"\n   ⚠️ {over_blocking} alert(s) blocked at or above target — "
+                        f"review MIN_WIN_RATE / MIN_WIN_RATE_SAMPLE for those keys."
+                    )
+                sections.append(header + "\n" + "\n".join(dropped_lines[:10]))
     except Exception:
         pass
 

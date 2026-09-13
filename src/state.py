@@ -765,8 +765,10 @@ class RedisStateStore:
             )
             return
 
-        ttl = (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60  # lookahead + buffer, in seconds
-
+        ttl = max(
+            (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60,
+            24 * 3600,
+        )
         try:
             await asyncio.wait_for(
                 self._redis.set(key, payload, ex=ttl),
@@ -814,7 +816,10 @@ class RedisStateStore:
             )
             return
 
-        ttl = (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60
+        ttl = max(
+            (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60,
+            24 * 3600,
+        )
 
         try:
             await asyncio.wait_for(
@@ -1198,38 +1203,46 @@ class RedisStateStore:
                                 approximate=True,
                             )
                         write_pipe.delete(key)
-                        pending_writes += 1
+                        pending_writes += 1                 
                         resolved_count += 1
                         if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
-                            resolved_for_file.append({
-                                "pair": str(pair),
-                                "alert_key": str(alert_key),
-                                "direction": str(direction),
-                                "entry_ts": entry_ts,
-                                "score": conf_score,
-                                "total": conf_total,
-                                "win": win,
-                                "pct_move": pct_move,
-                                "mae": mae,
-                                "mfe": mfe,
-                                "session": session,
-                                "votes": conf_votes,
-                                "adx_val": adx_val,
-                                "context": row_context,
-                                # ── Three-metric fields ──
-                                "close_win": result.get("close_win", win),
-                                "mfe_win": result.get("mfe_win", False),
-                                "mae_loss": result.get("mae_loss", False),
-                                "tp_first": result.get("tp_first"),
-                                "outcome_reason": result.get("outcome_reason", "unknown"),
-                                # ── R:R and Bonus fields ──
-                                "bonus_win": result.get("bonus_win", False),
-                                "rr_achieved": result.get("rr_achieved", 0.0),
-                                "win_weight": result.get("win_weight", 1.0),
-                                "signal_price": signal_price,
-                                "fill_price": fill_price,
-                                "fees_paid_pct": fees_paid_pct,
-                            })
+                            if conf_score is None or conf_total is None:
+                                logger_pair.warning(
+                                    f"[{pair}] Archived row for {alert_key} dropped: "
+                                    f"score={conf_score} total={conf_total}. "
+                                    f"Confluence was not computed for this alert's direction "
+                                    f"(check ENABLE_CONFLUENCE_GATE and gate_passed)."
+                                )
+                            else:
+                                resolved_for_file.append({
+                                    "pair": str(pair),
+                                    "alert_key": str(alert_key),
+                                    "direction": str(direction),
+                                    "entry_ts": entry_ts,
+                                    "score": conf_score,
+                                    "total": conf_total,
+                                    "win": win,
+                                    "pct_move": pct_move,
+                                    "mae": mae,
+                                    "mfe": mfe,
+                                    "session": session,
+                                    "votes": conf_votes,
+                                    "adx_val": adx_val,
+                                    "context": row_context,
+                                    # ── Three-metric fields ──
+                                    "close_win": result.get("close_win", win),
+                                    "mfe_win": result.get("mfe_win", False),
+                                    "mae_loss": result.get("mae_loss", False),
+                                    "tp_first": result.get("tp_first"),
+                                    "outcome_reason": result.get("outcome_reason", "unknown"),
+                                    # ── R:R and Bonus fields ──
+                                    "bonus_win": result.get("bonus_win", False),
+                                    "rr_achieved": result.get("rr_achieved", 0.0),
+                                    "win_weight": result.get("win_weight", 1.0),
+                                    "signal_price": signal_price,
+                                    "fill_price": fill_price,
+                                    "fees_paid_pct": fees_paid_pct,
+                                })
                     except Exception as e:
                         logger_pair.debug(f"Failed to resolve pending outcome {key}: {e}")
                         bad_payload_count += 1
@@ -1384,31 +1397,39 @@ class RedisStateStore:
                         resolved_count += 1              
 
                         if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
-                            resolved_for_file.append({
-                                "pair": str(pair),
-                                "alert_key": str(alert_key),
-                                "direction": str(direction),
-                                "entry_ts": entry_ts,
-                                "score": conf_score,
-                                "total": conf_total,
-                                "win": win,
-                                "pct_move": pct_move,
-                                "mae": mae,
-                                "mfe": mfe,
-                                "session": _get_session_from_ts(entry_ts) if entry_ts else "dead",
-                                "votes": conf_votes,
-                                "shadow": True,
-                                # ─ Three-metric fields ──
-                                "close_win": result.get("close_win", win),
-                                "mfe_win": result.get("mfe_win", False),
-                                "mae_loss": result.get("mae_loss", False),
-                                "tp_first": result.get("tp_first"),
-                                "outcome_reason": result.get("outcome_reason", "unknown"),
-                                # ── R:R and Bonus fields ──
-                                "bonus_win": result.get("bonus_win", False),
-                                "rr_achieved": result.get("rr_achieved", 0.0),
-                                "win_weight": result.get("win_weight", 1.0),
-                            })
+                            if conf_score is None or conf_total is None:
+                                logger_pair.warning(
+                                    f"[{pair}] Shadow archived row for {alert_key} dropped: "
+                                    f"score={conf_score} total={conf_total}. "
+                                    f"Confluence was not computed for this alert's direction "
+                                    f"(check ENABLE_CONFLUENCE_GATE and gate_passed)."
+                                )
+                            else:
+                                resolved_for_file.append({
+                                    "pair": str(pair),
+                                    "alert_key": str(alert_key),
+                                    "direction": str(direction),
+                                    "entry_ts": entry_ts,
+                                    "score": conf_score,
+                                    "total": conf_total,
+                                    "win": win,
+                                    "pct_move": pct_move,
+                                    "mae": mae,
+                                    "mfe": mfe,
+                                    "session": _get_session_from_ts(entry_ts) if entry_ts else "dead",
+                                    "votes": conf_votes,
+                                    "shadow": True,
+                                    # ─ Three-metric fields ──
+                                    "close_win": result.get("close_win", win),
+                                    "mfe_win": result.get("mfe_win", False),
+                                    "mae_loss": result.get("mae_loss", False),
+                                    "tp_first": result.get("tp_first"),
+                                    "outcome_reason": result.get("outcome_reason", "unknown"),
+                                    # ── R:R and Bonus fields ──
+                                    "bonus_win": result.get("bonus_win", False),
+                                    "rr_achieved": result.get("rr_achieved", 0.0),
+                                    "win_weight": result.get("win_weight", 1.0),
+                                })
                     except Exception as e:
                         logger_pair.debug(
                             f"Failed to resolve shadow pending outcome {key}: {e}"
