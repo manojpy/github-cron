@@ -1937,6 +1937,16 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 f"🌐🎯🟢 Queued {len(alerts_to_send)} alert(s) for {pair_name} | "
                 f"Keys: {[ak for _, _, ak in alerts_to_send]} → batch dispatch"
             )
+
+            # ── FIX: record outcomes now, at the gate decision, not after send ──
+            # Reached only after confirm_candle_unchanged/verify_mark_price_agrees
+            # passed above (repaints and inconclusive checks return early and
+            # never reach here), so this can't record a confirmed repaint. A
+            # later Telegram send failure no longer loses the outcome — it's
+            # already in Redis with a TTL and resolves normally either way.
+            if cfg.ENABLE_WIN_RATE_FILTER:
+                await _record_win_rates()
+
             first_key = alerts_to_send[0][2]
             direction = "buy" if first_key in BUY_ALERT_KEYS else "sell"
 
@@ -1959,7 +1969,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 ts=ts_curr,
                 macro_shadow=macro_shadow,
                 alert_keys=[ak for _, _, ak in alerts_to_send],
-                record_win_rate=(_record_win_rates if cfg.ENABLE_WIN_RATE_FILTER else None),
+                record_win_rate=None,  # already recorded above
             )
             if all_state_changes:
                 persist_ok = await sdb.atomic_batch_update(all_state_changes)
@@ -2083,6 +2093,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         budget_refunded = True
                         send_success = False
                     else:
+                        # ── FIX: record outcome before the send attempt ──
+                        # Reached only when reconfirm/mark-price checks passed
+                        # above, so repaints and inconclusive checks never get
+                        # recorded. A later send failure no longer loses it.
+                        if cfg.ENABLE_WIN_RATE_FILTER:
+                            await _record_win_rates()
                         send_success = await telegram_queue.send(msg)
 
                     if send_success:
@@ -2093,8 +2109,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"🔔🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
                             f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                         )
-                        if cfg.ENABLE_WIN_RATE_FILTER:
-                            await _record_win_rates()               
                     else:
                         if not budget_refunded:
                             await _refund_alert_budget(len(alerts_to_send))

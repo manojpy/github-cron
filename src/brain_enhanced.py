@@ -114,6 +114,23 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     except Exception:
         pass
 
+    # ── BLOCKED BY WIN-RATE FILTER (shadow, not dispatched) ─────────────
+    try:
+        shadow_rows = recs.get("_shadow_rows", []) or []
+        if shadow_rows:
+            shadow_stats = engine.per_alert_breakdown(shadow_rows, min_sample=1)
+            dropped_lines = []
+            for ak, awr, cnt, _avg in shadow_stats:
+                if cnt >= 5:  # only show meaningful shadow counts
+                    dropped_lines.append(f"  👻 {ak}: {cnt} trades blocked (shadow WR {awr:.0%})")
+            if dropped_lines:
+                sections.append(
+                    "🚫 BLOCKED BY WIN-RATE FILTER (sent to shadow, not dispatched)\n"
+                    + "\n".join(dropped_lines[:10])
+                )
+    except Exception:
+        pass
+
     # ── CONFLUENCE WEIGHT CHANGES ──────────────────────────────────────
     try:
         weight_lines: List[str] = []
