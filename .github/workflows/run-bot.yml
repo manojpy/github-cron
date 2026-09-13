@@ -128,13 +128,13 @@ jobs:
 
           {
             echo "reports/*.md"
+            echo "brain_state.json"
             for i in $(seq 0 39); do
               D=$(date -u -d "-${i} days" +%Y-%m-%d)
               echo "outcomes/${D}.jsonl"
               echo "shadow/${D}.jsonl"
             done
           } > .git/info/sparse-checkout
-
           git checkout main
           cd -
 
@@ -312,7 +312,7 @@ jobs:
           cd /tmp/data-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .
+          git add outcomes/ shadow/ reports/ brain_state.json
           if ! git diff --cached --quiet; then
             git commit -m "chore: bot outcomes $(date -u +%Y-%m-%d-%H:%M)"
             git push origin main
