@@ -672,7 +672,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     bias_context: Optional[BiasContext] = None
     if cfg.ENABLE_BIAS_HEADER:
         try:
-            bias_context = await _compute_bias_context(prepared_tasks, reference_time, parsed_cache)
+            bias_context = await  compute_bias_context(prepared_tasks, reference_time, parsed_cache)
             if bias_context:
                 logger_main.info(
                     f"🧭 Bias: up={bias_context.up_count}/{bias_context.total_pairs} "
