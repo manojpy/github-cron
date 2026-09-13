@@ -250,12 +250,11 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
                        macro_context: Optional[BtcMacroContext] = None,
                        cluster_context: Optional[ClusterContext] = None,
                        bias_context: Optional[BiasContext] = None,
-                       gate_cache: Optional[Dict[str, Any]] = None):
+                       gate_cache: Optional[Dict[str, Any]] = None,
+                       parsed_cache: Optional[Dict[str, Any]] = None):
     p_name, symbol, candles = task_data
     try:
-        pd_15m = parse_candles_to_numpy(candles.get("15"))
-        pd_5m = parse_candles_to_numpy(candles.get("5"))
-        pd_daily = parse_candles_to_numpy(candles.get("D")) if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else None
+        pd_15m, pd_5m, data_daily = (parsed_cache or {}).get(p_name, (None, None, None))
 
         if pd_15m is None:
             logger_main.warning(f"Skipping {p_name}: 15m parse failed")
@@ -267,7 +266,7 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
 
         data_15m = pd_15m
         data_5m = pd_5m
-        data_daily = pd_daily.as_dict() if pd_daily is not None else None
+
         result = await evaluate_pair_and_alert(
             p_name, data_15m, data_5m, data_daily,
             state_db, telegram_queue, correlation_id, reference_time, fetcher, symbol,
@@ -307,15 +306,9 @@ async def _compute_directional_cluster(
         p_name, symbol, candles = task
         async with semaphore:
             try:
-                pd_15m = parse_candles_to_numpy(candles.get("15"))
-                pd_5m = parse_candles_to_numpy(candles.get("5"))
+                pd_15m, pd_5m, data_daily = parsed_cache.get(p_name, (None, None, None))
                 if pd_15m is None or pd_5m is None:
                     return (None, p_name, _CLUSTER_CACHE_MISS)
-                pd_daily = (
-                    parse_candles_to_numpy(candles.get("D"))
-                    if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else None
-                )
-                data_daily = pd_daily.as_dict() if pd_daily is not None else None
                 oi = oi_gate_data.get(p_name) if (oi_gate_data and cfg.ENABLE_OI_FUNDING_FILTER) else None
                 gr = await _eval_gate(
                     p_name, pd_15m, pd_5m, data_daily, state_db, correlation_id, reference_time, oi,
@@ -366,7 +359,7 @@ async def _compute_bias_context(
 
     for p_name, symbol, candles in prepared_tasks:
         try:
-            pd_15m = parse_candles_to_numpy(candles.get("15"))
+            pd_15m, _, _ = parsed_cache.get(p_name, (None, None, None))
             if pd_15m is None:
                 continue
 
@@ -593,11 +586,19 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         state_db._shadow_pending_outcome_keys_by_pair = None
 
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
-
     prepared_tasks = []
+    parsed_cache: Dict[str, Tuple[Optional[PriceData], Optional[PriceData], Optional[Dict[str, np.ndarray]]]] = {}
     for pair_name, symbol in valid_tasks:
         candles = all_candles.get(symbol, {})
         prepared_tasks.append((pair_name, symbol, candles))
+
+        pd_15m = parse_candles_to_numpy(candles.get("15"))
+        pd_5m = parse_candles_to_numpy(candles.get("5"))
+        pd_daily = (
+            parse_candles_to_numpy(candles.get("D"))
+            if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else None
+        )
+        parsed_cache[pair_name] = (pd_15m, pd_5m, pd_daily.as_dict() if pd_daily is not None else None)
 
     logger_main.debug(f"Ready to evaluate {len(prepared_tasks)} pairs")
 
@@ -693,9 +694,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 cluster_context=cluster_context,
                 bias_context=bias_context,
                 gate_cache=gate_cache,
+                parsed_cache=parsed_cache,
             )
-
-
     results = await asyncio.gather(
         *[_bounded_eval(t) for t in prepared_tasks],
         return_exceptions=True,
