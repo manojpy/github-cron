@@ -99,8 +99,8 @@ jobs:
           outputs: type=image,compression=zstd,force-compression=true,push=true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            AOT_STRICT=1
+          build-args: |        
+            CYTHON_STRICT=1
           cache-from: |
             type=gha,scope=macd-aot-build
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
@@ -172,11 +172,10 @@ jobs:
                 "/app/src/apply_config_override.py" 
                 "/app/src/outcome_storage.py"
                 "/app/src/archive_reader.py"
-                "/app/src/macd_aot_compiled.so"
-                "/app/src/macd_aot_compiled.version"   
+                "/app/src/cython_functions*.so"
               )
               for file in "${FILES[@]}"; do
-                if [ ! -f "$file" ]; then
+                if ! compgen -G "$file" > /dev/null; then
                   echo "❌ MISSING: $file"
                   exit 1
                 fi
