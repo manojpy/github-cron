@@ -150,28 +150,31 @@ jobs:
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
+          START=$(date +%s)
+      
           git clone --depth=1 --filter=blob:none --no-checkout \
             "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" \
             /tmp/data-repo
+      
           cd /tmp/data-repo
           git sparse-checkout init --no-cone
-
+      
           {
-            echo "reports/*.md"
             echo "brain_state.json"
-            for i in $(seq 0 39); do
+            for i in $(seq 0 29); do
               D=$(date -u -d "-${i} days" +%Y-%m-%d)
               echo "outcomes/${D}.jsonl"
               echo "shadow/${D}.jsonl"
             done
           } > .git/info/sparse-checkout
+      
           git checkout main
           cd -
-
-          # Fix permissions so the Docker container's non-root user can write
+      
           chmod -R 777 /tmp/data-repo
           mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
-          chmod -R 777 /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
+      
+          echo "data_checkout_seconds=$(( $(date +%s) - START ))"
 
       - name: 🚀 Execute MACD Bot
         if: inputs.apply_brain_plan != true
@@ -343,7 +346,11 @@ jobs:
           cd /tmp/data-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add --sparse -- outcomes/ shadow/ reports/
+          TODAY=$(date -u +%F)
+          YESTERDAY=$(date -u -d "yesterday" +%F) 
+          git add --sparse -- "outcomes/${TODAY}.jsonl" "shadow/${TODAY}.jsonl"
+          git add --sparse -- "outcomes/${YESTERDAY}.jsonl" "shadow/${YESTERDAY}.jsonl"
+
           if [ -f brain_state.json ]; then
             git add --sparse -- brain_state.json
           fi
