@@ -1361,33 +1361,22 @@ class BrainEngineV2(BaseBrainEngine):
         """Override: send ONLY the plain-English action plan (no jargon), then store for application."""
         try:
             recs = await self.generate_recommendations()
-            
+
             # Build and send the plain-English action plan
             plan_messages = build_profit_action_plan(recs, cfg)  # already MarkdownV2-escaped
             sent_ok = True
             for msg in plan_messages:
                 if not await telegram_queue.send(msg):
                     sent_ok = False
-            
-            # Add a footer explaining how to apply
-            apply_hint = (
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "📝 TO APPLY THESE CHANGES:\n"
-                "Run: `python macd_unified.py --apply-brain`\n"
-                "Or manually edit config_macd.json with the values above."
-            )
-            if not await telegram_queue.send(escape_markdown_v2(apply_hint)):
-                sent_ok = False
-            
-            # Store the plan for later application
+
+            # Store the plan for later application (feature kept intact)
             await self._store_pending_plan(recs)
-            
+
             if sent_ok:
                 logger_run.info(f"Brain report sent ({len(plan_messages)} messages) and stored for application")
             else:
                 logger_run.error(f"Brain report FAILED to send ({len(plan_messages)} messages attempted) — plan still stored")
             return sent_ok
-            
         except Exception as e:
             logger_run.warning(f"Report generation failed: {e}")
             # Fall back to the old technical report if the new one fails
