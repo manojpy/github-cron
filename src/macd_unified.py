@@ -1320,7 +1320,6 @@ if __name__ == "__main__":
         if selftest_ok:
             logger.info(
                 "✅ Numeric self-test passed (%s backend)",
-                "AOT" if aot_bridge.is_using_aot() else "JIT"
                 aot_bridge.active_backend_module()
              )
         else:
