@@ -151,14 +151,22 @@ jobs:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
           START=$(date +%s)
-      
-          git clone --depth=1 --filter=blob:none --no-checkout \
+
+          git clone --depth=1 --no-checkout \
             "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" \
             /tmp/data-repo
-      
+
           cd /tmp/data-repo
+
+          # Fail loudly if the branch was renamed/removed — do not proceed
+          # into a silent empty checkout.
+          if ! git rev-parse --verify main >/dev/null 2>&1; then
+            echo "::error::Branch 'main' not found in outcome-data repo"
+            exit 1
+          fi
+
           git sparse-checkout init --no-cone
-      
+
           {
             echo "brain_state.json"
             for i in $(seq 0 29); do
@@ -166,14 +174,37 @@ jobs:
               echo "outcomes/${D}.jsonl"
               echo "shadow/${D}.jsonl"
             done
+            # Directory patterns — materialize the directories even when a
+            # specific day's file doesn't exist yet in the remote.
+            echo "/outcomes/"
+            echo "/shadow/"
           } > .git/info/sparse-checkout
-      
+
           git checkout main
           cd -
-      
+
           chmod -R 777 /tmp/data-repo
           mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
-      
+
+          # ── AUDIT: prove what actually landed on disk ──
+          echo "=== /tmp/data-repo top level ==="
+          ls -la /tmp/data-repo
+          echo "=== jsonl files (line counts) ==="
+          find /tmp/data-repo -maxdepth 2 -name '*.jsonl' -exec wc -l {} + || echo "(none)"
+          echo "=== today / yesterday ==="
+          TODAY=$(date -u +%F)
+          YESTERDAY=$(date -u -d "yesterday" +%F)
+          for f in "/tmp/data-repo/outcomes/${TODAY}.jsonl" \
+                   "/tmp/data-repo/outcomes/${YESTERDAY}.jsonl" \
+                   "/tmp/data-repo/shadow/${TODAY}.jsonl" \
+                   "/tmp/data-repo/shadow/${YESTERDAY}.jsonl"; do
+            if [ -f "$f" ]; then
+              echo "  ✓ $f ($(wc -l < "$f") lines)"
+            else
+              echo "  ✗ $f (missing)"
+            fi
+          done
+
           echo "data_checkout_seconds=$(( $(date +%s) - START ))"
 
       - name: 🚀 Execute MACD Bot
@@ -340,28 +371,50 @@ jobs:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
           if [ ! -d "/tmp/data-repo/.git" ]; then
-            echo "⚠️ Data repo not found, skipping persist"
+            echo "::warning::Data repo not present — outcomes NOT persisted this run"
             exit 0
           fi
+
           cd /tmp/data-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           TODAY=$(date -u +%F)
           YESTERDAY=$(date -u -d "yesterday" +%F)
+
+          # ── Stage today's/yesterday's files explicitly ──
+          # `git add -f` forces staging even when the file is new and the
+          # clone was made with --no-checkout. `--sparse` can silently
+          # refuse a file that has no prior index entry.
           for f in "outcomes/${TODAY}.jsonl" "shadow/${TODAY}.jsonl" \
                    "outcomes/${YESTERDAY}.jsonl" "shadow/${YESTERDAY}.jsonl"; do
             if [ -f "$f" ]; then
-              git add --sparse -- "$f"
+              git add -f "$f"
             fi
           done
 
+          # Safety net: if anything else new appeared under these dirs, grab it.
+          git add -f outcomes shadow 2>/dev/null || true
+
           if [ -f brain_state.json ]; then
-            git add --sparse -- brain_state.json
+            git add -f brain_state.json
           fi
+
+          # ── AUDIT: always print what's staged, even on no-op ──
+          echo "=== git status ==="
+          git status --short
+          echo "=== staged diff stat ==="
+          git diff --cached --stat || true
+
           if git diff --cached --quiet; then
-            echo "ℹ️ No outcome changes to persist"
+            echo "::warning::No outcome changes to persist (outcome files may be missing or empty)"
+            # Show what we actually looked for, so a zero-row Brain report
+            # is diagnosable from the run log alone.
+            echo "=== container output dir contents ==="
+            ls -la outcomes/ 2>/dev/null || echo "(no outcomes dir)"
+            ls -la shadow/   2>/dev/null || echo "(no shadow dir)"
             exit 0
           fi
+
           git commit -m "chore: persist outcomes $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           git push "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" HEAD:main
