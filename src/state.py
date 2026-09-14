@@ -30,6 +30,7 @@ async def _blanket_reset_pair(sdb: RedisStateStore, pair_name: str, logger_pair:
         )
     return len(resets)
 
+
 async def _clear_all_redis_states(
     sdb: RedisStateStore,
     pairs: List[str],
@@ -42,10 +43,11 @@ async def _clear_all_redis_states(
     clear_alert_stats: bool = False,
     clear_shadow_stats: bool = False,
     clear_outcome_streams: bool = False,
-) -> Tuple[int, int, int, int, int, int, int, int]:
+    clear_daily_cache: bool = False,
+) -> Tuple[int, int, int, int, int, int, int, int, int]:
     if sdb.degraded or not sdb._redis:
         logger.warning("Redis degraded — skipping mass state purge")
-        return 0, 0, 0, 0, 0, 0, 0, 0
+        return 0, 0, 0, 0, 0, 0, 0, 0, 0
 
     deleted_states = 0
     deleted_dedups = 0
@@ -55,6 +57,7 @@ async def _clear_all_redis_states(
     deleted_shadow_stats = 0
     deleted_shadow_hiconf = 0
     deleted_streams = 0
+    deleted_daily_cache = 0
 
     async def _scan_keys_with_timeout(match: str, count: int = 100, timeout: float = 10.0) -> List[str]:
         """Safely consume an async scan_iter with a timeout to prevent runaway loops."""
@@ -118,19 +121,27 @@ async def _clear_all_redis_states(
             all_stream_keys = exact_keys + brain_report_keys
             deleted_streams = await _batch_unlink(all_stream_keys)
 
+        if clear_daily_cache:
+            daily_cache_keys = await _scan_keys_with_timeout(
+                f"{RedisKeyPrefix.METADATA}daily_cache:*", count=200
+            )
+            deleted_daily_cache = await _batch_unlink(daily_cache_keys)
+
         logger.info(
             f"🧹 MASS RESET complete | "
             f"States: {deleted_states} | Dedups: {deleted_dedups} | "
             f"Pending: {deleted_pending} | ShadowPending: {deleted_shadow_pending} | "
             f"AlertStats: {deleted_alert_stats} | ShadowStats: {deleted_shadow_stats} | "
-            f"ShadowHiConf: {deleted_shadow_hiconf} | Streams: {deleted_streams}"
+            f"ShadowHiConf: {deleted_shadow_hiconf} | Streams: {deleted_streams} | "
+            f"DailyCache: {deleted_daily_cache}"
         )
         return (deleted_states, deleted_dedups, deleted_pending, deleted_shadow_pending,
-                deleted_alert_stats, deleted_shadow_stats, deleted_shadow_hiconf, deleted_streams)
+                deleted_alert_stats, deleted_shadow_stats, deleted_shadow_hiconf, deleted_streams,
+                deleted_daily_cache)
 
     except Exception as e:
         logger.error(f"Mass reset failed: {e}")
-        return 0, 0, 0, 0, 0, 0, 0, 0
+        return 0, 0, 0, 0, 0, 0, 0, 0, 0
 
 def build_products_map_from_cfg() -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}

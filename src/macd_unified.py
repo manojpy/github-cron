@@ -446,19 +446,32 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     if fetch_daily and daily_symbols:
         day_key = get_utc_date_key(reference_time)
-        cache_keys = [f"daily_cache:{sym}:{day_key}" for sym in daily_symbols]
-        cached_map = await state_db.batch_get_metadata(cache_keys)
+        seconds_into_utc_day = reference_time % 86400
+        daily_cache_settled = seconds_into_utc_day >= Constants.DAILY_CACHE_SETTLE_SEC
 
-        for sym, ck in zip(daily_symbols, cache_keys):
-            raw = cached_map.get(ck)
-            if raw:
-                all_candles.setdefault(sym, {})["D"] = json_loads(raw)
-            else:
-                miss_symbols.append(sym)
+        if daily_cache_settled:
+            cache_keys = [f"daily_cache:{sym}:{day_key}" for sym in daily_symbols]
+            cached_map = await state_db.batch_get_metadata(cache_keys)
+
+            for sym, ck in zip(daily_symbols, cache_keys):
+                raw = cached_map.get(ck)
+                if raw:
+                    all_candles.setdefault(sym, {})["D"] = json_loads(raw)
+                else:
+                    miss_symbols.append(sym)
+        else:
+            logger_main.info(
+                f"📅 Daily cache bypassed — {seconds_into_utc_day}s into UTC day "
+                f"(< {Constants.DAILY_CACHE_SETTLE_SEC}s settle window), fetching {len(daily_symbols)} daily bar(s) live"
+            )
+            miss_symbols = list(daily_symbols)
 
         if miss_symbols:
             daily_task = asyncio.gather(*(
-                fetcher.fetch_daily_cached(state_db, sym, daily_limit, reference_time)
+                fetcher.fetch_daily_cached(
+                    state_db, sym, daily_limit, reference_time,
+                    allow_cache_write=daily_cache_settled,
+                )
                 for sym in miss_symbols
             ), return_exceptions=True)
 
@@ -911,7 +924,7 @@ async def run_once() -> Optional[bool]:
             if sdb and not sdb.degraded:
                 logger_run.warning("🚨 CLEAR_REDIS requested — purging ALL Redis states...")
 
-                st, dd, pend, sp, ast, sst, shc, strm = await _clear_all_redis_states(
+                st, dd, pend, sp, ast, sst, shc, strm, dcache = await _clear_all_redis_states(
                     sdb, pairs_to_process, logger_run,
                     clear_active_states=True,
                     clear_dedups=True,
@@ -920,6 +933,7 @@ async def run_once() -> Optional[bool]:
                     clear_alert_stats=True,
                     clear_shadow_stats=True,
                     clear_outcome_streams=True,
+                    clear_daily_cache=True,
                 )
 
                 parts = []
@@ -931,6 +945,7 @@ async def run_once() -> Optional[bool]:
                 if sst: parts.append(f"ShadowStats: {sst}")
                 if shc: parts.append(f"ShadowHiConf: {shc}")
                 if strm: parts.append(f"Streams: {strm}")
+                if dcache: parts.append(f"DailyCache: {dcache}")
                 cleared_str = " | ".join(parts) if parts else "Nothing cleared"
 
                 if telegram_queue is None:

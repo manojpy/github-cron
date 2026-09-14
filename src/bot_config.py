@@ -136,6 +136,8 @@ class Constants:
     CANDLE_FETCH_BUFFER_PERIODS = 3 
     API_TIMESTAMP_TOLERANCE_SEC = 300
     MIN_CANDLE_AGE_FROM_OPEN = 850
+    DAILY_CACHE_SETTLE_RUNS = 3          # skip daily-candle caching for this many 15m runs after UTC midnight
+    DAILY_CACHE_SETTLE_SEC = DAILY_CACHE_SETTLE_RUNS * 900   # 2700s = 45min — let the exchange's daily bar settle before trusting it for the whole day
     MIN_BODY_RATIO = 0.50
     HIGH_DEVIATION_THRESHOLD = 0.5
     REVERSAL_MARUBOZU_BODY_RATIO = 0.90 

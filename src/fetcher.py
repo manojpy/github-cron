@@ -534,14 +534,16 @@ class DataFetcher:
         return None
 
     async def fetch_daily_cached(self, sdb: "RedisStateStore", symbol: str, limit: int,
-                                   reference_time: int) -> Optional[Dict[str, Any]]:
+                                   reference_time: int, allow_cache_write: bool = True) -> Optional[Dict[str, Any]]:
         day_key = get_utc_date_key(reference_time)
         cache_key = f"daily_cache:{symbol}:{day_key}"
 
         logger.debug(f"📅 Daily cache MISS | {symbol} — fetching live")
         data = await self.fetch_candles(symbol, "D", limit, reference_time)
 
-        if data and data.get("result") and not sdb.degraded:
+        if not allow_cache_write:
+            logger.debug(f"📅 Daily cache WRITE SKIPPED for {symbol}: still inside settle window")
+        elif data and data.get("result") and not sdb.degraded:
             try:
                 t = data["result"].get("t") or []
                 last_ts = int(t[-1]) if t else 0
