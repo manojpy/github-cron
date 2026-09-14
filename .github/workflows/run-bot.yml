@@ -346,10 +346,15 @@ jobs:
           cd /tmp/data-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           TODAY=$(date -u +%F)
-          YESTERDAY=$(date -u -d "yesterday" +%F) 
-          git add --sparse -- "outcomes/${TODAY}.jsonl" "shadow/${TODAY}.jsonl"
-          git add --sparse -- "outcomes/${YESTERDAY}.jsonl" "shadow/${YESTERDAY}.jsonl"
+          YESTERDAY=$(date -u -d "yesterday" +%F)
+          for f in "outcomes/${TODAY}.jsonl" "shadow/${TODAY}.jsonl" \
+                   "outcomes/${YESTERDAY}.jsonl" "shadow/${YESTERDAY}.jsonl"; do
+            if [ -f "$f" ]; then
+              git add --sparse -- "$f"
+            fi
+          done
 
           if [ -f brain_state.json ]; then
             git add --sparse -- brain_state.json
