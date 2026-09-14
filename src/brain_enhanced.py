@@ -7,7 +7,6 @@ import json
 import logging
 import random
 import time
-import re
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 import os
@@ -45,11 +44,6 @@ _PHASE_MIN_SAMPLES = {
 # ══════════════════════════════════════════════════════════════════════
 #  PLAIN-ENGLISH PROFIT ACTION PLAN (layman-friendly report layer)
 # ══════════════════════════════════════════════════════════════════════
-_TG_ESCAPE = re.compile(r'[_*\[\]()~`>#+\-=|{}.!]')
-
-def _tg(x: Any) -> str:
-    """MarkdownV2-escape so TelegramQueue.send() never rejects the message."""
-    return _TG_ESCAPE.sub(r'\\\g<0>', str(x))
 
 def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     """Translate Brain findings into a plain-English, copy-paste action plan.
@@ -995,7 +989,7 @@ class BrainEngineV2(BaseBrainEngine):
                     "type": "fdr_summary",
                     "severity": "low",
                     "message": (
-                        f"�� FDR (Benjamini-Hochberg, α=0.10): {n_survived}/{n_tested} "
+                        f"🔬 FDR (Benjamini-Hochberg, α=0.10): {n_survived}/{n_tested} "
                         f"statistical claims survived correction across the report. "
                         f"Surviving claims are marked `fdr_passed=True`; demoted "
                         f"claims are downgraded to low severity."
@@ -1363,7 +1357,7 @@ class BrainEngineV2(BaseBrainEngine):
             ))
             return False
 
-    async def generate_report(self, pairs, telegram_queue, logger_run):
+    async def generate_report(self, pairs, telegram_queue, logger_run) -> bool:
         """Override: send ONLY the plain-English action plan (no jargon), then store for application."""
         try:
             recs = await self.generate_recommendations()
@@ -1392,6 +1386,7 @@ class BrainEngineV2(BaseBrainEngine):
                 logger_run.info(f"Brain report sent ({len(plan_messages)} messages) and stored for application")
             else:
                 logger_run.error(f"Brain report FAILED to send ({len(plan_messages)} messages attempted) — plan still stored")
+            return sent_ok
             
         except Exception as e:
             logger_run.warning(f"Report generation failed: {e}")
@@ -1400,57 +1395,11 @@ class BrainEngineV2(BaseBrainEngine):
                 return await self._generate_and_send(pairs, telegram_queue, logger_run)
             except Exception as fallback_e:
                 logger_run.error(f"Fallback report also failed: {fallback_e}")
-                return None
+                return False
 
-    async def maybe_generate_report(
-        self,
-        pairs: List[str],
-        telegram_queue: Any,
-        logger_run: logging.Logger,
-    ) -> None:
-        """Override: same run-count/interval gating as the base class, but
-        route the actual send through generate_report() (Profit Action Plan)
-        instead of BrainEngine._generate_and_send() (old jargon report)."""
-        interval = getattr(cfg, "BRAIN_REPORT_INTERVAL_RUNS", 48)
-        if interval <= 0:
-            logger_run.warning("BRAIN_REPORT_INTERVAL_RUNS is <= 0, disabling brain reports.")
-            return
-        if not getattr(cfg, "ENABLE_BRAIN", True):
-            return
-        if not cfg.ENABLE_WIN_RATE_FILTER:
-            logger_run.warning(
-                "ENABLE_BRAIN is on but ENABLE_WIN_RATE_FILTER is off — brain has no data source, skipping report."
-            )
-            return
-        if getattr(cfg, "DRY_RUN_MODE", False):
-            logger_run.info("DRY_RUN_MODE is on — skipping brain report (outcome data would be synthetic).")
-            return
-
-        run_count = await self._next_run_count()
-        if run_count is None or run_count % interval != 0:
-            return
-
-        try:
-            await self.generate_report(pairs, telegram_queue, logger_run)
-        except Exception:
-            await self._rollback_run_count()
-            raise
-
-    async def send_report_now(self, pairs: List[str], telegram_queue: Any, logger_run: logging.Logger) -> bool:
-        """Override: on-demand path also goes through generate_report() (Profit
-        Action Plan) instead of BrainEngine._generate_and_send()."""
-        if not getattr(cfg, "ENABLE_BRAIN", True):
-            logger_run.warning("ENABLE_BRAIN is off — skipping on-demand brain report.")
-            return True
-        if not cfg.ENABLE_WIN_RATE_FILTER:
-            logger_run.warning(
-                "ENABLE_BRAIN is on but ENABLE_WIN_RATE_FILTER is off — "
-                "brain has no data source, skipping report."
-            )
-            return True
-        if getattr(cfg, "DRY_RUN_MODE", False):
-            logger_run.info("DRY_RUN_MODE is on — skipping brain report (outcome data would be synthetic).")
-            return True
-
-        result = await self.generate_report(pairs, telegram_queue, logger_run)
-        return result is not None
+    async def _deliver_report(self, pairs: List[str], telegram_queue: Any, logger_run: logging.Logger) -> bool:
+        """Override: route through generate_report() (Profit Action Plan)
+        instead of BrainEngine._generate_and_send() (old jargon report).
+        maybe_generate_report()/send_report_now() and all their guards are
+        inherited unchanged from the base class."""
+        return await self.generate_report(pairs, telegram_queue, logger_run)

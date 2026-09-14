@@ -1448,7 +1448,7 @@ class BrainEngine:
             return
 
         try:
-            await self._generate_and_send(pairs, telegram_queue, logger_run)
+            await self._deliver_report(pairs, telegram_queue, logger_run)
         except Exception:
             await self._rollback_run_count()
             raise
@@ -1469,6 +1469,12 @@ class BrainEngine:
             logger_run.info("DRY_RUN_MODE is on — skipping brain report (outcome data would be synthetic).")
             return True
 
+        return await self._deliver_report(pairs, telegram_queue, logger_run)
+
+    async def _deliver_report(self, pairs: List[str], telegram_queue: Any, logger_run: logging.Logger) -> bool:
+        """Hook: which report path to invoke once the self-guards in
+        maybe_generate_report()/send_report_now() have passed. Subclasses
+        override this instead of re-implementing those guards."""
         return await self._generate_and_send(pairs, telegram_queue, logger_run)
 
     def _build_full_markdown_report(self, recs: Dict[str, Any]) -> str:
@@ -1704,8 +1710,7 @@ class BrainEngine:
             "per_alert_breakdown", "vote_interaction", "counterfactual",
             "cusum_drift", "disable_alert", "auto_disabled", "auto_reenabled",
             "three_metric_evaluation", "permutation_importance",
-            "dynamic_weights_applied", "dynamic_weights_shadow",
-            "dynamic_weights_persist_failed", "parameter_autopsy",
+            "dynamic_weights_applied", "parameter_autopsy",
             "config_regression", "config_improvement",
         }
         others = [
