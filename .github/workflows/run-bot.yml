@@ -316,3 +316,9 @@ jobs:
           if [ -f brain_state.json ]; then
             git add --sparse -- brain_state.json
           fi
+          if git diff --cached --quiet; then
+            echo "ℹ️ No outcome changes to persist"
+            exit 0
+          fi
+          git commit -m "chore: persist outcomes $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" HEAD:main
