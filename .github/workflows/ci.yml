@@ -73,6 +73,12 @@ jobs:
   actionlint:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      # Only fail on real bugs (warning/error). shellcheck's "info"/"style"
+      # findings (unquoted vars in low-risk spots, redirect-grouping
+      # preferences) are noisy across existing scripts and aren't worth
+      # blocking merges over.
+      SHELLCHECK_OPTS: "--severity=warning"
     steps:
       - uses: actions/checkout@v7
       - name: Run actionlint
