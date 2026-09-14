@@ -1321,7 +1321,8 @@ if __name__ == "__main__":
             logger.info(
                 "✅ Numeric self-test passed (%s backend)",
                 "AOT" if aot_bridge.is_using_aot() else "JIT"
-            )
+                aot_bridge.active_backend_module()
+             )
         else:
             for msg in selftest_failures:
                 logger.critical("❌ Numeric self-test failure: %s", msg)

@@ -154,6 +154,9 @@ def is_using_aot() -> bool:
     """True when the Cython backend is active."""
     return _using_compiled
 
+def active_backend_module() -> str:
+    """Name of the module actually serving indicator calls right now."""
+    return _compiled_module.__name__ if _using_compiled else "numba_functions_shared"
 
 def get_fallback_reason() -> Optional[str]:
     """Why we fell back to JIT (None when Cython is active)."""
@@ -163,7 +166,6 @@ def get_fallback_reason() -> Optional[str]:
 def requires_warmup() -> bool:
     """JIT needs a warm-up pass; Cython does not."""
     return not _using_compiled
-
 
 # ──────────────────────────────────────────────────────────────────────
 # HIGH-PERFORMANCE DISPATCH INTERFACE  (identical signatures to before)
