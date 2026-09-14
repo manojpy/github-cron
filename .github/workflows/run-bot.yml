@@ -25,6 +25,11 @@ on:
         required: false
         default: false
         type: boolean
+      apply_brain_plan:
+        description: '✅ Apply last Brain action plan (--apply-brain) and exit'
+        required: false
+        default: false
+        type: boolean
 
 # Prevent overlapping runs from cron + manual dispatch
 concurrency:
@@ -99,7 +104,30 @@ jobs:
           docker pull --quiet --platform linux/amd64 "$IMAGE"
           echo "✅ Image ready in $(( $(date +%s) - START ))s"
 
+      - name: ✅ Apply Brain Plan (on-demand)
+        if: inputs.apply_brain_plan == true
+        run: |
+          ENV_FILE="$(pwd)/.bot_env"
+          cat > "$ENV_FILE" <<EOF
+          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+          REDIS_URL=${{ secrets.REDIS_URL }}
+          DELTA_API_BASE=${{ secrets.DELTA_API_BASE }}
+          EOF
+
+          docker run --rm \
+            --platform linux/amd64 \
+            --env-file "$ENV_FILE" \
+            -e PYTHONPATH=/app/src \
+            -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" \
+            python macd_unified.py --apply-brain
+
+          rm -f "$ENV_FILE"
+          echo "✅ Apply-brain step finished — see logs above for applied changes." >> $GITHUB_STEP_SUMMARY
+
       - name: ⏱️ Check Dispatch Latency
+        if: inputs.apply_brain_plan != true
         run: |
           BUFFER=$(python3 -c "import json; print(json.load(open('config_macd.json')).get('CANDLE_MIN_AGE_BUFFER', 60))" 2>/dev/null || echo 60)
           STALENESS=$(python3 -c "import json; print(json.load(open('config_macd.json')).get('MAX_CANDLE_STALENESS_SEC', 1200))" 2>/dev/null || echo 1200)
@@ -117,6 +145,7 @@ jobs:
           fi
 
       - name: 📦 Checkout outcome-data archive
+        if: inputs.apply_brain_plan != true
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
@@ -144,6 +173,7 @@ jobs:
           chmod -R 777 /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
 
       - name: 🚀 Execute MACD Bot
+        if: inputs.apply_brain_plan != true
         id: bot_run
         timeout-minutes: 12
         env:
