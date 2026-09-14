@@ -2,7 +2,6 @@
   "TELEGRAM_BOT_TOKEN": "__SET_IN_GITHUB_SECRETS__",
   "TELEGRAM_CHAT_ID": "__SET_IN_GITHUB_SECRETS__",
   "REDIS_URL": "__SET_IN_GITHUB_SECRETS__",
-  "DATA_REPO_TOKEN": "__SET_IN_GITHUB_SECRETS__",
   "DELTA_API_BASE": "https://api.india.delta.exchange",
   "OUTCOME_DATA_DIR": "outcome-data",
   
