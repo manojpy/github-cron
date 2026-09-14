@@ -3,6 +3,14 @@
 # cython: wraparound=False
 # cython: initializedcheck=False
 # cython: cdivision=True
+#
+# WARNING: with cdivision=True, `%` on cdef ints follows C truncation semantics
+# (sign of dividend), NOT Python floor semantics. Any use of `%` on a value that
+# can be negative will silently differ from the Numba implementation.
+# All current `%` sites in rolling_min_max_numba operate on monotonically
+# increasing indices (min_h, min_t, max_h, max_t, buf_idx) and are provably
+# non-negative. If you refactor those to allow negative indices, use a helper
+# `mod_floor(x, m)` or drop cdivision for that function.
 # distutils: define_macros=NPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION
 """
 Cython replacement for numba_functions_shared.py
@@ -53,6 +61,11 @@ def rolling_mean_numba(double[:] data, int period):
             has_nan = 1
             break
 
+    # Declare here so BOTH paths use a C double (previously only the slow path did).
+    cdef double window_sum
+    cdef double w_sum
+    cdef int nan_count
+
     if not has_nan:
         # Fast path – no NaN in input
         window_sum = 0.0
@@ -65,8 +78,8 @@ def rolling_mean_numba(double[:] data, int period):
         return out
 
     # Slow path – NaN-tolerant sliding window
-    cdef double w_sum = 0.0
-    cdef int nan_count = 0
+    w_sum = 0.0
+    nan_count = 0
     cdef np.ndarray queue_np = np.zeros(period, dtype=np.float64)
     cdef double[:] queue = queue_np
     cdef np.ndarray is_nan_q_np = np.zeros(period, dtype=np.bool_)
@@ -171,6 +184,7 @@ def rolling_min_max_numba(double[:] arr, int period):
 # ══════════════════════════════════════════════════════════════════════
 # 4. ema_loop
 # ══════════════════════════════════════════════════════════════════════
+
 def ema_loop(double[:] data, double length_float):
     cdef int n = data.shape[0]
     cdef int length = <int>length_float
@@ -514,14 +528,14 @@ def calculate_atr_rma(double[:] high, double[:] low, double[:] close, int period
 # ══════════════════════════════════════════════════════════════════════
 # 13. calculate_adx_core
 # ══════════════════════════════════════════════════════════════════════
+
 def calculate_adx_core(double[:] high, double[:] low, double[:] close,
                        int di_length, int adx_length):
     cdef int n = high.shape[0]
-    cdef np.ndarray adx_np = np.full(n, np.nan, dtype=np.float64)
-    cdef double[:] adx
+    cdef np.ndarray adx_np
 
     if n < di_length + adx_length:
-        return adx_np
+        return np.full(n, np.nan, dtype=np.float64)
 
     cdef np.ndarray tr_np = true_range_numba(high, low, close)
     cdef double[:] tr = tr_np
