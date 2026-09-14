@@ -31,35 +31,27 @@ RUN --mount=type=cache,target=/tmp/uv_cache \
     uv pip install -r requirements.txt && \
     python -m compileall -q -o 2 $VIRTUAL_ENV
 
-# ---------- STAGE 3: AOT COMPILER ----------
-FROM deps-builder AS aot-builder
+# ---------- STAGE 3: CYTHON COMPILER ----------
+FROM deps-builder AS cython-builder
 
 WORKDIR /build
 
-# Only copy files the compiler actually imports.
-COPY src/aot_meta.py ./
-COPY src/numba_functions_shared.py ./
-COPY src/aot_build.py ./
+COPY setup.py ./
+COPY src/cython_functions.pyx ./src/
 
-ARG AOT_STRICT=0
+ARG CYTHON_STRICT=0
 
-# Clean structured shell block to correctly handle AOT_STRICT fallbacks
 RUN set -e; \
-    echo "🔨 Starting AOT compilation..."; \
-    if python aot_build.py --output-dir /build --module-name macd_aot_compiled --verify; then \
-        echo "✅ AOT build successful"; \
-        SO_FILE=$(ls -1 /build/macd_aot_compiled*.so 2>/dev/null | head -1); \
-        if [ -n "$SO_FILE" ]; then \
-            mv "$SO_FILE" /build/macd_aot_compiled.so; \
-        fi; \
+    echo "🔨 Starting Cython compilation..."; \
+    if python setup.py build_ext --inplace; then \
+        echo "✅ Cython build successful"; \
     else \
-        echo "⚠️ AOT compilation failed!"; \
-        if [ "$AOT_STRICT" = "1" ]; then \
-            echo "❌ AOT_STRICT=1: Aborting build."; \
+        echo "⚠️ Cython compilation failed!"; \
+        if [ "$CYTHON_STRICT" = "1" ]; then \
+            echo "❌ CYTHON_STRICT=1: Aborting build."; \
             exit 1; \
         else \
-            echo "⚠️ AOT_STRICT=0: Creating empty stub files for JIT fallback..."; \
-            touch /build/macd_aot_compiled.so /build/macd_aot_compiled.version; \
+            echo "⚠️ CYTHON_STRICT=0: continuing — bot will use Numba JIT fallback."; \
         fi; \
     fi
 
@@ -85,9 +77,8 @@ WORKDIR /app/src
 COPY --from=deps-builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy AOT binary + version stamp from aot-builder
-COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled.so ./
-COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled.version ./
+# Copy compiled Cython extension (filename carries the ABI tag, e.g. .cpython-311-x86_64-linux-gnu.so)
+COPY --from=cython-builder --chown=appuser:appuser /build/cython_functions*.so ./
 
 # Copy AOT / bridge files (change rarely — keep early for layer cache)
 COPY --chown=appuser:appuser src/aot_meta.py ./
@@ -121,9 +112,8 @@ ENV PYTHONUNBUFFERED=1 \
     NUMBA_THREADING_LAYER=tbb \
     NUMBA_NUM_THREADS=2 \
     OMP_NUM_THREADS=2 \
-    MEMORY_LIMIT_BYTES=850000000 \
-    TZ=Asia/Kolkata \
-    AOT_LIB_PATH=/app/src
+    MEMORY_LIMIT_BYTES=850000000 \ 
+    TZ=Asia/Kolkata
 
 LABEL org.opencontainers.image.title="MACD Unified Bot (AOT)" \
       org.opencontainers.image.description="High-performance trading alert bot with AOT compilation" \
