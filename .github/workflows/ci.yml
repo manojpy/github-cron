@@ -68,6 +68,45 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements.txt pytest
       - run: pip check
+
+      # Smoke-import: catches circular imports, missing optional deps,
+      # and module-level assertions (e.g. alerts.validate_alert_definitions())
+      # that neither compileall, pyflakes, nor pytest exercise if the module
+      # isn't already under test. Runs BEFORE pytest so a broken import
+      # fails fast and unambiguously instead of surfacing as a test
+      # collection error.
+      - name: Smoke import
+        run: |
+          timeout 30s python - <<'PY'
+          import aot_bridge
+          import bot_config
+          import fetcher
+          import indicators
+          import state
+          import gates
+          import alerts
+          import threshold_engine
+          import brain
+          import brain_enhanced
+
+          # Invariant: alert definitions and their Redis-key mapping must not drift.
+          assert len(alerts.ALERT_DEFINITIONS) == len(alerts.ALERT_KEYS), (
+              f"ALERT_DEFINITIONS ({len(alerts.ALERT_DEFINITIONS)}) and "
+              f"ALERT_KEYS ({len(alerts.ALERT_KEYS)}) have drifted out of sync"
+          )
+
+          # Invariant: every alert key must be classified as buy or sell.
+          uncovered = (
+              {d.key for d in alerts.ALERT_DEFINITIONS}
+              - alerts.BUY_ALERT_KEYS
+              - alerts.SELL_ALERT_KEYS
+          )
+          assert not uncovered, (
+              f"alert keys missing from both BUY_ALERT_KEYS and "
+              f"SELL_ALERT_KEYS: {sorted(uncovered)}"
+          )
+          PY
+
       - run: python -m pytest tests/ -q
 
   actionlint:
