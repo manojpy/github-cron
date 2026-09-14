@@ -10,18 +10,8 @@ on:
         options:
           - 'false'
           - 'true'
-      clear_redis:
-        description: '🧹 Clear ALL Redis keys'
-        required: false
-        default: false
-        type: boolean
       brain_report:
         description: '🧠 Send Brain Report'
-        required: false
-        default: false
-        type: boolean
-      clear_kill_switch:
-        description: '🔓 Clear Kill Switch (manual override after review)'
         required: false
         default: false
         type: boolean
@@ -30,6 +20,17 @@ on:
         required: false
         default: false
         type: boolean
+      clear_redis:
+        description: '🧹 Clear ALL Redis keys'
+        required: false
+        default: false
+        type: boolean
+      clear_kill_switch:
+        description: '🔓 Clear Kill Switch (manual override after review)'
+        required: false
+        default: false
+        type: boolean
+      
 
 # Prevent overlapping runs from cron + manual dispatch
 concurrency:
@@ -40,8 +41,8 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
   BOT_TIMEOUT: 660
-  CLEAR_REDIS: ${{ inputs.clear_redis }}
   BRAIN_REPORT_ON_DEMAND: ${{ inputs.brain_report }}
+  CLEAR_REDIS: ${{ inputs.clear_redis }}
   CLEAR_KILL_SWITCH: ${{ inputs.clear_kill_switch }}
 
 jobs:
