@@ -96,10 +96,14 @@ def _find_closed_daily_candle(data_daily: Dict[str, np.ndarray], reference_time:
     hi_arr = data_daily.get("high")
     lo_arr = data_daily.get("low")
     cl_arr = data_daily.get("close")
-
+    
+    # Explicitly check for None to satisfy mypy type narrowing
+    if ts_arr is None or hi_arr is None or lo_arr is None or cl_arr is None:
+        raise CprNotReadyError("daily array empty or missing")
+        
     for name, arr in (("timestamp", ts_arr), ("high", hi_arr),
                       ("low", lo_arr), ("close", cl_arr)):
-        if arr is None or len(arr) == 0:
+        if len(arr) == 0:
             raise CprNotReadyError(f"daily {name} array empty or missing")
 
     for name, arr in (("high", hi_arr), ("low", lo_arr), ("close", cl_arr)):

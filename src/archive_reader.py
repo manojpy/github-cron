@@ -99,17 +99,17 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
             except Exception:
                 context = None
 
-        mae = raw.get("mae")
-        mfe = raw.get("mfe")
+        mae_raw = raw.get("mae")
+        mfe_raw = raw.get("mfe")
         try:
-            mae = float(mae) if mae not in (None, "") else None
+            mae = float(str(mae_raw)) if mae_raw not in (None, "") else None
         except Exception:
             mae = None
         try:
-            mfe = float(mfe) if mfe not in (None, "") else None
+            mfe = float(str(mfe_raw)) if mfe_raw not in (None, "") else None
         except Exception:
             mfe = None
-
+            
         # ── Three-metric fields (robust to bool OR "1"/"0" strings) ──
         base_win = _coerce_bool(raw.get("win"), default=False)
         close_win_val = _coerce_bool(raw.get("close_win"), default=base_win)
@@ -123,23 +123,22 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
         rr_achieved_raw = raw.get("rr_achieved")
         try:
             rr_achieved_val = (
-                float(rr_achieved_raw)
+                float(str(rr_achieved_raw))
                 if rr_achieved_raw not in (None, "")
                 else 0.0
             )
         except (TypeError, ValueError):
             rr_achieved_val = 0.0
-
+  
         win_weight_raw = raw.get("win_weight")
         try:
             win_weight_val = (
-                float(win_weight_raw)
+                float(str(win_weight_raw))
                 if win_weight_raw not in (None, "")
                 else (1.0 if base_win else 0.0)
             )
         except (TypeError, ValueError):
             win_weight_val = 1.0 if base_win else 0.0
-
         return {
             "pair": raw.get("pair", "?"),
             "alert_key": raw.get("alert_key", "?"),
@@ -235,7 +234,10 @@ def load_archived_outcomes(
             pass
 
         stats["files_read"] += 1
-        opener = gzip.open if path.suffix == ".gz" else open
+        if path.suffix == ".gz":
+            opener = gzip.open
+        else:
+            opener = open
         try:
             with opener(path, "rt", encoding="utf-8") as f:
                 for line in f:

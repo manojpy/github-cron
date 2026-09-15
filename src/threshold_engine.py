@@ -761,11 +761,7 @@ def per_pair_session_breakdown(rows: List[Row], min_sample: int = 10):
     return results
 
 def session_breakdown(rows: List[Row], min_sample: int = 10):
-    """Groups by session ONLY (asian/london/ny/dead) — for comparing overall
-    session performance, as opposed to per_pair_session_breakdown()'s
-    (pair, session) granularity. Returns (session, win_rate, n) tuples,
-    sorted worst win-rate first."""
-    stats = defaultdict(lambda: {"wins": 0, "n": 0})
+    stats: DefaultDict[str, Dict[str, int]] = defaultdict(lambda: {"wins": 0, "n": 0})
     for r in rows:
         s = stats[r.get("session", "unknown")]
         s["wins"] += r["win"]
@@ -1198,7 +1194,7 @@ def calibration_alert(
 
 # ═══════════════════════════════════════════════════════════════════════
 #  NEW: Sequential CUSUM Drift Detector  (Recommended.txt §4)
-# ══════════════════════════════════════════════════════════════════��════
+# ══════════════════════════════════════════���═══════════════════════��════
 
 class CUSUMDetector:
     """Page-Hinkley / CUSUM for binary outcomes. Online, O(1) memory."""
@@ -1557,13 +1553,12 @@ def interaction_miner(
     the reference arm is too thin to pass min_sample); the FDR pass
     treats None as "not tested" and leaves the recommendation alone.
     """
-    vote_names: Set[str] = set()
+    vote_names_set: Set[str] = set()
     for r in rows:
         if r.get("votes"):
-            vote_names.update(r["votes"].keys())
-    vote_names = sorted(vote_names)
+            vote_names_set.update(r["votes"].keys())
+    vote_names: List[str] = sorted(vote_names_set)
     interactions: List[Dict[str, Any]] = []
-
     for i, v1 in enumerate(vote_names):
         for v2 in vote_names[i + 1 :]:
             both = [r for r in rows if r.get("votes") and r["votes"].get(v1) and r["votes"].get(v2)]
@@ -1699,7 +1694,7 @@ def interaction_miner(
                         entry["n_neither"] = n_neither
                     interactions.append(entry)
 
-    interactions.sort(key=lambda x: -abs(x["delta"]))
+    interactions.sort(key=lambda x: -abs(float(x["delta"]))) 
     return interactions
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2106,7 +2101,7 @@ def multi_metric_per_alert(rows: List[Row], min_sample: int = 10) -> List[Dict[s
             "gap_mfe_vs_close": (mfe_wins - close_wins) / n,
         })
 
-    results.sort(key=lambda x: -x["mfe_wr"])
+    results.sort(key=lambda x: -float(x["mfe_wr"]))
     return results
 
 def multi_metric_per_pair(rows: List[Row], min_sample: int = 15) -> List[Dict[str, Any]]:
@@ -2132,10 +2127,10 @@ def multi_metric_per_pair(rows: List[Row], min_sample: int = 15) -> List[Dict[st
             "mae_loss_rate": mae_losses / n,
         })
 
-    results.sort(key=lambda x: -x["mfe_wr"])
+    results.sort(key=lambda x: -float(x["mfe_wr"]))
     return results
 
-# ═══════════════���═════════════════════════════════════════════════════��═
+# ════════════════════════════════════════════════════════════════════��═
 #  ENHANCED WEIGHT OPTIMIZER — Walk-Forward + Confidence + Delta Limit
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -2585,8 +2580,7 @@ def diagnose_root_cause(
                     "confident": hi < target_wr,
                     "p_value": p,
                 })
-
-    candidates.sort(key=lambda c: -c["isolation_score"])
+    candidates.sort(key=lambda c: -float(c["isolation_score"]))
     seen: Set[str] = set()
     deduped: List[Dict[str, Any]] = []
     for c in candidates:
@@ -2702,7 +2696,7 @@ def find_wr_change_point(
             cv = (r.get("context") or {}).get("config_version")
             if cv:
                 counts[cv] += 1
-        return max(counts, key=counts.get) if counts else None
+        return max(counts, key=lambda k: counts[k]) if counts else None
 
     best["version_before"] = _dominant_version(ordered[:best["index"]])
     best["version_after"] = _dominant_version(ordered[best["index"]:])
@@ -3297,8 +3291,9 @@ class KillSwitch:
 
         ordered = sorted(
             (r for r in rows if r.get("entry_ts", 0) > 0),
-            key=lambda r: r["entry_ts"],
+            key=lambda r: r.get("entry_ts", 0),
         )
+
         cutoff = now_ts - self.lookback_hours * 3600
 
         # Losing streak, counted from the tail, freshness-gated to the

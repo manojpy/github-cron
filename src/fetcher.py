@@ -209,13 +209,14 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
                         total_delay = compute_backoff(backoff, attempt, cap=Constants.CIRCUIT_BREAKER_MAX_WAIT / 10)
                         await asyncio.sleep(total_delay)
                     continue
-
+           
                 if resp.status >= 400:
                     logger.error(
                         f"Client error {resp.status} for {url[:80]} | "
                         f"This usually indicates invalid request - not retrying"
                     )
-                    return False
+                    return None
+
                 try:
                     data = await resp.json(loads=json_loads)
                 except (JSONDecodeError, TypeError, ValueError) as e:
@@ -996,10 +997,9 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[PriceDa
                 f"parse_candles_to_numpy: Missing required fields: {missing} | "
                 f"Available: {list(res.keys())}"
             )
-            return None
-    
+            return None    
         try:
-            data = {
+            data: Dict[str, np.ndarray] = {
                 "timestamp": np.asarray(res["t"], dtype=np.int64),
                 "open":      np.asarray(res["o"], dtype=np.float64),
                 "high":      np.asarray(res["h"], dtype=np.float64),
@@ -1007,7 +1007,7 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[PriceDa
                 "close":     np.asarray(res["c"], dtype=np.float64),
                 "volume":    np.asarray(res["v"], dtype=np.float64),
             }
-    
+
         except (ValueError, TypeError) as e:
             logger.error(f"parse_candles_to_numpy: Failed to convert data to arrays: {e}")
             return None
