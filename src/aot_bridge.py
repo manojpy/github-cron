@@ -1,25 +1,14 @@
 """
 AOT Bridge Module — Runtime Compiled / JIT Function Dispatcher
-
-Tries to import the Cython-compiled extension (``cython_functions``).
-If it isn't available (not built, not installed, wrong platform), falls
-back transparently to the Numba JIT functions in
-``numba_functions_shared``.  Every downstream caller (indicators.py,
-gates.py, alerts.py, macd_unified.py) keeps importing from *this*
-module exactly as before — the dispatch table hides the backend.
-
-What changed vs. the old pycc version
---------------------------------------
-• ``find_aot_library``, ``load_aot_module``, ``check_aot_version_stamp``,
-  ``get_library_extension`` — all removed.  Cython modules are ordinary
-  importable packages; no path-searching or ``importlib`` tricks needed.
-• Version-stamp checking removed (Cython wheels embed their own
-  metadata; staleness is caught by ``pip install`` / Docker layer
-  caching instead).
-• ``initialize_aot`` → ``initialize_compiled`` (same contract).
-• ``is_using_aot`` / ``requires_warmup`` kept as-is so
-  ``macd_unified.py`` and ``indicators.py::warmup_if_needed`` need
-  zero edits.
+Why SOURCE_VERSION still lives here (despite aot_bridge.py no longer
+reading it on every run):
+  • numba_functions_shared.py and cython_functions.pyx each assert
+    their own export list against AOT_FUNCTION_NAMES at import time;
+    editing a function body without bumping SOURCE_VERSION won't be
+    caught by those assertions (they compare names, not bodies), so
+    the bump is still the manual signal that a rebuild is required.
+  • Callers that imported SOURCE_VERSION from aot_bridge in the old
+    pycc days can still read it from here directly.
 """
 
 import warnings
@@ -27,29 +16,9 @@ from typing import Optional, Callable, Dict, Tuple
 
 import numpy as np
 
-# Central function registry — single source of truth for every name
-# that must exist in whichever backend is active.
-try:
-    from aot_meta import AOT_FUNCTION_NAMES as REQUIRED_AOT_FUNCTIONS
-except ImportError:
-    # Hardcoded fallback so the bridge still works if aot_meta is absent
-    REQUIRED_AOT_FUNCTIONS = [
-        "sanitize_array_numba",
-        "rolling_mean_numba",
-        "rolling_min_max_numba",
-        "ema_loop",
-        "ema_loop_pine",
-        "ema_loop_alpha",
-        "kalman_loop",
-        "vwap_daily_loop_safe",
-        "calculate_ppo_core",
-        "calculate_rsi_core",
-        "true_range_numba",
-        "calculate_atr_rma",
-        "calculate_adx_core",
-        "percentile_rank_numba",
-        "dynamic_flow_direction_loop",
-    ]
+# Central function registry — single source of truth lives in aot_meta.py
+# (zero-import module, safe to import on every run).
+from aot_meta import AOT_FUNCTION_NAMES as REQUIRED_AOT_FUNCTIONS
 
 # ──────────────────────────────────────────────────────────────────────
 # Global state
@@ -90,7 +59,6 @@ def initialize_compiled() -> Tuple[bool, Optional[str]]:
     except Exception as exc:
         return False, f"Cython module raised on import: {exc}"
 
-
 def initialize_jit_fallback() -> None:
     """Import every required function from the Numba JIT module."""
     global _jit_functions, _fallback_reason
@@ -107,10 +75,12 @@ def initialize_jit_fallback() -> None:
         _jit_functions = {
             name: getattr(_shared, name) for name in REQUIRED_AOT_FUNCTIONS
         }
-    except ImportError as exc:
+    except Exception as exc:
+        # Catch broadly: a drift assertion (AssertionError) or any other
+        # import-time failure should surface with its original message,
+        # not as an opaque AttributeError three frames later.
         _fallback_reason = f"JIT fallback failed: {exc}"
-        raise RuntimeError(f"Cannot initialise JIT fallback: {exc}")
-
+        raise RuntimeError(f"Cannot initialise JIT fallback: {exc}") from exc
 
 def ensure_initialized() -> None:
     """Idempotent: pick Cython if available, else Numba JIT."""
@@ -250,14 +220,17 @@ __all__ = [
     "requires_warmup",
 ] + list(REQUIRED_AOT_FUNCTIONS)
 
-
 # ──────────────────────────────────────────────────────────────────────
-# Auto-initialise on import (same behaviour as before)
+# Auto-initialise on import
 # ──────────────────────────────────────────────────────────────────────
 try:
     ensure_initialized()
 except Exception as exc:
-    warnings.warn(
-        f"Auto-initialisation failed: {exc}. "
-        f"Call ensure_initialized() manually."
-    )
+    # Fail at import time, not at the first indicator call.  A silent warn
+    # here leaves _dispatch = {} and turns every downstream call into an
+    # opaque `KeyError`, which is far harder to diagnose than a hard crash
+    # at container start.
+    raise RuntimeError(
+        f"aot_bridge: neither Cython nor JIT backend could be initialised. "
+        f"Last error: {exc}"
+    ) from exc

@@ -12,7 +12,7 @@ import aot_bridge
 
 def _ref_ema_alpha(data: List[float], alpha: float) -> List[float]:
     n = len(data)
-    period = int(round(1.0 / alpha))
+    period = int(1.0 / alpha + 0.5)
     out = [None] * n
     if n < period:
         period = n
@@ -111,17 +111,28 @@ def _fixtures():
 
 TOLERANCE = 1e-6
 
-def _check(name: str, actual, expected, failures: List[str], tol: float = TOLERANCE) -> None:
+def _check(name, actual, expected, failures, tol=TOLERANCE):
     actual = np.asarray(actual, dtype=np.float64)
     expected = np.asarray(expected, dtype=np.float64)
-    both_nan = np.isnan(actual) & np.isnan(expected)
-    mask = ~both_nan
+
+    if actual.shape != expected.shape:
+        failures.append(f"{name}: shape mismatch {actual.shape} vs {expected.shape}")
+        return
+
+    # NaN-pattern mismatch: one side NaN, the other not.
+    nan_mismatch = np.isnan(actual) != np.isnan(expected)
+    if np.any(nan_mismatch):
+        bad = np.where(nan_mismatch)[0][:5].tolist()
+        failures.append(f"{name}: NaN pattern mismatch at indices {bad}")
+        return
+
+    mask = ~np.isnan(actual)
     if not np.any(mask):
         return
     diff = np.abs(actual[mask] - expected[mask])
-    max_diff = np.nanmax(diff)
+    max_diff = np.max(diff)
     if max_diff > tol:
-        bad = np.nanargmax(diff)
+        bad = np.argmax(diff)
         failures.append(
             f"{name}: max abs diff {max_diff:.3e} > tol {tol:.1e} "
             f"(worst: actual={actual[mask][bad]:.6f}, expected={expected[mask][bad]:.6f})"

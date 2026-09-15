@@ -27,7 +27,11 @@ numba_functions_shared.py and aot_build.py both import SOURCE_VERSION from
 here too, so there is exactly one place to update it.
 """
 
-SOURCE_VERSION = "2026-09-01.1"  # dynamic_flow_direction_loop now also returns the plotted midline (line_) for price-cross detection
+SOURCE_VERSION = "2026-09-02.1"
+# Guards added to ema_loop, ema_loop_pine, ema_loop_alpha, calculate_rsi_core,
+# true_range_numba, percentile_rank_numba, calculate_atr_rma, calculate_adx_core.
+# Cython calculate_adx_core reordered (previous version smoothed zero-arrays
+# and returned TR-smoothed-to-ADX; now computes DX correctly).
 
 AOT_FUNCTION_NAMES = [
     'sanitize_array_numba',

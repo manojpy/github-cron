@@ -269,7 +269,7 @@ def ema_loop_pine(double[:] data, double length_float):
 
     return out_np
 
-# ═════════════════════════════════════════════════════════════════════���
+# ═════════════════════════════════════════════════════════════════════����
 # 6. ema_loop_alpha
 # ═════════════════════════════════════════════════════════════════════
 def ema_loop_alpha(double[:] data, double alpha):
@@ -533,7 +533,7 @@ def true_range_numba(double[:] high, double[:] low, double[:] close):
 
     return tr_np
 
-# ═══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════���═════════════════════════════════
 # 12. calculate_atr_rma
 # ══════════════════════════════════════════════════════════════════════
 
@@ -745,4 +745,31 @@ EXPORTED_FUNCTION_NAMES = [
     "dynamic_flow_direction_loop",
 ]
 
-__all__ = EXPORTED_FUNCTION_NAMES + ["EXPORTED_FUNCTION_NAMES"]
+from aot_meta import (  # noqa: E402
+    SOURCE_VERSION as SOURCE_VERSION,
+    AOT_FUNCTION_NAMES,
+)
+
+# Callers that iterated EXPORT_CONFIG.items() on the Numba side keep working.
+# Cython has no signature object, so values are None — only the keys matter.
+EXPORT_CONFIG = {name: None for name in EXPORTED_FUNCTION_NAMES}
+
+_exported_names = set(EXPORTED_FUNCTION_NAMES)
+_registry_names = set(AOT_FUNCTION_NAMES)
+
+if _exported_names != _registry_names:
+    _missing_from_registry = sorted(_exported_names - _registry_names)
+    _missing_from_export   = sorted(_registry_names - _exported_names)
+    raise AssertionError(
+        f"EXPORTED_FUNCTION_NAMES (cython_functions) and AOT_FUNCTION_NAMES "
+        f"(aot_meta.py) have drifted apart. "
+        f"In cython_functions but not the registry -- add to aot_meta.py: "
+        f"{_missing_from_registry}. "
+        f"In the registry but not cython_functions -- add to "
+        f"EXPORTED_FUNCTION_NAMES: {_missing_from_export}."
+    )
+
+__all__ = (
+    list(EXPORT_CONFIG.keys())
+    + ["EXPORT_CONFIG", "EXPORTED_FUNCTION_NAMES", "SOURCE_VERSION"]
+)
