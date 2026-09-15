@@ -12,7 +12,8 @@ import time
 import random
 import statistics
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple
+
 from bot_config import cfg, format_ist_time
 
 Row = Dict[str, Any]
@@ -728,8 +729,8 @@ def per_pair_thresholds(
             results[pair] = rec
     return results
 
-def per_pair_breakdown(rows: List[Row], min_sample: int = 10):
-    stats = defaultdict(lambda: {"wins": 0, "n": 0})
+def per_pair_breakdown(rows: List[Row], min_sample: int = 10):  
+    stats: DefaultDict[str, Dict[str, int]] = defaultdict(lambda: {"wins": 0, "n": 0})
     for r in rows:
         s = stats[r["pair"]]
         s["wins"] += r["win"]
@@ -746,7 +747,7 @@ def per_pair_session_breakdown(rows: List[Row], min_sample: int = 10):
     """Groups by (pair, session) — e.g. reveals a pair performing well in
     Asian hours but randomly in the Dead Zone. Returns a list of
     (pair, session, win_rate, n) tuples, sorted worst win-rate first."""
-    stats = defaultdict(lambda: {"wins": 0, "n": 0})
+    stats: DefaultDict[Tuple[str, str], Dict[str, int]] = defaultdict(lambda: {"wins": 0, "n": 0})
     for r in rows:
         s = stats[(r["pair"], r.get("session", "unknown"))]
         s["wins"] += r["win"]
@@ -778,7 +779,7 @@ def session_breakdown(rows: List[Row], min_sample: int = 10):
     return results
 
 def per_alert_breakdown(rows: List[Row], min_sample: int = 10):
-    stats = defaultdict(lambda: {"wins": 0, "n": 0, "scores": []})
+    stats: DefaultDict[str, Dict[str, Any]] = defaultdict(lambda: {"wins": 0, "n": 0, "scores": []})
     for r in rows:
         s = stats[r["alert_key"]]
         s["wins"] += r["win"]
@@ -795,7 +796,7 @@ def per_alert_breakdown(rows: List[Row], min_sample: int = 10):
     return results
 
 def pain_adjusted_win_rate(rows: List[Row], min_sample: int = 10) -> Dict[str, Dict[str, Any]]:
-    stats = defaultdict(lambda: {"wins": 0, "n": 0, "maes": []})
+    stats: DefaultDict[str, Dict[str, Any]] = defaultdict(lambda: {"wins": 0, "n": 0, "maes": []})
     for r in rows:
         s = stats[r["alert_key"]]
         s["wins"] += r["win"]
@@ -1106,14 +1107,13 @@ def brier_score_and_calibration(
             holdout_buckets[b]["wins"] += int(r["win"])
             holdout_buckets[b]["n"] += 1
 
-        curve: List[Dict[str, Any]] = []
+        curve = []
         total_brier = 0.0
         count = 0
+        for b in sorted(buckets.keys()):
 
         # Only report buckets that exist in BOTH train and holdout
         all_buckets = set(train_buckets.keys()).intersection(set(holdout_buckets.keys()))
-
-        for b in sorted(all_buckets):
             t_d = train_buckets[b]
             h_d = holdout_buckets[b]
 
@@ -1300,7 +1300,7 @@ def is_vote_pattern_ood(
 ) -> Tuple[bool, Dict[str, Any]]:
     """Reject if vote count is outside historical 5th-95th percentile.
     Returns (is_ood, detail_dict)."""
-    historical_counts = []
+    historical_counts: List[float] = []
     for r in rows:
         if r.get("alert_key") != alert_key or not r.get("votes"):
             continue
@@ -1672,7 +1672,7 @@ def interaction_miner(
                     entry["n_neither"] = n_neither
                 interactions.append(entry)
 
-            # ── v1 poisons v2 ──────────────────���────����───────────────────
+            # ── v1 poisons v2 ──────────────────�����────����───────────────────
             if has_v2_sample:
                 poison_v2 = wr_only_v2 - wr_both
                 if poison_v2 > 0.15 and n_both >= min_sample:
@@ -2136,7 +2136,7 @@ def multi_metric_per_pair(rows: List[Row], min_sample: int = 15) -> List[Dict[st
     results.sort(key=lambda x: -x["mfe_wr"])
     return results
 
-# ═══════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════��═
 #  ENHANCED WEIGHT OPTIMIZER — Walk-Forward + Confidence + Delta Limit
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -2386,7 +2386,7 @@ def optimize_vote_weights(
         "coeff_stability": coeff_stability,
     }
 
-# ═══════════════════════════════════════════════════════���═══════════════
+# ═════════════════════════════════════════════════════���═���═══════════════
 #  PERMUTATION VOTE IMPORTANCE (AI/ML)
 # ═══════════════════════════════════════════════════════════════════════
 

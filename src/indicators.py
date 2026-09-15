@@ -3,7 +3,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections import OrderedDict
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple, List, cast
 import numpy as np
 import aot_bridge
 from bot_config import cfg, logger, Constants, CprNotReadyError, BotConfig, PAIR_ID
@@ -1638,7 +1638,7 @@ def _array_percentile_rank(arr: np.ndarray, i: int, lookback: int, min_history: 
     cached = _pctl_rank_cache.get(cache_key, _PCTL_CACHE_MISS)
     if cached is not _PCTL_CACHE_MISS:
         _pctl_rank_cache.move_to_end(cache_key)
-        return cached
+        return cast(Optional[float], cached)
     raw = percentile_rank_numba(arr, int(i), int(lookback), int(min_history), bool(allow_zero))
     result = None if np.isnan(raw) else float(raw)
 
@@ -1702,7 +1702,7 @@ def get_adaptive_adx_threshold(adx_arr: np.ndarray, i15: int, cfg: BotConfig) ->
     cached = _adx_thresh_cache.get(cache_key, _ADX_CACHE_MISS)
     if cached is not _ADX_CACHE_MISS:
         _adx_thresh_cache.move_to_end(cache_key)
-        return cached
+        return cast(float, cached)
 
     window = adx_arr[start:i15]
     valid = window[~np.isnan(window)]
