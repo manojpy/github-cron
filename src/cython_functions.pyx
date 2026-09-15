@@ -46,12 +46,25 @@ def sanitize_array_numba(double[:] arr, double default):
 # ══════════════════════════════════════════════════════════════════════
 # 2. rolling_mean_numba
 # ══════════════════════════════════════════════════════════════════════
+
 def rolling_mean_numba(double[:] data, int period):
     cdef int n = data.shape[0]
     cdef np.ndarray out = np.full(n, np.nan, dtype=np.float64)
     cdef double[:] ov = out
     cdef int i
     cdef int has_nan = 0
+    # Hoisted here so both the fast and slow paths use C doubles (the previous
+    # revision declared them mid-function, which Cython rejects).
+    cdef double window_sum
+    cdef double w_sum
+    cdef int nan_count
+    cdef np.ndarray queue_np
+    cdef double[:] queue
+    cdef np.ndarray is_nan_q_np
+    cdef unsigned char[:] is_nan_q
+    cdef int queue_idx
+    cdef double curr
+    cdef int curr_is_nan
 
     if period <= 0:
         return out
@@ -61,13 +74,7 @@ def rolling_mean_numba(double[:] data, int period):
             has_nan = 1
             break
 
-    # Declare here so BOTH paths use a C double (previously only the slow path did).
-    cdef double window_sum
-    cdef double w_sum
-    cdef int nan_count
-
     if not has_nan:
-        # Fast path – no NaN in input
         window_sum = 0.0
         for i in range(n):
             window_sum += data[i]
@@ -80,13 +87,11 @@ def rolling_mean_numba(double[:] data, int period):
     # Slow path – NaN-tolerant sliding window
     w_sum = 0.0
     nan_count = 0
-    cdef np.ndarray queue_np = np.zeros(period, dtype=np.float64)
-    cdef double[:] queue = queue_np
-    cdef np.ndarray is_nan_q_np = np.zeros(period, dtype=np.bool_)
-    cdef unsigned char[:] is_nan_q = is_nan_q_np
-    cdef int queue_idx = 0
-    cdef double curr
-    cdef int curr_is_nan
+    queue_np = np.zeros(period, dtype=np.float64)
+    queue = queue_np
+    is_nan_q_np = np.zeros(period, dtype=np.bool_)
+    is_nan_q = is_nan_q_np
+    queue_idx = 0
 
     for i in range(n):
         curr = data[i]
@@ -184,16 +189,21 @@ def rolling_min_max_numba(double[:] arr, int period):
 # ══════════════════════════════════════════════════════════════════════
 # 4. ema_loop
 # ══════════════════════════════════════════════════════════════════════
-
 def ema_loop(double[:] data, double length_float):
     cdef int n = data.shape[0]
     cdef int length = <int>length_float
-    cdef double alpha = 2.0 / (length + 1)
     cdef np.ndarray out_np = np.full(n, np.nan, dtype=np.float64)
     cdef double[:] out = out_np
     cdef int start_idx = -1
     cdef int i
+    cdef int seed_idx
     cdef double sum_val, curr
+    cdef double alpha
+
+    if length <= 0:
+        return out_np
+
+    alpha = 2.0 / (length + 1)
 
     for i in range(n):
         if not isnan(data[i]):
@@ -207,7 +217,7 @@ def ema_loop(double[:] data, double length_float):
     for i in range(start_idx, start_idx + length):
         sum_val += data[i]
 
-    cdef int seed_idx = start_idx + length - 1
+    seed_idx = start_idx + length - 1
     out[seed_idx] = sum_val / length
 
     for i in range(seed_idx + 1, n):
@@ -225,12 +235,20 @@ def ema_loop(double[:] data, double length_float):
 def ema_loop_pine(double[:] data, double length_float):
     cdef int n = data.shape[0]
     cdef int length = <int>length_float
-    cdef double alpha = 2.0 / (length + 1)
     cdef np.ndarray out_np = np.full(n, np.nan, dtype=np.float64)
     cdef double[:] out = out_np
     cdef int start_idx = -1
     cdef int i
     cdef double curr
+    cdef double alpha
+
+    # Guard first: length_float in (0, 1) truncates to 0, which would make
+    # alpha = 2.0 and collapse the EMA into "current bar only". Also avoids
+    # a potential division-by-zero if `length` is ever used as a divisor.
+    if length <= 0:
+        return out_np
+
+    alpha = 2.0 / (length + 1)
 
     for i in range(n):
         if not isnan(data[i]):
@@ -251,9 +269,9 @@ def ema_loop_pine(double[:] data, double length_float):
 
     return out_np
 
-# ══════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════���
 # 6. ema_loop_alpha
-# ══════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════
 def ema_loop_alpha(double[:] data, double alpha):
     cdef int n = data.shape[0]
     cdef np.ndarray out_np = np.full(n, np.nan, dtype=np.float64)
@@ -263,6 +281,9 @@ def ema_loop_alpha(double[:] data, double alpha):
     cdef int period, start_idx
     cdef double sma_sum, sma_init, prev, curr
     cdef int valid_count
+
+    if alpha <= 0.0 or alpha > 1.0:
+        return out_np
 
     for i in range(n):
         if not isnan(data[i]):
@@ -281,7 +302,9 @@ def ema_loop_alpha(double[:] data, double alpha):
             if not isnan(data[i]):
                 sma_sum += data[i]
                 valid_count += 1
-        sma_init = sma_sum / valid_count if valid_count > 0 else 0.0
+        # period >= 1 (guaranteed by alpha guard) and data[first_valid_idx]
+        # is non-NaN, so valid_count >= 1 here. No zero-division possible.
+        sma_init = sma_sum / valid_count
         for i in range(first_valid_idx, first_valid_idx + period):
             if not isnan(data[i]):
                 out[i] = sma_init
@@ -315,7 +338,7 @@ def kalman_loop(double[:] src, int length, double R, double Q):
     cdef double estimate, error_est, error_meas, Q_div_length
     cdef double prediction, kalman_gain, current
     cdef double length_f = <double>length
-
+    cdef double safe_len = length_f if length_f > 1.0 else 1.0
     for i in range(n):
         if not isnan(src[i]):
             first_valid_idx = i
@@ -324,7 +347,6 @@ def kalman_loop(double[:] src, int length, double R, double Q):
     if first_valid_idx == -1:
         return result_np
 
-    cdef double safe_len = length_f if length_f > 1.0 else 1.0
     estimate = src[first_valid_idx]
     error_est = 1.0
     error_meas = R * safe_len
@@ -411,16 +433,15 @@ def calculate_rsi_core(double[:] close, int period):
     cdef int n = close.shape[0]
     cdef np.ndarray rsi_np = np.full(n, np.nan, dtype=np.float64)
     cdef double[:] rsi = rsi_np
-
-    if n <= period:
-        return rsi_np
-
     cdef int first_valid_idx = -1
     cdef int i
     cdef double avg_gain = 0.0, avg_loss = 0.0, diff, rs, alpha, curr
     cdef double prev_valid
     cdef int valid_count = 0
     cdef int seed_idx, avg_period
+
+    if period <= 0 or n <= period:
+        return rsi_np
 
     for i in range(n):
         if not isnan(close[i]):
@@ -492,13 +513,13 @@ def calculate_rsi_core(double[:] close, int period):
 # 11. true_range_numba
 # ══════════════════════════════════════════════════════════════════════
 def true_range_numba(double[:] high, double[:] low, double[:] close):
-    """Shared True Range calc."""
     cdef int n = close.shape[0]
     cdef np.ndarray tr_np = np.empty(n, dtype=np.float64)
     cdef double[:] tr = tr_np
     cdef int i
     cdef double h, l, c, tr1, tr2, tr3
-
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
     tr[0] = high[0] - low[0]
 
     for i in range(1, n):
@@ -512,40 +533,61 @@ def true_range_numba(double[:] high, double[:] low, double[:] close):
 
     return tr_np
 
-# ══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 # 12. calculate_atr_rma
 # ══════════════════════════════════════════════════════════════════════
+
 def calculate_atr_rma(double[:] high, double[:] low, double[:] close, int period):
     cdef int n = close.shape[0]
-    if n < period:
+    cdef np.ndarray tr
+    cdef np.ndarray atr
+    cdef double alpha
+
+    # Guard MUST run before 1.0 / period.
+    if period <= 0 or n < period:
         return np.full(n, np.nan, dtype=np.float64)
 
-    cdef np.ndarray tr = true_range_numba(high, low, close)
-    cdef double alpha = 1.0 / (<double>period)
-    cdef np.ndarray atr = ema_loop_alpha(tr, alpha)
+    tr = true_range_numba(high, low, close)
+    alpha = 1.0 / (<double>period)
+    atr = ema_loop_alpha(tr, alpha)
     return atr
-
-# ══════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════
 # 13. calculate_adx_core
 # ══════════════════════════════════════════════════════════════════════
 
 def calculate_adx_core(double[:] high, double[:] low, double[:] close,
                        int di_length, int adx_length):
     cdef int n = high.shape[0]
+    cdef np.ndarray tr_np
+    cdef np.ndarray pdm_np
+    cdef np.ndarray mdm_np
+    cdef np.ndarray pds_np
+    cdef np.ndarray mds_np
+    cdef np.ndarray trs_np
     cdef np.ndarray adx_np
+    cdef double[:] tr
+    cdef double[:] plus_dm
+    cdef double[:] minus_dm
+    cdef double[:] pds
+    cdef double[:] mds
+    cdef double[:] trs
+    cdef double alpha_di, alpha_adx, di_diff, di_sum
+    cdef double h, l, prev_h, prev_l, up, down
+    cdef int i
 
-    if n < di_length + adx_length:
+    # 1. Guard first
+    if di_length <= 0 or adx_length <= 0 or n < (di_length + adx_length):
         return np.full(n, np.nan, dtype=np.float64)
 
-    cdef np.ndarray tr_np = true_range_numba(high, low, close)
-    cdef double[:] tr = tr_np
+    # 2. True Range
+    tr_np = true_range_numba(high, low, close)
+    tr = tr_np
 
-    cdef np.ndarray pdm_np = np.zeros(n, dtype=np.float64)
-    cdef np.ndarray mdm_np = np.zeros(n, dtype=np.float64)
-    cdef double[:] plus_dm = pdm_np
-    cdef double[:] minus_dm = mdm_np
-    cdef int i
-    cdef double h, l, prev_h, prev_l, up, down
+    # 3. Directional Movement (populate BEFORE smoothing)
+    pdm_np = np.zeros(n, dtype=np.float64)
+    mdm_np = np.zeros(n, dtype=np.float64)
+    plus_dm = pdm_np
+    minus_dm = mdm_np
 
     for i in range(1, n):
         h = high[i]
@@ -557,14 +599,16 @@ def calculate_adx_core(double[:] high, double[:] low, double[:] close,
         plus_dm[i] = up if (up > down and up > 0) else 0.0
         minus_dm[i] = down if (down > up and down > 0) else 0.0
 
-    cdef double alpha_di = 1.0 / (<double>di_length)
-    cdef np.ndarray pds_np = ema_loop_alpha(pdm_np, alpha_di)
-    cdef np.ndarray mds_np = ema_loop_alpha(mdm_np, alpha_di)
-    cdef np.ndarray trs_np = ema_loop_alpha(tr_np, alpha_di)
-    cdef double[:] pds = pds_np
-    cdef double[:] mds = mds_np
-    cdef double[:] trs = trs_np
+    # 4. Wilder smoothing of +DM, -DM, TR
+    alpha_di = 1.0 / (<double>di_length)
+    pds_np = ema_loop_alpha(pdm_np, alpha_di)
+    mds_np = ema_loop_alpha(mdm_np, alpha_di)
+    trs_np = ema_loop_alpha(tr_np, alpha_di)
+    pds = pds_np
+    mds = mds_np
+    trs = trs_np
 
+    # 5. +DI / -DI
     for i in range(n):
         if trs[i] > 0.0 and not isnan(trs[i]):
             pds[i] = 100.0 * pds[i] / trs[i]
@@ -572,39 +616,44 @@ def calculate_adx_core(double[:] high, double[:] low, double[:] close,
         else:
             pds[i] = 0.0
             mds[i] = 0.0
-    cdef double di_diff, di_sum
+
+    # 6. DX (reuses trs_np as scratch)
     for i in range(n):
         di_diff = fabs(pds[i] - mds[i])
         di_sum = pds[i] + mds[i]
-        
         trs[i] = 0.0 if di_sum == 0.0 else 100.0 * di_diff / di_sum
 
-    cdef double alpha_adx = 1.0 / (<double>adx_length)
+    # 7. ADX = Wilder smoothing of DX
+    alpha_adx = 1.0 / (<double>adx_length)
     adx_np = ema_loop_alpha(trs_np, alpha_adx)
     return adx_np
-
 # ══════════════════════════════════════════════════════════════════════
 # 14. percentile_rank_numba
 # ══════════════════════════════════════════════════════════════════════
 def percentile_rank_numba(double[:] arr, int i, int lookback,
                           int min_history, bint allow_zero):
-    """Single-pass O(lookback) percentile rank. Returns NaN where the
-    Python version returned None."""
-    cdef int start = i - lookback
-    if start < 0:
-        return np.nan
-
-    cdef double current = arr[i]
-    if isnan(current):
-        return np.nan
-    if not allow_zero and current <= 0.0:
-        return np.nan
-
+    cdef int n = arr.shape[0]
+    cdef int start
+    cdef double current
     cdef int count_valid = 0
     cdef int count_lt = 0
     cdef int count_eq = 0
     cdef int j
     cdef double v
+
+    # Boundary check to prevent segfaults with boundscheck=False
+    if i < 0 or i >= n:
+        return np.nan
+
+    start = i - lookback
+    if start < 0:
+        return np.nan
+
+    current = arr[i]
+    if isnan(current):
+        return np.nan
+    if not allow_zero and current <= 0.0:
+        return np.nan
 
     for j in range(start, i):
         v = arr[j]
@@ -616,7 +665,7 @@ def percentile_rank_numba(double[:] arr, int i, int lookback,
         elif v == current:
             count_eq += 1
 
-    if count_valid < min_history:
+    if count_valid == 0 or count_valid < min_history:
         return np.nan
 
     return (count_lt + 0.5 * count_eq) / count_valid

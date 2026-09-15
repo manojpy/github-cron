@@ -159,13 +159,16 @@ def rolling_min_max_numba(arr, period):
 
     return min_arr, max_arr
 
-
 @njit(SIG_EMA_LOOP, nogil=True, cache=True)
 def ema_loop(data, length_float):
     n = len(data)
     length = int(length_float)
-    alpha = 2.0 / (length + 1)
     out = np.full(n, np.nan, dtype=np.float64)
+
+    if length <= 0:
+        return out
+
+    alpha = 2.0 / (length + 1)
 
     start_idx = -1
     for i in range(n):
@@ -186,19 +189,22 @@ def ema_loop(data, length_float):
     for i in range(seed_idx + 1, n):
         curr = data[i]
         if np.isnan(curr):
-            out[i] = out[i-1]
+            out[i] = out[i - 1]
         else:
-            out[i] = alpha * curr + (1.0 - alpha) * out[i-1]
+            out[i] = alpha * curr + (1.0 - alpha) * out[i - 1]
 
     return out
-
 
 @njit(SIG_EMA_LOOP_PINE, nogil=True, cache=True)
 def ema_loop_pine(data, length_float):
     n = len(data)
     length = int(length_float)
-    alpha = 2.0 / (length + 1)
     out = np.full(n, np.nan, dtype=np.float64)
+
+    if length <= 0:
+        return out
+
+    alpha = 2.0 / (length + 1)
 
     # Find first non-NaN input
     start_idx = -1
@@ -221,11 +227,13 @@ def ema_loop_pine(data, length_float):
 
     return out
 
-
 @njit(SIG_EMA_LOOP_ALPHA, nogil=True, cache=True)
 def ema_loop_alpha(data, alpha):
     n = len(data)
     out = np.full(n, np.nan, dtype=np.float64)
+
+    if alpha <= 0.0 or alpha > 1.0:
+        return out
 
     first_valid_idx = -1
     for i in range(n):
@@ -238,6 +246,7 @@ def ema_loop_alpha(data, alpha):
 
     period = int(1.0 / alpha + 0.5)
 
+    # ---- RESTORED ----
     if first_valid_idx + period <= n:
         sma_sum = 0.0
         valid_count = 0
@@ -245,13 +254,12 @@ def ema_loop_alpha(data, alpha):
             if not np.isnan(data[i]):
                 sma_sum += data[i]
                 valid_count += 1
-        sma_init = sma_sum / valid_count 
+        sma_init = sma_sum / valid_count
         for i in range(first_valid_idx, first_valid_idx + period):
             if not np.isnan(data[i]):
                 out[i] = sma_init
-
         start_idx = first_valid_idx + period
-        prev = sma_init  # internal recursion anchor, independent of what's exposed in out[]
+        prev = sma_init
     else:
         out[first_valid_idx] = data[first_valid_idx]
         start_idx = first_valid_idx + 1
@@ -266,7 +274,6 @@ def ema_loop_alpha(data, alpha):
         prev = out[i]
 
     return out
-
 
 @njit(SIG_KALMAN_LOOP, nogil=True, cache=True)
 def kalman_loop(src, length, R, Q):
@@ -349,14 +356,14 @@ def calculate_ppo_core(close, fast, slow, signal):
     ppo_sig = ema_loop_pine(ppo, float(signal))
     return ppo, ppo_sig
 
+# Numba
 @njit(SIG_RSI_CORE, nogil=True, cache=True)
 def calculate_rsi_core(close, period):
     n = len(close)
     rsi = np.full(n, np.nan, dtype=np.float64)
 
-    if n <= period:
+    if period <= 0 or n <= period:
         return rsi
-
     first_valid_idx = -1
     for i in range(n):
         if not np.isnan(close[i]):
@@ -405,7 +412,7 @@ def calculate_rsi_core(close, period):
         rs = avg_gain / avg_loss
         rsi[seed_idx] = 100.0 - (100.0 / (1.0 + rs))
 
-    alpha = 1.0 / period
+    alpha = 1.0 / period       # period == 0 → inf
 
     # Wilder smoothing after the seed bar
     for i in range(seed_idx + 1, n):
@@ -434,13 +441,14 @@ def calculate_rsi_core(close, period):
 
     return rsi
 
+
 @njit(SIG_TRUE_RANGE, nogil=True, cache=True)
 def true_range_numba(high, low, close):
-    """Shared True Range calc — previously duplicated in calculate_atr_rma and calculate_adx_core."""
     n = len(close)
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
     tr = np.empty(n, dtype=np.float64)
     tr[0] = high[0] - low[0]
-
     for i in range(1, n):
         h = high[i]
         l = low[i]
@@ -455,11 +463,11 @@ def true_range_numba(high, low, close):
 @njit(SIG_ATR_RMA, nogil=True, cache=True)
 def calculate_atr_rma(high, low, close, period):
     n = len(close)
-    if n < period:
+    # Guard: ensure period > 0 before dividing 1.0 / period
+    if period <= 0 or n < period:
         return np.full(n, np.nan, dtype=np.float64)
 
     tr = true_range_numba(high, low, close)
-
     alpha = 1.0 / float(period)
     atr = ema_loop_alpha(tr, alpha)
     return atr
@@ -467,10 +475,10 @@ def calculate_atr_rma(high, low, close, period):
 @njit(SIG_ADX_CORE, nogil=True, cache=True)
 def calculate_adx_core(high, low, close, di_length, adx_length):
     n = len(high)
-    adx = np.full(n, np.nan, dtype=np.float64)
 
-    if n < di_length + adx_length:
-        return adx
+    # Guard: prevent zero-division in alpha_di and alpha_adx
+    if di_length <= 0 or adx_length <= 0 or n < (di_length + adx_length):
+        return np.full(n, np.nan, dtype=np.float64)
 
     tr = true_range_numba(high, low, close)
     plus_dm = np.zeros(n, dtype=np.float64)
@@ -511,14 +519,12 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
 
 @njit(SIG_PERCENTILE_RANK, nogil=True, cache=True)
 def percentile_rank_numba(arr, i, lookback, min_history, allow_zero):
-    """Single-pass O(lookback) percentile rank of arr[i] against the trailing
-    `lookback` window arr[i-lookback:i] (window excludes arr[i] itself, matching
-    the original _array_percentile_rank slicing). Returns NaN wherever the
-    Python version returned None -- callers translate NaN -> None."""
+    n = len(arr)
+    if i < 0 or i >= n:
+        return np.nan
     start = i - lookback
     if start < 0:
         return np.nan
-
     current = arr[i]
     if np.isnan(current):
         return np.nan
@@ -538,7 +544,7 @@ def percentile_rank_numba(arr, i, lookback, min_history, allow_zero):
         elif v == current:
             count_eq += 1
 
-    if count_valid < min_history:
+    if count_valid == 0 or count_valid < min_history:
         return np.nan
 
     return (count_lt + 0.5 * count_eq) / count_valid
