@@ -158,15 +158,15 @@ jobs:
 
           cd /tmp/data-repo
 
+if ! git rev-parse --verify --quiet origin/main >/dev/null; then
           # Fail loudly if the branch was renamed/removed — do not proceed
           # into a silent empty checkout.
-          if ! git rev-parse --verify main >/dev/null 2>&1; then
+          if ! git rev-parse --verify --quiet origin/main >/dev/null; then
             echo "::error::Branch 'main' not found in outcome-data repo"
             exit 1
           fi
 
           git sparse-checkout init --no-cone
-
           {
             echo "brain_state.json"
             for i in $(seq 0 29); do
