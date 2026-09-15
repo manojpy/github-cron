@@ -1534,7 +1534,6 @@ def conditional_performance(
 # ═══════════════════════════════════════════════════════════════════════
 #  PHASE 4 — VOTE INTERACTION MINER
 # ═══════════════════════════════════════════════════════════════════════
-
 def interaction_miner(
     rows: List[Row],
     min_sample: int = 20,
@@ -1557,10 +1556,10 @@ def interaction_miner(
     for r in rows:
         if r.get("votes"):
             vote_names_set.update(r["votes"].keys())
-    vote_names: List[str] = sorted(vote_names_set)
+    sorted_vote_names = sorted(vote_names_set)
     interactions: List[Dict[str, Any]] = []
-    for i, v1 in enumerate(vote_names):
-        for v2 in vote_names[i + 1 :]:
+    for i, v1 in enumerate(sorted_vote_names):
+        for v2 in sorted_vote_names[i + 1 :]:
             both = [r for r in rows if r.get("votes") and r["votes"].get(v1) and r["votes"].get(v2)]
             only_v1 = [r for r in rows if r.get("votes") and r["votes"].get(v1) and not r["votes"].get(v2)]
             only_v2 = [r for r in rows if r.get("votes") and r["votes"].get(v2) and not r["votes"].get(v1)]
@@ -1666,7 +1665,7 @@ def interaction_miner(
                     entry["n_neither"] = n_neither
                 interactions.append(entry)
 
-            # ── v1 poisons v2 ──────────────────�����────����───────────────────
+            # ── v1 poisons v2 ──────────────────�����────����─���─────────────────
             if has_v2_sample:
                 poison_v2 = wr_only_v2 - wr_both
                 if poison_v2 > 0.15 and n_both >= min_sample:
@@ -1694,7 +1693,7 @@ def interaction_miner(
                         entry["n_neither"] = n_neither
                     interactions.append(entry)
 
-    interactions.sort(key=lambda x: -abs(float(x["delta"]))) 
+    interactions.sort(key=lambda x: -abs(float(x.get("delta", 0.0))))
     return interactions
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2100,8 +2099,7 @@ def multi_metric_per_alert(rows: List[Row], min_sample: int = 10) -> List[Dict[s
             "clean_win_rate": clean_wins / n,
             "gap_mfe_vs_close": (mfe_wins - close_wins) / n,
         })
-
-    results.sort(key=lambda x: -float(x["mfe_wr"]))
+    results.sort(key=lambda x: -float(x.get("mfe_wr", 0.0)))
     return results
 
 def multi_metric_per_pair(rows: List[Row], min_sample: int = 15) -> List[Dict[str, Any]]:
@@ -2126,8 +2124,7 @@ def multi_metric_per_pair(rows: List[Row], min_sample: int = 15) -> List[Dict[st
             "mfe_wr": mfe_wins / n,
             "mae_loss_rate": mae_losses / n,
         })
-
-    results.sort(key=lambda x: -float(x["mfe_wr"]))
+    results.sort(key=lambda x: -float(x.get("mfe_wr", 0.0)))
     return results
 
 # ════════════════════════════════════════════════════════════════════��═
@@ -2580,7 +2577,7 @@ def diagnose_root_cause(
                     "confident": hi < target_wr,
                     "p_value": p,
                 })
-    candidates.sort(key=lambda c: -float(c["isolation_score"]))
+    candidates.sort(key=lambda c: -float(c.get("isolation_score", 0.0)))
     seen: Set[str] = set()
     deduped: List[Dict[str, Any]] = []
     for c in candidates:
@@ -2702,7 +2699,6 @@ def find_wr_change_point(
     best["version_after"] = _dominant_version(ordered[best["index"]:])
     best["valid"] = True
     return best
-
 
 def learn_repair_effectiveness(
     ledger_records: List[Dict[str, Any]],
