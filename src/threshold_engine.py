@@ -761,7 +761,11 @@ def per_pair_session_breakdown(rows: List[Row], min_sample: int = 10):
     return results
 
 def session_breakdown(rows: List[Row], min_sample: int = 10):
-    stats: DefaultDict[str, Dict[str, int]] = defaultdict(lambda: {"wins": 0, "n": 0})
+    """Groups by session ONLY (asian/london/ny/dead) — for comparing overall
+    session performance, as opposed to per_pair_session_breakdown()'s
+    (pair, session) granularity. Returns (session, win_rate, n) tuples,
+    sorted worst win-rate first."""
+    stats = defaultdict(lambda: {"wins": 0, "n": 0})
     for r in rows:
         s = stats[r.get("session", "unknown")]
         s["wins"] += r["win"]
@@ -1194,7 +1198,7 @@ def calibration_alert(
 
 # ═══════════════════════════════════════════════════════════════════════
 #  NEW: Sequential CUSUM Drift Detector  (Recommended.txt §4)
-# ══════════════════════════════════════════���═══════════════════════��════
+# ══════════════════════════════════════════════════════════════════��════
 
 class CUSUMDetector:
     """Page-Hinkley / CUSUM for binary outcomes. Online, O(1) memory."""
@@ -1534,6 +1538,7 @@ def conditional_performance(
 # ═══════════════════════════════════════════════════════════════════════
 #  PHASE 4 — VOTE INTERACTION MINER
 # ═══════════════════════════════════════════════════════════════════════
+
 def interaction_miner(
     rows: List[Row],
     min_sample: int = 20,
@@ -1552,14 +1557,15 @@ def interaction_miner(
     the reference arm is too thin to pass min_sample); the FDR pass
     treats None as "not tested" and leaves the recommendation alone.
     """
-    vote_names_set: Set[str] = set()
+    vote_names: Set[str] = set()
     for r in rows:
         if r.get("votes"):
-            vote_names_set.update(r["votes"].keys())
-    sorted_vote_names = sorted(vote_names_set)
+            vote_names.update(r["votes"].keys())
+    vote_names = sorted(vote_names)
     interactions: List[Dict[str, Any]] = []
-    for i, v1 in enumerate(sorted_vote_names):
-        for v2 in sorted_vote_names[i + 1 :]:
+
+    for i, v1 in enumerate(vote_names):
+        for v2 in vote_names[i + 1 :]:
             both = [r for r in rows if r.get("votes") and r["votes"].get(v1) and r["votes"].get(v2)]
             only_v1 = [r for r in rows if r.get("votes") and r["votes"].get(v1) and not r["votes"].get(v2)]
             only_v2 = [r for r in rows if r.get("votes") and r["votes"].get(v2) and not r["votes"].get(v1)]
@@ -1665,7 +1671,7 @@ def interaction_miner(
                     entry["n_neither"] = n_neither
                 interactions.append(entry)
 
-            # ── v1 poisons v2 ──────────────────�����────����─���─────────────────
+            # ── v1 poisons v2 ──────────────────�����────����───────────────────
             if has_v2_sample:
                 poison_v2 = wr_only_v2 - wr_both
                 if poison_v2 > 0.15 and n_both >= min_sample:
@@ -1693,7 +1699,7 @@ def interaction_miner(
                         entry["n_neither"] = n_neither
                     interactions.append(entry)
 
-    interactions.sort(key=lambda x: -abs(float(x.get("delta", 0.0))))
+    interactions.sort(key=lambda x: -abs(x["delta"]))
     return interactions
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2099,7 +2105,8 @@ def multi_metric_per_alert(rows: List[Row], min_sample: int = 10) -> List[Dict[s
             "clean_win_rate": clean_wins / n,
             "gap_mfe_vs_close": (mfe_wins - close_wins) / n,
         })
-    results.sort(key=lambda x: -float(x.get("mfe_wr", 0.0)))
+
+    results.sort(key=lambda x: -x["mfe_wr"])
     return results
 
 def multi_metric_per_pair(rows: List[Row], min_sample: int = 15) -> List[Dict[str, Any]]:
@@ -2124,10 +2131,11 @@ def multi_metric_per_pair(rows: List[Row], min_sample: int = 15) -> List[Dict[st
             "mfe_wr": mfe_wins / n,
             "mae_loss_rate": mae_losses / n,
         })
-    results.sort(key=lambda x: -float(x.get("mfe_wr", 0.0)))
+
+    results.sort(key=lambda x: -x["mfe_wr"])
     return results
 
-# ════════════════════════════════════════════════════════════════════��═
+# ═══════════════���═════════════════════════════════════════════════════��═
 #  ENHANCED WEIGHT OPTIMIZER — Walk-Forward + Confidence + Delta Limit
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -2577,7 +2585,8 @@ def diagnose_root_cause(
                     "confident": hi < target_wr,
                     "p_value": p,
                 })
-    candidates.sort(key=lambda c: -float(c.get("isolation_score", 0.0)))
+
+    candidates.sort(key=lambda c: -c["isolation_score"])
     seen: Set[str] = set()
     deduped: List[Dict[str, Any]] = []
     for c in candidates:
@@ -2693,12 +2702,13 @@ def find_wr_change_point(
             cv = (r.get("context") or {}).get("config_version")
             if cv:
                 counts[cv] += 1
-        return max(counts, key=lambda k: counts[k]) if counts else None
+        return max(counts, key=counts.get) if counts else None
 
     best["version_before"] = _dominant_version(ordered[:best["index"]])
     best["version_after"] = _dominant_version(ordered[best["index"]:])
     best["valid"] = True
     return best
+
 
 def learn_repair_effectiveness(
     ledger_records: List[Dict[str, Any]],
@@ -3287,9 +3297,8 @@ class KillSwitch:
 
         ordered = sorted(
             (r for r in rows if r.get("entry_ts", 0) > 0),
-            key=lambda r: r.get("entry_ts", 0),
+            key=lambda r: r["entry_ts"],
         )
-
         cutoff = now_ts - self.lookback_hours * 3600
 
         # Losing streak, counted from the tail, freshness-gated to the
