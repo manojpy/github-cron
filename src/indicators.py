@@ -102,6 +102,8 @@ def _find_closed_daily_candle(data_daily: Dict[str, np.ndarray], reference_time:
         if arr is None or len(arr) == 0:
             raise CprNotReadyError(f"daily {name} array empty or missing")
 
+    assert ts_arr is not None and hi_arr is not None and lo_arr is not None and cl_arr is not None
+
     for name, arr in (("high", hi_arr), ("low", lo_arr), ("close", cl_arr)):
         if np.any(np.isnan(arr)) or np.any(np.isinf(arr)):
             raise ValueError(f"daily {name} contains NaN/Inf — data corrupt")

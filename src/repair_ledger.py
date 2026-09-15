@@ -59,11 +59,11 @@ def _matches_scope(row: dict, scope: Optional[dict]) -> bool:
     if kind == "segment":
         if not isinstance(val, dict):
             return False
-        feat_name = val.get("feature")
-        if not isinstance(feat_name, str):
-            return False
         feats = _flatten_row_features(row)
-        v = feats.get(feat_name)
+        feature = val.get("feature")
+        if not isinstance(feature, str):
+            return False
+        v = feats.get(feature)
         if v is None:
             return False
         op = val.get("op")

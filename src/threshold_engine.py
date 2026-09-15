@@ -765,7 +765,7 @@ def session_breakdown(rows: List[Row], min_sample: int = 10):
     session performance, as opposed to per_pair_session_breakdown()'s
     (pair, session) granularity. Returns (session, win_rate, n) tuples,
     sorted worst win-rate first."""
-    stats = defaultdict(lambda: {"wins": 0, "n": 0})
+    stats: DefaultDict[str, Dict[str, int]] = defaultdict(lambda: {"wins": 0, "n": 0})
     for r in rows:
         s = stats[r.get("session", "unknown")]
         s["wins"] += r["win"]
@@ -1198,7 +1198,7 @@ def calibration_alert(
 
 # ═══════════════════════════════════════════════════════════════════════
 #  NEW: Sequential CUSUM Drift Detector  (Recommended.txt §4)
-# ══════════════════════════════════════════════════════════════════��════
+# ══════════════════════════════════════════���═══════════════════════��════
 
 class CUSUMDetector:
     """Page-Hinkley / CUSUM for binary outcomes. Online, O(1) memory."""
@@ -1561,11 +1561,11 @@ def interaction_miner(
     for r in rows:
         if r.get("votes"):
             vote_names.update(r["votes"].keys())
-    vote_names = sorted(vote_names)
+    sorted_vote_names: List[str] = sorted(vote_names)
     interactions: List[Dict[str, Any]] = []
 
-    for i, v1 in enumerate(vote_names):
-        for v2 in vote_names[i + 1 :]:
+    for i, v1 in enumerate(sorted_vote_names):
+        for v2 in sorted_vote_names[i + 1 :]:
             both = [r for r in rows if r.get("votes") and r["votes"].get(v1) and r["votes"].get(v2)]
             only_v1 = [r for r in rows if r.get("votes") and r["votes"].get(v1) and not r["votes"].get(v2)]
             only_v2 = [r for r in rows if r.get("votes") and r["votes"].get(v2) and not r["votes"].get(v1)]
@@ -1671,8 +1671,10 @@ def interaction_miner(
                     entry["n_neither"] = n_neither
                 interactions.append(entry)
 
-            # ── v1 poisons v2 ──────────────────�����────����───────────────────
+            # ── v1 poisons v2 ─────────────────────────────────────────
+            
             if has_v2_sample:
+                assert wr_only_v2 is not None  # guaranteed by has_v2_sample
                 poison_v2 = wr_only_v2 - wr_both
                 if poison_v2 > 0.15 and n_both >= min_sample:
                     wins_only_v2 = sum(r["win"] for r in only_v2)
@@ -1982,7 +1984,6 @@ def learned_actionability(
     blend = 0.5 * base + 0.5 * (base * learned * 2.0)
     return blend
 
-
 # ═══════════════════════════════════════════════════════════════════════
 #  THREE-METRIC OUTCOME ANALYSIS
 # ═══════════════════════════════════════════════════════════════════════
@@ -2083,7 +2084,7 @@ def multi_metric_per_alert(rows: List[Row], min_sample: int = 10) -> List[Dict[s
     for r in rows:
         by_alert[r["alert_key"]].append(r)
 
-    results = []
+    results: List[Dict[str, Any]] = []
     for ak, alert_rows in by_alert.items():
         if len(alert_rows) < min_sample:
             continue
@@ -2114,8 +2115,7 @@ def multi_metric_per_pair(rows: List[Row], min_sample: int = 15) -> List[Dict[st
     by_pair: Dict[str, List[Row]] = defaultdict(list)
     for r in rows:
         by_pair[r["pair"]].append(r)
-
-    results = []
+    results: List[Dict[str, Any]] = []
     for pair, pair_rows in by_pair.items():
         if len(pair_rows) < min_sample:
             continue
@@ -2135,7 +2135,7 @@ def multi_metric_per_pair(rows: List[Row], min_sample: int = 15) -> List[Dict[st
     results.sort(key=lambda x: -x["mfe_wr"])
     return results
 
-# ═══════════════���═════════════════════════════════════════════════════��═
+# ═══════════════════════════════════════════════════════════════════��═
 #  ENHANCED WEIGHT OPTIMIZER — Walk-Forward + Confidence + Delta Limit
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -2401,20 +2401,19 @@ def permutation_vote_importance(
     comparison because it preserves the marginal distribution."""
     if len(rows) < min_sample:
         return []
-
     vote_names: Set[str] = set()
     for r in rows:
         if r.get("votes"):
             vote_names.update(r["votes"].keys())
-    vote_names = sorted(vote_names)
-    if not vote_names:
+    sorted_vote_names: List[str] = sorted(vote_names)
+    if not sorted_vote_names:
         return []
 
     rng = random.Random(seed)
     baseline_wr = sum(r["win"] for r in rows) / len(rows)
-    results = []
+    results: List[Dict[str, Any]] = []
 
-    for vn in vote_names:
+    for vn in sorted_vote_names:
         drops = []
         for _ in range(n_permutations):
             shuffled_rows = []
@@ -2702,13 +2701,12 @@ def find_wr_change_point(
             cv = (r.get("context") or {}).get("config_version")
             if cv:
                 counts[cv] += 1
-        return max(counts, key=counts.get) if counts else None
+        return max(counts, key=lambda k: counts[k]) if counts else None
 
     best["version_before"] = _dominant_version(ordered[:best["index"]])
     best["version_after"] = _dominant_version(ordered[best["index"]:])
     best["valid"] = True
     return best
-
 
 def learn_repair_effectiveness(
     ledger_records: List[Dict[str, Any]],
@@ -2891,7 +2889,8 @@ def repair_shop_diagnosis(
     # ── 3. CUSUM drift freeze ──
     if drift_alerts:
         drifted_names = [d.get("alert", "?") for d in drift_alerts]
-        drifted_keys = sorted({d.get("alert") for d in drift_alerts if d.get("alert")})
+        alert_values = [d.get("alert") for d in drift_alerts]
+        drifted_keys = sorted({a for a in alert_values if a})
         repairs.append({
             "severity": "high",
             "category": "cusum_drift",
@@ -3193,7 +3192,6 @@ def calibration_gate_decision(
         )
     return True, cal_wr, "ok"
 
-
 # ══════════════════════════════════════════════════════════════════════
 #  PORTFOLIO HEAT — hard exposure caps, independent of confluence math
 # ══════════════════════════════════════════════════════════════════════
@@ -3383,7 +3381,7 @@ def fill_reconciliation(
         if len(slips) >= min_sample:
             mean_slip = statistics.fmean(slips)
             realized = max(0.0, mean_slip)
-            pair_rows = []
+            pair_rows: List[Dict[str, Any]] = []
             for pair, ps in per_pair.items():
                 if len(ps) < max(3, min_sample // 2):
                     continue

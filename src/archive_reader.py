@@ -98,18 +98,17 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
                 context = json.loads(context)
             except Exception:
                 context = None
-
-        mae_raw = raw.get("mae")
-        mfe_raw = raw.get("mfe")
+        mae = raw.get("mae")
+        mfe = raw.get("mfe")
         try:
-            mae = float(str(mae_raw)) if mae_raw not in (None, "") else None
+            mae = float(mae) if mae is not None and mae != "" else None
         except Exception:
             mae = None
         try:
-            mfe = float(str(mfe_raw)) if mfe_raw not in (None, "") else None
+            mfe = float(mfe) if mfe is not None and mfe != "" else None
         except Exception:
-            mfe = None
-            
+            mfe = None 
+
         # ── Three-metric fields (robust to bool OR "1"/"0" strings) ──
         base_win = _coerce_bool(raw.get("win"), default=False)
         close_win_val = _coerce_bool(raw.get("close_win"), default=base_win)
@@ -123,22 +122,23 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
         rr_achieved_raw = raw.get("rr_achieved")
         try:
             rr_achieved_val = (
-                float(str(rr_achieved_raw))
-                if rr_achieved_raw not in (None, "")
+                float(rr_achieved_raw)
+                if rr_achieved_raw is not None and rr_achieved_raw != ""
                 else 0.0
             )
         except (TypeError, ValueError):
             rr_achieved_val = 0.0
-  
+
         win_weight_raw = raw.get("win_weight")
         try:
             win_weight_val = (
-                float(str(win_weight_raw))
-                if win_weight_raw not in (None, "")
+                float(win_weight_raw)
+                if win_weight_raw is not None and win_weight_raw != ""
                 else (1.0 if base_win else 0.0)
             )
         except (TypeError, ValueError):
             win_weight_val = 1.0 if base_win else 0.0
+
         return {
             "pair": raw.get("pair", "?"),
             "alert_key": raw.get("alert_key", "?"),
@@ -232,14 +232,13 @@ def load_archived_outcomes(
                 break
         except OSError:
             pass
-
         stats["files_read"] += 1
-        if path.suffix == ".gz":
-            opener = gzip.open
-        else:
-            opener = open
         try:
-            with opener(path, "rt", encoding="utf-8") as f:
+            if path.suffix == ".gz":
+                f = gzip.open(path, "rt", encoding="utf-8")
+            else:
+                f = open(path, "rt", encoding="utf-8")
+            with f:
                 for line in f:
                     line = line.strip()
                     if not line:

@@ -209,14 +209,13 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
                         total_delay = compute_backoff(backoff, attempt, cap=Constants.CIRCUIT_BREAKER_MAX_WAIT / 10)
                         await asyncio.sleep(total_delay)
                     continue
-           
+
                 if resp.status >= 400:
                     logger.error(
                         f"Client error {resp.status} for {url[:80]} | "
                         f"This usually indicates invalid request - not retrying"
                     )
                     return None
-
                 try:
                     data = await resp.json(loads=json_loads)
                 except (JSONDecodeError, TypeError, ValueError) as e:
@@ -439,7 +438,7 @@ class DataFetcher:
             failure_threshold=cfg.CB_FAILURE_THRESHOLD,
             recovery_timeout=cfg.CB_RECOVERY_TIMEOUT,
         )
-        self.fetch_stats = {
+        self.fetch_stats: Dict[str, Any] = {
             "products": {"success": 0, "failed": 0},
             "candles": {"success": 0, "failed": 0},
             "circuit_breaker_blocks": 0,
@@ -447,7 +446,6 @@ class DataFetcher:
             "total_wait_time": 0.0,
             "oi_funding_blocks": 0,
         }
-
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._external_session is not None:
             return self._external_session
@@ -669,13 +667,15 @@ class DataFetcher:
             asyncio.gather(*all_tasks, return_exceptions=True),
             timeout=cfg.FETCH_PHASE_TIMEOUT_SEC
         )
-        output = {}
+        
+        output: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {}
         success_count = 0
         
         for (symbol, resolution), result in zip(task_metadata, results):
             if symbol not in output: 
                 output[symbol] = {}
-            if isinstance(result, Exception):
+        
+            if isinstance(result, BaseException):
                 output[symbol][resolution] = None
             else:
                 output[symbol][resolution] = result
@@ -997,9 +997,10 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[PriceDa
                 f"parse_candles_to_numpy: Missing required fields: {missing} | "
                 f"Available: {list(res.keys())}"
             )
-            return None    
+            return None
+    
         try:
-            data: Dict[str, np.ndarray] = {
+            data = {
                 "timestamp": np.asarray(res["t"], dtype=np.int64),
                 "open":      np.asarray(res["o"], dtype=np.float64),
                 "high":      np.asarray(res["h"], dtype=np.float64),
@@ -1007,7 +1008,7 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[PriceDa
                 "close":     np.asarray(res["c"], dtype=np.float64),
                 "volume":    np.asarray(res["v"], dtype=np.float64),
             }
-
+    
         except (ValueError, TypeError) as e:
             logger.error(f"parse_candles_to_numpy: Failed to convert data to arrays: {e}")
             return None
