@@ -12,9 +12,11 @@ reading it on every run):
 """
 
 import warnings
+import numpy as np
+from types import ModuleType
 from typing import Optional, Callable, Dict, Tuple
 
-import numpy as np
+
 
 # Central function registry — single source of truth lives in aot_meta.py
 # (zero-import module, safe to import on every run).
@@ -23,7 +25,7 @@ from aot_meta import AOT_FUNCTION_NAMES as REQUIRED_AOT_FUNCTIONS
 # ──────────────────────────────────────────────────────────────────────
 # Global state
 # ──────────────────────────────────────────────────────────────────────
-_compiled_module: Optional[object] = None   # the live Cython module (or None)
+_compiled_module: Optional[ModuleType] = None   # the live Cython module (or None)
 _using_compiled: bool = False
 _fallback_reason: Optional[str] = None
 _initialized: bool = False
@@ -33,7 +35,6 @@ _dispatch: Dict[str, Callable] = {}
 
 # JIT fallback storage
 _jit_functions: Dict[str, Callable] = {}
-
 
 # ──────────────────────────────────────────────────────────────────────
 # Initialisation helpers
@@ -125,9 +126,10 @@ def is_using_aot() -> bool:
     return _using_compiled
 
 def active_backend_module() -> str:
-    """Name of the module actually serving indicator calls right now."""
-    return _compiled_module.__name__ if _using_compiled else "numba_functions_shared"
-
+    if _using_compiled and _compiled_module is not None:
+        return _compiled_module.__name__
+    return "numba_functions_shared"
+ 
 def get_fallback_reason() -> Optional[str]:
     """Why we fell back to JIT (None when Cython is active)."""
     return _fallback_reason
