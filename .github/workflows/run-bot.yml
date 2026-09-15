@@ -158,7 +158,6 @@ jobs:
 
           cd /tmp/data-repo
 
-if ! git rev-parse --verify --quiet origin/main >/dev/null; then
           # Fail loudly if the branch was renamed/removed — do not proceed
           # into a silent empty checkout.
           if ! git rev-parse --verify --quiet origin/main >/dev/null; then
