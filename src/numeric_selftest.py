@@ -39,10 +39,16 @@ def _ref_atr_rma(high: List[float], low: List[float], close: List[float], period
     tr = _ref_true_range(high, low, close)
     return _ref_ema_alpha(tr, 1.0 / period)
 
+
 def _ref_rolling_min_max(arr: List[float], period: int) -> Tuple[List[float], List[float]]:
+    """Pine ta.lowest/ta.highest semantics: NaN until a full window exists."""
     mins, maxs = [], []
     for i in range(len(arr)):
-        window = arr[max(0, i - period + 1): i + 1]
+        if i < period - 1:
+            mins.append(float("nan"))
+            maxs.append(float("nan"))
+            continue
+        window = arr[i - period + 1: i + 1]
         mins.append(min(window))
         maxs.append(max(window))
     return mins, maxs
