@@ -553,7 +553,7 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
-    # ── CHoCH liquidity-sweep reversal ──
+    # ─�� CHoCH liquidity-sweep reversal ──
     for k, ok_key in ((AlertKey.CHOCH_BUY, "choch_buy"), (AlertKey.CHOCH_SELL, "choch_sell")):
         rk = ALERT_KEYS.get(k)
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
@@ -1902,23 +1902,70 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 mark_agrees = await verify_mark_price_agrees(
                     fetcher, pair_name, ts_curr, is_green, is_red, reference_time, logger_pair
                 ) if reconfirmed is True else None
-
                 if reconfirmed is None:
-                    logger_pair.warning(...)
+                    logger_pair.warning(
+                        f"[{pair_name}] Confirmation inconclusive — alert suppressed this run, "
+                        f"dedup key RELEASED so it can retry next run"
+                    )
                     await _release_dedup_claims()
-                    return pair_name, {...}, None
+                    return pair_name, {
+                        "state": "SUPPRESSED_RECONFIRM_INCONCLUSIVE",
+                        "ts": int(time.time()),
+                        "summary": {
+                            "alerts": 0,
+                            "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                            "hist_rma": round(hist_curr, 4),
+                            "suppression": "Confirmation inconclusive — dedup released, will retry next run",
+                        },
+                    }, None
                 elif reconfirmed is False:
-                    logger_pair.warning(...)
+                    logger_pair.warning(
+                        f"[{pair_name}] 🔁 Confirmed repaint in send-queue window — "
+                        f"alert suppressed, dedup key KEPT to prevent duplicates"
+                    )
                     await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
-                    return pair_name, {...}, None
+                    return pair_name, {
+                        "state": "SUPPRESSED_REPAINT_CONFIRMED",
+                        "ts": int(time.time()),
+                        "summary": {
+                            "alerts": 0,
+                            "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                            "hist_rma": round(hist_curr, 4),
+                            "suppression": "Confirmed candle repaint — dedup kept to prevent duplicates",
+                        },
+                    }, None
                 elif mark_agrees is None:
-                    logger_pair.warning(...)
+                    logger_pair.warning(
+                        f"[{pair_name}] Mark price check inconclusive — alert suppressed this run, "
+                        f"dedup key RELEASED so it can retry next run"
+                    )
                     await _release_dedup_claims()
-                    return pair_name, {...}, None
+                    return pair_name, {
+                        "state": "SUPPRESSED_MARK_INCONCLUSIVE",
+                        "ts": int(time.time()),
+                        "summary": {
+                            "alerts": 0,
+                            "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                            "hist_rma": round(hist_curr, 4),
+                            "suppression": "Mark price check inconclusive — dedup released, will retry next run",
+                        },
+                    }, None
                 elif mark_agrees is False:
-                    logger_pair.warning(...)
+                    logger_pair.warning(
+                        f"[{pair_name}] Mark price disagreement confirmed — alert suppressed, "
+                        f"dedup key KEPT to prevent duplicates"
+                    )
                     await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
-                    return pair_name, {...}, None
+                    return pair_name, {
+                        "state": "SUPPRESSED_MARK_DISAGREEMENT",
+                        "ts": int(time.time()),
+                        "summary": {
+                            "alerts": 0,
+                            "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                            "hist_rma": round(hist_curr, 4),
+                            "suppression": "Mark price disagreement confirmed — dedup kept to prevent duplicates",
+                        },
+                    }, None
 
                 # ── Reached only when reconfirm is True AND mark_agrees is True ──
                 # 1. Record the outcome first (survives send failures)
