@@ -1076,7 +1076,6 @@ def ev_and_kelly_for(
 # ════════════════════════════════════════════════════════════════════���══
 #  FIXED: Brier Score & Calibration Curve  (Recommended.txt §2)
 # ═══════════════════════════════════════════════════════════════════════
-
 def brier_score_and_calibration(
     rows: List[Row],
     bucket_size: float = 1.0,
@@ -1107,13 +1106,14 @@ def brier_score_and_calibration(
             holdout_buckets[b]["wins"] += int(r["win"])
             holdout_buckets[b]["n"] += 1
 
-        curve = []
+        curve: List[Dict[str, Any]] = []
         total_brier = 0.0
         count = 0
-        for b in sorted(buckets.keys()):
 
         # Only report buckets that exist in BOTH train and holdout
         all_buckets = set(train_buckets.keys()).intersection(set(holdout_buckets.keys()))
+
+        for b in sorted(all_buckets):
             t_d = train_buckets[b]
             h_d = holdout_buckets[b]
 
@@ -1146,8 +1146,7 @@ def brier_score_and_calibration(
             buckets.setdefault(b, {"wins": 0, "n": 0})
             buckets[b]["wins"] += int(r["win"])
             buckets[b]["n"] += 1
-
-        curve: List[Dict[str, Any]] = []
+        curve = []
         total_brier = 0.0
         count = 0
         for b in sorted(buckets.keys()):
@@ -2136,7 +2135,7 @@ def multi_metric_per_pair(rows: List[Row], min_sample: int = 15) -> List[Dict[st
     results.sort(key=lambda x: -x["mfe_wr"])
     return results
 
-# ═════════════════════════════════════════════════════════════════════��═
+# ═══════════════���═════════════════════════════════════════════════════��═
 #  ENHANCED WEIGHT OPTIMIZER — Walk-Forward + Confidence + Delta Limit
 # ═══════════════════════════════════════════════════════════════════════
 
