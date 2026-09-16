@@ -417,16 +417,8 @@ class BrainEngine:
                 except (TypeError, ValueError):
                     row_context = None
 
-                mae_raw = f.get("mae")
-                mfe_raw = f.get("mfe")
-                try:
-                    mae = float(mae_raw) if mae_raw not in (None, "") else None
-                except (TypeError, ValueError):
-                    mae = None
-                try:
-                    mfe = float(mfe_raw) if mfe_raw not in (None, "") else None
-                except (TypeError, ValueError):
-                    mfe = None
+                mae = _to_opt_float(f, "mae")
+                mfe = _to_opt_float(f, "mfe")
 
                 # ── Three-metric fields (backward compatible with old rows) ──
                 close_win_raw = f.get("close_win")
@@ -447,18 +439,10 @@ class BrainEngine:
                 # ── R:R and Bonus fields (backward compatible) ──
                 bonus_win_raw = f.get("bonus_win")
                 bonus_win_val = (bonus_win_raw == "1") if bonus_win_raw else False
+                rr_achieved_val = _to_opt_float(f, "rr_achieved") or 0.0
 
-                rr_achieved_raw = f.get("rr_achieved")
-                try:
-                    rr_achieved_val = float(rr_achieved_raw) if rr_achieved_raw not in (None, "") else 0.0
-                except (TypeError, ValueError):
-                    rr_achieved_val = 0.0
-
-                win_weight_raw = f.get("win_weight")
-                try:
-                    win_weight_val = float(win_weight_raw) if win_weight_raw not in (None, "") else (1.0 if base_win else 0.0)
-                except (TypeError, ValueError):
-                    win_weight_val = 1.0 if base_win else 0.0
+                win_weight_parsed = _to_opt_float(f, "win_weight")
+                win_weight_val = win_weight_parsed if win_weight_parsed is not None else (1.0 if base_win else 0.0)
 
                 parsed.append({
                     "pair": pair,
@@ -824,8 +808,9 @@ class BrainEngine:
                     f"{wf_note}"
                 ),
             }
+            
             # ── Stability Gate check on threshold recommendation ─────────────
-            if emit_patch:
+            if emit_patch and target_floor is not None:
                 history = await self.sdb.load_threshold_history()
                 gate_ok, gate_reason = self.stability_gate.approve(
                     target_floor, history,
@@ -834,7 +819,7 @@ class BrainEngine:
                     threshold_rec["severity"] = "medium"
                     threshold_rec["stability_blocked"] = True
                     threshold_rec["message"] += (
-                        f"\n⚠️ STABILITY GATE BLOCKED: {gate_reason}. "
+                        f"⚠️ STABILITY GATE BLOCKED: {gate_reason}. "
                         f"Patch suppressed to prevent oscillation."
                     )
                     emit_patch = False
@@ -860,10 +845,12 @@ class BrainEngine:
                 })
 
             recommendations.append(threshold_rec)
-            if emit_patch:
+            if emit_patch and target_floor is not None:
                 config_patch.append({
-                    "path": "CONFLUENCE_MIN_ABS_SCORE", "current": cfg.CONFLUENCE_MIN_ABS_SCORE,
-                    "suggested": target_floor, "supporting_samples": rec_n,
+                    "path": "CONFLUENCE_MIN_ABS_SCORE",
+                    "current": cfg.CONFLUENCE_MIN_ABS_SCORE,
+                    "suggested": target_floor,
+                    "supporting_samples": rec_n,
                 })
                 rec_subset = [r for r in real_rows if r["score"] >= target_floor]
                 avg_total = sum(r["total"] for r in rec_subset) / rec_n if rec_n else 0.0

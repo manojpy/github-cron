@@ -2089,10 +2089,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     msg = f"{body}\n{DIVIDER}\n{_format_bias_header(bias_context)}\n{datetime_line}"
 
                 if not cfg.DRY_RUN_MODE:
+                    assert cached_snapshot is not None
                     reconfirmed = await confirm_candle_unchanged(
                         fetcher, symbol, pair_name, ts_curr, cached_snapshot, reference_time, logger_pair
                     )
-
                     mark_agrees = await verify_mark_price_agrees(
                         fetcher, pair_name, ts_curr, is_green, is_red, reference_time, logger_pair
                     ) if reconfirmed is True else None
