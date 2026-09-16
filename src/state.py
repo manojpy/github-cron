@@ -1065,21 +1065,23 @@ class RedisStateStore:
                     tp_first = False  # Only SL hit
         # else: neither hit → tp_first stays None
 
-        # ── OUTCOME REASON: human-readable label mirroring tp_first/mfe_win/
-         if ambiguous_same_candle:
-             outcome_reason = "ambiguous_same_candle"
-         elif tp_first is True:
-             outcome_reason = "target_hit"
-         elif tp_first is False:
-             outcome_reason = "stop_hit"
-         elif mfe_win and mae_loss:
-             outcome_reason = "both_hit"
-         elif mfe_win:
-             outcome_reason = "target_hit_ever"
-         elif mae_loss:
-             outcome_reason = "stop_hit_ever"
-         else:
-             outcome_reason = "no_hit"
+     # ── OUTCOME REASON: human-readable label mirroring tp_first/mfe_win/
+     # mae_loss, kept for archive_reader.py and any reporting that wants
+     # a single descriptive field instead of the boolean trio ──
+     if ambiguous_same_candle:
+         outcome_reason = "ambiguous_same_candle"
+     elif tp_first is True:
+         outcome_reason = "target_hit"
+     elif tp_first is False:
+         outcome_reason = "stop_hit"
+     elif mfe_win and mae_loss:
+         outcome_reason = "both_hit"
+     elif mfe_win:
+         outcome_reason = "target_hit_ever"
+     elif mae_loss:
+         outcome_reason = "stop_hit_ever"
+     else:
+         outcome_reason = "no_hit"
 
         # ── PRIMARY WIN: configurable ──
         primary_metric = getattr(cfg, "OUTCOME_PRIMARY_METRIC", "mfe")

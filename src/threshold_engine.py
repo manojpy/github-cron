@@ -1908,7 +1908,7 @@ def regime_profile_optimizer(
 
 # ══════════════════════════════════════════════════════════════════════
 #  RISK FLAGS — Config Version Hash & Actionability
-# ═══════════════════════════════════════════════════════════════════════
+# ══════════════════════════��════════════════════════════════════════════
 def compare_config_versions(
     rows: List[Row],
     min_sample: int = 20,
@@ -3004,13 +3004,12 @@ def find_wr_change_point(
     best["valid"] = True
     return best
 
-
 def learn_repair_effectiveness(
     ledger_records: List[Dict[str, Any]],
     current_state: Dict[str, Any],
     min_records: int = 100,
 ) -> Dict[str, Any]:
-    Trains on resolved repair-ledger entries (snapshot_before + verdict)
+    """Trains on resolved repair-ledger entries (snapshot_before + verdict)
     and predicts, for the CURRENT system state, how likely each repair
     category is to actually help. Reuses the same pure-Python logistic
     trainer as the vote-weight optimizer — no external deps.
