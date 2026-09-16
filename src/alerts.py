@@ -631,20 +631,20 @@ AlertKey = cast(Any, _AlertKeyRaw)
 logger.debug("Alert keys initialized: %s mappings", len(ALERT_KEYS))
 
 BUY_ALERT_KEYS: Set[str] = {
- "ppo_signal_up ",  "ppo_zero_up ",  "ppo_adaptive_up ",
- "rsi_ema5_up ",  "rsi_cross_adaptive_up ",  "vwap_up ",  "hist_rma_buy ",  "ppohist_buy ",
- "cloud_cross_up ",  "tk_conversion_up ",  "kijun_cross_up ",  "equilibrium_cross_up ",  "ob_reversal_buy ",
- "strong_reversal_buy ",  "choch_buy ",  "dynamic_flow_cross_buy ",  "fib_reversal_buy ",
- "bos_buy ",
+    "ppo_signal_up", "ppo_zero_up", "ppo_adaptive_up",
+    "rsi_ema5_up", "rsi_cross_adaptive_up", "vwap_up", "hist_rma_buy", "ppohist_buy",
+    "cloud_cross_up", "tk_conversion_up", "kijun_cross_up", "equilibrium_cross_up", "ob_reversal_buy",
+    "strong_reversal_buy", "choch_buy", "dynamic_flow_cross_buy", "fib_reversal_buy",
+    "bos_buy",
 }
 BUY_ALERT_KEYS.update(f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY)
 
 SELL_ALERT_KEYS: Set[str] = {
- "ppo_signal_down ",  "ppo_zero_down ",  "ppo_adaptive_down ",
- "rsi_ema5_down ",  "rsi_cross_adaptive_down ",  "vwap_down ",  "hist_rma_sell ",  "ppohist_sell ",
- "cloud_cross_down ",  "tk_conversion_down ",  "kijun_cross_down ",  "equilibrium_cross_down ",  "ob_reversal_sell ",
- "strong_reversal_sell ",  "choch_sell ",  "dynamic_flow_cross_sell ",  "fib_reversal_sell ",
- "bos_sell ",
+    "ppo_signal_down", "ppo_zero_down", "ppo_adaptive_down",
+    "rsi_ema5_down", "rsi_cross_adaptive_down", "vwap_down", "hist_rma_sell", "ppohist_sell",
+    "cloud_cross_down", "tk_conversion_down", "kijun_cross_down", "equilibrium_cross_down", "ob_reversal_sell",
+    "strong_reversal_sell", "choch_sell", "dynamic_flow_cross_sell", "fib_reversal_sell",
+    "bos_sell",
 }
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
 
