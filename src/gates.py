@@ -745,48 +745,33 @@ async def _eval_gate(
         rsi_guard_ema_curr = rsi_guard_ema_arr[i15]
         rma_cloud_fast_curr = rma_cloud_fast_arr[i15]
 
-        if cfg.ENABLE_PPO_GATE:
-            if not np.isnan(ppo_gate_curr) and not np.isnan(ppo_gate_sig_curr):
-                ppo_gate_ok_buy = bool(ppo_gate_curr > ppo_gate_sig_curr)
-                ppo_gate_ok_sell = bool(ppo_gate_curr < ppo_gate_sig_curr)
-            else:
-                ppo_gate_ok_buy = None
-                ppo_gate_ok_sell = None
+        if cfg.ENABLE_PPO_GATE and not np.isnan(ppo_gate_curr) and not np.isnan(ppo_gate_sig_curr):
+            ppo_gate_ok_buy = bool(ppo_gate_curr > ppo_gate_sig_curr)
+            ppo_gate_ok_sell = bool(ppo_gate_curr < ppo_gate_sig_curr)
         else:
             ppo_gate_ok_buy = None
             ppo_gate_ok_sell = None
 
-        if cfg.RSI_GUARD_ENABLED:
-            if not np.isnan(rsi_guard_smooth_curr) and not np.isnan(rsi_guard_ema_curr):         
-                rsi_guard_ok_buy = bool(rsi_guard_smooth_curr > rsi_guard_ema_curr)
-                rsi_guard_ok_sell = bool(rsi_guard_smooth_curr < rsi_guard_ema_curr)
-            else:
-                rsi_guard_ok_buy = None
-                rsi_guard_ok_sell = None
+        if cfg.RSI_GUARD_ENABLED and not np.isnan(rsi_guard_smooth_curr) and not np.isnan(rsi_guard_ema_curr):
+            rsi_guard_ok_buy = bool(rsi_guard_smooth_curr > rsi_guard_ema_curr)
+            rsi_guard_ok_sell = bool(rsi_guard_smooth_curr < rsi_guard_ema_curr)
         else:
             rsi_guard_ok_buy = None
             rsi_guard_ok_sell = None
 
-        if cfg.RMA_CLOUD_ENABLED:
-            if not np.isnan(rma_cloud_fast_curr) and not np.isnan(rma50_15_val):
-                rma_cloud_ok_buy = bool(rma_cloud_fast_curr > rma50_15_val)
-                rma_cloud_ok_sell = bool(rma_cloud_fast_curr < rma50_15_val)
-            else:
-                rma_cloud_ok_buy = None
-                rma_cloud_ok_sell = None
+        if cfg.RMA_CLOUD_ENABLED and not np.isnan(rma_cloud_fast_curr) and not np.isnan(rma50_15_val):
+            rma_cloud_ok_buy = bool(rma_cloud_fast_curr > rma50_15_val)
+            rma_cloud_ok_sell = bool(rma_cloud_fast_curr < rma50_15_val)
         else:
             rma_cloud_ok_buy = None
             rma_cloud_ok_sell = None
-
+      
         dynamic_flow_curr = dynamic_flow_trend_arr[i15]
-        if cfg.DYNAMIC_FLOW_RIBBON_ENABLED:
-            if not np.isnan(dynamic_flow_curr):
-                dynamic_flow_ok_buy = bool(dynamic_flow_curr == -1.0)
-                dynamic_flow_ok_sell = bool(dynamic_flow_curr == 1.0)
-            else:
-                dynamic_flow_ok_buy = None
-                dynamic_flow_ok_sell = None
+        if cfg.DYNAMIC_FLOW_RIBBON_ENABLED and not np.isnan(dynamic_flow_curr):
+            dynamic_flow_ok_buy = bool(dynamic_flow_curr == -1.0)
+            dynamic_flow_ok_sell = bool(dynamic_flow_curr == 1.0)
         else:
+            # This single else block now handles both "disabled" and "NaN" scenarios
             dynamic_flow_ok_buy = None
             dynamic_flow_ok_sell = None
 
@@ -798,15 +783,16 @@ async def _eval_gate(
             if (not np.isnan(dynamic_flow_curr) and not np.isnan(dynamic_flow_line_curr)
                     and not np.isnan(dynamic_flow_line_prev) and not np.isnan(close_prev)):
                 dynamic_flow_cross_up = bool(
-                    dynamic_flow_curr == -1.0
+                    np.isclose(dynamic_flow_curr, -1.0, atol=1e-9)
                     and close_prev < dynamic_flow_line_prev
                     and close_curr > dynamic_flow_line_curr
                 )
                 dynamic_flow_cross_down = bool(
-                    dynamic_flow_curr == 1.0
+                    np.isclose(dynamic_flow_curr, 1.0, atol=1e-9)
                     and close_prev > dynamic_flow_line_prev
                     and close_curr < dynamic_flow_line_curr
                 )
+
         ppo_gate_prev_val = ppo_gate_arr[i15 - 1] if i15 >= 1 else ppo_gate_curr
         if (cfg.ENABLE_PPO_GATE_MOMENTUM_VOTE
                 and not np.isnan(ppo_gate_curr) and not np.isnan(ppo_gate_prev_val)):
