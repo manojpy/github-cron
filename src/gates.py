@@ -337,7 +337,8 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, flo
             other_score = score - w - (base_trend_weight if base_trend else 0.0)
             if other_score < cfg.OB_MIN_OTHER_SCORE:
                 score -= w
-                votes["order_block"] = False  # reverted by OB_MIN_OTHER_SCORE guard — keep vote map consistent with actual scoring outcome
+                total -= w  # Guard invalidated the vote — remove from achievable set too
+                votes["order_block"] = False
 
     return score, total, votes
 
