@@ -259,11 +259,7 @@ def weighted_win_rate_with_bonus(
     return point_wr, point_n_eff, boots[lo_idx], boots[hi_idx]
 
 def favourable_move(row: Row) -> float:
-    """pct_move is signed by price direction, not by trade outcome — a
-    winning sell has a negative pct_move. Always take the magnitude of the
-    move that was favourable to the position, or wins/losses from opposite
-    directions cancel toward zero when averaged."""
-    return abs(row.get("pct_move", 0.0))
+    return abs(float(row.get("pct_move", 0.0)))
 
 def expected_value(wins: int, losses: int, avg_win_pct: float, avg_loss_pct: float) -> float:
     """EV per trade in % terms. Positive = profitable long-run."""
@@ -1167,13 +1163,14 @@ def ev_and_kelly_for(
     if not rows:
         return 0.0, 0.0, 0.0
     total_cost = (fee_pct * 2) + (slippage_pct * 2)  # entry + exit for both
-    net_moves = []
+    net_moves: List[float] = []
     for r in rows:
-        mag = abs(r.get("pct_move", 0.0))
+        mag = abs(float(r.get("pct_move", 0.0)))
         if r["win"]:
             net_moves.append(mag - total_cost)
         else:
             net_moves.append(-(mag + total_cost))
+
     wins = [m for m in net_moves if m > 0]
     losses = [abs(m) for m in net_moves if m <= 0]
     wr = len(wins) / len(net_moves) if net_moves else 0.0
@@ -1908,7 +1905,7 @@ def regime_profile_optimizer(
 
 # ══════════════════════════════════════════════════════════════════════
 #  RISK FLAGS — Config Version Hash & Actionability
-# ══════════════════════════��════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 def compare_config_versions(
     rows: List[Row],
     min_sample: int = 20,
@@ -2741,8 +2738,8 @@ def ev_first_objective(
     p_ev_positive = _prob_ev_positive(net_ev, ev_std)
 
     # Profit factor
-    wins = [abs(r.get("pct_move", 0.0)) for r in rows if r["win"]]
-    losses = [abs(r.get("pct_move", 0.0)) for r in rows if not r["win"]]
+    wins = [abs(float(r.get("pct_move", 0.0))) for r in rows if r["win"]]
+    losses = [abs(float(r.get("pct_move", 0.0))) for r in rows if not r["win"]]
     gross_profit = sum(wins) if wins else 0.0
     gross_loss = sum(losses) if losses else 0.0
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
@@ -2754,7 +2751,7 @@ def ev_first_objective(
     peak = 0.0
     max_dd = 0.0
     for r in ordered:
-        mag = abs(r.get("pct_move", 0.0))
+        mag = abs(float(r.get("pct_move", 0.0)))
         pnl = (mag - total_cost) if r["win"] else -(mag + total_cost)
         cumulative += pnl
         peak = max(peak, cumulative)
@@ -3607,8 +3604,9 @@ class KillSwitch:
         window = [r for r in ordered if r["entry_ts"] >= cutoff]
         pnl = 0.0
         for r in window:
-            mag = abs(r.get("pct_move", 0.0))
+            mag = abs(float(r.get("pct_move", 0.0)))
             pnl += (mag - total_cost) if r["win"] else -(mag + total_cost)
+
         result.update(
             pnl_pct=round(pnl, 4),
             drawdown_pct=round(-pnl, 4) if pnl < 0 else 0.0,
@@ -3701,7 +3699,7 @@ def fill_reconciliation(
             return result
 
     # ── Tier 2: estimated from win-move shortfall ──────────────────
-    wins = [abs(r.get("pct_move", 0.0)) for r in rows if r["win"]]
+    wins = [abs(float(r.get("pct_move", 0.0))) for r in rows if r["win"]]
     if len(wins) < min_sample:
         return {"valid": False, "measured": False, "error": "insufficient_data", "n": len(wins)}
     realized_pp = statistics.fmean(wins)
@@ -3709,10 +3707,11 @@ def fill_reconciliation(
     shortfall_pp = max(0.0, expected_pp - realized_pp)
     implied_frac = (shortfall_pp / 2.0) / 100.0  # split across entry+exit, pp → fraction
 
-    per_pair = defaultdict(list)
+    per_pair: Dict[str, List[float]] = defaultdict(list)
     for r in rows:
         if r["win"]:
-            per_pair[r["pair"]].append(abs(r.get("pct_move", 0.0)))
+            per_pair[r["pair"]].append(abs(float(r.get("pct_move", 0.0))))
+
     pair_rows = []
     for pair, moves in per_pair.items():
         if len(moves) < max(3, min_sample // 2):

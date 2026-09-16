@@ -139,6 +139,12 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
         except (TypeError, ValueError):
             win_weight_val = 1.0 if base_win else 0.0
 
+        # ── Extract effective gate state to locals for mypy type narrowing ──
+        _eff_score = raw.get("effective_score")
+        _eff_req = raw.get("effective_required")
+        _macro_mult = raw.get("macro_multiplier")
+        _cluster_pen = raw.get("cluster_penalty")
+
         return {
             "pair": raw.get("pair", "?"),
             "alert_key": raw.get("alert_key", "?"),
@@ -174,23 +180,13 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
                 float(raw.get("realized_cost_pct", 0.0))
                 if raw.get("realized_cost_pct") is not None else None
             ),
+         
             # ── NEW: effective gate state ──
-            "effective_score": (
-                float(raw.get("effective_score"))
-                if raw.get("effective_score") is not None else None
-            ),
-            "effective_required": (
-                float(raw.get("effective_required"))
-                if raw.get("effective_required") is not None else None
-            ),
-            "macro_multiplier": (
-                float(raw.get("macro_multiplier"))
-                if raw.get("macro_multiplier") is not None else None
-            ),
-            "cluster_penalty": (
-                float(raw.get("cluster_penalty"))
-                if raw.get("cluster_penalty") is not None else None
-            ),
+            "effective_score": float(_eff_score) if _eff_score is not None else None,
+            "effective_required": float(_eff_req) if _eff_req is not None else None,
+            "macro_multiplier": float(_macro_mult) if _macro_mult is not None else None,
+            "cluster_penalty": float(_cluster_pen) if _cluster_pen is not None else None,
+
             "gate_passed": _coerce_bool(raw.get("gate_passed"), default=None),
             # ── Provenance — lets downstream consumers audit vintage ──
             "schema_version": row_schema,

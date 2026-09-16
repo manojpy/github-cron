@@ -68,15 +68,16 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
             ev_obj.get("p_ev_positive", 0) >= 0.85
             if ev_obj and ev_obj.get("valid") else False
         )
-        if net_ev > 0 and ev_positive:
+        if net_ev > 0 and ev_positive and ev_obj is not None:
             verdict = (
                 f"✅ PROFITABLE: Net EV {net_ev:+.2f}%/trade, "
                 f"P(EV>0)={ev_obj['p_ev_positive']:.0%}, WR={wr:.0%}."
             )
         elif net_ev > 0:
+            _p_ev = ev_obj.get("p_ev_positive", 0) if ev_obj is not None else 0
             verdict = (
                 f"⚠️ MARGINALLY POSITIVE: Net EV {net_ev:+.2f}%/trade "
-                f"but P(EV>0) only {ev_obj.get('p_ev_positive', 0):.0%}. "
+                f"but P(EV>0) only {_p_ev:.0%}. "
                 f"WR={wr:.0%}. Evidence is thin."
             )
         else:
