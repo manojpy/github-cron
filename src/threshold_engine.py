@@ -2633,9 +2633,8 @@ def oos_permutation_importance(
         return ev
 
     baseline_ev = _eval_ev(X_hold, holdout_rows)
-
     rng = random.Random(seed)
-    results = []
+    results: List[Dict[str, Any]] = []
 
     for feat_idx, fname in enumerate(feat_names):
         drops = []
@@ -2656,8 +2655,7 @@ def oos_permutation_importance(
             "std": round(statistics.pstdev(drops), 5) if len(drops) > 1 else 0.0,
             "direction": "positive" if mean_drop > 0 else "negative",
         })
-
-    results.sort(key=lambda x: -abs(x["importance_ev"]))
+    results.sort(key=lambda x: -abs(float(x["importance_ev"])))
     return results
 
 def _prob_edge_broken(wins: int, n: int, target_wr: float,
@@ -3707,22 +3705,23 @@ def fill_reconciliation(
     shortfall_pp = max(0.0, expected_pp - realized_pp)
     implied_frac = (shortfall_pp / 2.0) / 100.0  # split across entry+exit, pp → fraction
 
-    per_pair: Dict[str, List[float]] = defaultdict(list)
+    per_pair_est: Dict[str, List[float]] = defaultdict(list)
     for r in rows:
         if r["win"]:
-            per_pair[r["pair"]].append(abs(float(r.get("pct_move", 0.0))))
+            per_pair_est[r["pair"]].append(abs(float(r.get("pct_move", 0.0))))
 
-    pair_rows = []
-    for pair, moves in per_pair.items():
+    pair_rows_est: List[Dict[str, Any]] = []
+    for pair, moves in per_pair_est.items():
         if len(moves) < max(3, min_sample // 2):
             continue
         implied_p = max(0.0, (expected_pp - statistics.fmean(moves)) / 2.0) / 100.0
-        pair_rows.append({
+        pair_rows_est.append({
             "pair": pair, "n": len(moves),
             "realized_slippage_per_side": round(implied_p, 6),
             "gap_bps": round((implied_p - assumed_slippage_pct) * 10000, 1),
         })
-    pair_rows.sort(key=lambda x: -x["gap_bps"])
+
+    pair_rows_est.sort(key=lambda x: -float(x["gap_bps"]))
 
     return {
         "valid": True, "measured": False, "n": len(wins),
