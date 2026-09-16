@@ -3731,7 +3731,7 @@ def fill_reconciliation(
         "assumed_slippage_per_side": assumed_slippage_pct,
         "gap_bps": round((implied_frac - assumed_slippage_pct) * 10000, 2),
         "ev_overstated_pct_per_trade": round(2 * max(0.0, implied_frac - assumed_slippage_pct), 6),
-        "per_pair": pair_rows,
+        "per_pair": pair_rows_est,
         "note": "estimated from win-move shortfall; wire fill prices into the "
                 "outcome writer for the measured tier",
     }
