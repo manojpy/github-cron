@@ -1431,12 +1431,12 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
             # Continuity: sweep must flow into the displacement candle without gaps
             if not _continuity_ok(sweep_idx, r):
                 continue
-
             fvg_fn = _bullish_fvg_at if is_buy else _bearish_fvg_at
             has_fvg = any(
                 fvg_fn(h, l, k)
-                for k in range(max(sweep_idx, 2), r + 1)
-            )
+                for k in range(max(sweep_idx, 2), min(r + 2, len(h)))
+           )
+
             if cfg_obj.CHOCH_REQUIRE_FVG and not has_fvg:
                 continue
 
@@ -1502,6 +1502,114 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
         choch_ok_buy, choch_ok_sell, reason,
         fvg_buy, fvg_sell, poi_tap_buy, poi_tap_sell
     )
+
+def _bos_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
+    """Detect Break of Structure (BoS) — trend continuation signal.
+
+    Bullish BoS: close breaks above the most recent confirmed swing high.
+    Bearish BoS: close breaks below the most recent confirmed swing low.
+    Unlike CHoCH (reversal), BoS confirms the existing trend is resuming
+    after a pullback.
+
+    Returns (bos_ok_buy, bos_ok_sell, reason).
+    """
+    pair = PAIR_ID.get() or "?"
+    n = len(c)
+    length = cfg_obj.BOS_SWING_LEN
+    lookback = cfg_obj.BOS_LOOKBACK_CANDLES
+    min_break_dist_atr = cfg_obj.BOS_MIN_BREAK_DISTANCE_ATR
+    persistence = cfg_obj.BOS_PERSISTENCE_CANDLES
+
+    if i15 is None or i15 >= n or i15 < length + 2:
+        return None, None, None
+
+    scan_start = max(length, i15 - lookback - persistence)
+    tops, btms = _get_minor_swings(h, l, length, scan_start, i15)
+
+    def _continuity_ok(start_idx, end_idx) -> bool:
+        for idx in range(start_idx + 1, end_idx + 1):
+            if (ts[idx] - ts[idx - 1]) != 900:
+                logger.debug(
+                    f"[{pair}] BoS: candle gap at idx {idx} "
+                    f"({ts[idx]} - {ts[idx - 1]} != 900)"
+                )
+                return False
+        return True
+
+    def _scan(is_buy: bool):
+        pivots = tops if is_buy else btms
+        if not pivots:
+            return None, None
+
+        atr_val = atr_short_arr[i15] if i15 < len(atr_short_arr) else np.nan
+        break_dist = (
+            min_break_dist_atr * atr_val
+            if not np.isnan(atr_val) and atr_val > 0
+            else 0.0
+        )
+
+        for idx, price, piv_idx in reversed(pivots):
+            # Swing must be confirmed strictly before the break candle
+            if idx >= i15:
+                continue
+
+            if is_buy:
+                broke_now = c[i15] > price + break_dist
+                prev_at_or_below = c[i15 - 1] <= price + break_dist
+            else:
+                broke_now = c[i15] < price - break_dist
+                prev_at_or_below = c[i15 - 1] >= price - break_dist
+
+            if broke_now and prev_at_or_below:
+                # Fresh break on the current candle
+                if _continuity_ok(piv_idx, i15):
+                    side = "Bullish" if is_buy else "Bearish"
+                    level = "swing high" if is_buy else "swing low"
+                    reason = (
+                        f"{side} BoS: broke {level} {price:.4g} "
+                        f"(pivot @idx{piv_idx}), close {c[i15]:.4g} @idx{i15}"
+                    )
+                    return True, reason
+            elif broke_now and persistence > 0:
+                # Break happened on a recent candle — check persistence window
+                for r in range(i15 - 1, max(scan_start, i15 - persistence - 1) - 1, -1):
+                    if r < 1:
+                        break
+                    if is_buy:
+                        r_broke = c[r] > price + break_dist
+                        r_prev = c[r - 1] <= price + break_dist
+                    else:
+                        r_broke = c[r] < price - break_dist
+                        r_prev = c[r - 1] >= price - break_dist
+                    if r_broke and r_prev:
+                        age = i15 - r
+                        if age <= persistence and _continuity_ok(piv_idx, r):
+                            side = "Bullish" if is_buy else "Bearish"
+                            level = "swing high" if is_buy else "swing low"
+                            reason = (
+                                f"{side} BoS: broke {level} {price:.4g} "
+                                f"(pivot @idx{piv_idx}), close {c[r]:.4g} @idx{r}, "
+                                f"still valid ({age}/{persistence})"
+                            )
+                            return True, reason
+                        break  # stale — stop searching this pivot
+
+        return False, f"no qualifying {'bullish' if is_buy else 'bearish'} BoS structure found"
+
+    bos_ok_buy, reason_buy = _scan(is_buy=True)
+    bos_ok_sell, reason_sell = _scan(is_buy=False)
+
+    reason = (
+        reason_buy if bos_ok_buy
+        else (reason_sell if bos_ok_sell else (reason_buy or reason_sell))
+    )
+
+    logger.debug(
+        f"[{pair}] BoS diag | ok_buy={bos_ok_buy} ok_sell={bos_ok_sell} | "
+        f"reason={reason or 'no qualifying BoS structure found'}"
+    )
+
+    return bos_ok_buy, bos_ok_sell, reason
 
 def _oi_price_divergence_reason(oi_now: float, oi_history: List[List[float]], price_now: Optional[float], price_history: List[List[float]], is_buy: bool) -> Optional[str]:
     if not cfg.ENABLE_OI_PRICE_DIVERGENCE or price_now is None:

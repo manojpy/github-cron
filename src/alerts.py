@@ -414,6 +414,9 @@ _ALERT_DEFINITIONS_RAW: List[Dict[str, Any]] = [
     {"key":"dynamic_flow_cross_sell","title":"🌊🔴 Dynamic Flow Cross SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("dynamic_flow_cross_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('dynamic_flow_cross_reason') or 'Dynamic Flow Ribbon flipped bearish'}","requires":["dynamic_flow_cross"]},
     {"key":"equilibrium_cross_up","title":"⚖️🟢 Equilibrium Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_wick",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Equilibrium {ctx.get('equilibrium_curr',0) or 0:.2f} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"equilibrium_cross_down","title":"⚖️🔴 Equilibrium Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_wick",False) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Equilibrium {ctx.get('equilibrium_curr',0) or 0:.2f} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
+    { "key ": "bos_buy ", "title ": "🟢📐 BoS BUY ", "check_fn ":lambda ctx,ppo,ppo_sig,rsi:(ctx.get( "buy_common_relaxed_wick ",False) and ctx.get( "bos_gate_ok_buy ",False) and (ppo.get( "curr ",np.nan) <Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get( "curr ",np.nan) <Constants.RSI_SIGNAL_CROSS_MAX_BUY)), "extra_fn ":lambda ctx,ppo,ppo_sig,rsi, :f "{ctx.get('bos_reason') or 'Bullish break of structure'} ", "requires ":[ "bos "]},
+    { "key ": "bos_sell ", "title ": "🔴📐 BoS SELL ", "check_fn ":lambda ctx,ppo,ppo_sig,rsi:(ctx.get( "sell_common_relaxed_wick ",False) and ctx.get( "bos_gate_ok_sell ",False) and (ppo.get( "curr ",np.nan) >Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get( "curr ",np.nan) >Constants.RSI_SIGNAL_CROSS_MIN_SELL)), "extra_fn ":lambda ctx,ppo,ppo_sig,rsi, :f "{ctx.get('bos_reason') or 'Bearish break of structure'} ", "requires ":[ "bos "]},
+  
 ]
 
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
@@ -572,6 +575,12 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
+     # ── BoS break of structure ──
+     for k, ok_key in ((AlertKey.BOS_BUY, "bos_gate_ok_buy"), (AlertKey.BOS_SELL, "bos_gate_ok_sell")):
+         rk = ALERT_KEYS.get(k)
+         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
+             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
+    
     # ── Pivots ──
     piv = context.get("pivots", {})
     close_c, close_p = context["close_curr"], context["close_prev"]
@@ -624,19 +633,20 @@ AlertKey = cast(Any, _AlertKeyRaw)
 logger.debug("Alert keys initialized: %s mappings", len(ALERT_KEYS))
 
 BUY_ALERT_KEYS: Set[str] = {
-    "ppo_signal_up", "ppo_zero_up", "ppo_adaptive_up",
-    "rsi_ema5_up", "rsi_cross_adaptive_up", "vwap_up", "hist_rma_buy", "ppohist_buy",
-    "cloud_cross_up", "tk_conversion_up", "kijun_cross_up", "equilibrium_cross_up", "ob_reversal_buy", 
-    "strong_reversal_buy", "choch_buy", "dynamic_flow_cross_buy", "fib_reversal_buy",
+ "ppo_signal_up ",  "ppo_zero_up ",  "ppo_adaptive_up ",
+ "rsi_ema5_up ",  "rsi_cross_adaptive_up ",  "vwap_up ",  "hist_rma_buy ",  "ppohist_buy ",
+ "cloud_cross_up ",  "tk_conversion_up ",  "kijun_cross_up ",  "equilibrium_cross_up ",  "ob_reversal_buy ",
+ "strong_reversal_buy ",  "choch_buy ",  "dynamic_flow_cross_buy ",  "fib_reversal_buy ",
+ "bos_buy ",
 }
-
 BUY_ALERT_KEYS.update(f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY)
 
 SELL_ALERT_KEYS: Set[str] = {
-    "ppo_signal_down", "ppo_zero_down", "ppo_adaptive_down",
-    "rsi_ema5_down", "rsi_cross_adaptive_down", "vwap_down", "hist_rma_sell", "ppohist_sell",
-    "cloud_cross_down", "tk_conversion_down", "kijun_cross_down", "equilibrium_cross_down", "ob_reversal_sell",
-    "strong_reversal_sell", "choch_sell", "dynamic_flow_cross_sell", "fib_reversal_sell",
+ "ppo_signal_down ",  "ppo_zero_down ",  "ppo_adaptive_down ",
+ "rsi_ema5_down ",  "rsi_cross_adaptive_down ",  "vwap_down ",  "hist_rma_sell ",  "ppohist_sell ",
+ "cloud_cross_down ",  "tk_conversion_down ",  "kijun_cross_down ",  "equilibrium_cross_down ",  "ob_reversal_sell ",
+ "strong_reversal_sell ",  "choch_sell ",  "dynamic_flow_cross_sell ",  "fib_reversal_sell ",
+ "bos_sell ",
 }
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
 
@@ -892,6 +902,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
     choch_reason = gr.choch_reason
     choch_fvg_buy, choch_fvg_sell = gr.choch_fvg_buy, gr.choch_fvg_sell
     choch_poi_tap_buy, choch_poi_tap_sell = gr.choch_poi_tap_buy, gr.choch_poi_tap_sell
+    bos_gate_ok_buy, bos_gate_ok_sell = gr.bos_gate_ok_buy, gr.bos_gate_ok_sell
+    bos_reason = gr.bos_reason
     dynamic_flow_cross_up, dynamic_flow_cross_down = gr.dynamic_flow_cross_up, gr.dynamic_flow_cross_down
 
     try:
@@ -982,7 +994,6 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
         sell_common_strict_wick = bool(sell_trend_common and strict_wick_sell)
         buy_common_relaxed_strict_wick = bool(buy_trend_common_relaxed and strict_wick_buy)
         sell_common_relaxed_strict_wick = bool(sell_trend_common_relaxed and strict_wick_sell)
-
 
         hist_curr = hist_rma[i15]
         hist_m1 = hist_rma[i15 - 1] if i15 >= 1 else 0.0
@@ -1164,6 +1175,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "fib_reversal_reason": fib_reversal_reason,
             "dynamic_flow_cross_buy": dynamic_flow_cross_buy, "dynamic_flow_cross_sell": dynamic_flow_cross_sell,
             "dynamic_flow_cross_reason": dynamic_flow_cross_reason,
+            "bos_gate_ok_buy": bos_gate_ok_buy, "bos_gate_ok_sell": bos_gate_ok_sell,
+            "bos_reason": bos_reason,
         }
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
@@ -1182,6 +1195,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             elif "choch" in requires and not cfg.ENABLE_CHOCH_ALERT:
                 skip = True
             elif "fib_reversal" in requires and not cfg.ENABLE_FIB_REVERSAL_ALERT:
+                skip = True
+            elif "bos" in requires and not cfg.ENABLE_BOS_ALERT:
                 skip = True
             elif "vwap" in requires and not vwap_available:
                 skip = True

@@ -15,7 +15,7 @@ from indicators import (
     get_volume_percentile, get_adaptive_rvol_threshold, get_adaptive_ppo_threshold,
     get_adaptive_rsi_thresholds, get_adaptive_cpr_threshold, _order_block_gate_reason,
     _oi_funding_gate_reason, get_adaptive_adx_threshold_smoothed, _get_smoothed_pctl,
-    _choch_gate_reason, calculate_ob_equilibrium, 
+    _choch_gate_reason, _bos_gate_reason, calculate_ob_equilibrium,
 )
 
 @dataclass(slots=True)
@@ -171,6 +171,9 @@ class GateResult:
     choch_fvg_sell: bool = False
     choch_poi_tap_buy: bool = False
     choch_poi_tap_sell: bool = False
+    bos_gate_ok_buy: Optional[bool] = None
+    bos_gate_ok_sell: Optional[bool] = None
+    bos_reason: Optional[str] = None
     atr_short_arr: Optional[np.ndarray] = None
 
     # -- percentile-rank confluence votes (optional, all default-disabled) --
@@ -942,9 +945,11 @@ async def _eval_gate(
         )
         reversal_candidate = (
             (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT
-             or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT)
+             or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT
+             or cfg.ENABLE_BOS_ALERT)
             and (buy_trend_common_relaxed or sell_trend_common_relaxed)
         )
+
         if not buy_common and not sell_common and not reversal_candidate:
             await _blanket_reset_pair(sdb, pair_name, logger_pair)
             reasons = []
@@ -1028,6 +1033,17 @@ async def _eval_gate(
             if choch_reason:
                 logger_pair.debug(f"[{pair_name}] CHoCH gate: {choch_reason}")
 
+        bos_gate_ok_buy = bos_gate_ok_sell = None
+        bos_reason = None
+        if cfg.ENABLE_BOS_ALERT:
+            bos_gate_ok_buy, bos_gate_ok_sell, bos_reason = await asyncio.to_thread(
+                _bos_gate_reason,
+                data_15m.open, data_15m.high, data_15m.low, data_15m.close, data_15m.ts,
+                atr_short_arr, i15, cfg,
+            )
+            if bos_reason:
+                logger_pair.debug(f"[{pair_name}] BoS gate: {bos_reason}")
+
         return GateResult(
             pair_name=pair_name, i15=i15, i5=i5, ts_curr=ts_curr, reference_time=reference_time,
             candle_info=candle_info, o=o, h=h, l=l, c=c,
@@ -1083,6 +1099,8 @@ async def _eval_gate(
             choch_reason=choch_reason,
             choch_fvg_buy=choch_fvg_buy, choch_fvg_sell=choch_fvg_sell,
             choch_poi_tap_buy=choch_poi_tap_buy, choch_poi_tap_sell=choch_poi_tap_sell,
+            bos_gate_ok_buy=bos_gate_ok_buy, bos_gate_ok_sell=bos_gate_ok_sell,
+            bos_reason=bos_reason,   
             atr_short_arr=atr_short_arr,
             dynamic_flow_cross_up=dynamic_flow_cross_up, dynamic_flow_cross_down=dynamic_flow_cross_down,
             ppo_gate_momentum_ok_buy=ppo_gate_momentum_ok_buy,
