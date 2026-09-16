@@ -574,9 +574,6 @@ def monte_carlo_walk_forward(
         ),
     }
 
-
-    }
-
 def rolling_walk_forward(
     rows: List[Row],
     n_folds: int = 5,
