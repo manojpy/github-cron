@@ -282,20 +282,18 @@ class BrainEngine:
         return f"{conf_pct:.0f}% confluence, shadow WR {wr:.0%} over {total} tracked rejections"
 
     # ── Calibration live gate ────────────────────────────────────────────
-
     async def _persist_calibration_curves(self, calib: Dict[str, Any]) -> None:
         if self.sdb.degraded or not self.sdb._redis:
             return
         try:
-            await self.sdb._safe_redis_op(           
+            await self.sdb._safe_redis_op(
                 lambda: _rc(self.sdb._redis).set(
-                   CALIBRATION_CURVES_KEY, json_dumps(calib),
-                   ex=int(getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30) * 86400),
-                ),
-                    CALIBRATION_CURVES_KEY, json_dumps(calib),
+                    CALIBRATION_CURVES_KEY,
+                    json_dumps(calib),
                     ex=int(getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30) * 86400),
                 ),
-                2.0, "calibration_persist",
+                2.0,
+                "calibration_persist",
             )
         except Exception:
             pass
@@ -1644,7 +1642,7 @@ class BrainEngine:
                     ))
                 lines.append("")
 
-        # ── 🤖 AI INSIGHTS ──
+        # ── 🤖 AI INSIGHTS ���─
         ai_lines = []
 
         # Synergy / Poison
