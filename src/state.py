@@ -987,7 +987,6 @@ class RedisStateStore:
         future_price = float(data_15m.close[target_idx])
         pct_move = (future_price - entry_price) / entry_price * 100.0
 
-        # ── METRIC 1: close_win (legacy point-in-time check) ──
         # ── R:R-BASED THRESHOLDS ──
         risk_pct = cfg.OUTCOME_MAE_LOSS_PCT / 100.0            # e.g. 0.005
         target_pct = risk_pct * cfg.OUTCOME_RR_TARGET           # e.g. 0.010 (1.0%)
@@ -1029,6 +1028,7 @@ class RedisStateStore:
 
         # ── BONUS: tp_first ordering (candle-by-candle) ──
         tp_first: Optional[bool] = None
+        ambiguous_same_candle = False          # ← initialized BEFORE the loop
         if len(path_low) and len(path_high):
             tp_level = entry_price * (1 + target_pct) if is_buy else entry_price * (1 - target_pct)
             sl_level = entry_price * (1 - risk_pct) if is_buy else entry_price * (1 + risk_pct)
@@ -1050,7 +1050,6 @@ class RedisStateStore:
                     sl_hit_idx = candle_offset
 
                 # Early exit if both found
-                ambiguous_same_candle = False
                 if tp_hit_idx is not None and sl_hit_idx is not None:
                     if tp_hit_idx < sl_hit_idx:
                         tp_first = True
@@ -1059,29 +1058,30 @@ class RedisStateStore:
                     else:
                         tp_first = False
                         ambiguous_same_candle = True
+                    break
                 elif tp_hit_idx is not None:
                     tp_first = True   # Only TP hit
                 elif sl_hit_idx is not None:
                     tp_first = False  # Only SL hit
         # else: neither hit → tp_first stays None
 
-     # ── OUTCOME REASON: human-readable label mirroring tp_first/mfe_win/
-     # mae_loss, kept for archive_reader.py and any reporting that wants
-     # a single descriptive field instead of the boolean trio ──
-     if ambiguous_same_candle:
-         outcome_reason = "ambiguous_same_candle"
-     elif tp_first is True:
-         outcome_reason = "target_hit"
-     elif tp_first is False:
-         outcome_reason = "stop_hit"
-     elif mfe_win and mae_loss:
-         outcome_reason = "both_hit"
-     elif mfe_win:
-         outcome_reason = "target_hit_ever"
-     elif mae_loss:
-         outcome_reason = "stop_hit_ever"
-     else:
-         outcome_reason = "no_hit"
+        # ── OUTCOME REASON: human-readable label mirroring tp_first/mfe_win/
+        # mae_loss, kept for archive_reader.py and any reporting that wants
+        # a single descriptive field instead of the boolean trio ──
+        if ambiguous_same_candle:
+            outcome_reason = "ambiguous_same_candle"
+        elif tp_first is True:
+            outcome_reason = "target_hit"
+        elif tp_first is False:
+            outcome_reason = "stop_hit"
+        elif mfe_win and mae_loss:
+            outcome_reason = "both_hit"
+        elif mfe_win:
+            outcome_reason = "target_hit_ever"
+        elif mae_loss:
+            outcome_reason = "stop_hit_ever"
+        else:
+            outcome_reason = "no_hit"
 
         # ── PRIMARY WIN: configurable ──
         primary_metric = getattr(cfg, "OUTCOME_PRIMARY_METRIC", "mfe")
@@ -1123,6 +1123,7 @@ class RedisStateStore:
             net_pnl_pct = pct_move - realized_cost
         else:
             net_pnl_pct = -pct_move - realized_cost
+
         return {
             "alert_key": key.split(":")[-2],
             "direction": direction,
@@ -1153,7 +1154,7 @@ class RedisStateStore:
             "fees_paid_pct": data.get("fees_paid_pct"),
             "net_pnl_pct": round(net_pnl_pct, 6),
             "realized_cost_pct": round(realized_cost, 6),
-        }, ""
+        }, "" 
 
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
                                          logger_pair: logging.Logger) -> None:
