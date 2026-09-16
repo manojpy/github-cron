@@ -125,10 +125,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         if isinstance(gr, tuple):
             return gr
 
-     reversal_eligible = (
+    reversal_eligible = (
          (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_BOS_ALERT)
          and (gr.buy_trend_common_relaxed or gr.sell_trend_common_relaxed)
-     )
+    )
     gate_passed = gr.buy_common or gr.sell_common or reversal_eligible
     buy_side = gr.buy_common or gr.buy_trend_common or gr.buy_trend_common_relaxed
 
