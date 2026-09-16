@@ -69,7 +69,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
         else:
             verdict = f"⚠️ You're LOSING at {wr:.0%} (target {target:.0%})."
         dir_note = ""
-        if None not in (buy_wr, sell_wr) and buy_n >= 5 and sell_n >= 5:
+        if buy_wr is not None and sell_wr is not None and buy_n >= 5 and sell_n >= 5:
             if sell_wr < buy_wr - 0.15:
                 dir_note = f"Your SELL alerts win only {sell_wr:.0%} vs BUY {buy_wr:.0%} — the sell side is dragging you down."
             elif buy_wr < sell_wr - 0.15:
@@ -231,7 +231,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     except Exception:
         pass
 
-    # ── BEST / WORST CONDITIONS ──────────────────������────���─���──────────────
+    # ── BEST / WORST CONDITIONS ────────────────────────────────────
     try:
         pair_stats = engine.per_pair_breakdown(rows, min_sample=5)  # worst-first
         if len(pair_stats) >= 2:
@@ -950,7 +950,7 @@ class BrainEngineV2(BaseBrainEngine):
                 _top = (top_positive + top_negative)[:1]
                 _top_rec = _top[0] if _top else None
 
-                _rec = {
+                _rec: Dict[str, Any] = {
                     "type": "permutation_importance", "severity": "low",
                     "message": f"🤖 Permutation importance — {'; '.join(parts)}",
                 }
@@ -974,10 +974,10 @@ class BrainEngineV2(BaseBrainEngine):
             keep_mask = engine.benjamini_hochberg(p_vals, alpha=0.10)
             n_survived = sum(keep_mask)
             n_tested = len(p_vals)
-            for flag, idx in zip(keep_mask, p_val_indices):
-                recommendations[idx]["fdr_passed"] = bool(flag)
-            for flag, idx in zip(keep_mask, p_val_indices):
-                if not flag and recommendations[idx]["severity"] in ("high", "medium"):
+            for fdr_flag, idx in zip(keep_mask, p_val_indices):
+                recommendations[idx]["fdr_passed"] = bool(fdr_flag)
+            for fdr_flag, idx in zip(keep_mask, p_val_indices):
+                if not fdr_flag and recommendations[idx]["severity"] in ("high", "medium"):
                     recommendations[idx]["severity"] = "low"
                     recommendations[idx]["message"] = (
                         f"{recommendations[idx]['message']}\n"
@@ -1003,13 +1003,14 @@ class BrainEngineV2(BaseBrainEngine):
             )
             if rec.get("_repair_id"):
                 cat = rec.get("category") or rec.get("type")
-                stats = (self._repair_success_rates or {}).get(cat, {})
-                if stats.get("n", 0) >= 8:
-                    rec["_empirical_help_rate"] = round(stats["help_rate"], 3)
+                if cat:
+                    stats = (self._repair_success_rates or {}).get(cat, {})
+                    if stats.get("n", 0) >= 8:
+                        rec["_empirical_help_rate"] = round(stats["help_rate"], 3)
 
         severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
         recommendations.sort(key=lambda x: (
-            severity_order.get(x.get("severity"), 4),
+            severity_order.get(x.get("severity", ""), 4),
             -x.get("actionability_score", 0),
         ))
         # ── Config version hash ──────────────────────────────────────────

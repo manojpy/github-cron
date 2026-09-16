@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from alerts import escape_markdown_v2
 from bot_config import cfg, json_dumps, format_ist_time, CONFLUENCE_WEIGHTS
-from state import RedisKeyPrefix, RedisStateStore
+from state import RedisKeyPrefix, RedisStateStore, _rc
 import threshold_engine as engine
 
 from threshold_engine import CUSUMDetector, StabilityGate
@@ -89,7 +89,7 @@ def _hget_int(data: dict, key: str, default: int = 0) -> int:
 
 def _to_opt_float(f: Dict[str, str], key: str) -> Optional[float]:
     raw = f.get(key)
-    if raw in (None, ""):
+    if raw is None or raw == "":
         return None
     try:
         return float(raw)
@@ -130,7 +130,8 @@ def _extract_p_value_for_fdr(
         n = rec.get("n")
         pred = rec.get("predicted")
         obs = rec.get("observed")
-        if all(isinstance(v, (int, float)) for v in (n, pred, obs)) and n > 0:
+        if (isinstance(n, (int, float)) and isinstance(pred, (int, float)) and isinstance(obs, (int, float))
+                and n > 0):
             wins_obs = int(round(obs * n))
             return engine.one_proportion_p_value(wins_obs, int(n), float(pred))
         return None
@@ -226,8 +227,6 @@ class BrainEngine:
         self._calib_cache: Optional[Dict[str, Any]] = None
         self._calib_cache_ts = 0.0
 
-    # ── Rewardable override ─────────────────────────────────────────────────
-
     async def check_rewardable_override(
         self,
         alert_key: str,
@@ -251,7 +250,7 @@ class BrainEngine:
         hiconf_key = f"{RedisKeyPrefix.SHADOW_HICONF_STATS}{alert_key}"
         try:
             data = await self.sdb._safe_redis_op(
-                lambda: self.sdb._redis.hgetall(hiconf_key), 2.0, f"brain_hiconf:{alert_key}",
+                lambda: _rc(self.sdb._redis).hgetall(hiconf_key), 2.0, f"brain_hiconf:{alert_key}",
             )
         except Exception:
             return None
@@ -272,7 +271,7 @@ class BrainEngine:
         cooldown_key = f"{_OVERRIDE_COOLDOWN_PREFIX}{alert_key}"
         try:
             acquired = await self.sdb._safe_redis_op(
-                lambda: self.sdb._redis.set(cooldown_key, "1", nx=True, ex=cooldown_seconds),
+                lambda: _rc(self.sdb._redis).set(cooldown_key, "1", nx=True, ex=cooldown_seconds),
                 2.0, f"brain_override_cooldown:{alert_key}",
             )
         except Exception:
@@ -288,8 +287,11 @@ class BrainEngine:
         if self.sdb.degraded or not self.sdb._redis:
             return
         try:
-            await self.sdb._safe_redis_op(
-                lambda: self.sdb._redis.set(
+            await self.sdb._safe_redis_op(           
+                lambda: _rc(self.sdb._redis).set(
+                   CALIBRATION_CURVES_KEY, json_dumps(calib),
+                   ex=int(getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30) * 86400),
+                ),
                     CALIBRATION_CURVES_KEY, json_dumps(calib),
                     ex=int(getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30) * 86400),
                 ),
@@ -304,7 +306,7 @@ class BrainEngine:
             if self.sdb.degraded or not self.sdb._redis:
                 return None
             raw = await self.sdb._safe_redis_op(
-                lambda: self.sdb._redis.get(CALIBRATION_CURVES_KEY),
+                lambda: _rc(self.sdb._redis).get(CALIBRATION_CURVES_KEY),
                 2.0, "calibration_load",
             )
             if not raw:
@@ -345,7 +347,7 @@ class BrainEngine:
             return False
         try:
             return bool(await self.sdb._safe_redis_op(
-                lambda: self.sdb._redis.exists(KILL_SWITCH_KEY),
+                lambda: _rc(self.sdb._redis).exists(KILL_SWITCH_KEY),
                 2.0, "kill_switch_poll",
             ))
         except Exception:
@@ -357,7 +359,7 @@ class BrainEngine:
             return False
         try:
             await self.sdb._safe_redis_op(
-                lambda: self.sdb._redis.delete(KILL_SWITCH_KEY),
+                lambda: _rc(self.sdb._redis).delete(KILL_SWITCH_KEY),
                 2.0, "kill_switch_clear",
             )
             return True
@@ -372,7 +374,7 @@ class BrainEngine:
             return []
         try:
             entries = await self.sdb._safe_redis_op(
-                lambda: self.sdb._redis.xrevrange(stream_key, count=count),
+                lambda: _rc(self.sdb._redis).xrevrange(stream_key, count=count),
                 5.0, f"brain_read:{stream_key}",
             )
         except Exception as e:
@@ -619,6 +621,7 @@ class BrainEngine:
                 wr, n_eff, lo, hi = engine.weighted_win_rate_with_bonus(
                     s["rows"], decay_days=recency_decay_days
                 )
+                assert wr is not None
                 sample_label = (
                     f"{total} samples (n_eff={n_eff:.0f} "
                     f"recency+bonus-weighted, {recency_decay_days:.0f}d decay)"
@@ -1059,9 +1062,8 @@ class BrainEngine:
                     f"(raw: {total_wins/len(real_rows):.1%})"
                 ),
             })
-
         if rec.get("overlapping_toxic"):
-            worst = max(rec["overlapping_toxic"], key=lambda t: t[1])
+            worst = max(rec["overlapping_toxic"], key=lambda t: t[1])  # type: ignore[arg-type]
             recommendations.append({
                 "type": "toxic_zone_note", "severity": "low",
                 "message": (
@@ -1284,8 +1286,8 @@ class BrainEngine:
             if ks_state["tripped"]:
                 ttl = int(getattr(cfg, "KILL_SWITCH_COOLDOWN_HOURS", 12) * 3600)
                 if self.sdb._redis and not self.sdb.degraded:
-                    await self.sdb._safe_redis_op(
-                        lambda: self.sdb._redis.set(KILL_SWITCH_KEY, json_dumps(ks_state), ex=ttl),
+                    await self.sdb._safe_redis_op(                   
+                        lambda: _rc(self.sdb._redis).set(KILL_SWITCH_KEY, json_dumps(ks_state), ex=ttl),
                         2.0, "kill_switch_set",
                     )
                 recommendations.append({
@@ -1367,8 +1369,8 @@ class BrainEngine:
             )
             return None
         try:
-            result = await self.sdb._safe_redis_op(
-                lambda: self.sdb._redis.incr(RedisKeyPrefix.BRAIN_RUN_COUNTER),
+            result = await self.sdb._safe_redis_op(             
+                lambda: _rc(self.sdb._redis).incr(RedisKeyPrefix.BRAIN_RUN_COUNTER),
                 2.0, "brain_run_counter",
             )
 
@@ -1391,7 +1393,7 @@ class BrainEngine:
             return
         try:
             await self.sdb._safe_redis_op(
-                lambda: self.sdb._redis.decrby(RedisKeyPrefix.BRAIN_RUN_COUNTER, 1),
+                lambda: _rc(self.sdb._redis).decrby(RedisKeyPrefix.BRAIN_RUN_COUNTER, 1),
                 2.0, "brain_run_counter_rollback",
             )
         except Exception:
@@ -1734,7 +1736,7 @@ class BrainEngine:
         report_key = f"brain_report:{int(time.time())}"
         if self.sdb._redis and not self.sdb.degraded:
             await self.sdb._safe_redis_op(
-                lambda: self.sdb._redis.set(report_key, json_dumps(recs), ex=30 * 86400),
+                lambda: _rc(self.sdb._redis).set(report_key, json_dumps(recs), ex=30 * 86400),
                 2.0, f"brain_report_persist:{report_key}",
             )
 

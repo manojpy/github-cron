@@ -7,8 +7,7 @@ import asyncio
 import logging
 from enum import StrEnum
 from dataclasses import dataclass, field
-from typing import Dict, Any, Optional, Tuple, List, Set, Callable, Union, Awaitable
-
+from typing import Dict, Any, Optional, Tuple, List, Set, Callable, Union, Awaitable, cast
 import numpy as np
 
 @dataclass
@@ -36,7 +35,8 @@ from fetcher import (
     CandleSnapshot, cross_check_15m_against_5m,
     confirm_candle_unchanged, verify_mark_price_agrees, detect_reversal_candle_pattern,
 )
-from state import RedisStateStore, TokenBucket
+from state import RedisStateStore, TokenBucket, _rc
+
 from gates import GateResult, IndicatorCache
 import threshold_engine as engine
 
@@ -368,7 +368,7 @@ class AlertRule:
     key: str
     title: str
     check_fn: Callable[[Any, Any, Any, Any], bool]
-    extra_fn: Callable[[Any, Any, Any, Any, Dict[str, Any]], str]
+    extra_fn: Callable[[Any, Any, Any, Any, Optional[Dict[str, Any]]], str]
     requires: List[str]
 
     def __post_init__(self) -> None:
@@ -503,6 +503,7 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
         cu_c, cu_pr = context.get(cu), context.get(cu_p)
         cl_c, cl_pr = context.get(cl), context.get(cl_p)
         if all(v is not None and not np.isnan(v) for v in (cu_c, cu_pr, cl_c, cl_pr)):
+            assert cu_c is not None and cu_pr is not None and cl_c is not None and cl_pr is not None
             _add(up_k, down_k, context["close_curr"], context["close_prev"], cu_c, cu_pr, cl_c, cl_pr)
         else:
             for k in (up_k, down_k):
@@ -553,7 +554,7 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
-    # ─�� CHoCH liquidity-sweep reversal ──
+    # ─ CHoCH liquidity-sweep reversal ──
     for k, ok_key in ((AlertKey.CHOCH_BUY, "choch_buy"), (AlertKey.CHOCH_SELL, "choch_sell")):
         rk = ALERT_KEYS.get(k)
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
@@ -617,8 +618,8 @@ ALERT_DEFINITIONS_MAP = {d.key: d for d in ALERT_DEFINITIONS}
 ALERT_KEYS: Dict[str, str] = {
     d.key: f"ALERT:{d.key.upper()}" for d in ALERT_DEFINITIONS
 }
-
-AlertKey = StrEnum("AlertKey", {k.upper(): k for k in ALERT_KEYS})
+_AlertKeyRaw = StrEnum("AlertKey", {k.upper(): k for k in ALERT_KEYS})  # type: ignore[misc]
+AlertKey = cast(Any, _AlertKeyRaw) 
 
 logger.debug("Alert keys initialized: %s mappings", len(ALERT_KEYS))
 
@@ -831,7 +832,7 @@ validate_alert_definitions()
 
 async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[Dict[str, np.ndarray]],
     reference_time: int, sdb: RedisStateStore, correlation_id: str, logger_pair: logging.Logger
-) -> Union[Tuple[Dict[str, Any], Dict[str, bool], List[Tuple[str, str, str]]], Tuple[str, Dict[str, Any]], None]:
+) -> Union[Tuple[Dict[str, Any], Dict[str, bool], List[Tuple[str, str, str]]], Tuple[str, Dict[str, Any]], Tuple[str, Dict[str, Any], None], None]:
     pair_name = gr.pair_name
     i15 = gr.i15
     
@@ -913,8 +914,10 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
         ppo_signal = indicators.ppo_signal
         smooth_rsi = indicators.smooth_rsi
         smooth_rsi_ema = indicators.smooth_rsi_ema
+        assert ppo is not None and ppo_signal is not None and smooth_rsi is not None and smooth_rsi_ema is not None
         vwap = indicators.vwap
         hist_rma = indicators.hist_rma
+        assert hist_rma is not None
         piv = indicators.pivots or {}
 
         ppo_sig_curr = ppo_signal[i15]
@@ -1204,7 +1207,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
         raw_alerts: List[Tuple[str, str, str]] = []
 
         # ── Registry for cross-based alerts (same pattern as _build_resets) ──
-        _CROSS_HANDLERS = {
+        _CROSS_HANDLERS: Dict[str, Dict[str, Any]] = {
             "vwap": {
                 "keys": {"vwap_up", "vwap_down"},
                 "enabled": vwap_available,
@@ -1413,7 +1416,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     cluster_context: Optional[ClusterContext] = None,
     bias_context: Optional[BiasContext] = None,
     batch_mode: bool = False,
-) -> Tuple[str, Dict[str, Any], Optional[AlertPayload]]:
+) -> Optional[Tuple[str, Dict[str, Any], Optional[AlertPayload]]]:
 
     def _confluence_for(alert_key: str) -> Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]:
         if alert_key in BUY_ALERT_KEYS:
@@ -1427,7 +1430,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     if cfg.ENABLE_KILL_SWITCH and sdb and not sdb.degraded and sdb._redis:
         try:
             if await sdb._safe_redis_op(
-                lambda: sdb._redis.exists("brain:kill_switch_active"),
+                lambda: _rc(sdb._redis).exists("brain:kill_switch_active"),
                 2.0, "kill_switch_poll",
             ):
                 logger_pair.warning(f"[{pair_name}] Kill switch active — dispatch blocked")
@@ -1443,7 +1446,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     if cfg.ENABLE_PORTFOLIO_HEAT_GATE and sdb and not sdb.degraded and sdb._redis:
         try:
             raw = await sdb._safe_redis_op(
-                lambda: sdb._redis.get("open_positions"),
+                lambda: _rc(sdb._redis).get("open_positions"),
                 2.0, "open_positions_get",
             )
             open_positions = json_loads(raw) if raw else []
@@ -1733,8 +1736,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
                     if (alerts_to_send and cfg.ENABLE_CALIBRATION_GATE
                             and confluence_total and confluence_total > 0):
-                        from brain import BrainEngine
-                        _brain = BrainEngine(sdb)
+                        from brain import BrainEngine as _CalibrationBrainEngine
+                        _brain = _CalibrationBrainEngine(sdb)
                         survivors = []
                         for alert_title, alert_extra, alert_key in alerts_to_send:
                             conf_pct = (confluence_score or 0.0) / confluence_total * 100.0
@@ -1894,8 +1897,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
             # Strip the datetime line so the run-level dispatcher can add one shared footer
             msg_body, _, _ = msg.rpartition("\n")
-
             if not cfg.DRY_RUN_MODE:
+                assert cached_snapshot is not None
                 reconfirmed = await confirm_candle_unchanged(
                     fetcher, symbol, pair_name, ts_curr, cached_snapshot, reference_time, logger_pair
                 )

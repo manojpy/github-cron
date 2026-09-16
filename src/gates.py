@@ -111,11 +111,11 @@ class GateResult:
     ppo_gate_arr: np.ndarray; ppo_gate_signal_arr: np.ndarray
     ppo_gate_curr: float; ppo_gate_prev: float
     ppo_gate_sig_curr: float; ppo_gate_sig_prev: float
-    ppo_gate_ok_buy: bool; ppo_gate_ok_sell: bool
+    ppo_gate_ok_buy: Optional[bool]; ppo_gate_ok_sell: Optional[bool]
     rsi_guard_smooth_curr: float; rsi_guard_ema_curr: float
-    rsi_guard_ok_buy: bool; rsi_guard_ok_sell: bool
+    rsi_guard_ok_buy: Optional[bool]; rsi_guard_ok_sell: Optional[bool]
     rma_cloud_fast_curr: float
-    rma_cloud_ok_buy: bool; rma_cloud_ok_sell: bool
+    rma_cloud_ok_buy: Optional[bool]; rma_cloud_ok_sell: Optional[bool]
 
     # -- trend gate combination --
     trend_gate_ok_buy: bool; trend_gate_ok_sell: bool
@@ -409,6 +409,7 @@ async def _eval_gate(
             logger_pair.debug(
                 f"[{pair_name}] Shape-rejected candle kept for strong-reversal check: {error_msg}"
             )
+        assert candle_info is not None
         o = candle_info["open"]
         h = candle_info["high"]
         l = candle_info["low"]
@@ -495,9 +496,9 @@ async def _eval_gate(
                 f"Close={data_5m.close[i5]:.2f}"
             )
 
-        # ════════════════════════════════════════�������═══════════������═
+        # ═══════════════════════════════════════════════════
         # PHASE 1 — Gate indicators only (cheap)
-        # ═══════════════════════════════════════���═══���══════
+        # ════════════════════════════════════════════════
         gate_indicators = await asyncio.to_thread(
             calculate_gate_indicators_numpy, data_15m.as_dict(), data_5m.as_dict(), data_daily, reference_time
         )
@@ -525,8 +526,8 @@ async def _eval_gate(
         rma_cloud_fast_arr = gate_indicators["rma_cloud_fast_15"]
         dynamic_flow_trend_arr = gate_indicators["dynamic_flow_trend_15"]
         dynamic_flow_line_arr = gate_indicators["dynamic_flow_line_15"]
-        cpr_ok = gate_indicators.get('cpr_ok', not cfg.ENABLE_CPR)
-        nr_cpr = gate_indicators.get('nr_cpr', float('nan'))
+        cpr_ok = bool(gate_indicators.get('cpr_ok', not cfg.ENABLE_CPR))
+        nr_cpr = float(gate_indicators.get('nr_cpr', float('nan')))
         prev_day_close = gate_indicators.get('prev_day_close', float('nan'))
 
         future_green = ichimoku_future_green[i15]

@@ -3,16 +3,30 @@ import time
 import asyncio
 import logging
 import uuid
-from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, TYPE_CHECKING, Set
+from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, TYPE_CHECKING, Set, Sequence
 import numpy as np
-import redis.asyncio as redis
-from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
+import redis.asyncio as redis  # type: ignore[import-untyped]
+from redis.exceptions import ConnectionError as RedisConnectionError, RedisError  # type: ignore[import-untyped]
+
 
 from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError, CONFIG_OVERRIDE_ALLOWED_FIELDS, CONFIG_OVERRIDE_METADATA_KEY, BRAIN_DISABLED_KEYS_METADATA_KEY, PAIR_THRESHOLDS_METADATA_KEY, _get_session_from_ts
 from fetcher import compute_backoff
 
 if TYPE_CHECKING:
     from fetcher import PriceData
+
+
+def _rc(client: "Optional[redis.Redis]") -> "redis.Redis":
+    """Narrow an Optional Redis client for mypy at call sites that are
+    already guarded by an `if not self._redis: return ...` / `if not
+    sdb._redis: return ...` check one scope removed (inside a lambda
+    passed to `_safe_redis_op`, a nested function, or right after a
+    helper call whose truthy return implies the client is connected).
+    No behavior change — the assert only documents an invariant these
+    call sites already guarantee at runtime; it should never fire.
+    """
+    assert client is not None
+    return client
 
 async def _blanket_reset_pair(sdb: RedisStateStore, pair_name: str, logger_pair: logging.Logger) -> int:
     from alerts import ALERT_KEYS
@@ -29,7 +43,6 @@ async def _blanket_reset_pair(sdb: RedisStateStore, pair_name: str, logger_pair:
             f"[{pair_name}] Blanket reset: {len(resets)} active state(s) cleared"
         )
     return len(resets)
-
 
 async def _clear_all_redis_states(
     sdb: RedisStateStore,
@@ -79,7 +92,7 @@ async def _clear_all_redis_states(
             batch = keys[i:i + batch_size]
             try:
                 # unlink() frees memory in a background thread on the Redis server
-                total_deleted += await sdb._redis.unlink(*batch)
+                total_deleted += await _rc(sdb._redis).unlink(*batch)
             except Exception as e:
                 logger.error(f"Batch unlink failed for {len(batch)} keys: {e}")
         return total_deleted
@@ -360,7 +373,7 @@ class RedisStateStore:
 
         for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
             if await self._attempt_connect(timeout):
-                max_conn = getattr(self._redis.connection_pool, "max_connections", "?")
+                max_conn = getattr(_rc(self._redis).connection_pool, "max_connections", "?")
                 logger.info(f"✅ Redis connected ({max_conn} max)")
                 self.degraded = False
                 self.degraded_alerted = False
@@ -417,7 +430,8 @@ class RedisStateStore:
                 cls._pool_reuse_count.pop(url, None)
             
     async def _ping_with_retry(self, timeout: float) -> bool:
-        result = await self._safe_redis_op(lambda: self._redis.ping(), timeout, "ping")
+        result = await self._safe_redis_op(lambda: _rc(self._redis).ping(), timeout, "ping")
+
         return bool(result)
 
     async def _safe_redis_op(self, fn: Callable[[], Any], timeout: float, op_name: str, parser: Optional[Callable[[Any], Any]] = None):
@@ -436,7 +450,7 @@ class RedisStateStore:
 
     async def get(self, key: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
         return await self._safe_redis_op(
-            lambda: self._redis.get(f"{self.state_prefix}{key}"),
+            lambda: _rc(self._redis).get(f"{self.state_prefix}{key}"),
             timeout,
             f"get {key}",
             parser=lambda r: json_loads(r) if r else None,
@@ -447,7 +461,7 @@ class RedisStateStore:
         redis_key = f"{self.state_prefix}{key}"
         data = json_dumps({"state": state, "ts": ts})
         await self._safe_redis_op(
-            lambda: self._redis.set(
+            lambda: _rc(self._redis).set(
                 redis_key,
                 data,
                 ex=self.expiry_seconds if self.expiry_seconds > 0 else None,
@@ -458,7 +472,7 @@ class RedisStateStore:
 
     async def get_metadata(self, key: str, timeout: float = 2.0) -> Optional[str]:
         return await self._safe_redis_op(
-            lambda: self._redis.get(f"{self.meta_prefix}{key}"),
+            lambda: _rc(self._redis).get(f"{self.meta_prefix}{key}"),
             timeout,
             f"get_metadata {key}",
             parser=lambda r: r if r else None,
@@ -466,7 +480,7 @@ class RedisStateStore:
     async def set_metadata(self, key: str, value: str, timeout: float = 2.0,
                              ttl: Optional[int] = None) -> None:
         await self._safe_redis_op(
-            lambda: self._redis.set(
+            lambda: _rc(self._redis).set(
                 f"{self.meta_prefix}{key}",
                 value,
                 ex=ttl if ttl is not None else self.metadata_expiry_seconds
@@ -671,7 +685,7 @@ class RedisStateStore:
             return None
         key = f"{RedisKeyPrefix.LAST_PROCESSED_CANDLE}{pair_name}"
         raw = await self._safe_redis_op(
-            lambda: self._redis.get(key),
+            lambda: _rc(self._redis).get(key),
             2.0,
             f"last_processed_candle_get:{pair_name}",
         )
@@ -689,7 +703,7 @@ class RedisStateStore:
         key = f"{RedisKeyPrefix.LAST_PROCESSED_CANDLE}{pair_name}"
         try:
             await self._safe_redis_op(
-                lambda: self._redis.set(key, str(ts), ex=self.expiry_seconds),
+                lambda: _rc(self._redis).set(key, str(ts), ex=self.expiry_seconds),
                 2.0,
                 f"last_processed_candle_set:{pair_name}",
             )
@@ -755,7 +769,7 @@ class RedisStateStore:
             return
         recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
         try:
-            await asyncio.wait_for(self._redis.delete(recent_key), timeout=1.0)
+            await asyncio.wait_for(_rc(self._redis).delete(recent_key), timeout=1.0)
         except Exception as e:
             logger.warning(f"Failed to release dedup claim for {pair}:{alert_key}: {e}")
 
@@ -802,21 +816,19 @@ class RedisStateStore:
                 f"Failed to serialize pending outcome for {pair}:{alert_key}: {e}"
             )
             return
-
         ttl = max(
             (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60,
             24 * 3600,
         )
         try:
             await asyncio.wait_for(
-                self._redis.set(key, payload, ex=ttl),
+                _rc(self._redis).set(key, payload, ex=ttl),
                 timeout=2.0,
             )
         except Exception as e:
             logger.warning(
                 f"Failed to record pending outcome for {pair}:{alert_key}: {e}"
-            )
-
+            ) 
         if confluence_votes is not None:
             await self.record_vote_count(alert_key, confluence_votes)
 
@@ -861,14 +873,13 @@ class RedisStateStore:
 
         try:
             await asyncio.wait_for(
-                self._redis.set(key, payload, ex=ttl),
+                _rc(self._redis).set(key, payload, ex=ttl),
                 timeout=2.0,
             )
         except Exception as e:
             logger.warning(
                 f"Failed to record shadow pending outcome for {pair}:{alert_key}: {e}"
             )
-
     # ── Vote-count history (OOD gate) ────────────────────────────────────────
 
     async def record_vote_count(self, alert_key: str, votes: Dict[str, bool]) -> None:
@@ -899,7 +910,7 @@ class RedisStateStore:
 
         try:
             raw_list = await self._safe_redis_op(
-                lambda: self._redis.lrange(
+                lambda: _rc(self._redis).lrange(
                     key,
                     0,
                     self.VOTE_COUNT_HISTORY_MAX - 1,
@@ -923,7 +934,7 @@ class RedisStateStore:
             return precomputed.get(pair, [])
         try:
             pattern = f"{key_prefix}{pair}:*"
-            return [k async for k in self._redis.scan_iter(match=pattern, count=100)]
+            return [k async for k in _rc(self._redis).scan_iter(match=pattern, count=100)]
         except Exception as e:
             logger_pair.debug(f"Failed to scan {label} outcomes for {pair}: {e}")
             return []
@@ -1122,7 +1133,6 @@ class RedisStateStore:
         )
         if not keys:
             return
-
         try:
             async with self._redis.pipeline() as read_pipe:
                 for key in keys:
@@ -1169,6 +1179,8 @@ class RedisStateStore:
                             continue
                         if skip_reason == "not_ready":
                             not_ready_count += 1
+                            continue
+                        if result is None:
                             continue
 
                         alert_key = result["alert_key"]
@@ -1365,6 +1377,8 @@ class RedisStateStore:
                         )
                         if skip_reason:
                             continue
+                        if result is None:
+                            continue
 
                         alert_key = result["alert_key"]
                         direction = result["direction"]
@@ -1501,7 +1515,7 @@ class RedisStateStore:
             return None, 0
         stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
         try:
-            data = await asyncio.wait_for(self._redis.hgetall(stats_key), timeout=2.0)
+            data = await asyncio.wait_for(_rc(self._redis).hgetall(stats_key), timeout=2.0)
             wins = int(data.get("wins", 0))
             losses = int(data.get("losses", 0))
             total = wins + losses
@@ -1519,7 +1533,7 @@ class RedisStateStore:
             return None, 0
         stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}:{session}"
         try:
-            data = await asyncio.wait_for(self._redis.hgetall(stats_key), timeout=2.0)
+            data = await asyncio.wait_for(_rc(self._redis).hgetall(stats_key), timeout=2.0)
             wins = int(data.get("wins", 0))
             losses = int(data.get("losses", 0))
             total = wins + losses
@@ -1534,7 +1548,7 @@ class RedisStateStore:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not alert_keys:
             return {k: (None, 0) for k in alert_keys}
         try:
-            async with self._redis.pipeline() as pipe:
+            async with _rc(self._redis).pipeline() as pipe:
                 for ak in alert_keys:
                     pipe.hgetall(f"{RedisKeyPrefix.ALERT_STATS}{pair}:{ak}")
                 raw_results = await asyncio.wait_for(pipe.execute(), timeout=timeout)
@@ -1593,7 +1607,7 @@ class RedisStateStore:
             await self._record_redis_failure(f"batch_get_all_alert_states({pair})", e)
             return {k: False for k in alert_keys}
 
-    async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
+    async def atomic_batch_update(self, updates: Sequence[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
         if self.degraded or not self._redis:
             return False
 
@@ -1668,7 +1682,7 @@ class RedisStateStore:
             return None
         key = f"{RedisKeyPrefix.CUSUM_STATE}{alert_key}"
         raw = await self._safe_redis_op(
-            lambda: self._redis.get(key), 2.0, f"cusum_load:{alert_key}",
+            lambda: _rc(self._redis).get(key), 2.0, f"cusum_load:{alert_key}",
         )
         if raw is None:
             return None
@@ -1683,7 +1697,7 @@ class RedisStateStore:
         key = f"{RedisKeyPrefix.CUSUM_STATE}{alert_key}"
         try:
             await self._safe_redis_op(
-                lambda: self._redis.set(key, json_dumps(state), ex=30 * 86400),
+                lambda: _rc(self._redis).set(key, json_dumps(state), ex=30 * 86400),
                 2.0, f"cusum_save:{alert_key}",
             )
         except Exception:
@@ -1697,7 +1711,7 @@ class RedisStateStore:
         key = f"{RedisKeyPrefix.CUSUM_WATERMARK}{alert_key}"
         try:
             raw = await self._safe_redis_op(
-                lambda: self._redis.get(key), 2.0, f"cusum_watermark_load:{alert_key}",
+                lambda: _rc(self._redis).get(key), 2.0, f"cusum_watermark_load:{alert_key}",
             )
             return int(raw) if raw else 0
         except Exception:
@@ -1709,7 +1723,7 @@ class RedisStateStore:
         key = f"{RedisKeyPrefix.CUSUM_WATERMARK}{alert_key}"
         try:
             await self._safe_redis_op(
-                lambda: self._redis.set(key, str(entry_ts), ex=30 * 86400),
+                lambda: _rc(self._redis).set(key, str(entry_ts), ex=30 * 86400),
                 2.0, f"cusum_watermark_save:{alert_key}",
             )
         except Exception:
@@ -1724,7 +1738,7 @@ class RedisStateStore:
         key = f"{RedisKeyPrefix.THRESHOLD_HISTORY}{key_suffix}"
         try:
             raw_list = await self._safe_redis_op(
-                lambda: self._redis.lrange(key, 0, 9),
+                lambda: _rc(self._redis).lrange(key, 0, 9),
                 2.0, f"threshold_history_load:{key_suffix or 'global'}",
             )
             if not raw_list:
