@@ -472,6 +472,8 @@ class BrainEngine:
                     "signal_price": _to_opt_float(f, "signal_price"),
                     "fill_price": _to_opt_float(f, "fill_price"),
                     "fees_paid_pct": _to_opt_float(f, "fees_paid_pct"),
+                    "net_pnl_pct": _to_opt_float(f, "net_pnl_pct"),
+                    "realized_cost_pct": _to_opt_float(f, "realized_cost_pct"),
                 })
             except (KeyError, ValueError) as e:
                 logging.getLogger("macd_bot").debug(f"Brain: dropping malformed outcome row: {e}")
