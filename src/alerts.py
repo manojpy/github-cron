@@ -1415,6 +1415,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     macro_context: Optional[BtcMacroContext] = None,
     cluster_context: Optional[ClusterContext] = None,
     bias_context: Optional[BiasContext] = None,
+    calibration_curves: Optional[Dict[str, Any]] = None,
     batch_mode: bool = False,
 ) -> Optional[Tuple[str, Dict[str, Any], Optional[AlertPayload]]]:
 
@@ -1695,7 +1696,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     brain_engine = BrainEngine(sdb)
                 except Exception as e:
                     logger_pair.debug(f"Brain engine init failed: {e}")
-
+         
             for alert_title, alert_extra, alert_key in alerts_to_send:
                 direction = "buy" if alert_key in BUY_ALERT_KEYS else "sell"
                 win_rate, sample = win_rate_map.get(alert_key, (None, 0))
@@ -1714,67 +1715,79 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 f"{session_win_rate:.0%} in {current_session} session over "
                                 f"{session_sample} samples (need >= {cfg.MIN_WIN_RATE:.0%})"
                             )
-                if failing_rate is not None:
-                    alert_score, alert_total, alert_votes = _confluence_for(alert_key)
 
-                    override_reason = None
-                    if brain_engine:
-                        try:
-                            override_reason = await brain_engine.check_rewardable_override(
-                                alert_key, alert_score, alert_total
+                alert_score, alert_total, alert_votes = _confluence_for(alert_key)
+
+                # ── Calibration gate (independent of the win-rate filter) ──
+                if (cfg.ENABLE_CALIBRATION_GATE
+                        and calibration_curves is not None
+                        and alert_total and alert_total > 0
+                        and alert_score is not None):
+                    curve = calibration_curves.get(alert_key)
+                    if curve is not None:
+                        conf_pct = alert_score / alert_total * 100.0
+                        ok, cal_wr, _reason = engine.calibration_gate_decision(
+                            curve, conf_pct, cfg.MIN_WIN_RATE,
+                            min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
+                            slack=getattr(cfg, "CALIBRATION_SLACK", 0.05),
+                        )
+                        if not ok:
+                            logger_pair.info(
+                                f"[{pair_name}] calibration gate dropped {alert_key}: "
+                                f"calibrated WR {cal_wr:.0%} below floor at conf {conf_pct:.0f}%"
                             )
-                        except Exception as e:
-                            logger_pair.debug(f"Brain override check failed for {alert_key}: {e}")
-                    if override_reason:
-                        logger_pair.info(
-                            f"[{pair_name}] 🧠 Rewardable override for {alert_key}: "
-                            f"WR={failing_rate:.0%} below {cfg.MIN_WIN_RATE:.0%}, but {override_reason}"
-                        )
-                        alert_extra = f"{alert_extra} | 🧠 {override_reason}"
-                        surviving_alerts.append((alert_title, alert_extra, alert_key))
-                        continue
+                            continue
 
-                    if (alerts_to_send and cfg.ENABLE_CALIBRATION_GATE
-                            and confluence_total and confluence_total > 0):
-                        from brain import BrainEngine as _CalibrationBrainEngine
-                        _brain = _CalibrationBrainEngine(sdb)
-                        survivors = []
-                        for alert_title, alert_extra, alert_key in alerts_to_send:
-                            conf_pct = (confluence_score or 0.0) / confluence_total * 100.0
-                            ok, cal_wr = await _brain.check_calibration_gate(alert_key, conf_pct)
-                            if ok:
-                                survivors.append((alert_title, alert_extra, alert_key))
-                            else:
-                                logger_pair.info(
-                                    f"[{pair_name}] calibration gate dropped {alert_key}: "
-                                    f"calibrated WR {cal_wr:.0%} below floor"
-                                )
-                        alerts_to_send = survivors
+                if failing_rate is None:
+                    # Passed both gates — keep it.
+                    surviving_alerts.append((alert_title, alert_extra, alert_key))
+                    continue
 
-                    if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
-                        shadow_context = {
-                            "rsi_curr": context.get("rsi_curr"),
-                            "rsi_adaptive_buy": gr.rsi_adaptive_buy,
-                            "rsi_adaptive_sell": gr.rsi_adaptive_sell,
-                            "ppo_curr": context.get("ppo_curr"),
-                            "ppo_adaptive_threshold": gr.ppo_adaptive_threshold,
-                            "buy_wick_ratio": gr.buy_wick_ratio,
-                            "sell_wick_ratio": gr.sell_wick_ratio,
-                            "adx_val": gr.adx_val,
-                            "config_version": hash_config_state(
-                                CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
-                            ),
-                        }
-                        # ── NEW: also log the rejection reason for counterfactual ──
-                        shadow_context["rejection_reason"] = "win_rate_filter"
-                        shadow_context["failing_wr"] = failing_rate
-                        shadow_context["fail_note"] = fail_note
-                        await sdb.record_shadow_pending_outcome(
-                            pair_name, alert_key, direction, ts_curr, close_curr,
-                            confluence_score=alert_score, confluence_total=alert_total,
-                            confluence_votes=alert_votes,
-                            context=shadow_context,               
+                # ── Alert failed the win-rate filter ──
+                # Check for a rewardable override before dropping.
+                override_reason = None
+                if brain_engine:
+                    try:
+                        override_reason = await brain_engine.check_rewardable_override(
+                            alert_key, alert_score, alert_total
                         )
+                    except Exception as e:
+                        logger_pair.debug(f"Brain override check failed for {alert_key}: {e}")
+
+                if override_reason:
+                    logger_pair.info(
+                        f"[{pair_name}] 🧠 Rewardable override for {alert_key}: "
+                        f"WR={failing_rate:.0%} below {cfg.MIN_WIN_RATE:.0%}, but {override_reason}"
+                    )
+                    alert_extra = f"{alert_extra} | 🧠 {override_reason}"
+                    surviving_alerts.append((alert_title, alert_extra, alert_key))
+                    continue
+
+                # ── Shadow record for the counterfactual dataset ──
+                shadow_context = {
+                    "rsi_curr": context.get("rsi_curr"),
+                    "rsi_adaptive_buy": gr.rsi_adaptive_buy,
+                    "rsi_adaptive_sell": gr.rsi_adaptive_sell,
+                    "ppo_curr": context.get("ppo_curr"),
+                    "ppo_adaptive_threshold": gr.ppo_adaptive_threshold,
+                    "buy_wick_ratio": gr.buy_wick_ratio,
+                    "sell_wick_ratio": gr.sell_wick_ratio,
+                    "adx_val": gr.adx_val,
+                    "config_version": hash_config_state(
+                        CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
+                    ),
+                    "rejection_reason": "win_rate_filter",
+                    "failing_wr": failing_rate,
+                    "fail_note": fail_note,
+                }
+
+                if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
+                    await sdb.record_shadow_pending_outcome(
+                        pair_name, alert_key, direction, ts_curr, close_curr,
+                        confluence_score=alert_score, confluence_total=alert_total,
+                        confluence_votes=alert_votes,
+                        context=shadow_context,
+                    )
                     if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                         from outcome_storage import append_outcome
                         append_outcome({
@@ -1788,13 +1801,14 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             "votes": alert_votes,
                             "context": shadow_context,
                         }, shadow=True)
-                    logger_pair.info(
-                        f"[{pair_name}] Win-rate filter dropped {alert_key}: {fail_note}"
-                    )
-                    continue
-                surviving_alerts.append((alert_title, alert_extra, alert_key))
-            alerts_to_send = surviving_alerts
 
+                logger_pair.info(
+                    f"[{pair_name}] Win-rate filter dropped {alert_key}: {fail_note}"
+                )
+                continue
+
+            alerts_to_send = surviving_alerts
+           
         async def _record_win_rates() -> None:
             """Records this pair's fired alerts for later win-rate scoring. ..."""
             recorded = [ak for _, _, ak in alerts_to_send]
@@ -1826,10 +1840,13 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 macro_mult = None
                 clust_pen = None
                 if macro_shadow is not None:
-                    macro_mult = macro_shadow.get("multiplier")
+                    macro_mult = macro_shadow.get("multiplier") 
                 if cluster_context is not None:
+                    # Per-alert direction, not the batch's. A mixed-direction
+                    # batch must price each side against its own cluster pct.
+                    alert_is_buy = alert_key in BUY_ALERT_KEYS
                     cluster_pct = (
-                        cluster_context.buy_pct if is_buy_batch
+                        cluster_context.buy_pct if alert_is_buy
                         else cluster_context.sell_pct
                     )
                     if cluster_pct > cfg.CLUSTER_PCT_THRESHOLD:

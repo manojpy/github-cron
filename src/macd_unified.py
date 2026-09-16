@@ -32,12 +32,11 @@ from indicators import (
     _normalize_samples, _prune_stale_samples, _oi_funding_gate_reason,
     calculate_ichimoku_numpy,
 )
-# ── state / gates / alerts : trim to direct usage ──
+# ── state / gates / alerts : trim to direct usage ─
 from state import (
     _blanket_reset_pair, _clear_all_redis_states, build_products_map_from_cfg,
-    RedisKeyPrefix, RedisStateStore, RedisLock,
+    RedisKeyPrefix, RedisStateStore, RedisLock, _rc,
 )
-
 from gates import compute_confluence_score, _eval_gate, _resolve_pair_outcomes
 
 import threshold_engine as engine
@@ -96,8 +95,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     macro_context: Optional[BtcMacroContext] = None,
     cluster_context: Optional[ClusterContext] = None,
     bias_context: Optional[BiasContext] = None,
-    gate_cache: Optional[Dict[str, Any]] = None) -> Optional[Tuple[str, Dict[str, Any], Optional[Any]]]:
-                                                     
+    gate_cache: Optional[Dict[str, Any]] = None,
+    calibration_curves: Optional[Dict[str, Any]] = None) -> Optional[Tuple[str, Dict[str, Any], Optional[Any]]]:
+
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     pair_oi = (oi_gate_data or {}).get(pair_name)
     PAIR_ID.set(pair_name)
@@ -228,6 +228,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             macro_context=macro_context,
             cluster_context=cluster_context,
             bias_context=bias_context,
+            calibration_curves=calibration_curves,
             batch_mode=getattr(cfg, "ENABLE_BATCHED_ALERTS", True),
         )
     finally:
@@ -251,7 +252,8 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
                        cluster_context: Optional[ClusterContext] = None,
                        bias_context: Optional[BiasContext] = None,
                        gate_cache: Optional[Dict[str, Any]] = None,
-                       parsed_cache: Optional[Dict[str, Any]] = None):
+                       parsed_cache: Optional[Dict[str, Any]] = None,
+                       calibration_curves: Optional[Dict[str, Any]] = None):
     p_name, symbol, candles = task_data
     try:
         pd_15m, pd_5m, data_daily = (parsed_cache or {}).get(p_name, (None, None, None))
@@ -275,10 +277,10 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
             macro_context=macro_context,
             cluster_context=cluster_context,
             bias_context=bias_context,
-            gate_cache=gate_cache, 
+            gate_cache=gate_cache,
+            calibration_curves=calibration_curves,
         )
         return result
-
     except asyncio.CancelledError:
         logger_main.warning(f"Evaluation cancelled for {p_name}")
         raise
@@ -592,7 +594,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             for k in keys:
                 pair = k[prefix_len:].split(":", 1)[0]
                 shadow_by_pair.setdefault(pair, []).append(k)
-            
+
             state_db._shadow_pending_outcome_keys_by_pair = shadow_by_pair
             total = sum(len(v) for v in shadow_by_pair.values())
             logger_main.info(f"👻 Pre-scanned {total} shadow pending outcome(s) across {len(shadow_by_pair)} pair(s)")
@@ -601,6 +603,34 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             state_db._shadow_pending_outcome_keys_by_pair = None
     else:
         state_db._shadow_pending_outcome_keys_by_pair = None
+
+    # ── Calibration curves: loaded ONCE per run ──
+    # The blob is rewritten only when a brain report fires (every
+    # BRAIN_REPORT_INTERVAL_RUNS), so a per-run snapshot is authoritative
+    # for the whole run. Loading it here eliminates the per-alert Redis
+    # GET + JSON parse that _apply_and_dispatch_alerts used to trigger.
+    calibration_curves: Dict[str, Any] = {}
+    if (cfg.ENABLE_CALIBRATION_GATE and cfg.ENABLE_BRAIN
+            and state_db and not state_db.degraded and state_db._redis):
+        try:
+            from brain import CALIBRATION_CURVES_KEY
+            raw = await state_db._safe_redis_op(
+                lambda: _rc(state_db._redis).get(CALIBRATION_CURVES_KEY),
+                2.0, "calibration_curves_runload",
+            )
+            if raw:
+                payload = json_loads(raw)
+                calibration_curves = payload.get("curves", {}) or {}
+                logger_main.info(
+                    f"🎯 Calibration curves pre-loaded: "
+                    f"{len(calibration_curves)} alert_key(s) "
+                    f"(ECE mean={payload.get('ece_mean')})"
+                )
+            else:
+                logger_main.info("🎯 Calibration curves: none stored yet (gate will fail-open)")
+        except Exception as e:
+            logger_main.warning(f"Calibration curve pre-load failed (fail-open): {e}")
+            calibration_curves = {}
 
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
     prepared_tasks = []
@@ -712,6 +742,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 bias_context=bias_context,
                 gate_cache=gate_cache,
                 parsed_cache=parsed_cache,
+                calibration_curves=calibration_curves,
             )
     results = await asyncio.gather(
         *[_bounded_eval(t) for t in prepared_tasks],

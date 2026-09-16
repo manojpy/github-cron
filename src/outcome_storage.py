@@ -78,7 +78,14 @@ def append_outcome_batch(records: List[Dict[str, Any]], shadow: bool = False) ->
 
 def load_recent_outcomes(days: int = 30, shadow: bool = False,
                           hours: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Read last N days (or N hours) of outcome lines (newest first)."""
+    """Read last N days (or N hours) of RESOLVED outcome lines (newest first).
+
+    Filters out signal-only rows — the pre-resolution records written by
+    alerts.py at dispatch time. Those carry no `win` field, and callers
+    like KillSwitch.evaluate read `row["win"]` directly, so leaking them
+    through raises KeyError. Presence of `win` is the canonical marker of
+    a resolved outcome (matches archive_reader's filter).
+    """
     subdir = "shadow" if shadow else "outcomes"
     rows: List[Dict[str, Any]] = []
     if hours is not None:
@@ -100,13 +107,19 @@ def load_recent_outcomes(days: int = 30, shadow: bool = False,
                     line = line.strip()
                     if not line:
                         continue
-                    row = json.loads(line)
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    # Drop signal-only rows (no resolution yet).
+                    if "win" not in row:
+                        continue
                     if row.get("entry_ts", 0) >= cutoff:
                         rows.append(row)
         except Exception:
             continue
     return rows
-
+ 
 def save_brain_state(state: Dict[str, Any]) -> None:
     path = os.path.join(_OUTCOME_DIR, "brain_state.json")
     with open(path, "w", encoding="utf-8") as f:

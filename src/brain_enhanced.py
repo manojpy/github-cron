@@ -319,6 +319,7 @@ class BrainEngineV2(BaseBrainEngine):
         self._repair_success_rates: Dict[str, Dict[str, float]] = {}
         self._ledger_stats: Dict[str, Any] = {}
         self._repair_help_preds: Dict[str, float] = {}
+        self._rows_cache: Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]] = None
 
     @staticmethod
     def _shadow_weight_check(
@@ -400,10 +401,13 @@ class BrainEngineV2(BaseBrainEngine):
 
     async def _load_rows(self) -> tuple:
         """Shared row loader — reads from archived files if available,
-        otherwise falls back to Redis streams."""
+        otherwise falls back to Redis streams. Memoized per report cycle."""
+        cached = getattr(self, "_rows_cache", None)
+        if cached is not None:
+            return cached
+
         window_days = getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30)
         
-        # Try file archive first (set in config or env)
         data_dir = getattr(cfg, "OUTCOME_DATA_DIR", None) or os.environ.get("OUTCOME_DATA_DIR")
         if data_dir and Path(data_dir).exists():
             real_rows = load_archived_outcomes(data_dir, window_days=window_days, shadow=False)
@@ -414,9 +418,9 @@ class BrainEngineV2(BaseBrainEngine):
                     f"🗄️ Brain using file archive: {len(real_rows)} real, "
                     f"{len(shadow_rows)} shadow rows from {data_dir}"
                 )
+                self._rows_cache = (real_rows, shadow_rows)
                 return real_rows, shadow_rows
-        
-        # Fallback to Redis streams
+
         sample_size = getattr(cfg, "BRAIN_REPORT_STREAM_SAMPLE", 5000)
         real_raw, shadow_raw = await asyncio.gather(
             self._read_stream(RedisKeyPrefix.OUTCOME_LOG_STREAM, sample_size),
@@ -424,6 +428,7 @@ class BrainEngineV2(BaseBrainEngine):
         )
         real_rows = self._parse_rows(real_raw, window_days=window_days)
         shadow_rows = self._parse_rows(shadow_raw, window_days=window_days)
+        self._rows_cache = (real_rows, shadow_rows)
         return real_rows, shadow_rows
 
     async def generate_recommendations(self) -> Dict[str, Any]:
@@ -431,6 +436,9 @@ class BrainEngineV2(BaseBrainEngine):
         now = time.time()
         if self._recs_cache is not None and (now - self._recs_cache_ts) < 120:
             return self._recs_cache
+        # Invalidate the row-level cache so a fresh report re-reads the
+        # archive, but calls within the same report cycle reuse it.
+        self._rows_cache = None
         result = await self._generate_recommendations_full()
         self._recs_cache = result
         self._recs_cache_ts = now
@@ -1136,8 +1144,10 @@ class BrainEngineV2(BaseBrainEngine):
 
     # ── Baseline wrapper that also exposes raw rows ──────────────────────
     async def _generate_baseline_recommendations(self) -> Dict[str, Any]:
-        base = await super().generate_recommendations()
+        # Load rows ONCE, attach them, and hand them to the baseline via the
+        # subclass hook so the parent doesn't read the archive a second time.
         real_rows, shadow_rows = await self._get_rows()
+        base = await super().generate_recommendations()
         base["_real_rows"] = real_rows
         base["_shadow_rows"] = shadow_rows
         return base
@@ -1189,6 +1199,10 @@ class BrainEngineV2(BaseBrainEngine):
 
             # Only store safe config patches
             for patch in recs.get("config_patch", []):
+                # Action gate is authoritative — a patch marked blocked must
+                # not enter the pending plan, regardless of field safelisting.
+                if patch.get("_blocked_by_action_gate"):
+                    continue
                 field = patch.get("path")
                 suggested = patch.get("suggested")
                 if field in CONFIG_OVERRIDE_ALLOWED_FIELDS and suggested is not None:
@@ -1375,8 +1389,16 @@ class BrainEngineV2(BaseBrainEngine):
             
             # Apply config changes
             for patch in plan.get("config_patch", []):
+                # Defense in depth: even if a blocked patch somehow reached
+                # the stored plan (older plan, mid-upgrade race), never apply it.
+                if patch.get("_blocked_by_action_gate"):
+                    logger_run.warning(
+                        f"Skipping blocked patch (action gate): {patch.get('path')}"
+                    )
+                    continue
                 field = patch.get("path")
                 value = patch.get("suggested")
+
                 if field in CONFIG_OVERRIDE_ALLOWED_FIELDS:
                     ok = await self.sdb.write_config_override(field, value)
                     if ok:

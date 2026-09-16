@@ -1154,7 +1154,12 @@ class RedisStateStore:
             "fees_paid_pct": data.get("fees_paid_pct"),
             "net_pnl_pct": round(net_pnl_pct, 6),
             "realized_cost_pct": round(realized_cost, 6),
-        }, "" 
+            "effective_score": data.get("effective_score"),
+            "effective_required": data.get("effective_required"),
+            "macro_multiplier": data.get("macro_multiplier"),
+            "cluster_penalty": data.get("cluster_penalty"),
+            "gate_passed": data.get("gate_passed"),
+        }, ""
 
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
                                          logger_pair: logging.Logger) -> None:
@@ -1330,6 +1335,11 @@ class RedisStateStore:
                                     "fees_paid_pct": fees_paid_pct,
                                     "net_pnl_pct": result.get("net_pnl_pct", 0.0),
                                     "realized_cost_pct": result.get("realized_cost_pct", 0.0),
+                                    "effective_score": result.get("effective_score"),
+                                    "effective_required": result.get("effective_required"),
+                                    "macro_multiplier": result.get("macro_multiplier"),
+                                    "cluster_penalty": result.get("cluster_penalty"),
+                                    "gate_passed": result.get("gate_passed"), 
                                 })
                     except Exception as e:
                         logger_pair.debug(f"Failed to resolve pending outcome {key}: {e}")
@@ -1519,6 +1529,13 @@ class RedisStateStore:
                                     "bonus_win": result.get("bonus_win", False),
                                     "rr_achieved": result.get("rr_achieved", 0.0),
                                     "win_weight": result.get("win_weight", 1.0),
+                                    "net_pnl_pct": result.get("net_pnl_pct", 0.0),
+                                    "realized_cost_pct": result.get("realized_cost_pct", 0.0),
+                                    "effective_score": result.get("effective_score"),
+                                    "effective_required": result.get("effective_required"),
+                                    "macro_multiplier": result.get("macro_multiplier"),
+                                    "cluster_penalty": result.get("cluster_penalty"),
+                                    "gate_passed": result.get("gate_passed"),
                                 })
                     except Exception as e:
                         logger_pair.debug(
