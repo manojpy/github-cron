@@ -57,7 +57,6 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     wins = sum(1 for r in rows if r["win"])
     wr = wins / n if n else 0.0
     target = getattr(cfg, "MIN_WIN_RATE", 0.55)
-    star = getattr(cfg, "BRAIN_STAR_ALERT_WR", 0.70)
     kill_thr = getattr(cfg, "BRAIN_ALERT_DISABLE_THRESHOLD_WR", 0.40)
     net_ev = ai.get("net_ev", 0.0) or 0.0
 

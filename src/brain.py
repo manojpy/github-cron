@@ -617,7 +617,7 @@ class BrainEngine:
 
             if hi < disable_wr:
                 # ── EV-gated disable: only disable if EV is ALSO negative ──
-                ev_obj = ev_first_objective(s["rows"], min_sample=min_sample)
+                ev_obj = engine.ev_first_objective(s["rows"], min_sample=min_sample)
                 if ev_obj.get("valid") and ev_obj["net_ev"] <= 0:
                     alert_verdicts[alert_key] = "disable"
                 else:
