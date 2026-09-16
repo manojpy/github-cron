@@ -1765,11 +1765,15 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
                             ),
                         }
+                        # ── NEW: also log the rejection reason for counterfactual ──
+                        shadow_context["rejection_reason"] = "win_rate_filter"
+                        shadow_context["failing_wr"] = failing_rate
+                        shadow_context["fail_note"] = fail_note
                         await sdb.record_shadow_pending_outcome(
                             pair_name, alert_key, direction, ts_curr, close_curr,
                             confluence_score=alert_score, confluence_total=alert_total,
                             confluence_votes=alert_votes,
-                            context=shadow_context,
+                            context=shadow_context,               
                         )
                     if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                         from outcome_storage import append_outcome
@@ -1816,6 +1820,29 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     "macro_multiplier": macro_shadow.get("multiplier") if macro_shadow else None,
                     "macro_would_block": macro_shadow.get("would_block") if macro_shadow else None,
                 }
+                # ── NEW: compute effective score after macro/cluster ──
+                eff_score = s
+                eff_required = None
+                macro_mult = None
+                clust_pen = None
+                if macro_shadow is not None:
+                    macro_mult = macro_shadow.get("multiplier")
+                if cluster_context is not None:
+                    cluster_pct = (
+                        cluster_context.buy_pct if is_buy_batch
+                        else cluster_context.sell_pct
+                    )
+                    if cluster_pct > cfg.CLUSTER_PCT_THRESHOLD:
+                        clust_pen = cfg.CLUSTER_PENALTY_PCT
+                if clust_pen is not None and s is not None:
+                    eff_score = s * (1 - clust_pen)
+                if t is not None and t > 0:
+                    abs_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
+                    pct_floor = t * (cfg.CONFLUENCE_MIN_PCT / 100.0)
+                    eff_required = max(pct_floor, abs_floor)
+                    if macro_mult is not None and getattr(cfg, "MACRO_CONTEXT_LIVE", False):
+                        eff_required = eff_required * macro_mult
+
                 await sdb.record_pending_outcome(
                     pair_name, alert_key,
                     "buy" if alert_key in BUY_ALERT_KEYS else "sell",
@@ -1824,6 +1851,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     adx_val=adx_val,
                     context=trigger_context,
                     signal_price=close_curr,
+                    # ── NEW: effective gate state ──
+                    effective_score=eff_score,
+                    effective_required=eff_required,
+                    macro_multiplier=macro_mult,
+                    cluster_penalty=clust_pen,
+                    gate_passed=True,
                 )
             await asyncio.gather(*(_record_one(alert_key) for _, _, alert_key in alerts_to_send))
 

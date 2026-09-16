@@ -722,6 +722,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     if cfg.ENABLE_KILL_SWITCH and state_db and not state_db.degraded and state_db._redis:
         try:
+            
             from outcome_storage import load_recent_outcomes
             recent = load_recent_outcomes(hours=cfg.KILL_SWITCH_LOOKBACK_HOURS)
             ks_state = engine.KillSwitch(
@@ -731,6 +732,17 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 fee_pct=cfg.BRAIN_FEE_PCT,
                 slippage_pct=cfg.BRAIN_SLIPPAGE_PCT,
             ).evaluate(recent)
+            # ── NEW: also check net EV before tripping ──
+            if ks_state["tripped"] and recent:
+                ev_obj = engine.ev_first_objective(recent, min_sample=5)
+                if ev_obj.get("valid") and ev_obj["net_ev"] > 0:
+                    logger_main.warning(
+                        f"Kill switch would trip but net EV is positive "
+                        f"({ev_obj['net_ev']:+.3f}%) — downgrading to warning"
+                    )
+                    ks_state["tripped"] = False
+                    ks_state["reason"] = f"DOWNGRADED: {ks_state['reason']} (EV positive)"
+
             if ks_state["tripped"]:
                 ttl = int(cfg.KILL_SWITCH_COOLDOWN_HOURS * 3600)
                 await state_db._safe_redis_op(

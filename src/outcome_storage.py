@@ -14,7 +14,7 @@ from bot_config import cfg
 
 # ── Outcome schema version ───────────────────────────────────────────
 
-OUTCOME_SCHEMA_VERSION = 2
+OUTCOME_SCHEMA_VERSION = 3
 
 _OUTCOME_DIR = getattr(cfg, "OUTCOME_DATA_DIR", "outcome-data")
 os.makedirs(os.path.join(_OUTCOME_DIR, "outcomes"), exist_ok=True)

@@ -616,7 +616,12 @@ class BrainEngine:
             auto_eligible = auto_disable_on and total >= auto_disable_min
 
             if hi < disable_wr:
-                alert_verdicts[alert_key] = "disable"
+                # ── EV-gated disable: only disable if EV is ALSO negative ──
+                ev_obj = ev_first_objective(s["rows"], min_sample=min_sample)
+                if ev_obj.get("valid") and ev_obj["net_ev"] <= 0:
+                    alert_verdicts[alert_key] = "disable"
+                else:
+                    alert_verdicts[alert_key] = "monitor"
                 recommendations.append({
                     "type": "disable_alert", "severity": "high", "alert": alert_key,
                     "win_rate": round(wr, 3), "sample_size": total, "pairs_affected": len(s["pairs"]),
@@ -1342,6 +1347,15 @@ class BrainEngine:
                 "cusum_drifts": len(drift_alerts),
                 "threshold_history": await self.sdb.load_threshold_history(),
                 "ood_status": ood_status,
+                "ev_objective": (
+                    engine.ev_first_objective(real_rows, min_sample=min_sample)
+                    if real_rows else None
+                ),
+                # ── NEW: rolling walk-forward ──
+                "rolling_wf": (
+                    engine.rolling_walk_forward(real_rows, n_folds=5)
+                    if len(real_rows) >= min_sample * 6 else None
+                ),
             },
         }
     # ── Report generation / delivery ───────────────────────────────────────

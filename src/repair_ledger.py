@@ -15,7 +15,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
 from bot_config import json_dumps, json_loads
-from threshold_engine import _flatten_row_features, wilson_ci
+from threshold_engine import _flatten_row_features, wilson_ci, ev_and_kelly_for
 
 LEDGER_KEY = "brain_repair_ledger"
 LEDGER_MAX = 500
@@ -76,12 +76,14 @@ def _matches_scope(row: dict, scope: Optional[dict]) -> bool:
     return True
 
 def _scope_metrics(rows: List[dict], scope: Optional[dict]):
-    """(wr, n) on the subset matching scope, or (None, 0) if empty."""
+    """(wr, n, net_ev) on the subset matching scope, or (None, 0, None) if empty."""
     subset = [r for r in rows if _matches_scope(r, scope)]
     if not subset:
-        return None, 0
+        return None, 0, None
     wins = sum(1 for r in subset if r["win"])
-    return wins / len(subset), len(subset)
+    wr = wins / len(subset)
+    net_ev, _hk, _wr = ev_and_kelly_for(subset)
+    return wr, len(subset), net_ev
 
 def _repair_id(rec: Dict[str, Any], ts: int) -> str:
     """Stable ID — retries within the same 15m bucket produce the same ID,
@@ -122,10 +124,11 @@ async def record_repair_issued(sdb, rec: Dict[str, Any],
     scope = rec.get("scope")
     snapshot = dict(snapshot)
     if scope and real_rows:
-        scope_wr, scope_n = _scope_metrics(real_rows, scope)
+        scope_wr, scope_n, scope_ev = _scope_metrics(real_rows, scope)
         if scope_n > 0:
             snapshot["scope_wr"] = scope_wr
             snapshot["scope_n"] = scope_n
+            snapshot["scope_ev"] = scope_ev
     entry = {
         "id": rid,
         "issued_at": ts,
@@ -214,29 +217,46 @@ async def evaluate_pending_repairs(sdb, current_rows: List[dict],
 
         post_wins = sum(1 for r in post_scope if r["win"])
         post_wr = post_wins / len(post_scope)
+        post_ev, _hk, _wr = ev_and_kelly_for(post_scope)
 
         # Pre-repair baseline: prefer the scoped snapshot; fall back to
         # overall only if the scope was empty at issue time.
         if is_scoped:
             pre_wr = e["snapshot_before"].get("scope_wr")
+            pre_ev = e["snapshot_before"].get("scope_ev")
         else:
             pre_wr = None
+            pre_ev = None
         if pre_wr is None:
             pre_wr = e["snapshot_before"].get("overall_wr")
         if pre_wr is None:
             pre_wr = post_wr
-        delta = post_wr - pre_wr
+        if pre_ev is None:
+            pre_ev = e["snapshot_before"].get("net_ev")
+        if pre_ev is None:
+            pre_ev = post_ev
+
+        delta_wr = post_wr - pre_wr
+        delta_ev = post_ev - pre_ev
 
         lo, hi, _ = wilson_ci(post_wins, len(post_scope))
-        if delta > 0.03 and lo > pre_wr:
+
+        # ── EV-first verdict ──      
+        if delta_ev > 0.02 and delta_wr > -0.03:
             verdict = "helped"
-        elif delta < -0.03 and hi < pre_wr:
+        elif delta_ev < -0.02 and delta_wr < 0.03:
+            verdict = "hurt"
+        elif delta_wr > 0.03 and lo > pre_wr:
+            verdict = "helped"
+        elif delta_wr < -0.03 and hi < pre_wr:
             verdict = "hurt"
         else:
             verdict = "neutral"
+
         e["verdict"] = verdict
         e["delta_observed"] = {
-            "wr": round(delta, 4),
+            "wr": round(delta_wr, 4),
+            "ev": round(delta_ev, 4),
             "n_post": len(post_scope),
             "n_post_total": len(post),
             "scoped": is_scoped,

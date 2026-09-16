@@ -63,11 +63,28 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
 
     # ── BOTTOM LINE ────────────────────────────────────────────────────
     try:
-        buy_wr, buy_n, sell_wr, sell_n = engine.direction_split(rows)
-        if wr >= target:
-            verdict = f"✅ You're WINNING at {wr:.0%} (target {target:.0%}). Keep what works; tweaks below push it higher."
+        buy_wr, buy_n, sell_wr, sell_n = engine.direction_split(rows)    
+        ev_obj = engine.ev_first_objective(rows, min_sample=10) if rows else None
+        ev_positive = (
+            ev_obj.get("p_ev_positive", 0) >= 0.85
+            if ev_obj and ev_obj.get("valid") else False
+        )
+        if net_ev > 0 and ev_positive:
+            verdict = (
+                f"✅ PROFITABLE: Net EV {net_ev:+.2f}%/trade, "
+                f"P(EV>0)={ev_obj['p_ev_positive']:.0%}, WR={wr:.0%}."
+            )
+        elif net_ev > 0:
+            verdict = (
+                f"⚠️ MARGINALLY POSITIVE: Net EV {net_ev:+.2f}%/trade "
+                f"but P(EV>0) only {ev_obj.get('p_ev_positive', 0):.0%}. "
+                f"WR={wr:.0%}. Evidence is thin."
+            )
         else:
-            verdict = f"⚠️ You're LOSING at {wr:.0%} (target {target:.0%})."
+            verdict = (
+                f"🔴 UNPROFITABLE: Net EV {net_ev:+.2f}%/trade, "
+                f"WR={wr:.0%}. Costs exceed gains."
+            )
         dir_note = ""
         if buy_wr is not None and sell_wr is not None and buy_n >= 5 and sell_n >= 5:
             if sell_wr < buy_wr - 0.15:
@@ -88,17 +105,43 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     try:
         stats = engine.per_alert_breakdown(rows, min_sample=1)  # (ak, wr, n, avg_score)
         groups: Dict[str, List[str]] = {"🔴": [], "🟡": [], "🟢": [], "⚪": []}
+
+        # Group rows by alert_key for EV computation
+        rows_by_alert: Dict[str, list] = defaultdict(list)
+        for r in rows:
+            rows_by_alert[r["alert_key"]].append(r)
+
         for ak, awr, cnt, _avg in stats:
             if cnt < 10:
-                groups["⚪"].append(f"⚪ {ak}: {awr:.0%} WR (n={cnt}) — not enough trades yet to judge")
-            elif awr >= star:
-                groups["🟢"].append(f"🟢 {ak}: {awr:.0%} WR (n={cnt}) — star performer, keep it")
-            elif awr >= target:
-                groups["🟢"].append(f"🟢 {ak}: {awr:.0%} WR (n={cnt}) — profitable, keep it")
+                groups["⚪"].append(
+                    f"⚪ {ak}: {awr:.0%} WR (n={cnt}) — not enough trades yet to judge"
+                )
+                continue
+            ak_rows = rows_by_alert.get(ak, [])
+            ak_ev = engine.ev_first_objective(ak_rows, min_sample=10) if ak_rows else None
+            ak_net_ev = ak_ev.get("net_ev", 0) if ak_ev and ak_ev.get("valid") else 0
+            ak_p_ev = ak_ev.get("p_ev_positive", 0) if ak_ev and ak_ev.get("valid") else 0
+
+            if ak_net_ev > 0 and ak_p_ev >= 0.85:
+                groups["🟢"].append(
+                    f"🟢 {ak}: EV {ak_net_ev:+.2f}% (P>0: {ak_p_ev:.0%}), "
+                    f"WR {awr:.0%} (n={cnt}) — profitable, keep it"
+                )
+            elif ak_net_ev > 0:
+                groups["🟡"].append(
+                    f"🟡 {ak}: EV {ak_net_ev:+.2f}% but P(EV>0)={ak_p_ev:.0%}, "
+                    f"WR {awr:.0%} (n={cnt}) — thin evidence, monitor"
+                )
             elif awr >= kill_thr:
-                groups["🟡"].append(f"🟡 {ak}: {awr:.0%} WR (n={cnt}) — below {target:.0%} target; raise its required score or tighten its filter")
+                groups["🟡"].append(
+                    f"🟡 {ak}: EV {ak_net_ev:+.2f}%, WR {awr:.0%} (n={cnt}) "
+                    f"— below target; tighten its filter"
+                )
             else:
-                groups["🔴"].append(f"🔴 {ak}: {awr:.0%} WR (n={cnt}) — losing money, disable it now")
+                groups["🔴"].append(
+                    f"🔴 {ak}: EV {ak_net_ev:+.2f}%, WR {awr:.0%} (n={cnt}) "
+                    f"— losing money, disable it"
+                )
         titles = {"🔴": "DISABLE THESE NOW", "🟡": "IMPROVE THESE", "🟢": "KEEP THESE", "⚪": "NEED MORE DATA"}
         block = "🚦 YOUR ALERTS — WHAT TO DO WITH EACH"
         for e in ("🔴", "🟡", "🟢", "⚪"):
@@ -305,6 +348,37 @@ class BrainEngineV2(BaseBrainEngine):
         if new_wr < cur_wr - max_wr_drop:
             return False, f"suggested weights degrade shadow WR {cur_wr:.0%}→{new_wr:.0%} (n={new_n})"
         return True, f"shadow WR stable {cur_wr:.0%}→{new_wr:.0%} (n={new_n})"
+
+    @staticmethod
+    def _action_gate_check(
+        real_rows: List[Dict[str, Any]],
+        min_sample: int = 20,
+    ) -> Dict[str, Any]:
+        """Six-layer confirmation gate. Returns which patches are actionable."""
+        gate: Dict[str, Any] = {
+            "data_quality": len(real_rows) >= 100,
+            "oos_prediction": False,
+            "profitability": False,
+            "stability": True,
+            "risk": True,
+            "execution": True,
+        }
+
+        # OOS prediction: rolling walk-forward must pass
+        rwc = engine.rolling_walk_forward(real_rows, n_folds=5)
+        if rwc.get("valid"):
+            gate["oos_prediction"] = rwc["p_ev_positive"] >= 0.70
+
+        # Profitability: net EV must be positive with high confidence
+        ev_obj = engine.ev_first_objective(real_rows, min_sample=min_sample)
+        if ev_obj.get("valid"):
+            gate["profitability"] = (
+                ev_obj["p_ev_positive"] >= 0.85
+                and ev_obj["ev_p5"] > -0.10
+            )
+
+        gate["actionable"] = all(gate.values())
+        return gate
 
     @staticmethod
     def _match_shadow_regime(rpo_shadow, rng):
@@ -759,7 +833,7 @@ class BrainEngineV2(BaseBrainEngine):
                     recommendations.append({
                         "type": "vote_interaction", "kind": "poison", "severity": "medium",
                         "message": (
-                            f"☠️ Poison: {poisoner} kills {victim}. "
+                            f"Poison: {poisoner} kills {victim}. "
                             f"Together={inter['wr_both']:.0%}, {victim} alone={wr_victim_alone:.0%}."
                         ),
                         "delta_ev": abs(inter["delta"]),
@@ -1037,6 +1111,21 @@ class BrainEngineV2(BaseBrainEngine):
                 sum(1 for r in shadow_rows if r["win"]) / len(shadow_rows), 4
             )
 
+        # ── Action gate: suppress config patches unless evidence is strong ──
+        action_gate = self._action_gate_check(real_rows, min_sample=min_sample)
+        ai_metrics["action_gate"] = action_gate
+        if not action_gate.get("actionable", False):
+            # Downgrade all config patches to informational
+            for patch in config_patch:
+                patch["_blocked_by_action_gate"] = True
+                patch["reason"] = (
+                    f"[GATE BLOCKED] {patch.get('reason', '')} "
+                    f"— OOS EV evidence insufficient"
+                )
+            logger.info(
+                f"🚫 Action gate BLOCKED config patches: {action_gate}"
+            )
+
         # ─ Re-assemble ──────────────────────────────────────────────────
         result = dict(base_recs)
         result["recommendations"] = recommendations
@@ -1183,8 +1272,11 @@ class BrainEngineV2(BaseBrainEngine):
                 p_help = stats.get("help_rate")
         if p_help is None:
             return 1.0, 1.0
-        p_help = max(0.0, min(1.0, p_help))
-        strength = 2.0  # gentle: learned signal nudges, never dominates
+        p_help = max(0.0, min(1.0, p_help))      
+        # Reduce strength until we have enough repair history
+        stats = self._repair_success_rates.get(category)
+        n_resolved = stats.get("n", 0) if stats else 0
+        strength = 2.0 if n_resolved >= 100 else 0.5
         return 1.0 + strength * p_help, 1.0 + strength * (1.0 - p_help)
 
     def _root_cause_to_weight_adjustment(self, rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:

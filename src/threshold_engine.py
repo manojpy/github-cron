@@ -509,9 +509,9 @@ def monte_carlo_walk_forward(
     blocks = [b for b in blocks if b]
     if len(blocks) < 5:
         return {"valid": False, "error": "insufficient_blocks", "n_blocks": len(blocks)}
-
     oos_wr_list: List[float] = []
     threshold_list: List[float] = []
+    oos_ev_list: List[float] = []
 
     for _ in range(n_simulations):
         sampled_blocks = rng.choices(blocks, k=len(blocks))
@@ -534,6 +534,9 @@ def monte_carlo_walk_forward(
         wins = sum(r["win"] for r in holdout_subset)
         oos_wr_list.append(wins / len(holdout_subset))
         threshold_list.append(threshold)
+        # ── NEW: track EV alongside WR ──
+        ev_val, _hk, _wr = ev_and_kelly_for(holdout_subset)
+        oos_ev_list.append(ev_val)
 
     if len(oos_wr_list) < 10:
         return {
@@ -557,11 +560,101 @@ def monte_carlo_walk_forward(
         "oos_wr_p5": oos_wr_list[p5_idx],
         "oos_wr_p95": oos_wr_list[p95_idx],
         "threshold_mean": statistics.fmean(threshold_list),
-        "threshold_std": statistics.pstdev(threshold_list) if len(threshold_list) > 1 else 0.0,
-        # Mean/spread ratio — a rough "is this edge stable or just lucky
-        # sometimes" signal. Not a statistical test, just a sort key for
-        # the report; read oos_wr_p5 for the actual worst-case number.
+        "threshold_std": statistics.pstdev(threshold_list) if len(threshold_list) > 1 else 0.0, 
         "robustness_score": mean_wr / max(std_wr, 0.01),
+        # ── NEW: EV distribution ──
+        "oos_ev_mean": statistics.fmean(oos_ev_list) if oos_ev_list else 0.0,
+        "oos_ev_p5": (
+            sorted(oos_ev_list)[max(0, min(len(oos_ev_list) - 1, round(0.05 * (len(oos_ev_list) - 1))))]
+            if oos_ev_list else 0.0
+        ),
+        "p_ev_positive": (
+            sum(1 for e in oos_ev_list if e > 0) / len(oos_ev_list)
+            if oos_ev_list else 0.0
+        ),
+    }
+
+
+    }
+
+def rolling_walk_forward(
+    rows: List[Row],
+    n_folds: int = 5,
+    train_frac: float = 0.60,
+    min_sample: int = 20,
+    target_winrate: float = 0.55,
+) -> Dict[str, Any]:
+    """Multi-fold chronological walk-forward.
+
+    Splits the timeline into n_folds sequential windows.
+    For each fold, trains on the preceding data, tests on the fold.
+    Aggregates OOS performance across all folds.
+    """
+    ordered = sorted(rows, key=lambda r: r.get("entry_ts", 0))
+    n = len(ordered)
+    if n < min_sample * (n_folds + 1):
+        return {"valid": False, "error": "insufficient_data", "n": n}
+
+    fold_size = n // (n_folds + 1)
+
+    oos_wr_list: List[float] = []
+    oos_ev_list: List[float] = []
+    oos_n_list: List[int] = []
+    thresholds: List[float] = []
+
+    for fold_idx in range(n_folds):
+        train_end = fold_size * (fold_idx + 1)
+        test_start = train_end
+        test_end = min(test_start + fold_size, n)
+
+        train_rows = ordered[:train_end]
+        test_rows = ordered[test_start:test_end]
+
+        if len(train_rows) < min_sample * 2 or len(test_rows) < min_sample:
+            continue
+
+        train_result = recommend_threshold(
+            train_rows, target_winrate=target_winrate, min_sample=min_sample
+        )
+        if not train_result.get("valid"):
+            continue
+
+        threshold = train_result["recommended"]
+        thresholds.append(threshold)
+
+        test_subset = [r for r in test_rows if r["score"] >= threshold]
+        if len(test_subset) < 5:
+            continue
+
+        wins = sum(r["win"] for r in test_subset)
+        oos_wr_list.append(wins / len(test_subset))
+        oos_n_list.append(len(test_subset))
+
+        ev, _, _ = ev_and_kelly_for(test_subset)
+        oos_ev_list.append(ev)
+
+    if len(oos_wr_list) < 3:
+        return {
+            "valid": False,
+            "error": "too_few_valid_folds",
+            "n_folds": len(oos_wr_list),
+        }
+
+    return {
+        "valid": True,
+        "n_folds": len(oos_wr_list),
+        "oos_wr_mean": statistics.fmean(oos_wr_list),
+        "oos_wr_std": statistics.pstdev(oos_wr_list),
+        "oos_ev_mean": statistics.fmean(oos_ev_list),
+        "oos_ev_std": statistics.pstdev(oos_ev_list),
+        "oos_ev_p5": min(oos_ev_list),
+        "p_ev_positive": sum(1 for e in oos_ev_list if e > 0) / len(oos_ev_list),
+        "oos_total_n": sum(oos_n_list),
+        "threshold_mean": statistics.fmean(thresholds),
+        "threshold_std": statistics.pstdev(thresholds) if len(thresholds) > 1 else 0.0,
+        "stability_score": (
+            statistics.fmean(oos_ev_list) / max(statistics.pstdev(oos_ev_list), 0.01)
+        ),
     }
 
 def flag_anomalous_rows(
@@ -977,18 +1070,41 @@ def recommend_threshold(
     result["ev_data"] = ev_data
     best_ev = max(ev_data, key=lambda x: x[3]) if ev_data else None
     result["best_ev"] = best_ev
+    # ── EV-first target floor selection ──
     target_floor = None
-    for cap, _n_pass, wr, wr_lo in caps_data:
-        if wr_lo >= target_winrate:
-            target_floor = cap
-            break
+    best_ev_at_cap = None
+    for cap, _n_pass, _wr, _wr_lo in caps_data:
+        subset = [r for r in rows if r["score"] >= cap]
+        if len(subset) < min_sample:
+            continue
+        ev_obj = ev_first_objective(subset, min_sample=min_sample)
+        if not ev_obj.get("valid"):
+            continue
+        # Select the LOWEST cap where P(EV>0) >= 0.85 AND ev_p5 > -0.10
+        if ev_obj["p_ev_positive"] >= 0.85 and ev_obj["ev_p5"] > -0.10:
+            if target_floor is None or cap < target_floor:
+                target_floor = cap
+                best_ev_at_cap = ev_obj
+
+    ev_gate_passed = target_floor is not None
+
+    # Fallback: if no cap clears the EV gate, use the WR floor
+    # but flag it as provisional
     if target_floor is None:
-        for cap, _n_pass, wr, _wr_lo in caps_data:
-            if wr >= target_winrate:
+        for cap, _n_pass, wr, wr_lo in caps_data:
+            if wr_lo >= target_winrate:
                 target_floor = cap
                 break
-    result["target_floor"] = target_floor
+        if target_floor is None:
+            for cap, _n_pass, wr, _wr_lo in caps_data:
+                if wr >= target_winrate:
+                    target_floor = cap
+                    break
 
+    result["target_floor"] = target_floor
+    result["ev_gate_passed"] = ev_gate_passed
+    if best_ev_at_cap:
+        result["target_ev_objective"] = best_ev_at_cap
     if knee is None and best_ev is None and target_floor is None:
         result["error"] = "no_valid_floor"
         return result
@@ -1944,7 +2060,6 @@ def score_actionability(rec: Dict[str, Any]) -> float:
         effort = 2.0
     return impact * confidence / effort
 
-
 def learned_actionability(
     rec: Dict[str, Any],
     success_rates: Optional[Dict[str, Dict[str, float]]] = None,
@@ -2156,6 +2271,56 @@ def _build_vote_dataset(
         y.append(1.0 if r["win"] else 0.0)
         sw.append(r.get("win_weight", 1.0) if r["win"] else 1.0)
     return X, y, sw
+
+def build_market_state_features(
+    rows: List[Row],
+    feature_names: Optional[List[str]] = None,
+) -> Tuple[List[List[float]], List[float], List[str]]:
+    """Extract full market-state feature matrix from rows.
+
+    Features: votes + numeric context + session encoding + direction.
+    Returns (X, y, feature_names).
+    """
+    if feature_names is None:
+        all_features: Set[str] = set()
+        for r in rows:
+            if r.get("votes"):
+                all_features.update(f"vote:{k}" for k in r["votes"])
+            if r.get("context"):
+                for k, v in r["context"].items():
+                    if isinstance(v, (int, float)):
+                        all_features.add(f"ctx:{k}")
+        feature_names = sorted(all_features)
+
+    X: List[List[float]] = []
+    y: List[float] = []
+
+    for r in rows:
+        vec = [1.0]  # intercept
+        votes = r.get("votes") or {}
+        ctx = r.get("context") or {}
+
+        for fname in feature_names:
+            if fname.startswith("vote:"):
+                vname = fname[5:]
+                vec.append(1.0 if votes.get(vname) else 0.0)
+            elif fname.startswith("ctx:"):
+                cname = fname[4:]
+                val = ctx.get(cname)
+                vec.append(float(val) if isinstance(val, (int, float)) else 0.0)
+
+        # Session encoding
+        session = r.get("session", "unknown")
+        for s in ["asian", "london", "ny", "dead"]:
+            vec.append(1.0 if session == s else 0.0)
+
+        # Direction
+        vec.append(1.0 if r.get("direction") == "buy" else 0.0)
+
+        X.append(vec)
+        y.append(1.0 if r["win"] else 0.0)
+
+    return X, y, feature_names
 
 def _train_logistic(
     X: List[List[float]], y: List[float], sample_weights: List[float],
@@ -2438,6 +2603,69 @@ def permutation_vote_importance(
     results.sort(key=lambda x: -abs(x["importance"]))
     return results
 
+def oos_permutation_importance(
+    rows: List[Row],
+    min_sample: int = 30,
+    n_permutations: int = 15,
+    train_frac: float = 0.67,
+    seed: int = 42,
+) -> List[Dict[str, Any]]:
+    """OOS permutation importance using EV deterioration.
+
+    Trains a logistic model on the train split, then measures
+    how much OOS EV drops when each feature is shuffled.
+    """
+    train_rows, holdout_rows = walk_forward_split(rows, train_frac)
+    if len(train_rows) < min_sample or len(holdout_rows) < min_sample:
+        return []
+
+    X_train, y_train, feat_names = build_market_state_features(train_rows)
+    X_hold, y_hold, _ = build_market_state_features(holdout_rows, feat_names)
+    sw_train = [1.0] * len(X_train)
+
+    beta = _train_logistic(X_train, y_train, sw_train, max_iter=1500)
+    if not beta:
+        return []
+
+    def _eval_ev(X: List[List[float]], y_rows: List[Row]) -> float:
+        kept = []
+        for i, row in enumerate(y_rows):
+            z = sum(b * x for b, x in zip(beta, X[i]))
+            if _sigmoid(z) >= 0.5:
+                kept.append(row)
+        if len(kept) < 5:
+            return 0.0
+        ev, _, _ = ev_and_kelly_for(kept)
+        return ev
+
+    baseline_ev = _eval_ev(X_hold, holdout_rows)
+
+    rng = random.Random(seed)
+    results = []
+
+    for feat_idx, fname in enumerate(feat_names):
+        drops = []
+        for _ in range(n_permutations):
+            X_shuffled = [row[:] for row in X_hold]
+            col_vals = [X_shuffled[i][feat_idx + 1] for i in range(len(X_shuffled))]
+            rng.shuffle(col_vals)
+            for i in range(len(X_shuffled)):
+                X_shuffled[i][feat_idx + 1] = col_vals[i]
+
+            shuffled_ev = _eval_ev(X_shuffled, holdout_rows)
+            drops.append(baseline_ev - shuffled_ev)
+
+        mean_drop = statistics.fmean(drops)
+        results.append({
+            "feature": fname,
+            "importance_ev": round(mean_drop, 5),
+            "std": round(statistics.pstdev(drops), 5) if len(drops) > 1 else 0.0,
+            "direction": "positive" if mean_drop > 0 else "negative",
+        })
+
+    results.sort(key=lambda x: -abs(x["importance_ev"]))
+    return results
+
 def _prob_edge_broken(wins: int, n: int, target_wr: float,
                        prior_strength: float = 10.0) -> float:
     """Bayesian P(true_wr < target_wr) under a Beta posterior.
@@ -2460,7 +2688,6 @@ def _prob_edge_broken(wins: int, n: int, target_wr: float,
     z = (target_wr - mean) / math.sqrt(var)
     return 0.5 * math.erfc(-z / math.sqrt(2.0)) 
 
-
 def _prob_ev_negative(rows: List[Row], n_sims: int = 400) -> float:
     """Posterior P(true EV <= 0) under a flat prior.
 
@@ -2482,6 +2709,79 @@ def _prob_ev_negative(rows: List[Row], n_sims: int = 400) -> float:
     z = (0.0 - ev_mean) / ev_std
     return 0.5 * math.erfc(-z / math.sqrt(2.0))
 
+def _prob_ev_positive(ev_mean: float, ev_std: float) -> float:
+    """P(true EV > 0) under normal approximation on the bootstrap
+    distribution. Complements _prob_ev_negative()."""
+    if ev_std <= 0:
+        return 1.0 if ev_mean > 0 else 0.0
+    z = ev_mean / ev_std
+    return 0.5 * math.erfc(-z / math.sqrt(2.0))
+
+def ev_first_objective(
+    rows: List[Row],
+    min_sample: int = 20,
+    fee_pct: float = 0.0006,
+    slippage_pct: float = 0.0003,
+) -> Dict[str, Any]:
+    """Unified profitability assessment. Replaces WR-first gating.
+
+    Returns the full evidence stack:
+    - net_ev, p_ev_positive, ev_p5 (5th percentile)
+    - profit_factor, max_drawdown_pct
+    - wr (demoted to informational)
+    - n, confidence label
+    """
+    if len(rows) < min_sample:
+        return {"valid": False, "error": "insufficient_data", "n": len(rows)}
+
+    net_ev, half_kelly, wr = ev_and_kelly_for(rows, fee_pct, slippage_pct)
+
+    # Bootstrap EV distribution for uncertainty
+    bs = bootstrap_ev_ci(rows, n_sims=500, seed=42)
+    ev_p5 = bs.get("ev_p5", net_ev) if bs.get("valid") else net_ev
+    ev_std = bs.get("ev_std", 0.0) if bs.get("valid") else 0.0
+
+    p_ev_positive = _prob_ev_positive(net_ev, ev_std)
+
+    # Profit factor
+    wins = [abs(r.get("pct_move", 0.0)) for r in rows if r["win"]]
+    losses = [abs(r.get("pct_move", 0.0)) for r in rows if not r["win"]]
+    gross_profit = sum(wins) if wins else 0.0
+    gross_loss = sum(losses) if losses else 0.0
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+
+    # Max drawdown (cumulative PnL trough)
+    total_cost = (fee_pct * 2 + slippage_pct * 2) * 100
+    ordered = sorted(rows, key=lambda r: r.get("entry_ts", 0))
+    cumulative = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for r in ordered:
+        mag = abs(r.get("pct_move", 0.0))
+        pnl = (mag - total_cost) if r["win"] else -(mag + total_cost)
+        cumulative += pnl
+        peak = max(peak, cumulative)
+        max_dd = max(max_dd, peak - cumulative)
+
+    n = len(rows)
+    win_count = sum(1 for r in rows if r["win"])
+    lo, hi, _ = wilson_ci(win_count, n)
+
+    return {
+        "valid": True,
+        "n": n,
+        "wr": wr,
+        "wilson_lo": lo,
+        "wilson_hi": hi,
+        "net_ev": round(net_ev, 4),
+        "p_ev_positive": round(p_ev_positive, 4),
+        "ev_p5": round(ev_p5, 4),
+        "ev_std": round(ev_std, 4),
+        "half_kelly": round(half_kelly, 4),
+        "profit_factor": round(profit_factor, 3),
+        "max_drawdown_pct": round(max_dd, 3),
+        "confidence": confidence_label(n, lo, hi),
+    }
 
 # ═══════════════════════════════════════════════════════════════════════
 #  ML DIAGNOSTICS — Root Cause, Drift, Change-Point, Repair Learning
@@ -2505,7 +2805,6 @@ def _flatten_row_features(row: Row) -> Dict[str, float]:
             elif isinstance(v, (int, float)):
                 feats[f"ctx:{k}"] = float(v)
     return feats
-
 
 def diagnose_root_cause(
     rows: List[Row],
@@ -2708,13 +3007,12 @@ def find_wr_change_point(
     best["valid"] = True
     return best
 
+
 def learn_repair_effectiveness(
     ledger_records: List[Dict[str, Any]],
     current_state: Dict[str, Any],
-    min_records: int = 30,
+    min_records: int = 100,
 ) -> Dict[str, Any]:
-    """Contextual logistic model: P(repair helps | system state).
-
     Trains on resolved repair-ledger entries (snapshot_before + verdict)
     and predicts, for the CURRENT system state, how likely each repair
     category is to actually help. Reuses the same pure-Python logistic
@@ -3443,3 +3741,99 @@ def fill_reconciliation(
         "note": "estimated from win-move shortfall; wire fill prices into the "
                 "outcome writer for the measured tier",
     }
+
+def trade_quality_score(
+    row: Row,
+    ev_model_result: Dict[str, Any],
+    calibration_curve: Optional[Dict[str, Any]],
+    regime_info: Optional[Dict[str, Any]],
+    kill_switch_active: bool = False,
+    portfolio_blocked: bool = False,
+) -> Dict[str, Any]:
+    """Unified quality assessment for a single prospective trade."""
+    result: Dict[str, Any] = {
+        "pair": row.get("pair"),
+        "alert_key": row.get("alert_key"),
+        "direction": row.get("direction"),
+    }
+
+    # ── Layer 1: Hard vetoes ──
+    if kill_switch_active:
+        result["verdict"] = "BLOCKED"
+        result["reason"] = "kill_switch_active"
+        return result
+    if portfolio_blocked:
+        result["verdict"] = "BLOCKED"
+        result["reason"] = "portfolio_heat_limit"
+        return result
+
+    # ── Layer 2: Probabilistic assessment ──
+    p_profit = ev_model_result.get("p_ev_positive", 0.5)
+    net_ev = ev_model_result.get("net_ev", 0.0)
+    ev_p5 = ev_model_result.get("ev_p5", net_ev)
+    n_oos = ev_model_result.get("n", 0)
+
+    # ── Layer 3: Calibration ──
+    cal_wr = None
+    if calibration_curve:
+        conf_pct = row.get("conf_pct", 50.0)
+        ok, cal_wr, reason = calibration_gate_decision(
+            calibration_curve, conf_pct,
+            target_wr=0.55, min_sample=15, slack=0.05,
+        )
+        result["calibration"] = {
+            "pass": ok, "calibrated_wr": cal_wr, "reason": reason,
+        }
+        if not ok:
+            result["verdict"] = "BLOCKED"
+            result["reason"] = f"calibration_gate: {reason}"
+            return result
+
+    # ── Layer 4: Regime compatibility ──
+    regime_ok = True
+    if regime_info and regime_info.get("valid"):
+        adx = (row.get("context") or {}).get("adx_val")
+        if adx is not None:
+            median_adx = regime_info.get("median_adx", adx)
+            regime = "trending" if adx >= median_adx else "ranging"
+            reg_data = regime_info.get("regimes", {}).get(regime, {})
+            if reg_data.get("valid") and reg_data.get("wr", 0.5) < 0.40:
+                regime_ok = False
+                result["regime_warning"] = (
+                    f"{regime} regime WR={reg_data['wr']:.0%}"
+                )
+
+    # ── Layer 5: Composite score ──
+    evidence_factor = min(1.0, n_oos / 200.0)
+    quality = (
+        0.40 * p_profit
+        + 0.25 * max(0.0, min(1.0, (net_ev + 0.5) / 1.5))
+        + 0.15 * evidence_factor
+        + 0.10 * (0.5 if regime_ok else 0.0)
+        + 0.10 * (cal_wr if cal_wr is not None else 0.5)
+    )
+
+    # ── Verdict ──
+    if quality >= 0.70 and p_profit >= 0.85 and ev_p5 > -0.10:
+        verdict = "HIGH"
+    elif quality >= 0.50 and p_profit >= 0.65:
+        verdict = "MEDIUM"
+    else:
+        verdict = "LOW"
+
+    result.update({
+        "verdict": verdict,
+        "quality_score": round(quality, 3),
+        "p_ev_positive": round(p_profit, 3),
+        "net_ev": round(net_ev, 4),
+        "ev_p5": round(ev_p5, 4),
+        "n_oos": n_oos,
+        "evidence_strength": (
+            "strong" if n_oos >= 200
+            else "moderate" if n_oos >= 50
+            else "weak"
+        ),
+        "regime_compatible": regime_ok,
+    })
+
+    return result

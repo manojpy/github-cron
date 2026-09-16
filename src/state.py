@@ -790,6 +790,11 @@ class RedisStateStore:
         signal_price: Optional[float] = None,
         fill_price: Optional[float] = None,
         fees_paid_pct: Optional[float] = None,
+        effective_score: Optional[float] = None,
+        effective_required: Optional[float] = None,
+        macro_multiplier: Optional[float] = None,
+        cluster_penalty: Optional[float] = None,
+        gate_passed: Optional[bool] = None,
     ) -> None:
 
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
@@ -810,6 +815,11 @@ class RedisStateStore:
                 "signal_price": signal_price,
                 "fill_price": fill_price,
                 "fees_paid_pct": fees_paid_pct,
+                "effective_score": effective_score,
+                "effective_required": effective_required,
+                "macro_multiplier": macro_multiplier,
+                "cluster_penalty": cluster_penalty,
+                "gate_passed": gate_passed,
             })
         except Exception as e:
             logger.warning(
@@ -1040,39 +1050,36 @@ class RedisStateStore:
                     sl_hit_idx = candle_offset
 
                 # Early exit if both found
+                ambiguous_same_candle = False
                 if tp_hit_idx is not None and sl_hit_idx is not None:
-                    break
-
-            if tp_hit_idx is not None and sl_hit_idx is not None:
-                if tp_hit_idx < sl_hit_idx:
-                    tp_first = True
-                elif sl_hit_idx < tp_hit_idx:
-                    tp_first = False
-                else:
-                    # Same candle — can't determine intra-candle order.
-                    # Resolved optimistically: target assumed first.
-                    tp_first = True
-            elif tp_hit_idx is not None:
-                tp_first = True   # Only TP hit
-            elif sl_hit_idx is not None:
-                tp_first = False  # Only SL hit
-            # else: neither hit → tp_first stays None
+                    if tp_hit_idx < sl_hit_idx:
+                        tp_first = True
+                    elif sl_hit_idx < tp_hit_idx:
+                        tp_first = False
+                    else:
+                        tp_first = False
+                        ambiguous_same_candle = True
+                elif tp_hit_idx is not None:
+                    tp_first = True   # Only TP hit
+                elif sl_hit_idx is not None:
+                    tp_first = False  # Only SL hit
+        # else: neither hit → tp_first stays None
 
         # ── OUTCOME REASON: human-readable label mirroring tp_first/mfe_win/
-        # mae_loss, kept for archive_reader.py and any reporting that wants
-        # a single descriptive field instead of the boolean trio ──
-        if tp_first is True:
-            outcome_reason = "target_hit"
-        elif tp_first is False:
-            outcome_reason = "stop_hit"
-        elif mfe_win and mae_loss:
-            outcome_reason = "both_hit"
-        elif mfe_win:
-            outcome_reason = "target_hit_ever"
-        elif mae_loss:
-            outcome_reason = "stop_hit_ever"
-        else:
-            outcome_reason = "no_hit"
+         if ambiguous_same_candle:
+             outcome_reason = "ambiguous_same_candle"
+         elif tp_first is True:
+             outcome_reason = "target_hit"
+         elif tp_first is False:
+             outcome_reason = "stop_hit"
+         elif mfe_win and mae_loss:
+             outcome_reason = "both_hit"
+         elif mfe_win:
+             outcome_reason = "target_hit_ever"
+         elif mae_loss:
+             outcome_reason = "stop_hit_ever"
+         else:
+             outcome_reason = "no_hit"
 
         # ── PRIMARY WIN: configurable ──
         primary_metric = getattr(cfg, "OUTCOME_PRIMARY_METRIC", "mfe")
@@ -1092,6 +1099,28 @@ class RedisStateStore:
 
         win_weight = _compute_win_weight(rr_achieved, win)
 
+        # ── NET P&L (cost-adjusted, fill-aware when available) ──
+        fee_pct = getattr(cfg, "BRAIN_FEE_PCT", 0.0006)
+        slip_pct = getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003)
+        base_cost_pct = (fee_pct * 2 + slip_pct * 2) * 100  # round-trip, in %
+
+        sig_p = data.get("signal_price")
+        fill_p = data.get("fill_price")
+        if sig_p and fill_p and float(sig_p) > 0:
+            sig_p = float(sig_p)
+            fill_p = float(fill_p)
+            if is_buy:
+                entry_slip_pct = (fill_p - sig_p) / sig_p * 100
+            else:
+                entry_slip_pct = (sig_p - fill_p) / sig_p * 100
+            realized_cost = base_cost_pct + max(0.0, entry_slip_pct) * 2
+        else:
+            realized_cost = base_cost_pct
+
+        if is_buy:
+            net_pnl_pct = pct_move - realized_cost
+        else:
+            net_pnl_pct = -pct_move - realized_cost
         return {
             "alert_key": key.split(":")[-2],
             "direction": direction,
@@ -1120,6 +1149,8 @@ class RedisStateStore:
             "signal_price": data.get("signal_price"),
             "fill_price": data.get("fill_price"),
             "fees_paid_pct": data.get("fees_paid_pct"),
+            "net_pnl_pct": round(net_pnl_pct, 6),
+            "realized_cost_pct": round(realized_cost, 6),
         }, ""
 
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
@@ -1235,6 +1266,8 @@ class RedisStateStore:
                                 "signal_price": f"{signal_price:.8f}" if signal_price is not None else "",
                                 "fill_price": f"{fill_price:.8f}" if fill_price is not None else "",
                                 "fees_paid_pct": f"{fees_paid_pct:.6f}" if fees_paid_pct is not None else "",
+                                "net_pnl_pct": f"{result.get('net_pnl_pct', 0.0):.6f}",
+                                "realized_cost_pct": f"{result.get('realized_cost_pct', 0.0):.6f}",
                                 "votes": json_dumps(conf_votes) if conf_votes is not None else "",
                                 "adx_val": str(adx_val) if adx_val is not None else "",
                                 "context": json_dumps(row_context) if row_context is not None else "",
@@ -1292,6 +1325,8 @@ class RedisStateStore:
                                     "signal_price": signal_price,
                                     "fill_price": fill_price,
                                     "fees_paid_pct": fees_paid_pct,
+                                    "net_pnl_pct": result.get("net_pnl_pct", 0.0),
+                                    "realized_cost_pct": result.get("realized_cost_pct", 0.0),
                                 })
                     except Exception as e:
                         logger_pair.debug(f"Failed to resolve pending outcome {key}: {e}")

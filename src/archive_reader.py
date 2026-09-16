@@ -165,9 +165,34 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
             "win_weight": win_weight_val,
             # ── Backward-compat fields ──
             "outcome_reason": raw.get("outcome_reason") or "legacy",
+            # ── Provenance — lets downstream consumers audit vintage ──               
+            "net_pnl_pct": (
+                float(raw.get("net_pnl_pct", 0.0))
+                if raw.get("net_pnl_pct") is not None else None
+            ),
+            "realized_cost_pct": (
+                float(raw.get("realized_cost_pct", 0.0))
+                if raw.get("realized_cost_pct") is not None else None
+            ),
+            # ── NEW: effective gate state ──
+            "effective_score": (
+                float(raw.get("effective_score"))
+                if raw.get("effective_score") is not None else None
+            ),
+            "effective_required": (
+                float(raw.get("effective_required"))
+                if raw.get("effective_required") is not None else None
+            ),
+            "macro_multiplier": (
+                float(raw.get("macro_multiplier"))
+                if raw.get("macro_multiplier") is not None else None
+            ),
+            "cluster_penalty": (
+                float(raw.get("cluster_penalty"))
+                if raw.get("cluster_penalty") is not None else None
+            ),
+            "gate_passed": _coerce_bool(raw.get("gate_passed"), default=None),
             # ── Provenance — lets downstream consumers audit vintage ──
-            # Useful for debugging future migrations: if a metric ever
-            # looks wrong again, group by this field first.
             "schema_version": row_schema,
         }
     except Exception:
