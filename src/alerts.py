@@ -573,11 +573,11 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
-     # ── BoS break of structure ──
-     for k, ok_key in ((AlertKey.BOS_BUY, "bos_gate_ok_buy"), (AlertKey.BOS_SELL, "bos_gate_ok_sell")):
-         rk = ALERT_KEYS.get(k)
-         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
-             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
+    # ── BoS break of structure ──
+    for k, ok_key in ((AlertKey.BOS_BUY, "bos_gate_ok_buy"), (AlertKey.BOS_SELL, "bos_gate_ok_sell")):
+        rk = ALERT_KEYS.get(k)
+        if rk and conditional_states.get(rk, False) and not context.get(ok_key):
+            resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
     
     # ── Pivots ──
     piv = context.get("pivots", {})
