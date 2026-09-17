@@ -333,6 +333,7 @@ class BotConfig(BaseModel):
     ENABLE_OB_PREMIUM_DISCOUNT_FILTER: bool = Field(default=False, description="Only accept demand-zone OB reversals below the 50% equilibrium of the OB_LOOKBACK_CANDLES dealing range (discount), and supply-zone reversals above it (premium). Zones on the wrong side are skipped entirely.")
     OUTCOME_LOOKAHEAD_CANDLES: int = Field(default=8, ge=1, le=96) 
     OUTCOME_FAVORABLE_MOVE_PCT: float = Field(default=0.5, ge=0.01, le=10.0) 
+    OUTCOME_FILL_DELAY_CANDLES: int = Field(default=1, ge=0, le=4, description="15m candles of latency assumed between signal and simulated fill, used to compute fill_price/entry_slip_pct for realistic net P&L. 0 = no live-order bot exists, so this can never be a real broker fill.")
     MIN_WIN_RATE_SAMPLE: int = Field(default=20, ge=1)    
     MIN_WIN_RATE: float = Field(default=0.55, ge=0.0, le=1.0)    
     OUTCOME_MAE_LOSS_PCT: float = Field(default=0.5, ge=0.01, le=10.0)  

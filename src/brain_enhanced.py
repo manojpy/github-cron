@@ -376,6 +376,7 @@ class BrainEngineV2(BaseBrainEngine):
     def _action_gate_check(
         real_rows: List[Dict[str, Any]],
         min_sample: int = 20,
+        recommendations: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Six-layer confirmation gate. Returns which patches are actionable."""
         gate: Dict[str, Any] = {
@@ -399,6 +400,28 @@ class BrainEngineV2(BaseBrainEngine):
                 ev_obj["p_ev_positive"] >= 0.85
                 and ev_obj["ev_p5"] > -0.10
             )
+        # ── Stability: no active CUSUM edge-decay alarm this cycle. Was
+        # hardcoded True, so a drifting alert's own recommendation could
+        # be auto-applied in the same report that flagged the drift. ──
+        if recommendations is not None:
+            gate["stability"] = not any(
+                r.get("category") == "cusum_drift" for r in recommendations
+            )
+
+        # ── Risk: realized max drawdown must stay inside the same budget
+        # the live kill switch enforces. ev_obj is already computed above,
+        # so this reuses it instead of a second pass over the rows. ──
+        if ev_obj.get("valid"):
+            dd_budget = getattr(cfg, "KILL_SWITCH_MAX_DRAWDOWN_PCT", 3.0)
+            gate["risk"] = ev_obj["max_drawdown_pct"] <= dd_budget
+        else:
+            gate["risk"] = False
+
+        # ── Execution: cost assumptions must be non-trivial, or every EV
+        # figure above is silently optimistic. ──
+        fee_pct = getattr(cfg, "BRAIN_FEE_PCT", 0.0006)
+        slip_pct = getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003)
+        gate["execution"] = fee_pct > 0 and slip_pct > 0
 
         gate["actionable"] = all(gate.values())
         return gate
@@ -1173,7 +1196,9 @@ class BrainEngineV2(BaseBrainEngine):
             )
 
         # ── Action gate: suppress config patches unless evidence is strong ──
-        action_gate = self._action_gate_check(real_rows, min_sample=min_sample)
+        action_gate = self._action_gate_check(
+            real_rows, min_sample=min_sample, recommendations=recommendations,
+        )
         ai_metrics["action_gate"] = action_gate
         if not action_gate.get("actionable", False):
             # Downgrade all config patches to informational

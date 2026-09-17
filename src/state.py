@@ -980,6 +980,15 @@ class RedisStateStore:
                 return None, "ts_mismatch"
             entry_idx = int(exact_matches[-1])
 
+        # ── Simulated executable fill: no live order exists, so use the
+        data.setdefault("signal_price", entry_price)
+        fill_delay = max(0, int(getattr(cfg, "OUTCOME_FILL_DELAY_CANDLES", 1)))
+        fill_idx = entry_idx + fill_delay
+        if fill_delay > 0 and fill_idx < len(data_15m.open):
+            data["fill_price"] = float(data_15m.open[fill_idx])
+        else:
+            data["fill_price"] = data.get("fill_price") or entry_price
+
         target_idx = entry_idx + cfg.OUTCOME_LOOKAHEAD_CANDLES
         if target_idx > i15:
             return None, "not_ready"
