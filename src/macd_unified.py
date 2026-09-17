@@ -10,7 +10,7 @@ import uuid
 import argparse
 import psutil
 import gc
-from typing import Dict, Any, Optional, Tuple, List, Union, cast 
+from typing import Dict, Any, Optional, Tuple, List, cast 
 from datetime import datetime, timezone
 import numpy as np
 
