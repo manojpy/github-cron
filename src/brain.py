@@ -64,6 +64,7 @@ _OVERRIDE_COOLDOWN_PREFIX = "brain_override_cooldown:"
 CALIBRATION_CURVES_KEY = "brain:calibration_curves"
 QUALITY_INPUTS_KEY = "brain:quality_inputs"
 KILL_SWITCH_KEY = "brain:kill_switch_active"
+MARKET_STATE_MODEL_KEY = "brain:market_state_model"
 
 def _resolve_config_path(alert_key: str) -> Optional[str]:
     path = _ALERT_CONFIG_MAP.get(alert_key)
@@ -216,6 +217,8 @@ class BrainEngine:
         self._calib_cache_ts = 0.0
         self._quality_cache: Optional[Dict[str, Any]] = None
         self._quality_cache_ts = 0.0
+        self._market_model_cache: Optional[Dict[str, Any]] = None
+        self._market_model_cache_ts = 0.0
 
     async def check_rewardable_override(
         self,
@@ -306,6 +309,41 @@ class BrainEngine:
             self._calib_cache_ts = now
         return self._calib_cache.get(alert_key) if self._calib_cache else None
 
+    # ── Market-state model (report-only trained fit, item #12) ────────
+    async def _persist_market_state_model(self, model: Dict[str, Any]) -> None:
+        if self.sdb.degraded or not self.sdb._redis:
+            return
+        try:
+            await self.sdb._safe_redis_op(
+                lambda: _rc(self.sdb._redis).set(
+                    MARKET_STATE_MODEL_KEY,
+                    json_dumps(model),
+                    ex=int(getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30) * 86400),
+                ),
+                2.0,
+                "market_state_model_persist",
+            )
+        except Exception:
+            pass
+
+    async def _load_market_state_model(self) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        if self._market_model_cache is None or now - self._market_model_cache_ts > 300:
+            if self.sdb.degraded or not self.sdb._redis:
+                return None
+            raw = await self.sdb._safe_redis_op(
+                lambda: _rc(self.sdb._redis).get(MARKET_STATE_MODEL_KEY),
+                2.0, "market_state_model_load",
+            )
+            if not raw:
+                return None
+            try:
+                self._market_model_cache = json.loads(raw)
+            except Exception:
+                return None
+            self._market_model_cache_ts = now
+        return self._market_model_cache
+
     async def check_calibration_gate(
         self, alert_key: str, conf_pct: float,
     ) -> Tuple[bool, Optional[float]]:
@@ -366,11 +404,16 @@ class BrainEngine:
         direction: str,
         conf_pct: float,
         adx_val: Optional[float] = None,
+        live_context: Optional[Dict[str, Any]] = None,
+        votes: Optional[Dict[str, bool]] = None,
+        session: str = "unknown",
     ) -> Optional[Dict[str, Any]]:
         """Dispatch hook: report-only trade-quality verdict for one
         prospective alert, from the per-alert EV/regime evidence the last
-        brain report persisted. Returns None (never blocks dispatch) on
-        any missing/thin data."""
+        brain report persisted, optionally blended with a live per-trade
+        market-state prediction (item #12) once
+        ENABLE_MARKET_STATE_LIVE_SCORE is on. Returns None (never blocks
+        dispatch) on any missing/thin data."""
         bundle = await self._load_quality_inputs()
         if not bundle:
             return None
@@ -378,19 +421,29 @@ class BrainEngine:
         if not ev_model_result:
             return None
         calibration_curve = await self._load_calibration_curve(alert_key)
+        context = dict(live_context or {})
+        context.setdefault("adx_val", adx_val)
         row = {
             "pair": pair,
             "alert_key": alert_key,
             "direction": direction,
             "conf_pct": conf_pct,
-            "context": {"adx_val": adx_val},
+            "context": context,
         }
+        market_state_p_win = None
+        if getattr(cfg, "ENABLE_MARKET_STATE_MODEL", True):
+            model = await self._load_market_state_model()
+            market_state_p_win = engine.predict_market_state_proba(
+                model, votes=votes, context=context, session=session, direction=direction,
+            )
         try:
             return engine.trade_quality_score(
                 row, ev_model_result, calibration_curve, bundle.get("regime_info"),
                 target_wr=getattr(cfg, "MIN_WIN_RATE", 0.55),
                 calibration_min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
                 calibration_slack=getattr(cfg, "CALIBRATION_SLACK", 0.05),
+                market_state_p_win=market_state_p_win,
+                use_market_state_live=getattr(cfg, "ENABLE_MARKET_STATE_LIVE_SCORE", False),
             )
         except Exception:
             return None
@@ -646,7 +699,7 @@ class BrainEngine:
             for d in drift_alerts
         )
 
-    # ── Recommendations ──────────────────────────────────────────────────────
+    # ── Recommendations ────────────────────���─────────────────────────────────
     async def generate_recommendations(self) -> Dict[str, Any]:
         """Build the full recommendation set: per-alert verdicts, a confluence
         threshold suggestion, shadow-mode insight, and a machine-readable
@@ -1479,6 +1532,39 @@ class BrainEngine:
                 "regime_info": rb,
                 "ts": int(time.time()),
             })
+
+        # ── Market-state model: report-only refresh each cycle. Discarded
+        # (previous persisted model kept as-is) unless it clears OOS EV
+        # validation — see train_market_state_model(). ──
+        if getattr(cfg, "ENABLE_MARKET_STATE_MODEL", True):
+            ms_model = engine.train_market_state_model(
+                real_rows,
+                min_sample=getattr(cfg, "MARKET_STATE_MODEL_MIN_SAMPLE", 150),
+                min_oos_p_ev_positive=getattr(cfg, "MARKET_STATE_MODEL_MIN_OOS_P", 0.70),
+            )
+            ai_metrics["market_state_model"] = {
+                k: v for k, v in ms_model.items() if k != "beta"
+            }
+            if ms_model.get("valid"):
+                await self._persist_market_state_model(ms_model)
+                recommendations.append({
+                    "type": "market_state_model_refreshed",
+                    "severity": "low",
+                    "message": (
+                        f"🤖 Market-state model refreshed: n_train={ms_model['n_train']}, "
+                        f"OOS P(EV>0)={ms_model['holdout_ev']['p_ev_positive']:.0%} "
+                        f"on n_holdout={ms_model['n_holdout']}."
+                    ),
+                })
+            else:
+                recommendations.append({
+                    "type": "market_state_model_rejected",
+                    "severity": "low",
+                    "message": (
+                        f"🤖 Market-state model NOT updated this cycle "
+                        f"({ms_model.get('error', 'unknown')}) — previous model, if any, kept live."
+                    ),
+                })
 
         # ── Kill switch: fast-failure stop (streak / rolling drawdown) ──
         if getattr(cfg, "ENABLE_KILL_SWITCH", False):

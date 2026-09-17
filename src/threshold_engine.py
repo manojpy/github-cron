@@ -2761,6 +2761,36 @@ def permutation_vote_importance(
     results.sort(key=lambda x: -abs(x["importance"]))
     return results
 
+def _pnl_sample_weights(
+    rows: List[Row],
+    fee_pct: float = 0.0006,
+    slippage_pct: float = 0.0003,
+    min_weight: float = 0.15,
+) -> List[float]:
+    """Per-row training weights from actual net P&L magnitude (item #13):
+    a trade that made/lost 2% should pull the fit harder than one that
+    made/lost 0.05%, instead of every row counting as one classification
+    example regardless of size. Uses the same net_pnl_pct-with-fallback
+    definition as ev_first_objective() so 'important' means the same
+    thing during training as it does during OOS acceptance.
+
+    Weights are normalized to mean 1.0 so the effective sample size (and
+    therefore existing min_sample/l2 tuning) stays comparable to plain
+    uniform weighting, and floored at min_weight so a near-zero-P&L row
+    still contributes rather than vanishing from the fit entirely."""
+    total_cost = (fee_pct * 2 + slippage_pct * 2) * 100
+    raw: List[float] = []
+    for r in rows:
+        net_pnl = r.get("net_pnl_pct")
+        if net_pnl is None:
+            mag = abs(float(r.get("pct_move", 0.0)))
+            net_pnl = mag - total_cost if r.get("win") else -(mag + total_cost)
+        raw.append(max(min_weight, abs(float(net_pnl))))
+    mean_w = statistics.fmean(raw) if raw else 1.0
+    if mean_w <= 0:
+        return [1.0] * len(rows)
+    return [w / mean_w for w in raw]
+
 def oos_permutation_importance(
     rows: List[Row],
     min_sample: int = 30,
@@ -2779,8 +2809,11 @@ def oos_permutation_importance(
 
     X_train, y_train, feat_names = build_market_state_features(train_rows)
     X_hold, y_hold, _ = build_market_state_features(holdout_rows, feat_names)
-    sw_train = [1.0] * len(X_train)
-
+    sw_train = (
+        _pnl_sample_weights(train_rows)
+        if getattr(cfg, "ENABLE_PNL_WEIGHTED_TRAINING", True)
+        else [1.0] * len(X_train)
+    )
     beta = _train_logistic(X_train, y_train, sw_train, max_iter=1500)
     if not beta:
         return []
@@ -2821,6 +2854,102 @@ def oos_permutation_importance(
         })
     results.sort(key=lambda x: -abs(float(x["importance_ev"])))
     return results
+
+def train_market_state_model(
+    rows: List[Row],
+    min_sample: int = 150,
+    train_frac: float = 0.67,
+    min_oos_p_ev_positive: float = 0.70,
+) -> Dict[str, Any]:
+    """Train the market-state logistic model (votes + numeric context +
+    session + direction — Recommended.txt items #4/#9) on a purge/embargo
+    -safe split, then decide whether to accept it purely on OOS
+    profitability of the holdout, not training-set classification
+    accuracy (item #6). Returns a dict with valid=False and a reason if
+    the fit doesn't clear the bar — callers should keep serving whatever
+    model they already had rather than overwrite it with this one.
+    """
+    if len(rows) < min_sample:
+        return {"valid": False, "error": "insufficient_data", "n": len(rows)}
+
+    train_rows, holdout_rows = walk_forward_split(rows, train_frac)
+    if len(train_rows) < min_sample * 0.5 or len(holdout_rows) < min_sample * 0.3:
+        return {
+            "valid": False, "error": "insufficient_split",
+            "n_train": len(train_rows), "n_holdout": len(holdout_rows),
+        }
+
+    X_train, y_train, feat_names = build_market_state_features(train_rows)
+    X_hold, y_hold, _ = build_market_state_features(holdout_rows, feat_names)
+    sw_train = (
+        _pnl_sample_weights(train_rows)
+        if getattr(cfg, "ENABLE_PNL_WEIGHTED_TRAINING", True)
+        else [1.0] * len(X_train)
+    )
+    beta = _train_logistic(X_train, y_train, sw_train, max_iter=1500)
+    if not beta:
+        return {"valid": False, "error": "training_failed"}
+
+    # OOS acceptance gate: only the trades the model would actually have
+    # taken (P(win) >= 0.5) on data it never trained on, evaluated on net
+    # EV — mirrors ev_first_objective's acceptance bar, not just accuracy.
+    kept = [
+        row for i, row in enumerate(holdout_rows)
+        if _sigmoid(sum(b * x for b, x in zip(beta, X_hold[i]))) >= 0.5
+    ]
+    min_kept = max(10, int(min_sample * 0.2))
+    if len(kept) < min_kept:
+        return {
+            "valid": False, "error": "holdout_too_thin_at_decision_boundary",
+            "n_kept": len(kept), "min_kept": min_kept,
+        }
+
+    holdout_ev_obj = ev_first_objective(kept, min_sample=min_kept)
+    if not holdout_ev_obj.get("valid") or holdout_ev_obj["p_ev_positive"] < min_oos_p_ev_positive:
+        return {
+            "valid": False, "error": "oos_ev_not_convincing",
+            "holdout_ev": holdout_ev_obj,
+        }
+
+    return {
+        "valid": True,
+        "beta": beta,
+        "feature_names": feat_names,
+        "n_train": len(train_rows),
+        "n_holdout": len(holdout_rows),
+        "n_kept_at_decision": len(kept),
+        "holdout_ev": holdout_ev_obj,
+        "trained_at": int(time.time()),
+    }
+
+def predict_market_state_proba(
+    model: Optional[Dict[str, Any]],
+    votes: Optional[Dict[str, bool]],
+    context: Optional[Dict[str, Any]],
+    session: str = "unknown",
+    direction: str = "buy",
+) -> Optional[float]:
+    """Score one live, prospective trade against a persisted
+    train_market_state_model() fit — the piece that was missing for a
+    true per-trade contextual prediction (item #12), as opposed to the
+    per-alert-key aggregate EV bucket trade_quality_score() used before.
+    Returns None (never raises) if there's no valid model yet or the
+    feature vector can't be built."""
+    if not model or not model.get("valid"):
+        return None
+    beta = model.get("beta")
+    feat_names = model.get("feature_names")
+    if not beta or not feat_names:
+        return None
+    row: Row = {
+        "votes": votes or {}, "context": context or {},
+        "session": session, "direction": direction, "win": False,
+    }
+    X, _, _ = build_market_state_features([row], feat_names)
+    if not X:
+        return None
+    z = sum(b * x for b, x in zip(beta, X[0]))
+    return _sigmoid(z)
 
 def _prob_edge_broken(wins: int, n: int, target_wr: float,
                        prior_strength: float = 10.0) -> float:
@@ -3908,6 +4037,8 @@ def trade_quality_score(
     target_wr: float = 0.55,
     calibration_min_sample: int = 15,
     calibration_slack: float = 0.05,
+    market_state_p_win: Optional[float] = None,
+    use_market_state_live: bool = False,
 ) -> Dict[str, Any]:
     """Unified quality assessment for a single prospective trade."""
     result: Dict[str, Any] = {
@@ -3931,6 +4062,15 @@ def trade_quality_score(
     ev_p5 = ev_model_result.get("ev_p5", net_ev)
     n_oos = ev_model_result.get("n", 0)
 
+    # ── Layer 2b: live per-trade market-state prediction (item #12).
+    # Always recorded for observability so you can watch it accumulate
+    # against real outcomes; only allowed to move quality/verdict once
+    # ENABLE_MARKET_STATE_LIVE_SCORE is explicitly turned on. ──
+    p_profit_effective = p_profit
+    if market_state_p_win is not None:
+        if use_market_state_live:
+            p_profit_effective = 0.5 * p_profit + 0.5 * market_state_p_win
+
     # ── Layer 3: Calibration ──
     cal_wr = None
     if calibration_curve:
@@ -3948,7 +4088,7 @@ def trade_quality_score(
             result["reason"] = f"calibration_gate: {reason}"
             return result
 
-    # ── Layer 4: Regime compatibility ──
+    # ── Layer 4: Regime compatibility ─���
     regime_ok = True
     if regime_info and regime_info.get("valid"):
         adx = (row.get("context") or {}).get("adx_val")
@@ -3961,11 +4101,10 @@ def trade_quality_score(
                 result["regime_warning"] = (
                     f"{regime} regime WR={reg_data['wr']:.0%}"
                 )
-
     # ── Layer 5: Composite score ──
     evidence_factor = min(1.0, n_oos / 200.0)
     quality = (
-        0.40 * p_profit
+        0.40 * p_profit_effective
         + 0.25 * max(0.0, min(1.0, (net_ev + 0.5) / 1.5))
         + 0.15 * evidence_factor
         + 0.10 * (0.5 if regime_ok else 0.0)
@@ -3973,9 +4112,9 @@ def trade_quality_score(
     )
 
     # ── Verdict ──
-    if quality >= 0.70 and p_profit >= 0.85 and ev_p5 > -0.10:
+    if quality >= 0.70 and p_profit_effective >= 0.85 and ev_p5 > -0.10:
         verdict = "HIGH"
-    elif quality >= 0.50 and p_profit >= 0.65:
+    elif quality >= 0.50 and p_profit_effective >= 0.65:
         verdict = "MEDIUM"
     else:
         verdict = "LOW"
@@ -3984,6 +4123,10 @@ def trade_quality_score(
         "verdict": verdict,
         "quality_score": round(quality, 3),
         "p_ev_positive": round(p_profit, 3),
+        "market_state_p_win": (
+            round(market_state_p_win, 3) if market_state_p_win is not None else None
+        ),
+        "market_state_live": bool(use_market_state_live and market_state_p_win is not None),
         "net_ev": round(net_ev, 4),
         "ev_p5": round(ev_p5, 4),
         "n_oos": n_oos,
@@ -3996,3 +4139,5 @@ def trade_quality_score(
     })
 
     return result
+
+    

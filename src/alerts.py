@@ -1840,9 +1840,28 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     # ── Trade-quality label (report-only, never gates dispatch) ──
                     if brain_engine and alert_total and alert_total > 0 and alert_score is not None:
                         try:
+                            # Same fields _record_win_rates() persists as
+                            # trigger_context — reused here so the live
+                            # prediction sees the same feature set the
+                            # model was trained on (rsi/ppo/wick/macro).
+                            live_context = {
+                                "rsi_curr": context.get("rsi_curr"),
+                                "rsi_adaptive_buy": gr.rsi_adaptive_buy,
+                                "rsi_adaptive_sell": gr.rsi_adaptive_sell,
+                                "ppo_curr": context.get("ppo_curr"),
+                                "ppo_adaptive_threshold": gr.ppo_adaptive_threshold,
+                                "buy_wick_ratio": gr.buy_wick_ratio,
+                                "sell_wick_ratio": gr.sell_wick_ratio,
+                                "adx_val": adx_val,
+                                "macro_correlation": macro_shadow.get("correlation") if macro_shadow else None,
+                                "macro_relative_strength": macro_shadow.get("relative_strength") if macro_shadow else None,
+                            }
                             tq = await brain_engine.get_trade_quality(
                                 pair_name, alert_key, direction,
                                 alert_score / alert_total * 100.0, adx_val,
+                                live_context=live_context,
+                                votes=alert_votes,
+                                session=current_session or "unknown",
                             )
                         except Exception as e:
                             tq = None

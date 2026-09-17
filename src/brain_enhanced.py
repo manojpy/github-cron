@@ -397,8 +397,8 @@ class BrainEngineV2(BaseBrainEngine):
         ev_obj = engine.ev_first_objective(real_rows, min_sample=min_sample)
         if ev_obj.get("valid"):
             gate["profitability"] = (
-                ev_obj["p_ev_positive"] >= 0.85
-                and ev_obj["ev_p5"] > -0.10
+                ev_obj["p_ev_positive"] >= getattr(cfg, "BRAIN_EV_GATE_P_THRESHOLD", 0.85)
+                and ev_obj["ev_p5"] > getattr(cfg, "BRAIN_EV_GATE_P5_FLOOR", -0.10)
             )
         # ── Stability: no active CUSUM edge-decay alarm this cycle. Was
         # hardcoded True, so a drifting alert's own recommendation could
@@ -1196,9 +1196,12 @@ class BrainEngineV2(BaseBrainEngine):
             )
 
         # ── Action gate: suppress config patches unless evidence is strong ──
-        action_gate = self._action_gate_check(
-            real_rows, min_sample=min_sample, recommendations=recommendations,
-        )
+        if getattr(cfg, "BRAIN_ACTION_GATE_ENABLED", True):
+            action_gate = self._action_gate_check(
+                real_rows, min_sample=min_sample, recommendations=recommendations,
+            )
+        else:
+            action_gate = {"actionable": True, "disabled": True}
         ai_metrics["action_gate"] = action_gate
         if not action_gate.get("actionable", False):
             # Downgrade all config patches to informational
