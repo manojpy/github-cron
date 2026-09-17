@@ -161,19 +161,20 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                 f"[{pair_name}] Confluence gate blocked: {score:.1f}/{total:.1f} weighted score "
                 f"(need {required:.1f}, pct-floor={pct_floor:.1f}, "
                 f"abs-floor={abs_floor:.1f}) — skipping Phase-2 indicators"
-            )
-            
-                  await _blanket_reset_pair(sdb, pair_name, logger_pair)
-                return pair_name, {
-                    "state": "NO_SIGNAL",
-                    "ts": int(time.time()),
-                    "summary": {
-                        "alerts": 0,
-                        "future_cloud": "green" if gr.cloud_up else "red" if gr.cloud_down else "neutral",
-                        "hist_rma": 0.0,
-                        "suppression": f"Confluence gate: {score:.1f}/{total:.1f} weighted score, need {required:.1f}"
-                    }
-                }, None
+
+
+            )      
+            await _blanket_reset_pair(sdb, pair_name, logger_pair)
+            return pair_name, {
+                "state": "NO_SIGNAL",
+                "ts": int(time.time()),
+                "summary": {
+                    "alerts": 0,
+                    "future_cloud": "green" if gr.cloud_up else "red" if gr.cloud_down else "neutral",
+                    "hist_rma": 0.0,
+                    "suppression": f"Confluence gate: {score:.1f}/{total:.1f} weighted score, need {required:.1f}"
+                }
+            }, None
 
     if cfg.ENABLE_OI_FUNDING_FILTER and not cfg.ENABLE_CONFLUENCE_GATE and gate_passed:
         if pair_oi is not None:
