@@ -399,7 +399,7 @@ class BrainEngineV2(BaseBrainEngine):
         """Override base class: read from file archive first, fall back to Redis."""
         return await self._load_rows()
 
-async def _get_layered_window_rows(self) -> tuple:
+    async def _get_layered_window_rows(self) -> tuple:
         """Override base class: read the recent/medium/long layered
         windows from the file archive first (mirrors _load_rows()'s
         file-storage branching), falling back to the base class's
@@ -1164,7 +1164,7 @@ async def _get_layered_window_rows(self) -> tuple:
                 f"🚫 Action gate BLOCKED config patches: {action_gate}"
             )
 
-        # ─ Re-assemble ──────────────────────────────────────────────────
+        # ─ Re-assemble ───────────────────���──────────────────────────────
         result = dict(base_recs)
         result["recommendations"] = recommendations
         result["recommendation_count"] = len(recommendations)
