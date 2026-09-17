@@ -76,7 +76,7 @@ jobs:
 
       - name: 🏷️ Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -92,7 +92,7 @@ jobs:
       # PHASE 2: BUILD & VERIFY
       - name: 🔨 Build & Push Docker Image
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
