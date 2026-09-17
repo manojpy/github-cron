@@ -2415,19 +2415,25 @@ def multi_metric_per_pair(rows: List[Row], min_sample: int = 15) -> List[Dict[st
 def _build_vote_dataset(
     rows: List[Row],
     vote_names: List[str],
+    use_pnl_weighting: bool = False,
 ) -> Tuple[List[List[float]], List[float], List[float]]:
-    """Extract vote feature matrix, labels, and sample weights."""
+    
+    raw_weights = _pnl_sample_weights(rows) if use_pnl_weighting else None
+
     X: List[List[float]] = []
     y: List[float] = []
     sw: List[float] = []
-    for r in rows:
+    for i, r in enumerate(rows):
         votes = r.get("votes")
         if not votes or not isinstance(votes, dict):
             continue
         vec = [1.0] + [1.0 if votes.get(vn) else 0.0 for vn in vote_names]
         X.append(vec)
         y.append(1.0 if r["win"] else 0.0)
-        sw.append(r.get("win_weight", 1.0) if r["win"] else 1.0)
+        if raw_weights is not None:
+            sw.append(raw_weights[i])
+        else:
+            sw.append(r.get("win_weight", 1.0) if r["win"] else 1.0)
     return X, y, sw
 
 def build_market_state_features(
@@ -2512,10 +2518,13 @@ def _train_logistic(
 def _score_with_beta(
     rows: List[Row], beta: List[float], vote_names: List[str],
     threshold: float = 0.5,
-) -> Tuple[float, int]:
-    """Apply logistic beta to rows, return (win_rate, n) for predicted-positive."""
-    hits = 0
-    total = 0
+    target_wr: float = 0.55,
+) -> Tuple[float, int, float]:
+    """Apply logistic beta to rows. Returns (net_ev, n_kept, wr) for
+    predicted-positive rows. Net EV uses the same cost model as
+    ev_first_objective so the WF veto is comparable to the optimizer's
+    own objective."""
+    kept: List[Row] = []
     for r in rows:
         votes = r.get("votes")
         if not votes or not isinstance(votes, dict):
@@ -2524,11 +2533,11 @@ def _score_with_beta(
             beta[j + 1] for j, vn in enumerate(vote_names) if votes.get(vn)
         )
         if _sigmoid(z) >= threshold:
-            total += 1
-            if r["win"]:
-                hits += 1
-    wr = hits / total if total else 0.0
-    return wr, total
+            kept.append(r)
+    if not kept:
+        return 0.0, 0, 0.0
+    net_ev, _hk, wr = ev_and_kelly_for(kept)
+    return net_ev, len(kept), wr
 
 def _map_coefficients_to_weights(
     beta: List[float],
@@ -2597,7 +2606,10 @@ def optimize_vote_weights(
       variance as a stability metric.
     """
     vote_names = sorted(current_weights.keys())
-    X, y, sample_weights = _build_vote_dataset(rows, vote_names)
+    use_pnl_weighting = getattr(cfg, "ENABLE_PNL_WEIGHTED_TRAINING", True)
+    X, y, sample_weights = _build_vote_dataset(
+        rows, vote_names, use_pnl_weighting=use_pnl_weighting,
+    )
     n = len(X)
 
     if n < min_sample:
@@ -2611,8 +2623,9 @@ def optimize_vote_weights(
     if walk_forward and n >= min_sample * 2:
         # ── Walk-forward split ──
         train_rows, holdout_rows = walk_forward_split(rows, wf_train_frac)
-        X_train, y_train, sw_train = _build_vote_dataset(train_rows, vote_names)
-
+        X_train, y_train, sw_train = _build_vote_dataset(
+            train_rows, vote_names, use_pnl_weighting=use_pnl_weighting,
+        )
         if len(X_train) < min_sample // 2 or len(holdout_rows) < min_sample // 3:
             # Fall back to full-data training with low confidence
             beta = _train_logistic(X, y, sample_weights, max_iter, lr, l2)
@@ -2620,12 +2633,13 @@ def optimize_vote_weights(
         else:
             beta = _train_logistic(X_train, y_train, sw_train, max_iter, lr, l2)
 
-            # Validate on holdout
-            wf_holdout_wr, wf_n = _score_with_beta(holdout_rows, beta, vote_names)
-            wf_baseline_wr = sum(r["win"] for r in holdout_rows) / len(holdout_rows) if holdout_rows else 0.0
+            wf_ev, wf_n, wf_holdout_wr = _score_with_beta(holdout_rows, beta, vote_names)
+            _, _, wf_baseline_wr = _score_with_beta(holdout_rows, [0.0]*len(beta), vote_names, threshold=0.0)
+            # Simpler: baseline net EV is just the holdout's own net EV.
+            baseline_ev, _, _ = ev_and_kelly_for(holdout_rows)
 
-            if wf_n >= 10:
-                wf_passed = wf_holdout_wr >= wf_baseline_wr
+             if wf_n >= 10:
+                wf_passed = (wf_ev >= baseline_ev) and (wf_holdout_wr >= wf_baseline_wr - 0.05)
                 if not wf_passed:
                     return {
                         "valid": False,
@@ -3828,7 +3842,7 @@ def portfolio_heat_check(
         return {"blocked": False, "reason": f"gate error (fail-open): {e}", **stats}
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ═══════════════���══════════════════════════════════════════════════════
 #  KILL SWITCH — fast-failure halt (streak / rolling drawdown)
 # ══════════════════════════════════════════════════════════════════════
 

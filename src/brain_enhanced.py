@@ -405,9 +405,8 @@ class BrainEngineV2(BaseBrainEngine):
         # be auto-applied in the same report that flagged the drift. ──
         if recommendations is not None:
             gate["stability"] = not any(
-                r.get("category") == "cusum_drift" for r in recommendations
+                r.get("type") == "cusum_drift" for r in recommendations
             )
-
         # ── Risk: realized max drawdown must stay inside the same budget
         # the live kill switch enforces. ev_obj is already computed above,
         # so this reuses it instead of a second pass over the rows. ──

@@ -981,6 +981,10 @@ class RedisStateStore:
             entry_idx = int(exact_matches[-1])
 
         # ── Simulated executable fill: no live order exists, so use the
+        # open of the candle OUTCOME_FILL_DELAY_CANDLES after entry as
+        # the assumed fill. This gives entry_slip_pct a real, direction-
+        # aware number (buy fills above signal, sell below) instead of
+        # collapsing to zero and hiding execution cost. ──
         data.setdefault("signal_price", entry_price)
         fill_delay = max(0, int(getattr(cfg, "OUTCOME_FILL_DELAY_CANDLES", 1)))
         fill_idx = entry_idx + fill_delay
@@ -1117,6 +1121,7 @@ class RedisStateStore:
 
         sig_p = data.get("signal_price")
         fill_p = data.get("fill_price")
+
         if sig_p and fill_p and float(sig_p) > 0:
             sig_p = float(sig_p)
             fill_p = float(fill_p)
@@ -1124,7 +1129,7 @@ class RedisStateStore:
                 entry_slip_pct = (fill_p - sig_p) / sig_p * 100
             else:
                 entry_slip_pct = (sig_p - fill_p) / sig_p * 100
-            realized_cost = base_cost_pct + max(0.0, entry_slip_pct) * 2
+            realized_cost = (fee_pct * 2) * 100 + abs(entry_slip_pct) * 2
         else:
             realized_cost = base_cost_pct
 

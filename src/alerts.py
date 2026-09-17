@@ -1865,8 +1865,16 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             )
                         except Exception as e:
                             tq = None
-                            logger_pair.debug(f"Trade quality lookup failed for {alert_key}: {e}")
+                            logger_pair.debug(f"Trade quality lookup failed for {alert_key}: {e}")                 
+
                         if tq and tq.get("verdict"):
+                            if tq.get("market_state_p_win") is not None:
+                                logger_pair.debug(
+                                    f"[{pair_name}] {alert_key} market-state "
+                                    f"P(win)={tq['market_state_p_win']:.3f} "
+                                    f"(live={tq['market_state_live']}, "
+                                    f"ev_bucket_p={tq.get('p_ev_positive', 0):.3f})"
+                                )
                             if tq["verdict"] == "BLOCKED":
                                 alert_extra = (
                                     f"{alert_extra} | 🎯 Quality: BLOCKED "
