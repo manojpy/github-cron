@@ -1159,25 +1159,12 @@ def ev_and_kelly_for(
     slippage_pct: float = 0.0003,
 ) -> Tuple[float, float, float]:
     """Net EV after round-trip fees + slippage, plus Half-Kelly fraction.
-    Returns (net_ev_pct, half_kelly_fraction, win_rate).
-
-    Prefers each row's own `net_pnl_pct` — the real cost-adjusted P&L
-    computed in state.py from actual fees/slippage and, when available,
-    measured signal-vs-fill slippage — over the flat estimate below.
-    Rows without net_pnl_pct (legacy data predating that field) fall
-    back to the flat fee/slippage estimate."""
+    Returns (net_ev_pct, half_kelly_fraction, win_rate)."""
     if not rows:
         return 0.0, 0.0, 0.0
-    # entry + exit for both fee and slippage; fee_pct/slippage_pct are
-    # fractions (e.g. 0.0006 = 0.06%) so this must be *100 to land in the
-    # same percentage-point units as pct_move (price_diff/price * 100).
-    total_cost = ((fee_pct * 2) + (slippage_pct * 2)) * 100
+    total_cost = (fee_pct * 2) + (slippage_pct * 2)  # entry + exit for both
     net_moves: List[float] = []
     for r in rows:
-        net_pnl = r.get("net_pnl_pct")
-        if net_pnl is not None:
-            net_moves.append(float(net_pnl))
-            continue
         mag = abs(float(r.get("pct_move", 0.0)))
         if r["win"]:
             net_moves.append(mag - total_cost)
@@ -1194,6 +1181,7 @@ def ev_and_kelly_for(
     full_kelly = (wr * b - (1 - wr)) / b if b > 0 else 0.0
     half_kelly = max(0.0, min(full_kelly * 0.5, 0.25))  # cap 25 %
     return ev, half_kelly, wr
+
 
 # ════════════════════════════════════════════════════════════════════���══
 #  FIXED: Brier Score & Calibration Curve  (Recommended.txt §2)
@@ -1991,7 +1979,6 @@ _STRUCTURAL_CONFIG_FIELDS: Tuple[str, ...] = (
     "OB_LOOKBACK_CANDLES", "OB_IMPULSE_LOOKAHEAD", "OB_CONFIRM_LOOKAHEAD_CANDLES",
     "OB_PERSISTENCE_CANDLES", "OB_MIN_PENETRATION_ATR_MULT",
     "CHOCH_SWING_LEN", "CHOCH_LOOKBACK_CANDLES", "CHOCH_CONFIRM_WINDOW_CANDLES",
-    "BOS_SWING_LEN", "BOS_LOOKBACK_CANDLES",
     "FIB_REVERSAL_SWING_LENGTH", "FIB_REVERSAL_SWING_LOOKBACK_CANDLES",
     "ATR_PCTL_LOOKBACK", "VOLUME_PCTL_LOOKBACK",
     "PIVOT_LOOKBACK_PERIOD",
@@ -2748,35 +2735,26 @@ def ev_first_objective(
 
     p_ev_positive = _prob_ev_positive(net_ev, ev_std)
 
-    # ── Net per-row P&L: prefer real net_pnl_pct, else flat cost estimate ──
-    # (mirrors ev_and_kelly_for, so profit_factor/max_drawdown are net of
-    # costs and consistent with net_ev above, not gross moves)
-    total_cost = (fee_pct * 2 + slippage_pct * 2) * 100
-    net_pnls: List[float] = []
-    for r in rows:
-        net_pnl = r.get("net_pnl_pct")
-        if net_pnl is not None:
-            net_pnls.append(float(net_pnl))
-            continue
-        mag = abs(float(r.get("pct_move", 0.0)))
-        net_pnls.append(mag - total_cost if r["win"] else -(mag + total_cost))
-
-    # Profit factor (net of costs)
-    wins = [p for p in net_pnls if p > 0]
-    losses = [abs(p) for p in net_pnls if p <= 0]
+    # Profit factor
+    wins = [abs(float(r.get("pct_move", 0.0))) for r in rows if r["win"]]
+    losses = [abs(float(r.get("pct_move", 0.0))) for r in rows if not r["win"]]
     gross_profit = sum(wins) if wins else 0.0
     gross_loss = sum(losses) if losses else 0.0
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
-    # Max drawdown (cumulative net PnL trough)
-    ordered_idx = sorted(range(len(rows)), key=lambda i: rows[i].get("entry_ts", 0))
+    # Max drawdown (cumulative PnL trough)
+    total_cost = (fee_pct * 2 + slippage_pct * 2) * 100
+    ordered = sorted(rows, key=lambda r: r.get("entry_ts", 0))
     cumulative = 0.0
     peak = 0.0
     max_dd = 0.0
-    for i in ordered_idx:
-        cumulative += net_pnls[i]
+    for r in ordered:
+        mag = abs(float(r.get("pct_move", 0.0)))
+        pnl = (mag - total_cost) if r["win"] else -(mag + total_cost)
+        cumulative += pnl
         peak = max(peak, cumulative)
         max_dd = max(max_dd, peak - cumulative)
+
     n = len(rows)
     win_count = sum(1 for r in rows if r["win"])
     lo, hi, _ = wilson_ci(win_count, n)

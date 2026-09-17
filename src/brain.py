@@ -54,8 +54,6 @@ _ALERT_CONFIG_MAP = {
     "kijun_cross_down":     "ENABLE_KIJUN_CROSS",
     "hist_rma_buy":         "ENABLE_HIST_RMA",
     "hist_rma_sell":        "ENABLE_HIST_RMA",
-    "bos_buy":              "ENABLE_BOS_ALERT",
-    "bos_sell":             "ENABLE_BOS_ALERT",
 }
 # pivot_up_r1 / pivot_down_s2 / etc. — variable-suffix family, matched by prefix
 _ALERT_CONFIG_PREFIX_MAP = {
@@ -474,8 +472,6 @@ class BrainEngine:
                     "signal_price": _to_opt_float(f, "signal_price"),
                     "fill_price": _to_opt_float(f, "fill_price"),
                     "fees_paid_pct": _to_opt_float(f, "fees_paid_pct"),
-                    "net_pnl_pct": _to_opt_float(f, "net_pnl_pct"),
-                    "realized_cost_pct": _to_opt_float(f, "realized_cost_pct"),
                 })
             except (KeyError, ValueError) as e:
                 logging.getLogger("macd_bot").debug(f"Brain: dropping malformed outcome row: {e}")
