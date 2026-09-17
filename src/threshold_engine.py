@@ -2638,7 +2638,7 @@ def optimize_vote_weights(
             # Simpler: baseline net EV is just the holdout's own net EV.
             baseline_ev, _, _ = ev_and_kelly_for(holdout_rows)
 
-             if wf_n >= 10:
+            if wf_n >= 10:
                 wf_passed = (wf_ev >= baseline_ev) and (wf_holdout_wr >= wf_baseline_wr - 0.05)
                 if not wf_passed:
                     return {
