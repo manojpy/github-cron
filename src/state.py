@@ -1626,8 +1626,6 @@ class RedisStateStore:
             return None, 0
         stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}:{session}"
         try:
-            data = await asyncio.wait_for(_rc(self._redis).hgetall(stats_key), timeout=2.0)
-
             data = await asyncio.wait_for(cast("Awaitable[dict[Any, Any]]", _rc(self._redis).hgetall(stats_key)), timeout=2.0)
             wins = int(data.get("wins", 0))
             losses = int(data.get("losses", 0))
