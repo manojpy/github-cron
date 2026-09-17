@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections import deque
-from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, TYPE_CHECKING
+from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, TYPE_CHECKING, cast
 import ssl
 import aiohttp
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
