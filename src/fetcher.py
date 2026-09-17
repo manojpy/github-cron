@@ -11,6 +11,7 @@ import ssl
 import aiohttp
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 import numpy as np
+from socket import AddressFamily
 
 from bot_config import (
     cfg, logger, logger_main, Constants, json_dumps, json_loads, JSONDecodeError,
@@ -62,7 +63,7 @@ class SessionManager:
                     enable_cleanup_closed=True,
                     ttl_dns_cache=3600,
                     keepalive_timeout=90,
-                    family=0,
+                    family=AddressFamily.AF_UNSPEC, 
                 )
 
                 timeout = aiohttp.ClientTimeout(
@@ -96,6 +97,7 @@ class SessionManager:
             except Exception as e:
                 logger.warning(f"Error closing old session: {e}")
 
+        assert new_session is not None
         return new_session
 
     @classmethod
@@ -177,9 +179,9 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
         if shutdown_event.is_set():
             logger.debug(f"Shutdown requested, aborting fetch: {url[:80]}")
             return None
-        
+             
         try:
-            async with session.get(url, params=params, timeout=timeout) as resp:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
                 if resp.status == 429:
                     retry_after = resp.headers.get('Retry-After')
                     try:
@@ -1025,8 +1027,7 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[PriceDa
             logger.error(f"Length mismatch: {bad}")
             return None
     
-        data["timestamp"] = np.where(data["timestamp"] > 1_000_000_000_000, data["timestamp"] // 1000, data["timestamp"])
-
+        data["timestamp"] = np.where(data["timestamp"] > 1_000_000_000_000, data["timestamp"] // np.int64(1000), data["timestamp"])
         o, h, l, c = data["open"], data["high"], data["low"], data["close"]
     
         error_mask = (
