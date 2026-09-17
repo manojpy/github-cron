@@ -670,8 +670,8 @@ class RedisStateStore:
         try:
             async with self._redis.pipeline() as pipe:
                 for k in keys:
-                    pipe.get(f"{self.meta_prefix}{k}")
-                values = await asyncio.wait_for(pipe.execute(), timeout=timeout)
+                    pipe.get(f"{self.meta_prefix}{k}")         
+                values = await asyncio.wait_for(_execute_pipeline(pipe), timeout=timeout)
             return {k: v for k, v in zip(keys, values)}
         except Exception as e:
             logger.error(f"batch_get_metadata failed for {len(keys)} keys: {e}")
@@ -687,7 +687,7 @@ class RedisStateStore:
                 for k, v in items.items():
                     pipe.set(f"{self.meta_prefix}{k}", v,
                               ex=ttl if ttl is not None else self.metadata_expiry_seconds)
-                await asyncio.wait_for(pipe.execute(), timeout=timeout)
+                await asyncio.wait_for(_execute_pipeline(pipe), timeout=timeout)
             return True
         except Exception as e:
             logger.error(f"batch_set_metadata failed: {e}")
@@ -772,7 +772,7 @@ class RedisStateStore:
                 for alert_key in alert_keys:
                     recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
                     pipe.set(recent_key, str(ts), nx=True, ex=effective_window)
-                results = await asyncio.wait_for(pipe.execute(), timeout=3.0)
+                results = await asyncio.wait_for(_execute_pipeline(pipe), timeout=3.0)
             return {k: bool(r) for k, r in zip(alert_keys, results)}
         except Exception as e:
             logger.error(f"batch_check_recent_alerts FAILED for {pair} ({alert_keys}): {e}")
@@ -1643,7 +1643,7 @@ class RedisStateStore:
             async with _rc(self._redis).pipeline() as pipe:
                 for ak in alert_keys:
                     pipe.hgetall(f"{RedisKeyPrefix.ALERT_STATS}{pair}:{ak}")
-                raw_results = await asyncio.wait_for(pipe.execute(), timeout=timeout)
+                raw_results = await asyncio.wait_for(_execute_pipeline(pipe), timeout=timeout)
             out: Dict[str, Tuple[Optional[float], int]] = {}
             for ak, data in zip(alert_keys, raw_results):
                 if not data:
