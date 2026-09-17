@@ -1011,11 +1011,11 @@ class BrainEngineV2(BaseBrainEngine):
 
         ai_metrics["config_comparisons"] = version_comparisons
 
-        # ── AI/ML: Permutation Vote Importance ───────────────────────────
-        if len(real_rows) >= 30:
+        # ── AI/ML: OOS Permutation Importance (EV-based, walk-forward) ────
+        if len(real_rows) >= min_sample * 3:
             _perm_n = 15
-            perm_imp = engine.permutation_vote_importance(
-                real_rows, min_sample=30, n_permutations=_perm_n
+            perm_imp = engine.oos_permutation_importance(
+                real_rows, min_sample=min_sample, n_permutations=_perm_n
             )
             if perm_imp:
                 top_positive = [p for p in perm_imp if p["direction"] == "positive"][:3]
@@ -1023,10 +1023,10 @@ class BrainEngineV2(BaseBrainEngine):
                 parts = []
                 if top_positive:
                     parts.append("most impactful: " + ", ".join(
-                        f"{p['vote']}({p['importance']:+.3f})" for p in top_positive))
+                        f"{p['feature']}({p['importance_ev']:+.4f})" for p in top_positive))
                 if top_negative:
                     parts.append("harmful: " + ", ".join(
-                        f"{p['vote']}({p['importance']:+.3f})" for p in top_negative))
+                        f"{p['feature']}({p['importance_ev']:+.4f})" for p in top_negative))
 
                 # FDR tests the single strongest signal. If the top signal
                 _top = (top_positive + top_negative)[:1]
@@ -1034,11 +1034,11 @@ class BrainEngineV2(BaseBrainEngine):
 
                 _rec: Dict[str, Any] = {
                     "type": "permutation_importance", "severity": "low",
-                    "message": f"🤖 Permutation importance — {'; '.join(parts)}",
+                    "message": f"🤖 OOS permutation importance (net EV) — {'; '.join(parts)}",
                 }
                 if _top_rec is not None:
-                    _rec["top_vote"] = _top_rec["vote"]
-                    _rec["top_importance"] = _top_rec["importance"]
+                    _rec["top_vote"] = _top_rec["feature"]
+                    _rec["top_importance"] = _top_rec["importance_ev"]
                     _rec["top_std"] = _top_rec.get("std", 0.0)
                     _rec["n_permutations"] = _perm_n
                 recommendations.append(_rec)

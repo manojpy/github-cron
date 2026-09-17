@@ -1740,6 +1740,28 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
                 if failing_rate is None:
                     # Passed both gates — keep it.
+                    # ── Trade-quality label (report-only, never gates dispatch) ──
+                    if brain_engine and alert_total and alert_total > 0 and alert_score is not None:
+                        try:
+                            tq = await brain_engine.get_trade_quality(
+                                pair_name, alert_key, direction,
+                                alert_score / alert_total * 100.0, adx_val,
+                            )
+                        except Exception as e:
+                            tq = None
+                            logger_pair.debug(f"Trade quality lookup failed for {alert_key}: {e}")
+                        if tq and tq.get("verdict"):
+                            if tq["verdict"] == "BLOCKED":
+                                alert_extra = (
+                                    f"{alert_extra} | 🎯 Quality: BLOCKED "
+                                    f"({tq.get('reason', 'n/a')})"
+                                )
+                            else:
+                                alert_extra = (
+                                    f"{alert_extra} | 🎯 Quality: {tq['verdict']} "
+                                    f"(P(profit)={tq.get('p_ev_positive', 0):.0%}, "
+                                    f"netEV={tq.get('net_ev', 0):+.2f}%)"
+                                )
                     surviving_alerts.append((alert_title, alert_extra, alert_key))
                     continue
 

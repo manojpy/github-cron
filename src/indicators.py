@@ -1435,7 +1435,7 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
             fvg_fn = _bullish_fvg_at if is_buy else _bearish_fvg_at
             has_fvg = any(
                 fvg_fn(h, l, k)
-                for k in range(max(sweep_idx, 2), r + 1)
+                for k in range(max(sweep_idx, 2), min(r + 2, len(h)))
             )
             if cfg_obj.CHOCH_REQUIRE_FVG and not has_fvg:
                 continue

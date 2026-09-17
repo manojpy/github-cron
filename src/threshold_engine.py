@@ -755,6 +755,69 @@ def regime_breakdown(rows: List[Row], min_sample: int = 20) -> Dict[str, Any]:
         result["wr_gap"] = regimes["trending"]["wr"] - regimes["ranging"]["wr"]
     return result
 
+def layered_window_analysis(
+    recent_rows: List[Row],
+    medium_rows: List[Row],
+    long_rows: List[Row],
+    min_sample: int = 20,
+) -> Dict[str, Any]:
+    """Per-alert-key comparison of recent vs medium vs long-history net EV,
+    so the brain can tell 'this alert is historically good but currently
+    in a weak patch' apart from 'this alert has always been weak' — the
+    same recent-only window can't distinguish the two on its own.
+
+    `recent_rows`/`medium_rows`/`long_rows` are the same outcome-log rows
+    parsed with progressively wider window_days cutoffs (e.g. 30/90/180) —
+    medium and long are chronological supersets of recent, not disjoint
+    slices. Purely diagnostic: never changes live gating on its own.
+
+    An alert_key is only scored if it has >= min_sample rows in BOTH the
+    recent and long windows (the two endpoints being compared) — a key
+    with only medium-window evidence is skipped rather than guessed at.
+    """
+    def _group(rows: List[Row]) -> Dict[str, List[Row]]:
+        g: Dict[str, List[Row]] = defaultdict(list)
+        for r in rows:
+            g[r["alert_key"]].append(r)
+        return g
+
+    def _summarize(rows: List[Row]) -> Optional[Dict[str, Any]]:
+        if len(rows) < min_sample:
+            return None
+        ev, _, wr = ev_and_kelly_for(rows)
+        return {"n": len(rows), "wr": round(wr, 3), "net_ev": round(ev, 4)}
+
+    recent_g, medium_g, long_g = _group(recent_rows), _group(medium_rows), _group(long_rows)
+    all_keys = set(recent_g) | set(medium_g) | set(long_g)
+
+    per_alert: Dict[str, Any] = {}
+    for ak in sorted(all_keys):
+        recent = _summarize(recent_g.get(ak, []))
+        medium = _summarize(medium_g.get(ak, []))
+        long_ = _summarize(long_g.get(ak, []))
+        if recent is None or long_ is None:
+            continue
+
+        recent_ev, long_ev = recent["net_ev"], long_["net_ev"]
+        if recent_ev <= 0.0 and long_ev > 0.05:
+            verdict = "historically_good_currently_weak"
+        elif recent_ev > 0.05 and long_ev <= 0.0:
+            verdict = "recently_emerging_edge"
+        elif recent_ev <= 0.0 and long_ev <= 0.0:
+            verdict = "always_weak"
+        elif recent_ev > 0.0 and long_ev > 0.0:
+            verdict = "consistently_good"
+        else:
+            verdict = "mixed"
+
+        per_alert[ak] = {
+            "recent": recent, "medium": medium, "long": long_,
+            "verdict": verdict,
+            "recent_vs_long_ev_gap": round(recent_ev - long_ev, 4),
+        }
+
+    return {"valid": bool(per_alert), "per_alert": per_alert}
+
 def find_knee_point(caps_data: List[CapRow], min_sample: int = 30, smooth_window: int = 3) -> Optional[float]:
     """Where marginal WR gain per +1 score flattens. WR values are smoothed
     first to resist single-bucket noise. Returns the (unsmoothed) score at
@@ -1152,19 +1215,31 @@ def recommend_threshold(
 # ══════════════════════════════════════════════════════════════════════
 #  NEW: Cost-Aware EV + Kelly Sizing  (Recommended.txt §5)
 # ══════════════════════════════════════════════════════════════════════
-
 def ev_and_kelly_for(
     rows: List[Row],
     fee_pct: float = 0.0006,
     slippage_pct: float = 0.0003,
 ) -> Tuple[float, float, float]:
     """Net EV after round-trip fees + slippage, plus Half-Kelly fraction.
-    Returns (net_ev_pct, half_kelly_fraction, win_rate)."""
+    Returns (net_ev_pct, half_kelly_fraction, win_rate).
+
+    Prefers each row's own `net_pnl_pct` — the real cost-adjusted P&L
+    computed in state.py from actual fees/slippage and, when available,
+    measured signal-vs-fill slippage — over the flat estimate below.
+    Rows without net_pnl_pct (legacy data predating that field) fall
+    back to the flat fee/slippage estimate."""
     if not rows:
         return 0.0, 0.0, 0.0
-    total_cost = (fee_pct * 2) + (slippage_pct * 2)  # entry + exit for both
+    # entry + exit for both fee and slippage; fee_pct/slippage_pct are
+    # fractions (e.g. 0.0006 = 0.06%) so this must be *100 to land in the
+    # same percentage-point units as pct_move (price_diff/price * 100).
+    total_cost = ((fee_pct * 2) + (slippage_pct * 2)) * 100
     net_moves: List[float] = []
     for r in rows:
+        net_pnl = r.get("net_pnl_pct")
+        if net_pnl is not None:
+            net_moves.append(float(net_pnl))
+            continue
         mag = abs(float(r.get("pct_move", 0.0)))
         if r["win"]:
             net_moves.append(mag - total_cost)
@@ -2735,23 +2810,33 @@ def ev_first_objective(
 
     p_ev_positive = _prob_ev_positive(net_ev, ev_std)
 
-    # Profit factor
-    wins = [abs(float(r.get("pct_move", 0.0))) for r in rows if r["win"]]
-    losses = [abs(float(r.get("pct_move", 0.0))) for r in rows if not r["win"]]
+    # ── Net per-row P&L: prefer real net_pnl_pct, else flat cost estimate ──
+    # (mirrors ev_and_kelly_for, so profit_factor/max_drawdown are net of
+    # costs and consistent with net_ev above, not gross moves)
+    total_cost = (fee_pct * 2 + slippage_pct * 2) * 100
+    net_pnls: List[float] = []
+    for r in rows:
+        net_pnl = r.get("net_pnl_pct")
+        if net_pnl is not None:
+            net_pnls.append(float(net_pnl))
+            continue
+        mag = abs(float(r.get("pct_move", 0.0)))
+        net_pnls.append(mag - total_cost if r["win"] else -(mag + total_cost))
+
+    # Profit factor (net of costs)
+    wins = [p for p in net_pnls if p > 0]
+    losses = [abs(p) for p in net_pnls if p <= 0]
     gross_profit = sum(wins) if wins else 0.0
     gross_loss = sum(losses) if losses else 0.0
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
-    # Max drawdown (cumulative PnL trough)
-    total_cost = (fee_pct * 2 + slippage_pct * 2) * 100
-    ordered = sorted(rows, key=lambda r: r.get("entry_ts", 0))
+    # Max drawdown (cumulative net PnL trough)
+    ordered_idx = sorted(range(len(rows)), key=lambda i: rows[i].get("entry_ts", 0))
     cumulative = 0.0
     peak = 0.0
     max_dd = 0.0
-    for r in ordered:
-        mag = abs(float(r.get("pct_move", 0.0)))
-        pnl = (mag - total_cost) if r["win"] else -(mag + total_cost)
-        cumulative += pnl
+    for i in ordered_idx:
+        cumulative += net_pnls[i]
         peak = max(peak, cumulative)
         max_dd = max(max_dd, peak - cumulative)
 
@@ -3743,6 +3828,9 @@ def trade_quality_score(
     regime_info: Optional[Dict[str, Any]],
     kill_switch_active: bool = False,
     portfolio_blocked: bool = False,
+    target_wr: float = 0.55,
+    calibration_min_sample: int = 15,
+    calibration_slack: float = 0.05,
 ) -> Dict[str, Any]:
     """Unified quality assessment for a single prospective trade."""
     result: Dict[str, Any] = {
@@ -3750,7 +3838,6 @@ def trade_quality_score(
         "alert_key": row.get("alert_key"),
         "direction": row.get("direction"),
     }
-
     # ── Layer 1: Hard vetoes ──
     if kill_switch_active:
         result["verdict"] = "BLOCKED"
@@ -3773,8 +3860,9 @@ def trade_quality_score(
         conf_pct = row.get("conf_pct", 50.0)
         ok, cal_wr, reason = calibration_gate_decision(
             calibration_curve, conf_pct,
-            target_wr=0.55, min_sample=15, slack=0.05,
+            target_wr=target_wr, min_sample=calibration_min_sample, slack=calibration_slack,
         )
+
         result["calibration"] = {
             "pass": ok, "calibrated_wr": cal_wr, "reason": reason,
         }

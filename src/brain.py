@@ -63,6 +63,7 @@ _ALERT_CONFIG_PREFIX_MAP = {
 
 _OVERRIDE_COOLDOWN_PREFIX = "brain_override_cooldown:"
 CALIBRATION_CURVES_KEY = "brain:calibration_curves"
+QUALITY_INPUTS_KEY = "brain:quality_inputs"
 KILL_SWITCH_KEY = "brain:kill_switch_active"
 
 def _resolve_config_path(alert_key: str) -> Optional[str]:
@@ -226,6 +227,8 @@ class BrainEngine:
         self._cusum_detectors: Dict[str, CUSUMDetector] = {}
         self._calib_cache: Optional[Dict[str, Any]] = None
         self._calib_cache_ts = 0.0
+        self._quality_cache: Optional[Dict[str, Any]] = None
+        self._quality_cache_ts = 0.0
 
     async def check_rewardable_override(
         self,
@@ -333,6 +336,77 @@ class BrainEngine:
             slack=getattr(cfg, "CALIBRATION_SLACK", 0.05),
         )
         return ok, cal_wr
+
+# ── Trade quality score (report-only) ───────────────────────────────
+    async def _persist_quality_inputs(self, quality_inputs: Dict[str, Any]) -> None:
+        if self.sdb.degraded or not self.sdb._redis:
+            return
+        try:
+            await self.sdb._safe_redis_op(
+                lambda: _rc(self.sdb._redis).set(
+                    QUALITY_INPUTS_KEY,
+                    json_dumps(quality_inputs),
+                    ex=int(getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30) * 86400),
+                ),
+                2.0,
+                "quality_inputs_persist",
+            )
+        except Exception:
+            pass
+
+    async def _load_quality_inputs(self) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        if self._quality_cache is None or now - self._quality_cache_ts > 300:
+            if self.sdb.degraded or not self.sdb._redis:
+                return None
+            raw = await self.sdb._safe_redis_op(
+                lambda: _rc(self.sdb._redis).get(QUALITY_INPUTS_KEY),
+                2.0, "quality_inputs_load",
+            )
+            if not raw:
+                return None
+            try:
+                self._quality_cache = json.loads(raw)
+            except Exception:
+                return None
+            self._quality_cache_ts = now
+        return self._quality_cache
+
+    async def get_trade_quality(
+        self,
+        pair: str,
+        alert_key: str,
+        direction: str,
+        conf_pct: float,
+        adx_val: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Dispatch hook: report-only trade-quality verdict for one
+        prospective alert, from the per-alert EV/regime evidence the last
+        brain report persisted. Returns None (never blocks dispatch) on
+        any missing/thin data."""
+        bundle = await self._load_quality_inputs()
+        if not bundle:
+            return None
+        ev_model_result = bundle.get("ev_by_alert", {}).get(alert_key)
+        if not ev_model_result:
+            return None
+        calibration_curve = await self._load_calibration_curve(alert_key)
+        row = {
+            "pair": pair,
+            "alert_key": alert_key,
+            "direction": direction,
+            "conf_pct": conf_pct,
+            "context": {"adx_val": adx_val},
+        }
+        try:
+            return engine.trade_quality_score(
+                row, ev_model_result, calibration_curve, bundle.get("regime_info"),
+                target_wr=getattr(cfg, "MIN_WIN_RATE", 0.55),
+                calibration_min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
+                calibration_slack=getattr(cfg, "CALIBRATION_SLACK", 0.05),
+            )
+        except Exception:
+            return None
 
     # ── Kill switch ──────────────────────────────────────────────────────
     async def is_kill_switch_active(self) -> bool:
@@ -472,6 +546,8 @@ class BrainEngine:
                     "signal_price": _to_opt_float(f, "signal_price"),
                     "fill_price": _to_opt_float(f, "fill_price"),
                     "fees_paid_pct": _to_opt_float(f, "fees_paid_pct"),
+                    "net_pnl_pct": _to_opt_float(f, "net_pnl_pct"),
+                    "realized_cost_pct": _to_opt_float(f, "realized_cost_pct"),
                 })
             except (KeyError, ValueError) as e:
                 logging.getLogger("macd_bot").debug(f"Brain: dropping malformed outcome row: {e}")
@@ -490,6 +566,27 @@ class BrainEngine:
         real_rows = self._parse_rows(real_raw, window_days=window_days)
         shadow_rows = self._parse_rows(shadow_raw, window_days=window_days)
         return real_rows, shadow_rows
+
+    async def _get_layered_window_rows(
+        self,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Real-outcome rows for the recent/medium/long-history comparison
+        (layered_window_analysis). Medium and long are chronological
+        supersets of recent, not separate populations, so this reads the
+        stream once at the long-window sample size and re-filters the
+        same raw rows three ways in Python rather than hitting Redis three
+        times. Runs as its own read (in addition to _get_rows()'s own
+        30-day-scoped read) since the long window generally needs far more
+        raw entries than the default report sample covers."""
+        long_sample = getattr(cfg, "BRAIN_LONG_WINDOW_STREAM_SAMPLE", 15000)
+        recent_days = getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30)
+        medium_days = getattr(cfg, "BRAIN_MEDIUM_WINDOW_DAYS", 90)
+        long_days = getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180)
+        raw = await self._read_stream(RedisKeyPrefix.OUTCOME_LOG_STREAM, long_sample)
+        recent_rows = self._parse_rows(raw, window_days=recent_days)
+        medium_rows = self._parse_rows(raw, window_days=medium_days)
+        long_rows = self._parse_rows(raw, window_days=long_days)
+        return recent_rows, medium_rows, long_rows
 
     # ── CUSUM drift detection ────────────────────────────────────────────
     async def _load_or_create_cusum(self, alert_key: str) -> CUSUMDetector:
@@ -913,6 +1010,58 @@ class BrainEngine:
                     f"Diagnostic only — no regime-specific threshold applied yet."
                 ),
             })
+        # ── Layered recent/medium/long-history comparison ──
+        if getattr(cfg, "ENABLE_LAYERED_WINDOW_ANALYSIS", True):
+            recent_days = getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30)
+            long_days = getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180)
+            try:
+                recent_lw, medium_lw, long_lw = await self._get_layered_window_rows()
+                lwa = engine.layered_window_analysis(
+                    recent_lw, medium_lw, long_lw, min_sample=min_sample,
+                )
+            except Exception as e:
+                lwa = {"valid": False}
+                logging.getLogger("macd_bot").debug(f"Brain: layered window analysis failed: {e}")
+            if lwa.get("valid"):
+                ai_metrics["layered_window_analysis"] = lwa["per_alert"]
+                weak_now = [
+                    (ak, v) for ak, v in lwa["per_alert"].items()
+                    if v["verdict"] == "historically_good_currently_weak"
+                ]
+                emerging = [
+                    (ak, v) for ak, v in lwa["per_alert"].items()
+                    if v["verdict"] == "recently_emerging_edge"
+                ]
+                always_weak = [
+                    ak for ak, v in lwa["per_alert"].items() if v["verdict"] == "always_weak"
+                ]
+                if weak_now or emerging:
+                    lines = []
+                    for ak, v in sorted(weak_now, key=lambda t: t[1]["recent_vs_long_ev_gap"])[:3]:
+                        lines.append(
+                            f"  {ak}: recent netEV {v['recent']['net_ev']:+.2f}% (n={v['recent']['n']}) "
+                            f"vs {long_days}d {v['long']['net_ev']:+.2f}% (n={v['long']['n']}) — "
+                            f"historically good, currently weak"
+                        )
+                    for ak, v in sorted(emerging, key=lambda t: -t[1]["recent_vs_long_ev_gap"])[:3]:
+                        lines.append(
+                            f"  {ak}: recent netEV {v['recent']['net_ev']:+.2f}% (n={v['recent']['n']}) "
+                            f"vs {long_days}d {v['long']['net_ev']:+.2f}% (n={v['long']['n']}) — "
+                            f"newly emerging, not yet in the long-history baseline"
+                        )
+                    always_weak_note = (
+                        f"\n{len(always_weak)} alert(s) confirmed weak in both windows — not a temporary dip."
+                        if always_weak else ""
+                    )
+                    recommendations.append({
+                        "type": "layered_window_analysis", "severity": "medium",
+                        "message": (
+                            f"🕰️ Recent ({recent_days}d) vs long-history ({long_days}d) divergence "
+                            f"on {len(weak_now) + len(emerging)} alert(s):\n" + "\n".join(lines)
+                            + always_weak_note +
+                            "\nDiagnostic only — no threshold change applied yet."
+                        ),
+                    })
         if target_floor is not None:
             attribution = engine.outcome_attribution(
                 real_rows, CONFLUENCE_WEIGHTS, threshold=target_floor, min_sample=min_sample,
@@ -971,7 +1120,7 @@ class BrainEngine:
                 f"  • MFE WR (TP ever hit):    {mfe_wr:.0%} "
                 f"[{mm_summary['mfe_wilson'][0]:.0%}-{mm_summary['mfe_wilson'][1]:.0%}]\n"
                 f"  • MAE Loss Rate (SL hit):  {mae_rate:.0%}\n"
-                f"  • Clean Win (TP w/o SL):   {clean_wr:.0%}"
+                f" Clean Win (TP w/o SL):   {clean_wr:.0%}"
             )
             if gap > 0.05:
                 summary_msg += (
@@ -1261,6 +1410,22 @@ class BrainEngine:
                         )
                     ),
                 })
+
+    # ── Trade-quality inputs: per-alert EV evidence + regime, persisted
+        # for the dispatch-time get_trade_quality() hook (report-only) ──
+        ev_by_alert: Dict[str, Any] = {}
+        for alert_key, s in alert_stats.items():
+            if len(s["rows"]) < min_sample:
+                continue
+            ev_obj = engine.ev_first_objective(s["rows"], min_sample=min_sample)
+            if ev_obj.get("valid"):
+                ev_by_alert[alert_key] = ev_obj
+        if ev_by_alert:
+            await self._persist_quality_inputs({
+                "ev_by_alert": ev_by_alert,
+                "regime_info": rb,
+                "ts": int(time.time()),
+            })
 
         # ── Kill switch: fast-failure stop (streak / rolling drawdown) ──
         if getattr(cfg, "ENABLE_KILL_SWITCH", False):
