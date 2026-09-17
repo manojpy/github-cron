@@ -3,14 +3,15 @@ import time
 import asyncio
 import logging
 import uuid
-from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, TYPE_CHECKING, Set, Sequence
+from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, TYPE_CHECKING, Set, Sequence, Awaitable, Union, cast
 import numpy as np
 import redis.asyncio as redis  # type: ignore[import-untyped]
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError  # type: ignore[import-untyped]
 
-
 from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError, CONFIG_OVERRIDE_ALLOWED_FIELDS, CONFIG_OVERRIDE_METADATA_KEY, BRAIN_DISABLED_KEYS_METADATA_KEY, PAIR_THRESHOLDS_METADATA_KEY, _get_session_from_ts
 from fetcher import compute_backoff
+
+StreamField = Union[bytes, memoryview, str, int, float]
 
 if TYPE_CHECKING:
     from fetcher import PriceData
@@ -307,7 +308,7 @@ class RedisStateStore:
 
                 if existing_pool and pool_is_healthy:
                     if self._redis is not existing_pool:
-                        await self._redis.aclose()
+                        await _rc(self._redis).aclose()
                     self._redis = existing_pool
                     logger.debug("Using pool created by another coroutine")
                 else:
@@ -1189,12 +1190,14 @@ class RedisStateStore:
         try:
             async with self._redis.pipeline() as read_pipe:
                 for key in keys:
-                    read_pipe.get(key)
-                raw_values = await asyncio.wait_for(read_pipe.execute(), timeout=2.0)
+                   read_pipe.get(key)
+                raw_values = await asyncio.wait_for(
+                    cast(Awaitable[List[Any]], read_pipe.execute()),
+                    timeout=2.0,
+                )
         except Exception as e:
             logger_pair.warning(f"Failed to batch-fetch pending outcomes for {pair}: {e}")
             return
-
         resolved_count = 0
         not_ready_count = 0
         ts_mismatch_count = 0
@@ -1202,11 +1205,12 @@ class RedisStateStore:
         bad_payload_count = 0
   
         stats_ttl = max(cfg.STATE_EXPIRY_DAYS * 86400, 7 * 86400)
+
+        stats_ttl = max(cfg.STATE_EXPIRY_DAYS * 86400, 7 * 86400)
         resolved_for_file: List[Dict[str, Any]] = []
         try:
             async with self._redis.pipeline() as write_pipe:
                 pending_writes = 0
-
                 for key, raw in zip(keys, raw_values):
                     try:
                         result, skip_reason = self._parse_pending_outcome_row(key, raw, data_15m, i15)
@@ -1259,6 +1263,8 @@ class RedisStateStore:
                         write_pipe.hincrby(session_stats_key, "wins" if win else "losses", 1)
                         write_pipe.expire(session_stats_key, stats_ttl)
                         stream_fields = None
+                        if conf_score is not None and conf_total is not None:
+                        stream_fields: Optional[Dict[StreamField, StreamField]] = None
                         if conf_score is not None and conf_total is not None:
                             stream_fields = {
                                 "pair": str(pair),
@@ -1361,7 +1367,8 @@ class RedisStateStore:
                         continue
 
                 if pending_writes:
-                    await asyncio.wait_for(write_pipe.execute(), timeout=2.0)
+                    await asyncio.wait_for(cast(Awaitable[List[Any]], write_pipe.execute()), timeout=2.0)
+
 
         except Exception as e:
             logger_pair.debug(f"Failed to persist resolved outcomes for {pair}: {e}")
@@ -1411,12 +1418,14 @@ class RedisStateStore:
         )
         if not keys:
             return
-
         try:
             async with self._redis.pipeline() as read_pipe:
                 for key in keys:
                     read_pipe.get(key)
-                raw_values = await asyncio.wait_for(read_pipe.execute(), timeout=2.0)
+                raw_values = await asyncio.wait_for(
+                    cast(Awaitable[List[Any]], read_pipe.execute()),
+                    timeout=2.0,
+                )
         except Exception as e:
             logger_pair.warning(
                 f"Failed to batch-fetch shadow pending outcomes for {pair}: {e}"
@@ -1427,7 +1436,7 @@ class RedisStateStore:
         hiconf_pct = getattr(cfg, "BRAIN_REWARDABLE_MIN_CONFLUENCE_PCT", 80.0)
         stats_ttl = max(cfg.STATE_EXPIRY_DAYS * 86400, 7 * 86400)
         resolved_for_file: List[Dict[str, Any]] = []
-        
+
         try:
             async with self._redis.pipeline() as write_pipe:
                 pending_writes = 0
@@ -1464,35 +1473,36 @@ class RedisStateStore:
                         ):
                             conf_pct = (conf_score / conf_total) * 100.0
                             if not getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                                shadow_stream_fields: Dict[StreamField, StreamField] = {
+                                    "pair": str(pair),
+                                    "alert_key": str(alert_key),
+                                    "direction": str(direction),
+                                    "score": str(conf_score),
+                                    "total": str(conf_total),
+                                    "pct_move": f"{pct_move:.4f}",
+                                    "win": "1" if win else "0",
+                                    "entry_ts": str(entry_ts),
+                                    "session": _get_session_from_ts(entry_ts)
+                                    if entry_ts
+                                    else "dead",
+                                    "mae": f"{mae:.5f}" if mae is not None else "",
+                                    "mfe": f"{mfe:.5f}" if mfe is not None else "",
+                                    "close_win": "1" if result.get("close_win", win) else "0",
+                                    "mfe_win": "1" if result.get("mfe_win", False) else "0",
+                                    "mae_loss": "1" if result.get("mae_loss", False) else "0",
+                                    "tp_first": (
+                                        "1" if result.get("tp_first") is True
+                                        else "0" if result.get("tp_first") is False
+                                        else ""
+                                    ),
+                                    "outcome_reason": result.get("outcome_reason", "unknown"),
+                                    "votes": json_dumps(conf_votes)
+                                    if conf_votes is not None
+                                    else "",
+                                }
                                 write_pipe.xadd(
                                     RedisKeyPrefix.SHADOW_LOG_STREAM,
-                                    {
-                                        "pair": str(pair),
-                                        "alert_key": str(alert_key),
-                                        "direction": str(direction),
-                                        "score": str(conf_score),
-                                        "total": str(conf_total),
-                                        "pct_move": f"{pct_move:.4f}",
-                                        "win": "1" if win else "0",
-                                        "entry_ts": str(entry_ts),
-                                        "session": _get_session_from_ts(entry_ts)
-                                        if entry_ts
-                                        else "dead",
-                                        "mae": f"{mae:.5f}" if mae is not None else "",
-                                        "mfe": f"{mfe:.5f}" if mfe is not None else "",
-                                        "close_win": "1" if result.get("close_win", win) else "0",
-                                        "mfe_win": "1" if result.get("mfe_win", False) else "0",
-                                        "mae_loss": "1" if result.get("mae_loss", False) else "0",
-                                        "tp_first": (
-                                            "1" if result.get("tp_first") is True
-                                            else "0" if result.get("tp_first") is False
-                                            else ""
-                                        ),
-                                        "outcome_reason": result.get("outcome_reason", "unknown"),
-                                        "votes": json_dumps(conf_votes)
-                                        if conf_votes is not None
-                                        else "",
-                                    },
+                                    shadow_stream_fields,
                                     maxlen=2000,
                                     approximate=True,
                                 )
@@ -1505,10 +1515,10 @@ class RedisStateStore:
                                     "wins" if win else "losses",
                                     1,
                                 )
-                                write_pipe.expire(hiconf_key, stats_ttl)          
+                                write_pipe.expire(hiconf_key, stats_ttl)
                         write_pipe.delete(key)
                         pending_writes += 1
-                        resolved_count += 1              
+                        resolved_count += 1
 
                         if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                             if conf_score is None or conf_total is None:
@@ -1558,14 +1568,14 @@ class RedisStateStore:
                         continue
 
                 if pending_writes:
-                    await asyncio.wait_for(write_pipe.execute(), timeout=2.0)
+                    await asyncio.wait_for(cast(Awaitable[List[Any]], write_pipe.execute()), timeout=2.0)
 
         except Exception as e:
             logger_pair.debug(
                 f"Failed to persist resolved shadow outcomes for {pair}: {e}"
             )
             return
-    
+
         if resolved_for_file and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
             try:
                 from outcome_storage import append_outcome_batch
@@ -1744,7 +1754,7 @@ class RedisStateStore:
             await self._record_redis_failure("atomic_batch_update", e)
             return False
 
-    # ── CUSUM state persistence ──────────────────────────────────────────
+    # ── CUSUM state persistence ─────────────────────────────────────────
     async def load_cusum_state(self, alert_key: str) -> Optional[Dict[str, Any]]:
         """Load persisted CUSUM accumulator for one alert_key."""
         if self.degraded or not self._redis:
@@ -1887,22 +1897,21 @@ class RedisLock:
             logger.error(f"Redis lock acquisition failed: {e}")
             return False
 
-    async def extend(self, timeout: float = 3.0) -> bool:     
+    async def extend(self, timeout: float = 3.0) -> bool:
         if not self.token or not self.redis or not self.acquired_by_me:
             self.lost = True
-            return False    
+            return False
         try:
             result = await asyncio.wait_for(
-                self.redis.eval(
+                cast(Awaitable[Any], self.redis.eval(
                     self.EXTEND_LUA,
                     1,
                     self.lock_key,
                     self.token,
-                    self.expire,
-                ),
+                    str(self.expire),
+                )),
                 timeout=timeout,
             )
-
             if result:
                 self.last_extend_time = time.monotonic()
                 if cfg.DEBUG_MODE:
@@ -1946,16 +1955,17 @@ class RedisLock:
             )
         
         return should_extend
-
-    async def release(self, timeout: float = 3.0) -> None:     
+   
+    async def release(self, timeout: float = 3.0) -> None:
         if not self.token or not self.redis or not self.acquired_by_me:
             return
         try:
             result = await asyncio.wait_for(
-                self.redis.eval(self.RELEASE_LUA, 1, self.lock_key, self.token),
+                cast(Awaitable[Any], self.redis.eval(
+                    self.RELEASE_LUA, 1, self.lock_key, self.token,
+                )),
                 timeout=timeout,
             )
-        
             if result:
                 logger.info(f"🔏 Lock released: {self.lock_key.replace('lock:', '')}")
                 self.acquired_by_me = False
