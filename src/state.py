@@ -1207,8 +1207,6 @@ class RedisStateStore:
         bad_payload_count = 0
   
         stats_ttl = max(cfg.STATE_EXPIRY_DAYS * 86400, 7 * 86400)
-
-        stats_ttl = max(cfg.STATE_EXPIRY_DAYS * 86400, 7 * 86400)
         resolved_for_file: List[Dict[str, Any]] = []
         try:
             async with self._redis.pipeline() as write_pipe:
@@ -1241,7 +1239,6 @@ class RedisStateStore:
                             continue
                         if result is None:
                             continue
-
                         alert_key = result["alert_key"]
                         direction = result["direction"]
                         entry_ts = result["entry_ts"]
@@ -1266,7 +1263,7 @@ class RedisStateStore:
                         write_pipe.expire(session_stats_key, stats_ttl)
                         stream_fields = None
                         if conf_score is not None and conf_total is not None:
-                            stream_fields: Optional[Dict[StreamField, StreamField]] = None
+                        stream_fields: Optional[Dict[StreamField, StreamField]] = None
                         if conf_score is not None and conf_total is not None:
                             stream_fields = {
                                 "pair": str(pair),
