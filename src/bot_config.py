@@ -14,6 +14,9 @@ from contextvars import ContextVar
 import numpy as np
 from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict, PrivateAttr
 
+JSONDecodeError: type[Exception]
+JSON_BACKEND: str
+
 try:
     import orjson
 

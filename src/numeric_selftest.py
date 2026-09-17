@@ -13,7 +13,7 @@ import aot_bridge
 def _ref_ema_alpha(data: List[float], alpha: float) -> List[float]:
     n = len(data)
     period = int(1.0 / alpha + 0.5)
-    out = [None] * n
+    out: List[float] = [0.0] * n
     if n < period:
         period = n
     sma_seed = sum(data[:period]) / period
