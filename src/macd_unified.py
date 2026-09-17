@@ -10,7 +10,7 @@ import uuid
 import argparse
 import psutil
 import gc
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple, List, Union, cast 
 from datetime import datetime, timezone
 import numpy as np
 
@@ -37,7 +37,8 @@ from state import (
     _blanket_reset_pair, _clear_all_redis_states, build_products_map_from_cfg,
     RedisKeyPrefix, RedisStateStore, RedisLock, _rc,
 )
-from gates import compute_confluence_score, _eval_gate, _resolve_pair_outcomes
+
+from gates import GateResult, compute_confluence_score, _eval_gate, _resolve_pair_outcomes
 
 import threshold_engine as engine
 
@@ -89,7 +90,9 @@ def get_trigger_timestamp() -> int:
 
 async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: PriceData,
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
-    reference_time: int, fetcher: DataFetcher, symbol: str, alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
+    reference_time: int, fetcher: DataFetcher, symbol: str,
+    alerts_sent_ref: Optional[List[int]] = None,
+    alerts_sent_lock: Optional[asyncio.Lock] = None,
     max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN,
     oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None,
     macro_context: Optional[BtcMacroContext] = None,
@@ -117,13 +120,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             return cached
         if cached is None:
             return None
-        gr = cached
+        gr = cast(GateResult, cached)
     else:
         gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time, pair_oi, resolve_outcomes=False)
         if gr is None:
             return None
         if isinstance(gr, tuple):
             return gr
+        gr = cast(GateResult, gr)
     reversal_eligible = (
         (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE)
         and (gr.buy_trend_common_relaxed or gr.sell_trend_common_relaxed)
@@ -158,18 +162,19 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                 f"(need {required:.1f}, pct-floor={pct_floor:.1f}, "
                 f"abs-floor={abs_floor:.1f}) — skipping Phase-2 indicators"
             )
-            await _blanket_reset_pair(sdb, pair_name, logger_pair)
-            return pair_name, {
-                "state": "NO_SIGNAL",
-                "ts": int(time.time()),
-                "summary": {
-                    "alerts": 0,
-                    "future_cloud": "green" if gr.cloud_up else "red" if gr.cloud_down else "neutral",
-                    "hist_rma": 0.0,
-                    "suppression": f"Confluence gate: {score:.1f}/{total:.1f} weighted score, need {required:.1f}"
-                }
-            }
-  
+            
+                  await _blanket_reset_pair(sdb, pair_name, logger_pair)
+                return pair_name, {
+                    "state": "NO_SIGNAL",
+                    "ts": int(time.time()),
+                    "summary": {
+                        "alerts": 0,
+                        "future_cloud": "green" if gr.cloud_up else "red" if gr.cloud_down else "neutral",
+                        "hist_rma": 0.0,
+                        "suppression": f"Confluence gate: {score:.1f}/{total:.1f} weighted score, need {required:.1f}"
+                    }
+                }, None
+
     if cfg.ENABLE_OI_FUNDING_FILTER and not cfg.ENABLE_CONFLUENCE_GATE and gate_passed:
         if pair_oi is not None:
             oi_reason = _oi_funding_gate_reason(
@@ -191,7 +196,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                         "hist_rma": 0.0,
                         "suppression": oi_reason
                     }
-                }
+                }, None
+
     if cfg.ENABLE_OB_GATE and not cfg.ENABLE_CONFLUENCE_GATE and gate_passed:
         ob_ok = gr.ob_gate_ok_buy if buy_side else gr.ob_gate_ok_sell
         if ob_ok is False:
@@ -207,7 +213,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                     "hist_rma": 0.0,
                     "suppression": ob_reason
                 }
-            }
+            }, None
     try: 
         alert_result = await _eval_alerts(gr, data_5m, data_daily, reference_time, sdb, correlation_id, logger_pair)
         if alert_result is None:
@@ -246,7 +252,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                 pass
 
 async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time, fetcher,
-                       alerts_sent_ref=None, alerts_sent_lock=None, max_alerts_per_run=cfg.MAX_ALERTS_PER_RUN,
+                       alerts_sent_ref: Optional[List[int]] = None,
+                       alerts_sent_lock: Optional[asyncio.Lock] = None,
+                       max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN,
                        oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None,
                        macro_context: Optional[BtcMacroContext] = None,
                        cluster_context: Optional[ClusterContext] = None,
@@ -442,9 +450,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         if fetch_daily:
             daily_symbols.append(pair_name)
 
-    all_candles = {}
+    all_candles: Dict[str, Dict[str, Any]] = {}
     daily_task = None
-    miss_symbols = []
+    miss_symbols: List[str] = []
 
     if fetch_daily and daily_symbols:
         day_key = get_utc_date_key(reference_time)

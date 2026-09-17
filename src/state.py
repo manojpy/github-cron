@@ -248,6 +248,8 @@ class RedisStateStore:
         self.expiry_seconds = max(cfg.STATE_EXPIRY_DAYS * 86400 if cfg.STATE_EXPIRY_DAYS > 0 else 0, 7 * 86400)
         self.alert_expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
         self.metadata_expiry_seconds = 7 * 86400
+        self._pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None
+        self._shadow_pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None
 
         self.degraded = False
         self.degraded_alerted = False
@@ -1264,7 +1266,7 @@ class RedisStateStore:
                         write_pipe.expire(session_stats_key, stats_ttl)
                         stream_fields = None
                         if conf_score is not None and conf_total is not None:
-                        stream_fields: Optional[Dict[StreamField, StreamField]] = None
+                            stream_fields: Optional[Dict[StreamField, StreamField]] = None
                         if conf_score is not None and conf_total is not None:
                             stream_fields = {
                                 "pair": str(pair),
