@@ -445,6 +445,14 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     alerts_sent_ref: Optional[List[int]] = None,
     alerts_sent_lock: Optional[asyncio.Lock] = None,
     max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN) -> List[Tuple[str, Dict[str, Any]]]:
+
+    # Narrow the Optional refs once here so the rest of the body (and the
+    # dispatch_combined_alerts call in particular) can use them as non-Optional.
+    if alerts_sent_ref is None:
+        alerts_sent_ref = []
+    if alerts_sent_lock is None:
+        alerts_sent_lock = asyncio.Lock()
+
     ticker_task = None
     if cfg.ENABLE_OI_FUNDING_FILTER:
         ticker_task = asyncio.create_task(fetcher.fetch_tickers_batch())

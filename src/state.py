@@ -30,14 +30,16 @@ def _rc(client: "Optional[redis.Redis]") -> "redis.Redis":
     return client
 
 async def _execute_pipeline(pipe: Any) -> Any:
-    """Await a redis-py pipeline's execute() in a way mypy accepts.
+    """Await a redis-py pipeline's execute() in a form mypy accepts.
 
-    redis-py types the async pipeline's execute() as `Awaitable[Any] | Any`
-    (because the same method name exists on sync pipelines), so passing it
-    directly to asyncio.wait_for() trips mypy's argument check even when a
-    cast is applied to the whole expression. Wrapping the await inside a
-    plain coroutine collapses the union to a single Awaitable."""
-    return await pipe.execute()
+    redis-py types Pipeline.execute() as `Awaitable[Dict] | Dict` because the
+    method is shared with the sync Pipeline class. Passing that union directly
+    to asyncio.wait_for fails overload resolution regardless of an inline
+    cast. Awaiting it inside a plain coroutine narrows it to a single
+    Coroutine[Any, Any, Any], which is unambiguously awaitable.
+    """
+    result = cast("Awaitable[Any]", pipe.execute())
+    return await result
 
 async def _blanket_reset_pair(sdb: RedisStateStore, pair_name: str, logger_pair: logging.Logger) -> int:
     from alerts import ALERT_KEYS

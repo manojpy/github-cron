@@ -707,7 +707,6 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
     if any(np.isnan([o, h, l, c])) or any(np.isinf([o, h, l, c])):
         return False, False, None, "Invalid OHLC: contains NaN or Inf"
     
-
     if any(x <= 0 for x in [o, h, l, c]):
         return False, False, None, "Invalid OHLC: non-positive values"
     
@@ -1027,7 +1026,8 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[PriceDa
             logger.error(f"Length mismatch: {bad}")
             return None
     
-        data["timestamp"] = np.where(data["timestamp"] > 1_000_000_000_000, data["timestamp"] // 1000, data["timestamp"])
+        ts_arr = cast(np.ndarray, data["timestamp"])
+        data["timestamp"] = np.where(ts_arr > 1_000_000_000_000, ts_arr // 1000, ts_arr)
         o, h, l, c = data["open"], data["high"], data["low"], data["close"]
     
         error_mask = (
