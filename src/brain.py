@@ -548,6 +548,7 @@ class BrainEngine:
                     "fees_paid_pct": _to_opt_float(f, "fees_paid_pct"),
                     "net_pnl_pct": _to_opt_float(f, "net_pnl_pct"),
                     "realized_cost_pct": _to_opt_float(f, "realized_cost_pct"),
+                    "adx_val": _to_opt_float(f, "adx_val"),
                 })
             except (KeyError, ValueError) as e:
                 logging.getLogger("macd_bot").debug(f"Brain: dropping malformed outcome row: {e}")
@@ -1060,6 +1061,39 @@ class BrainEngine:
                             f"on {len(weak_now) + len(emerging)} alert(s):\n" + "\n".join(lines)
                             + always_weak_note +
                             "\nDiagnostic only — no threshold change applied yet."
+                        ),
+                    })
+
+        # ── Hierarchical pair+direction+alert+regime analysis ──
+        if getattr(cfg, "ENABLE_HIERARCHICAL_COMBINATION_ANALYSIS", True):
+            try:
+                hca = engine.hierarchical_combination_analysis(
+                    real_rows,
+                    min_leaf_sample=getattr(cfg, "HIERARCHICAL_MIN_LEAF_SAMPLE", 15),
+                    shrinkage_k=getattr(cfg, "HIERARCHICAL_SHRINKAGE_K", 20.0),
+                )
+            except Exception as e:
+                hca = {"valid": False}
+                logging.getLogger("macd_bot").debug(f"Brain: hierarchical combination analysis failed: {e}")
+            if hca.get("valid"):
+                ai_metrics["hierarchical_combination_analysis"] = hca["leaves"]
+                leaves = list(hca["leaves"].values())
+                standout = [l for l in leaves if abs(l["vs_alert_dir_baseline"]) >= 0.10]
+                if standout:
+                    standout.sort(key=lambda l: -abs(l["vs_alert_dir_baseline"]))
+                    lines2 = []
+                    for l in standout[:5]:
+                        lines2.append(
+                            f"  {l['pair']}+{l['direction']}+{l['alert_key']}+{l['regime']}: "
+                            f"shrunk netEV {l['shrunk_net_ev']:+.2f}% (n={l['n']}, raw {l['raw_net_ev']:+.2f}%) "
+                            f"vs alert+dir baseline {l['alert_dir_baseline_net_ev']:+.2f}%"
+                        )
+                    recommendations.append({
+                        "type": "hierarchical_combination_analysis", "severity": "medium",
+                        "message": (
+                            f"🧬 {len(standout)} pair+direction+alert+regime combo(s) diverge "
+                            f"meaningfully from their alert+direction baseline:\n" + "\n".join(lines2) +
+                            "\nDiagnostic only — no per-combo threshold applied yet."
                         ),
                     })
         if target_floor is not None:

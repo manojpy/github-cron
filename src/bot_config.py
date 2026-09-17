@@ -488,6 +488,9 @@ class BotConfig(BaseModel):
     KILL_SWITCH_LOOKBACK_HOURS: int = Field(default=24, ge=1, le=168)
     KILL_SWITCH_COOLDOWN_HOURS: int = Field(default=12, ge=1, le=168) 
     ENABLE_FILL_RECONCILIATION: bool = Field(default=False) 
+    ENABLE_HIERARCHICAL_COMBINATION_ANALYSIS: bool = Field(default=True, description="Adds a pair+direction+alert_key+regime breakdown to the brain report, using empirical-Bayes shrinkage toward each combo's alert+direction+regime parent so small leaf combinations don't overfit. Purely diagnostic — never changes live gating on its own")
+    HIERARCHICAL_MIN_LEAF_SAMPLE: int = Field(default=15, ge=1, le=1000, description="Minimum raw sample size for a pair+direction+alert+regime leaf to be reported at all in hierarchical_combination_analysis — shrinkage still pulls it toward its parent above this floor, this just filters out leaves too thin to report on")
+    HIERARCHICAL_SHRINKAGE_K: float = Field(default=20.0, ge=1.0, le=500.0, description="Equivalent-sample-size prior strength for hierarchical_combination_analysis's empirical-Bayes shrinkage — higher pulls leaf estimates harder toward their parent bucket regardless of the leaf's own sample size")
 
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:

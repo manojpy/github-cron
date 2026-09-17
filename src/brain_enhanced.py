@@ -399,6 +399,36 @@ class BrainEngineV2(BaseBrainEngine):
         """Override base class: read from file archive first, fall back to Redis."""
         return await self._load_rows()
 
+async def _get_layered_window_rows(self) -> tuple:
+        """Override base class: read the recent/medium/long layered
+        windows from the file archive first (mirrors _load_rows()'s
+        file-storage branching), falling back to the base class's
+        Redis-stream path only when no archive directory is configured.
+        The base class implementation reads OUTCOME_LOG_STREAM directly,
+        which state.py never writes to when BRAIN_USE_FILE_STORAGE is
+        True — without this override, layered_window_analysis silently
+        gets zero rows in that configuration."""
+        cached = getattr(self, "_layered_rows_cache", None)
+        if cached is not None:
+            return cached
+
+        recent_days = getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30)
+        medium_days = getattr(cfg, "BRAIN_MEDIUM_WINDOW_DAYS", 90)
+        long_days = getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180)
+
+        data_dir = getattr(cfg, "OUTCOME_DATA_DIR", None) or os.environ.get("OUTCOME_DATA_DIR")
+        if data_dir and Path(data_dir).exists():
+            recent_rows = load_archived_outcomes(data_dir, window_days=recent_days, shadow=False)
+            medium_rows = load_archived_outcomes(data_dir, window_days=medium_days, shadow=False)
+            long_rows = load_archived_outcomes(data_dir, window_days=long_days, shadow=False)
+            result = (recent_rows, medium_rows, long_rows)
+            self._layered_rows_cache = result
+            return result
+
+        result = await super()._get_layered_window_rows()
+        self._layered_rows_cache = result
+        return result
+
     async def _load_rows(self) -> tuple:
         """Shared row loader — reads from archived files if available,
         otherwise falls back to Redis streams. Memoized per report cycle."""

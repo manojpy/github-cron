@@ -818,6 +818,95 @@ def layered_window_analysis(
 
     return {"valid": bool(per_alert), "per_alert": per_alert}
 
+def hierarchical_combination_analysis(
+    rows: List[Row],
+    min_leaf_sample: int = 10,
+    shrinkage_k: float = 20.0,
+) -> Dict[str, Any]:
+   
+    if not rows:
+        return {"valid": False}
+
+    adx_vals = sorted(
+        r["adx_val"] for r in rows
+        if (r.get("adx_val") if isinstance(r, dict) else None) is not None
+    )
+    median_adx: Optional[float] = None
+    if adx_vals:
+        mid = len(adx_vals) // 2
+        median_adx = (
+            adx_vals[mid] if len(adx_vals) % 2
+            else (adx_vals[mid - 1] + adx_vals[mid]) / 2.0
+        )
+
+    def _regime(r: Row) -> str:
+        adx_val = r.get("adx_val")
+        if median_adx is None or adx_val is None:
+            return "unknown"
+        return "trending" if adx_val >= median_adx else "ranging"
+
+    def _raw(bucket_rows: List[Row]) -> Dict[str, Any]:
+        n = len(bucket_rows)
+        if n == 0:
+            return {"n": 0, "wr": 0.0, "net_ev": 0.0}
+        wins = sum(1 for r in bucket_rows if r["win"])
+        ev, _, _ = ev_and_kelly_for(bucket_rows)
+        return {"n": n, "wr": wins / n, "net_ev": ev}
+
+    def _shrink(raw: Dict[str, Any], parent: Dict[str, Any]) -> Dict[str, float]:
+        n = raw["n"]
+        wr = (n * raw["wr"] + shrinkage_k * parent["wr"]) / (n + shrinkage_k)
+        ev = (n * raw["net_ev"] + shrinkage_k * parent["net_ev"]) / (n + shrinkage_k)
+        return {"wr": wr, "net_ev": ev}
+
+    by_alert: DefaultDict[str, List[Row]] = defaultdict(list)
+    by_alert_dir: DefaultDict[Tuple[str, str], List[Row]] = defaultdict(list)
+    by_alert_dir_regime: DefaultDict[Tuple[str, str, str], List[Row]] = defaultdict(list)
+    by_leaf: DefaultDict[Tuple[str, str, str, str], List[Row]] = defaultdict(list)
+
+    for r in rows:
+        ak = r["alert_key"]
+        d = r.get("direction", "?")
+        p = r.get("pair", "?")
+        reg = _regime(r)
+        by_alert[ak].append(r)
+        by_alert_dir[(ak, d)].append(r)
+        by_alert_dir_regime[(ak, d, reg)].append(r)
+        by_leaf[(ak, d, reg, p)].append(r)
+
+    global_shrunk = _raw(rows)  # root has no parent to shrink toward
+
+    alert_shrunk: Dict[str, Dict[str, float]] = {
+        ak: _shrink(_raw(bucket), global_shrunk) for ak, bucket in by_alert.items()
+    }
+    dir_shrunk: Dict[Tuple[str, str], Dict[str, float]] = {
+        key: _shrink(_raw(bucket), alert_shrunk[key[0]])
+        for key, bucket in by_alert_dir.items()
+    }
+    regime_shrunk: Dict[Tuple[str, str, str], Dict[str, float]] = {
+        key: _shrink(_raw(bucket), dir_shrunk[(key[0], key[1])])
+        for key, bucket in by_alert_dir_regime.items()
+    }
+
+    leaves: Dict[str, Any] = {}
+    for (ak, d, reg, p), bucket in by_leaf.items():
+        raw = _raw(bucket)
+        if raw["n"] < min_leaf_sample:
+            continue
+        shrunk = _shrink(raw, regime_shrunk[(ak, d, reg)])
+        parent_dir = dir_shrunk[(ak, d)]
+        key = f"{p}|{ak}|{d}|{reg}"
+        leaves[key] = {
+            "pair": p, "alert_key": ak, "direction": d, "regime": reg,
+            "n": raw["n"],
+            "raw_wr": round(raw["wr"], 3), "shrunk_wr": round(shrunk["wr"], 3),
+            "raw_net_ev": round(raw["net_ev"], 4), "shrunk_net_ev": round(shrunk["net_ev"], 4),
+            "alert_dir_baseline_net_ev": round(parent_dir["net_ev"], 4),
+            "vs_alert_dir_baseline": round(shrunk["net_ev"] - parent_dir["net_ev"], 4),
+        }
+
+    return {"valid": bool(leaves), "median_adx": median_adx, "leaves": leaves}
+
 def find_knee_point(caps_data: List[CapRow], min_sample: int = 30, smooth_window: int = 3) -> Optional[float]:
     """Where marginal WR gain per +1 score flattens. WR values are smoothed
     first to resist single-bucket noise. Returns the (unsmoothed) score at
@@ -1461,7 +1550,7 @@ class StabilityGate:
             )
         return True, "ok"
 
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════���═══════════════════════════════════════════════════
 #  NEW: Vote-Count OOD Gate  (Recommended.txt §8)
 # ══════════════════════════════════════════════════════════════════════
 

@@ -144,6 +144,7 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
         _eff_req = raw.get("effective_required")
         _macro_mult = raw.get("macro_multiplier")
         _cluster_pen = raw.get("cluster_penalty")
+        _adx_val = raw.get("adx_val")
 
         return {
             "pair": raw.get("pair", "?"),
@@ -188,6 +189,7 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
             "cluster_penalty": float(_cluster_pen) if _cluster_pen is not None else None,
 
             "gate_passed": _coerce_bool(raw.get("gate_passed"), default=None),
+            "adx_val": float(_adx_val) if _adx_val is not None and _adx_val != "" else None,
             # ── Provenance — lets downstream consumers audit vintage ──
             "schema_version": row_schema,
         }
