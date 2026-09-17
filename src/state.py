@@ -1179,7 +1179,7 @@ class RedisStateStore:
         }, ""
 
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
-                                         logger_pair: logging.Logger) -> None:
+                                       logger_pair: logging.Logger) -> None:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not self._redis:
             return
 
@@ -1192,7 +1192,7 @@ class RedisStateStore:
         try:
             async with self._redis.pipeline() as read_pipe:
                 for key in keys:
-                   read_pipe.get(key)
+                    read_pipe.get(key)
                 raw_values = await asyncio.wait_for(
                     cast(Awaitable[List[Any]], read_pipe.execute()),
                     timeout=2.0,
@@ -1200,17 +1200,19 @@ class RedisStateStore:
         except Exception as e:
             logger_pair.warning(f"Failed to batch-fetch pending outcomes for {pair}: {e}")
             return
+
         resolved_count = 0
         not_ready_count = 0
         ts_mismatch_count = 0
         missing_score_count = 0
         bad_payload_count = 0
-  
+
         stats_ttl = max(cfg.STATE_EXPIRY_DAYS * 86400, 7 * 86400)
         resolved_for_file: List[Dict[str, Any]] = []
         try:
             async with self._redis.pipeline() as write_pipe:
                 pending_writes = 0
+
                 for key, raw in zip(keys, raw_values):
                     try:
                         result, skip_reason = self._parse_pending_outcome_row(key, raw, data_15m, i15)
@@ -1239,6 +1241,7 @@ class RedisStateStore:
                             continue
                         if result is None:
                             continue
+
                         alert_key = result["alert_key"]
                         direction = result["direction"]
                         entry_ts = result["entry_ts"]
@@ -1261,8 +1264,6 @@ class RedisStateStore:
                         session_stats_key = f"{stats_key}:{session}"
                         write_pipe.hincrby(session_stats_key, "wins" if win else "losses", 1)
                         write_pipe.expire(session_stats_key, stats_ttl)
-                        stream_fields = None
-                        if conf_score is not None and conf_total is not None:
                         stream_fields: Optional[Dict[StreamField, StreamField]] = None
                         if conf_score is not None and conf_total is not None:
                             stream_fields = {
@@ -1313,7 +1314,7 @@ class RedisStateStore:
                                 approximate=True,
                             )
                         write_pipe.delete(key)
-                        pending_writes += 1                 
+                        pending_writes += 1
                         resolved_count += 1
                         if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                             if conf_score is None or conf_total is None:
@@ -1358,7 +1359,7 @@ class RedisStateStore:
                                     "effective_required": result.get("effective_required"),
                                     "macro_multiplier": result.get("macro_multiplier"),
                                     "cluster_penalty": result.get("cluster_penalty"),
-                                    "gate_passed": result.get("gate_passed"), 
+                                    "gate_passed": result.get("gate_passed"),
                                 })
                     except Exception as e:
                         logger_pair.debug(f"Failed to resolve pending outcome {key}: {e}")
@@ -1366,8 +1367,10 @@ class RedisStateStore:
                         continue
 
                 if pending_writes:
-                    await asyncio.wait_for(cast(Awaitable[List[Any]], write_pipe.execute()), timeout=2.0)
-
+                    await asyncio.wait_for(
+                        cast(Awaitable[List[Any]], write_pipe.execute()),
+                        timeout=2.0,
+                    )
 
         except Exception as e:
             logger_pair.debug(f"Failed to persist resolved outcomes for {pair}: {e}")
