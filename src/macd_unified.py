@@ -115,6 +115,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     if i15_for_resolve is not None and i15_for_resolve >= Constants.MIN_CLOSED_CANDLES_15M:
         await _resolve_pair_outcomes(pair_name, data_15m, i15_for_resolve, sdb, logger_pair)
 
+    gr: GateResult
     if cached is not _CLUSTER_CACHE_MISS:
         if isinstance(cached, tuple):
             return cached
@@ -122,12 +123,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             return None
         gr = cast(GateResult, cached)
     else:
-        gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time, pair_oi, resolve_outcomes=False)
-        if gr is None:
+        gr_result = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time, pair_oi, resolve_outcomes=False)
+        if gr_result is None:
             return None
-        if isinstance(gr, tuple):
-            return gr
-        gr = cast(GateResult, gr)
+        if isinstance(gr_result, tuple):
+            return gr_result
+        gr = gr_result
+
     reversal_eligible = (
         (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE)
         and (gr.buy_trend_common_relaxed or gr.sell_trend_common_relaxed)
@@ -161,8 +163,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                 f"[{pair_name}] Confluence gate blocked: {score:.1f}/{total:.1f} weighted score "
                 f"(need {required:.1f}, pct-floor={pct_floor:.1f}, "
                 f"abs-floor={abs_floor:.1f}) — skipping Phase-2 indicators"
-
-
             )      
             await _blanket_reset_pair(sdb, pair_name, logger_pair)
             return pair_name, {
@@ -215,13 +215,35 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                     "suppression": ob_reason
                 }
             }, None
+
+    # _apply_and_dispatch_alerts requires non-Optional refs; bind them here so
+    # callers that omit them (or pass None) still get a usable default.
+    if alerts_sent_ref is None:
+        alerts_sent_ref = []
+    if alerts_sent_lock is None:
+        alerts_sent_lock = asyncio.Lock()
+
     try: 
         alert_result = await _eval_alerts(gr, data_5m, data_daily, reference_time, sdb, correlation_id, logger_pair)
         if alert_result is None:
             return None
-        if isinstance(alert_result, tuple) and len(alert_result) == 2:
-            return alert_result  # reserved: RuntimeError path inside _eval_alerts
-        context, conditional_states, raw_alerts = alert_result
+
+        # Reserved: RuntimeError path inside _eval_alerts returns a 2-tuple
+        # (pair_name, summary_dict). Surface it as a non-dispatched result.
+        if len(alert_result) == 2:
+            pair_n, summary = cast(Tuple[str, Dict[str, Any]], alert_result)
+            return pair_n, summary, None
+
+        # 3-tuple: either the successful (Dict, Dict, List) shape, or the
+        # (str, Dict, None) error shape. Only the success shape is dispatched.
+        first = alert_result[0]
+        if not isinstance(first, dict):
+            return cast(Tuple[str, Dict[str, Any], Optional[Any]], alert_result)
+
+        context, conditional_states, raw_alerts = cast(
+            Tuple[Dict[str, Any], Dict[str, bool], List[Tuple[str, str, str]]],
+            alert_result,
+        )
         return await _apply_and_dispatch_alerts(
             gr, context, conditional_states, raw_alerts, sdb, telegram_queue, fetcher, symbol,
             correlation_id, logger_pair, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
@@ -419,10 +441,10 @@ async def compute_bias_context(
 
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict],
     pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue,
-    correlation_id: str, lock: RedisLock, reference_time: int,
-    alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
+    correlation_id: str, lock: Optional[RedisLock], reference_time: int,
+    alerts_sent_ref: Optional[List[int]] = None,
+    alerts_sent_lock: Optional[asyncio.Lock] = None,
     max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN) -> List[Tuple[str, Dict[str, Any]]]:
-
     ticker_task = None
     if cfg.ENABLE_OI_FUNDING_FILTER:
         ticker_task = asyncio.create_task(fetcher.fetch_tickers_batch())
@@ -786,7 +808,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             if ks_state["tripped"]:
                 ttl = int(cfg.KILL_SWITCH_COOLDOWN_HOURS * 3600)
                 await state_db._safe_redis_op(
-                    lambda: state_db._redis.set(
+                    lambda: _rc(state_db._redis).set(
                         "brain:kill_switch_active", json_dumps(ks_state), ex=ttl,
                     ),
                     2.0, "kill_switch_set",

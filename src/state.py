@@ -29,6 +29,16 @@ def _rc(client: "Optional[redis.Redis]") -> "redis.Redis":
     assert client is not None
     return client
 
+async def _execute_pipeline(pipe: Any) -> Any:
+    """Await a redis-py pipeline's execute() in a way mypy accepts.
+
+    redis-py types the async pipeline's execute() as `Awaitable[Any] | Any`
+    (because the same method name exists on sync pipelines), so passing it
+    directly to asyncio.wait_for() trips mypy's argument check even when a
+    cast is applied to the whole expression. Wrapping the await inside a
+    plain coroutine collapses the union to a single Awaitable."""
+    return await pipe.execute()
+
 async def _blanket_reset_pair(sdb: RedisStateStore, pair_name: str, logger_pair: logging.Logger) -> int:
     from alerts import ALERT_KEYS
     all_keys = list(ALERT_KEYS.values())
@@ -1194,7 +1204,7 @@ class RedisStateStore:
                 for key in keys:
                     read_pipe.get(key)
                 raw_values = await asyncio.wait_for(
-                    cast(Awaitable[List[Any]], read_pipe.execute()),
+                    _execute_pipeline(read_pipe),
                     timeout=2.0,
                 )
         except Exception as e:
@@ -1368,10 +1378,9 @@ class RedisStateStore:
 
                 if pending_writes:
                     await asyncio.wait_for(
-                        cast(Awaitable[List[Any]], write_pipe.execute()),
+                        _execute_pipeline(write_pipe),
                         timeout=2.0,
                     )
-
         except Exception as e:
             logger_pair.debug(f"Failed to persist resolved outcomes for {pair}: {e}")
             return
@@ -1425,7 +1434,7 @@ class RedisStateStore:
                 for key in keys:
                     read_pipe.get(key)
                 raw_values = await asyncio.wait_for(
-                    cast(Awaitable[List[Any]], read_pipe.execute()),
+                    _execute_pipeline(read_pipe),
                     timeout=2.0,
                 )
         except Exception as e:
@@ -1570,7 +1579,7 @@ class RedisStateStore:
                         continue
 
                 if pending_writes:
-                    await asyncio.wait_for(cast(Awaitable[List[Any]], write_pipe.execute()), timeout=2.0)
+                    await asyncio.wait_for(_execute_pipeline(write_pipe), timeout=2.0)
 
         except Exception as e:
             logger_pair.debug(

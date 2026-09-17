@@ -1027,7 +1027,7 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[PriceDa
             logger.error(f"Length mismatch: {bad}")
             return None
     
-        data["timestamp"] = np.where(data["timestamp"] > 1_000_000_000_000, data["timestamp"] // np.int64(1000), data["timestamp"])
+        data["timestamp"] = np.where(data["timestamp"] > 1_000_000_000_000, data["timestamp"] // 1000, data["timestamp"])
         o, h, l, c = data["open"], data["high"], data["low"], data["close"]
     
         error_mask = (

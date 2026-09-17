@@ -5,6 +5,7 @@ import json
 import random
 import asyncio
 import logging
+import aiohttp
 from enum import StrEnum
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, Tuple, List, Set, Callable, Union, Awaitable, cast
@@ -88,7 +89,7 @@ class TelegramQueue:
             if shutdown_event.is_set():
                 return False
             try:
-                async with session.post(url, data=params, timeout=10) as resp:
+                async with session.post(url, data=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 429:
                         wait_sec = min(int(resp.headers.get("Retry-After", 1)), Constants.CIRCUIT_BREAKER_MAX_WAIT)
                         await asyncio.sleep(wait_sec + random.uniform(0.1, 0.5))
@@ -147,7 +148,7 @@ class TelegramQueue:
             if shutdown_event.is_set():
                 return None
             try:
-                async with session.post(url, data=params, timeout=10) as resp:
+                async with session.post(url, data=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 429:
                         wait_sec = min(int(resp.headers.get("Retry-After", 1)), Constants.CIRCUIT_BREAKER_MAX_WAIT)
                         await asyncio.sleep(wait_sec + random.uniform(0.1, 0.5))
