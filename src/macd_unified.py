@@ -118,7 +118,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     gr: GateResult
     if cached is not _CLUSTER_CACHE_MISS:
         if isinstance(cached, tuple):
-            return cached
+            pair_n, summary = cast(Tuple[str, Dict[str, Any]], cached)
+            return pair_n, summary, None
+
+
         if cached is None:
             return None
         gr = cast(GateResult, cached)
@@ -127,8 +130,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         if gr_result is None:
             return None
         if isinstance(gr_result, tuple):
-            return gr_result
-        gr = gr_result
+            pair_n, summary = cast(Tuple[str, Dict[str, Any]], gr_result)
+            return pair_n, summary, None 
+
 
     reversal_eligible = (
         (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE)

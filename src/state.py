@@ -1607,7 +1607,8 @@ class RedisStateStore:
             return None, 0
         stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
         try:
-            data = await asyncio.wait_for(_rc(self._redis).hgetall(stats_key), timeout=2.0)
+            
+            data = await asyncio.wait_for(cast("Awaitable[dict[Any, Any]]", _rc(self._redis).hgetall(stats_key)), timeout=2.0)
             wins = int(data.get("wins", 0))
             losses = int(data.get("losses", 0))
             total = wins + losses
@@ -1626,6 +1627,8 @@ class RedisStateStore:
         stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}:{session}"
         try:
             data = await asyncio.wait_for(_rc(self._redis).hgetall(stats_key), timeout=2.0)
+
+            data = await asyncio.wait_for(cast("Awaitable[dict[Any, Any]]", _rc(self._redis).hgetall(stats_key)), timeout=2.0)
             wins = int(data.get("wins", 0))
             losses = int(data.get("losses", 0))
             total = wins + losses
@@ -1665,13 +1668,12 @@ class RedisStateStore:
         if not self._redis or self.degraded or not alert_keys:
             return {k: False for k in alert_keys}
 
-        try:
+        try:      
             hash_key = f"{self.state_prefix}{pair}"
             hash_data = await asyncio.wait_for(
-                self._redis.hgetall(hash_key),
+                cast("Awaitable[dict[Any, Any]]", _rc(self._redis).hgetall(hash_key)),
                 timeout=timeout,
             )
-
             states: Dict[str, bool] = {}
             for key in alert_keys:
                 val = hash_data.get(key)
