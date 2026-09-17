@@ -24,6 +24,8 @@ class AlertPayload:
     macro_shadow: Optional[Dict[str, Any]] = None
     alert_keys: List[str] = field(default_factory=list)
     record_win_rate: Optional[Callable[[], Awaitable[None]]] = None
+    record_win_rate_after_send: Optional[Callable[[], Awaitable[None]]] = None
+    mark_candle_processed: bool = False
 
 from bot_config import (
     cfg, logger, Constants, CompiledPatterns, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
@@ -206,6 +208,57 @@ def _fmt_score(score: Optional[float], total: Optional[float] = None) -> str:
     return f"({_fmt_num(score)})"
 
 DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+async def _record_counterfactual_block(
+    sdb: "RedisStateStore",
+    pair_name: str,
+    alerts_to_send: List[Tuple[str, str, str]],
+    ts_curr: int,
+    close_curr: float,
+    block_reason: str,
+    *,
+    confluence_scores: Optional[Dict[str, Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]]] = None,
+    macro_shadow: Optional[Dict[str, Any]] = None,
+    cluster_penalty: Optional[float] = None,
+    effective_score: Optional[float] = None,
+    effective_required: Optional[float] = None,
+    logger_pair: Optional[logging.Logger] = None,
+) -> None:
+    """Shadow-log every alert that reached the dispatch stage but was then
+    blocked by a non-win-rate gate (OOD, calibration, confluence, macro,
+    cluster, portfolio-heat). The win-rate path already has its own shadow
+    mechanism; without this, the brain cannot answer 'if we removed gate X,
+    what would OOS net EV have been?' — the whole point of implement.txt #18."""
+    if not (getattr(cfg, "ENABLE_BRAIN", False) and getattr(cfg, "BRAIN_SHADOW_MODE", True)):
+        return
+    if sdb is None or sdb.degraded:
+        return
+    if not alerts_to_send:
+        return
+    try:
+        for _, _, alert_key in alerts_to_send:
+            direction = "buy" if alert_key in BUY_ALERT_KEYS else "sell"
+            score: Optional[float] = None
+            total: Optional[float] = None
+            votes: Optional[Dict[str, bool]] = None
+            if confluence_scores and alert_key in confluence_scores:
+                score, total, votes = confluence_scores[alert_key]
+            await sdb.record_shadow_pending_outcome(
+                pair_name, alert_key, direction, ts_curr, close_curr,
+                confluence_score=score,
+                confluence_total=total,
+                confluence_votes=votes,
+                context={
+                    "rejection_reason": block_reason,
+                    "macro_shadow": macro_shadow,
+                    "cluster_penalty": cluster_penalty,
+                    "effective_score": effective_score,
+                    "effective_required": effective_required,
+                },
+            )
+    except Exception as e:
+        if logger_pair is not None:
+            logger_pair.debug(f"Counterfactual shadow write failed ({block_reason}): {e}")
 
 def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional[str] = None, score: Optional[float] = None, total: Optional[float] = None) -> str:
     if not title: 
@@ -758,12 +811,18 @@ async def dispatch_combined_alerts(
         for p in sent_payloads:
             if p.record_win_rate:
                 await p.record_win_rate()
+            if p.record_win_rate_after_send:
+                await p.record_win_rate_after_send()
+            if p.mark_candle_processed:
+                await sdb.set_last_processed_candle_ts(p.pair_name, p.ts)
         logger_run.info(
             f"🔔 Combined dispatch sent {len(sent_payloads)} pair(s) in {len(messages)} message(s)"
         )
 
+    already_sent = sum(p.budget_count for p in sent_payloads)
+
     if combined_success:
-        return sum(p.budget_count for p in ordered)
+        return already_sent
 
     # ── Fallback: only for payloads that weren't already sent ──
     sent_ids = {id(p) for p in sent_payloads}
@@ -786,7 +845,6 @@ async def dispatch_combined_alerts(
         if cfg.ENABLE_BIAS_HEADER and bias_context is not None:
             full_msg += "\n" + DIVIDER + "\n" + _format_bias_header(bias_context)
         full_msg += "\n" + datetime_line_p
-
         if await telegram_queue.send(full_msg):
             if p.state_changes:
                 await sdb.atomic_batch_update(p.state_changes)
@@ -794,6 +852,10 @@ async def dispatch_combined_alerts(
                 alerts_sent_ref[0] += p.budget_count
             if p.record_win_rate:
                 await p.record_win_rate()
+            if p.record_win_rate_after_send:
+                await p.record_win_rate_after_send()
+            if p.mark_candle_processed:
+                await sdb.set_last_processed_candle_ts(p.pair_name, p.ts)
             fallback_sent += p.budget_count
         else:
             # Send failed. Keep the dedup claims so the alert cannot
@@ -802,8 +864,11 @@ async def dispatch_combined_alerts(
                 f"Individual send failed for {p.pair_name} — keeping dedup claims "
                 f"({p.dedup_keys}) so it won't re-fire until window expires"
             )
-
-    return fallback_sent
+    
+    # Report the full delivered total — the caller logs this as "N alerts
+    # delivered", and silently returning only the fallback portion made
+    # partial-success batches look like complete failures.
+    return already_sent + fallback_sent
 
 def validate_alert_definitions() -> None:
     errors = []
@@ -1460,9 +1525,14 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 max_concurrent=cfg.MAX_CONCURRENT_POSITIONS,
                 max_net_directional=cfg.MAX_NET_DIRECTIONAL_POSITIONS,
                 max_same_direction_pct=cfg.PORTFOLIO_MAX_SAME_DIRECTION_PCT,
-            )
+            )     
             if verdict["blocked"]:
                 logger_pair.info(f"[{pair_name}] portfolio_heat: {verdict['reason']}")
+                # Note: at this point `alerts_to_send` has not been computed
+                # yet (we're still in the pre-eval gate stack). The shadow
+                # row is recorded further down, after raw_alerts is known —
+                # see the portfolio_heat shadow write in the confluence
+                # section below.
                 return pair_name, {
                     "state": "PORTFOLIO_HEAT",
                     "ts": int(time.time()),
@@ -1652,6 +1722,17 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     logger_pair.info(
                         f"[{pair_name}] Confluence gate blocked dispatch: {confluence_score:.1f}/{confluence_total:.1f} weighted score (need {required:.1f}, abs_floor={abs_floor:.1f}, macro_mult={macro_multiplier if getattr(cfg, 'MACRO_CONTEXT_LIVE', False) else 1.0:.2f})"
                     )
+                    await _record_counterfactual_block(
+                        sdb, pair_name, alerts_to_send, ts_curr, close_curr,
+                        block_reason="confluence_gate",
+                        confluence_scores={
+                            ak: _confluence_for(ak) for _, _, ak in alerts_to_send
+                        },
+                        macro_shadow=macro_shadow,
+                        effective_score=confluence_score,
+                        effective_required=required,
+                        logger_pair=logger_pair,
+                    )
                     alerts_to_send = []
 
         if alerts_to_send and getattr(cfg, "BRAIN_OOD_ENABLED", True):
@@ -1677,6 +1758,14 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         f"[{pair_name}] ⚠️ Unusual vote pattern detected — trade blocked as precaution: "
                         f"{alert_key} vote count {detail['current_count']} outside historical range "
                         f"[{detail['hist_p5']:.1f}-{detail['hist_p95']:.1f}] (n={detail['n_history']})"
+                    )
+                    await _record_counterfactual_block(
+                        sdb, pair_name,
+                        [(alert_title, alert_extra, alert_key)],
+                        ts_curr, close_curr,
+                        block_reason="ood_gate",
+                        confluence_scores={alert_key: _confluence_for(alert_key)},
+                        logger_pair=logger_pair,
                     )
                     continue
                 ood_survivors.append((alert_title, alert_extra, alert_key))
@@ -1735,6 +1824,14 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             logger_pair.info(
                                 f"[{pair_name}] calibration gate dropped {alert_key}: "
                                 f"calibrated WR {cal_wr:.0%} below floor at conf {conf_pct:.0f}%"
+                            )
+                            await _record_counterfactual_block(
+                                sdb, pair_name,
+                                [(alert_title, alert_extra, alert_key)],
+                                ts_curr, close_curr,
+                                block_reason="calibration_gate",
+                                confluence_scores={alert_key: _confluence_for(alert_key)},
+                                logger_pair=logger_pair,
                             )
                             continue
 
@@ -2088,10 +2185,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 macro_shadow=macro_shadow,
                 alert_keys=[ak for _, _, ak in alerts_to_send],
                 record_win_rate=None,          # already recorded above
+                record_win_rate_after_send=None,  # not needed yet — reserved for future
+                mark_candle_processed=True,    # dispatcher marks candle after delivery
             )
 
-            # ── CRITICAL FIX: Mark as processed on successful batch dispatch ──
-            await sdb.set_last_processed_candle_ts(pair_name, ts_curr)  # ← MARK AS PROCESSED
             return pair_name, {
                 "state": "BATCHED",
                 "ts": int(time.time()),

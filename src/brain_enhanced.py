@@ -260,6 +260,12 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
         pass
 
     # ── COPY-PASTE CONFIG BLOCK ────────────────────────────────────────
+    # Kept OUT of `sections` so it can be emitted as a real Telegram code
+    # block. If we ran it through escape_markdown_v2 like every other
+    # section, `CONFLUENCE_WEIGHTS` becomes `CONFLUENCE\_WEIGHTS`, every
+    # `{` becomes `\{` etc., and the user cannot paste the result into a
+    # JSON file. Inside a MarkdownV2 code block, only ` and \ need escaping.
+    json_block: Optional[str] = None
     try:
         json_changes: Dict[str, Any] = {}
         for p in cfg_patch:
@@ -270,7 +276,9 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
         if gate_rec is not None:
             json_changes["CONFLUENCE_MIN_ABS_SCORE"] = round(gate_rec["recommended"], 1)
         if json_changes:
-            sections.append("📋 COPY-PASTE INTO config_macd.json\n" + json.dumps(json_changes, indent=1))
+            raw_json = json.dumps(json_changes, indent=1)
+            code_safe = raw_json.replace("\\", "\\\\").replace("`", "\\`")
+            json_block = "```json\n" + code_safe + "\n```"
     except Exception:
         pass
 
@@ -290,7 +298,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     except Exception:
         pass
 
-    if not sections:
+    if not sections and json_block is None:
         return []
 
     # ── Pack sections into <4096-char messages ─────────────────────────
@@ -305,7 +313,18 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
             cur = (cur + "\n\n" + s) if cur else s
     if cur:
         msgs.append(cur)
-    return [escape_markdown_v2(m) for m in msgs]
+
+    escaped_msgs = [escape_markdown_v2(m) for m in msgs]
+
+    if json_block is not None:
+        header = escape_markdown_v2("📋 COPY-PASTE INTO config_macd.json")
+        candidate = header + "\n" + json_block
+        if escaped_msgs and len(escaped_msgs[-1]) + len(candidate) + 2 <= 3900:
+            escaped_msgs[-1] = escaped_msgs[-1] + "\n\n" + candidate
+        else:
+            escaped_msgs.append(candidate)
+
+    return escaped_msgs
 
 class BrainEngineV2(BaseBrainEngine):
     """Drop-in replacement for BrainEngine. Inherits the original and adds
@@ -320,6 +339,9 @@ class BrainEngineV2(BaseBrainEngine):
         self._ledger_stats: Dict[str, Any] = {}
         self._repair_help_preds: Dict[str, float] = {}
         self._rows_cache: Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]] = None
+        self._layered_rows_cache: Optional[Tuple[
+                List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]
+            ]] = None
 
     @staticmethod
     def _shadow_weight_check(
@@ -466,9 +488,10 @@ class BrainEngineV2(BaseBrainEngine):
         now = time.time()
         if self._recs_cache is not None and (now - self._recs_cache_ts) < 120:
             return self._recs_cache
-        # Invalidate the row-level cache so a fresh report re-reads the
-        # archive, but calls within the same report cycle reuse it.
+        # Invalidate the row-level caches so a fresh report re-reads the
+        # archive, but calls within the same report cycle reuse them.
         self._rows_cache = None
+        self._layered_rows_cache = None      # ← also invalidate the layered cache
         result = await self._generate_recommendations_full()
         self._recs_cache = result
         self._recs_cache_ts = now
@@ -519,7 +542,7 @@ class BrainEngineV2(BaseBrainEngine):
                 "brier": ai_metrics.get("brier_score"),
             }
             rem = engine.learn_repair_effectiveness(
-                ledger_entries, current_state, min_records=30,
+                ledger_entries, current_state, min_records=50,
             )
             if rem.get("valid"):
                 self._repair_help_preds = rem["p_help_by_category"]
@@ -1190,16 +1213,16 @@ class BrainEngineV2(BaseBrainEngine):
             disable_alerts = []
             reinstate_alerts = []
             weight_adjustments = []
-
             for rec in recs.get("recommendations", []):
                 rec_type = rec.get("type")
                 if rec_type == "disable_alert":
-                    # brain.py emits the alert under the "alert" key, not
-                    # "alert_key" — the old lookup silently dropped every
-                    # disable, so the decision never reached the plan.
+      
+                    if rec.get("_blocked_by_action_gate"):
+                        continue
                     ak = rec.get("alert") or rec.get("alert_key")
                     if ak:
                         disable_alerts.append(ak)
+
                 elif rec_type in ("reinstate_alert", "recovered_alert", "auto_reenabled"):
                     # brain.py emits recovered alerts as "recovered_alert" /
                     # "auto_reenabled", not "reinstate_alert".

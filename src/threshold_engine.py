@@ -1550,7 +1550,7 @@ class StabilityGate:
             )
         return True, "ok"
 
-# ═══════════════════���═══════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 #  NEW: Vote-Count OOD Gate  (Recommended.txt §8)
 # ══════════════════════════════════════════════════════════════════════
 
@@ -2845,31 +2845,19 @@ def _prob_edge_broken(wins: int, n: int, target_wr: float,
     return 0.5 * math.erfc(-z / math.sqrt(2.0)) 
 
 def _prob_ev_negative(rows: List[Row], n_sims: int = 400) -> float:
-    """Posterior P(true EV <= 0) under a flat prior.
-
-    Block-bootstraps the EV statistic via bootstrap_ev_ci() and applies a
-    normal approximation on the (mean, std) of the bootstrap distribution.
-    Under a flat prior the bootstrap distribution's shape equals the
-    posterior's shape around the sample mean, so Phi(-mean/std) is the
-    posterior probability that the true EV is <= 0.
-
-    Returns 0.5 (maximum uncertainty) when the sample is too thin for a
-    meaningful bootstrap — same convention as _prob_edge_broken()."""
     bs = bootstrap_ev_ci(rows, n_sims=n_sims)
     if not bs.get("valid"):
         return 0.5
     ev_mean = bs["ev_mean"]
     ev_std = bs["ev_std"]
     if ev_std <= 0:
-        return 1.0 if ev_mean <= 0 else 0.0
+        return 0.5
     z = (0.0 - ev_mean) / ev_std
     return 0.5 * math.erfc(-z / math.sqrt(2.0))
 
 def _prob_ev_positive(ev_mean: float, ev_std: float) -> float:
-    """P(true EV > 0) under normal approximation on the bootstrap
-    distribution. Complements _prob_ev_negative()."""
     if ev_std <= 0:
-        return 1.0 if ev_mean > 0 else 0.0
+        return 0.5
     z = ev_mean / ev_std
     return 0.5 * math.erfc(-z / math.sqrt(2.0))
 

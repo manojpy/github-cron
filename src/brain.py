@@ -102,18 +102,7 @@ def _extract_p_value_for_fdr(
     real_rows: List[Dict[str, Any]],
     min_sample: int,
 ) -> Optional[float]:
-    """Best-effort p-value for a recommendation.
-
-    Returns None for recs that don't make an explicit statistical claim
-    (informational, repair_shop, three_metric summaries that were never
-    paired-tested, etc.). Returning None excludes the rec from the BH
-    pass rather than contributing a fabricated 0.5 or 1.0 that would
-    pollute the correction's m count.
-
-    Every branch guards against missing or malformed fields — the extractor
-    runs inside the report loop, and a KeyError here would take down the
-    whole report for one malformed rec.
-    """
+  
     rtype = rec.get("type")
 
     # ── Interactions: p_value already stamped by the miner ──
@@ -203,13 +192,12 @@ def _extract_p_value_for_fdr(
     # ── Permutation importance: top-signal t-test against 0 ──
     # Approximate: the shuffle distribution gives a standard error for the
     if rtype == "permutation_importance":
-        mean = rec.get("top_importance")
-        std = rec.get("top_std")
-        n_perm = rec.get("n_permutations")
-        if (isinstance(mean, (int, float)) and isinstance(std, (int, float))
-                and isinstance(n_perm, int) and n_perm > 1 and std > 0.0):
-            z = abs(mean) / (std / math.sqrt(n_perm))
-            return math.erfc(z / math.sqrt(2.0))
+        # A correct permutation-based p-value would require the raw
+        # shuffle distribution (fraction of |shuffled_importance| >=
+        # |observed_importance|), which is not carried on the rec —
+        # only mean and std are. Reconstructing a z-score from those
+        # and treating it as a p-value over-rejects under BH, so we
+        # exclude permutation_importance from the FDR pass entirely.
         return None
 
     # ── Fallthrough: no clean single-hypothesis claim ──
@@ -716,24 +704,47 @@ class BrainEngine:
             if hi < disable_wr:
                 # ── EV-gated disable: only disable if EV is ALSO negative ──
                 ev_obj = engine.ev_first_objective(s["rows"], min_sample=min_sample)
-                if ev_obj.get("valid") and ev_obj["net_ev"] <= 0:
+                ev_negative = ev_obj.get("valid") and ev_obj["net_ev"] <= 0
+                if ev_negative:
                     alert_verdicts[alert_key] = "disable"
                 else:
                     alert_verdicts[alert_key] = "monitor"
-                recommendations.append({
-                    "type": "disable_alert", "severity": "high", "alert": alert_key,
-                    "win_rate": round(wr, 3), "sample_size": total, "pairs_affected": len(s["pairs"]),
-                    "message": (
-                        f"DISABLE {alert_key}: {wr:.0%} WR over {sample_label} across "
-                        f"{len(s['pairs'])} pairs (95% CI upper bound {hi:.0%}, still below {disable_wr:.0%})."
-                    ),
-                })
-                if auto_eligible and alert_key not in current_disabled_keys:
+
+                if ev_negative:
+                    recommendations.append({
+                        "type": "disable_alert", "severity": "high", "alert": alert_key,
+                        "win_rate": round(wr, 3), "sample_size": total,
+                        "pairs_affected": len(s["pairs"]),
+                        "message": (
+                            f"DISABLE {alert_key}: {wr:.0%} WR over {sample_label} across "
+                            f"{len(s['pairs'])} pairs (95% CI upper bound {hi:.0%}, still below "
+                            f"{disable_wr:.0%}) — net EV "
+                            f"{ev_obj.get('net_ev', 0):+.3f}%/trade, negative."
+                        ),
+                    })
+                else:
+                    recommendations.append({
+                        "type": "low_wr_but_ev_positive", "severity": "medium",
+                        "alert": alert_key,
+                        "win_rate": round(wr, 3), "sample_size": total,
+                        "message": (
+                            f"⚠️ LOW WR / EV-POSITIVE {alert_key}: {wr:.0%} WR over "
+                            f"{sample_label} (95% CI upper bound {hi:.0%} < "
+                            f"{disable_wr:.0%}), but net EV "
+                            f"{ev_obj.get('net_ev', 0):+.3f}%/trade is positive. "
+                            f"Keeping ENABLED — low WR alone is not a disable condition."
+                        ),
+                    })
+
+                # Auto-disable ONLY on the EV-negative branch.
+                if auto_eligible and ev_negative and alert_key not in current_disabled_keys:
                     if await self.sdb.set_alert_key_disabled(alert_key, True):
                         recommendations.append({
                             "type": "auto_disabled", "severity": "high", "alert": alert_key,
                             "message": (
-                                f"🔒 Auto-disabled {alert_key}: {wr:.0%} WR over {sample_label} "
+                                f"🔒 Auto-disabled {alert_key}: {wr:.0%} WR over "
+                                f"{sample_label}, net EV "
+                                f"{ev_obj.get('net_ev', 0):+.3f}%/trade, "
                                 f"(≥{auto_disable_min} required)."
                             ),
                         })
@@ -827,9 +838,18 @@ class BrainEngine:
         brier, cal_curve = engine.brier_score_and_calibration(real_rows)
         cal_alerts = engine.calibration_alert(real_rows)
         has_calibration_data = bool(cal_curve or cal_alerts)
+
         brier_status: Optional[str] = None
         if has_calibration_data:
-            brier_status = "Healthy" if brier < 0.20 else "MISALIBRATED"
+            _ev_check = engine.ev_first_objective(real_rows, min_sample=min_sample)
+            ev_positive = bool(
+                _ev_check.get("valid") and _ev_check.get("net_ev", 0.0) > 0
+            )
+            brier_status = (
+                "Healthy" if (brier < 0.20 and ev_positive)
+                else "MISALIBRATED" if brier >= 0.20
+                else "CALIBRATED-BUT-EV-NEGATIVE"
+            )
             recommendations.append({
                 "type": "calibration",
                 "severity": "medium" if brier >= 0.20 or cal_alerts else "low",
