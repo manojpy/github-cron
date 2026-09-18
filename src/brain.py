@@ -787,27 +787,25 @@ class BrainEngine:
                 else:
                     ev_obj = engine.ev_first_objective(s["rows"], min_sample=min_sample)
                     self._ev_obj_cache[_ev_cache_key] = ev_obj
-
                 ev_negative = ev_obj.get("valid") and ev_obj["net_ev"] <= 0
                 if ev_negative:
                     alert_verdicts[alert_key] = "disable"
                 else:
                     alert_verdicts[alert_key] = "monitor"
-
-                    if ev_negative:
-                        alert_verdicts[alert_key] = "disable"
-                        recommendations.append({
-                            "type": "disable_alert", "severity": "high", "alert": alert_key,
-                            "win_rate": round(wr, 3), "sample_size": total,
-                            "pairs_affected": len(s["pairs"]),
-                            "message": (
-                                f"LOW WR / NEGATIVE EV {alert_key}: {wr:.0%} WR over "
-                                f"{sample_label} across {len(s['pairs'])} pairs "
-                                f"(95% CI upper bound {hi:.0%} < {disable_wr:.0%}); "
-                                f"net EV {ev_obj.get('net_ev', 0):+.3f}%/trade. "
-                                f"Evidence supports disabling — review before applying."
-                            ),
-                        })
+                
+                if ev_negative:
+                    recommendations.append({
+                        "type": "disable_alert", "severity": "high", "alert": alert_key,
+                        "win_rate": round(wr, 3), "sample_size": total,
+                        "pairs_affected": len(s["pairs"]),
+                        "message": (
+                            f"LOW WR / NEGATIVE EV {alert_key}: {wr:.0%} WR over "
+                            f"{sample_label} across {len(s['pairs'])} pairs "
+                            f"(95% CI upper bound {hi:.0%} < {disable_wr:.0%}); "
+                            f"net EV {ev_obj.get('net_ev', 0):+.3f}%/trade. "
+                            f"Evidence supports disabling — review before applying."
+                        ),
+                    })
                 else:
                     recommendations.append({
                         "type": "low_wr_but_ev_positive", "severity": "medium",
@@ -821,7 +819,7 @@ class BrainEngine:
                             f"Keeping ENABLED — low WR alone is not a disable condition."
                         ),
                     })
-
+                
                 # Auto-disable ONLY on the EV-negative branch.
                 if auto_eligible and ev_negative and alert_key not in current_disabled_keys:
                     # FIX (Priority 3): Do NOT mutate here. Tag the
@@ -860,6 +858,25 @@ class BrainEngine:
                             f"🔓 Re-enable CANDIDATE {alert_key}: recovered to "
                             f"{wr:.0%} WR over {sample_label}. "
                             f"[Pending action gate]"
+                        ),
+                    })
+            else:
+                alert_verdicts[alert_key] = "monitor"
+                recommendations.append({
+                    "type": "monitor", "severity": "medium", "alert": alert_key,
+                    "win_rate": round(wr, 3), "sample_size": total,
+                    "message": f"{alert_key} viable ({wr:.0%} WR, {sample_label}).",
+                })
+                if auto_eligible and alert_key in current_disabled_keys:
+                    # FIX (Priority 3): do NOT mutate here. Tag for post-gate
+                    # execution — the action gate must be the sole authorizer.
+                    recommendations.append({
+                        "type": "auto_reenabled", "severity": "medium", "alert": alert_key,
+                        "pending_auto_action": True,
+                        "pending_action": "enable",
+                        "message": (
+                            f"🔓 Re-enable CANDIDATE {alert_key}: viable at "
+                            f"{wr:.0%} WR over {sample_label}. [Pending action gate]"
                         ),
                     })
             else:

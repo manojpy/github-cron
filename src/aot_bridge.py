@@ -78,9 +78,7 @@ def initialize_compiled() -> Tuple[bool, Optional[str]]:
                 f"'{compiled_version}' but aot_meta expects "
                 f"'{EXPECTED_VERSION}'. Stale artifact rejected."
             )
-        except ImportError:
-            pass  # aot_meta not available; skip version check
-
+        
         _compiled_module = _mod
         return True, None
 
