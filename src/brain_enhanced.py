@@ -1771,8 +1771,10 @@ class BrainEngineV2(BaseBrainEngine):
 
             # FIX (Priority 3): re-verify the gate at apply time. A plan written
             # by an older build (or a mid-upgrade race) may carry disable/reinstate
-            # entries that bypassed the gate.
-            plan_gate_passed = bool(plan.get("_action_gate_passed", True))
+            # entries that bypassed the gate. Default False (fail closed) — a
+            # plan missing this field IS the old-build case being guarded
+            # against, so treat "unknown" as "not passed," not as "passed."
+            plan_gate_passed = bool(plan.get("_action_gate_passed", False))
 
             if plan_gate_passed:
                 for ak in plan.get("disable_alerts", []):
