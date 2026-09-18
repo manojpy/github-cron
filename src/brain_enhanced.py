@@ -350,7 +350,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                 f"🚪 ENTRY BAR — RAISE IT\n"
                 f"CONFLUENCE_MIN_ABS_SCORE: {cfg.CONFLUENCE_MIN_ABS_SCORE:.1f} → {rec_thr['recommended']:.1f}\n"
                 f"   This alone filters out {rec_thr.get('dropped', 0)} weak trades "
-                ({rec_thr.get('dropped_pct', 0):.0%}) and {outcome_line}."
+                f" ({rec_thr.get('dropped_pct', 0):.0%}) and {outcome_line}."
             )
     except Exception as e:
         logging.getLogger("macd_bot").debug(f"Brain report: ENTRY GATE THRESHOLD section failed: {e}")
