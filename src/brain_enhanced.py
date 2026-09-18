@@ -60,6 +60,19 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     kill_thr = getattr(cfg, "BRAIN_ALERT_DISABLE_THRESHOLD_WR", 0.40)
     net_ev = ai.get("net_ev", 0.0) or 0.0
 
+    # Computed once here (was previously computed a second time, later,
+    # in the ENTRY GATE THRESHOLD section) so BOTTOM LINE can show
+    # current-vs-expected WR without a duplicate call.
+    try:
+        rec_thr = engine.recommend_threshold(
+            rows, target_winrate=target, min_sample=getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
+        )
+    except Exception:
+        rec_thr = {"valid": False}
+    rec_thr_available = (
+        rec_thr.get("valid") and rec_thr.get("recommended")
+        and rec_thr["recommended"] > cfg.CONFLUENCE_MIN_ABS_SCORE
+    )
     # ── BOTTOM LINE ────────────────────────────────────────────────────
     try:
         buy_wr, buy_n, sell_wr, sell_n = engine.direction_split(rows)    
@@ -91,12 +104,17 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                 dir_note = f"Your SELL alerts win only {sell_wr:.0%} vs BUY {buy_wr:.0%} — the sell side is dragging you down."
             elif buy_wr < sell_wr - 0.15:
                 dir_note = f"Your BUY alerts win only {buy_wr:.0%} vs SELL {sell_wr:.0%} — the buy side is dragging you down."
+        
         ev_note = f"Net per trade: {net_ev:+.2f}% after fees" + (" — negative ❌." if net_ev < 0 else " — positive ✅.")
+        wr_note = ""
+        if rec_thr_available:
+            rec_wr_val = rec_thr.get("rec_wr", 0)
+            wr_note = f"\nCurrent WR {wr:.0%} → ~{rec_wr_val:.0%} projected if you raise the entry bar (see 🚪 below)."
         low_data = f"\nℹ️ Only {n} trades so far — treat these as strong hints, not certainties." if n < 100 else ""
         sections.append(
             f"🧠 PROFIT ACTION PLAN\n📊 Based on {n} trades\n\n🎯 BOTTOM LINE\n{verdict}"
             + (f"\n{dir_note}" if dir_note else "")
-            + f"\n{ev_note}{low_data}"
+            + f"\n{ev_note}{wr_note}{low_data}"
         )
     except Exception:
         pass
@@ -111,12 +129,12 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
         for r in rows:
             rows_by_alert[r["alert_key"]].append(r)
 
+        needs_data: List[Tuple[str, float, int]] = []
         for ak, awr, cnt, _avg in stats:
             if cnt < 10:
-                groups["⚪"].append(
-                    f"⚪ {ak}: {awr:.0%} WR (n={cnt}) — not enough trades yet to judge"
-                )
+                needs_data.append((ak, awr, cnt))
                 continue
+
             ak_rows = rows_by_alert.get(ak, [])
             ak_ev = engine.ev_first_objective(ak_rows, min_sample=10) if ak_rows else None
             ak_net_ev = ak_ev.get("net_ev", 0) if ak_ev and ak_ev.get("valid") else 0
@@ -142,11 +160,20 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                     f"🔴 {ak}: EV {ak_net_ev:+.2f}%, WR {awr:.0%} (n={cnt}) "
                     f"— losing money, disable it"
                 )
-        titles = {"🔴": "DISABLE THESE NOW", "🟡": "IMPROVE THESE", "🟢": "KEEP THESE", "⚪": "NEED MORE DATA"}
+        titles = {"🔴": "DISABLE THESE NOW", "🟡": "IMPROVE THESE", "🟢": "KEEP THESE"}
         block = "🚦 YOUR ALERTS — WHAT TO DO WITH EACH"
-        for e in ("🔴", "🟡", "🟢", "⚪"):
+        for e in ("🔴", "🟡", "🟢"):
             if groups[e]:
                 block += f"\n\n{titles[e]}:\n" + "\n".join(groups[e])
+        if needs_data:
+            needs_data.sort(key=lambda t: t[2], reverse=True)
+            shown = needs_data[:5]
+            nd_lines = [f"⚪ {ak}: {awr:.0%} WR (n={cnt})" for ak, awr, cnt in shown]
+            remainder = len(needs_data) - len(shown)
+            nd_block = f"NEED MORE DATA ({len(needs_data)} alerts; closest to a verdict shown):\n" + "\n".join(nd_lines)
+            if remainder > 0:
+                nd_block += f"\n…and {remainder} more with too few trades to list."
+            block += f"\n\n{nd_block}"
         sections.append(block)
     except Exception:
         pass
@@ -238,10 +265,10 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
         pass
 
     # ── CONFLUENCE WEIGHT CHANGES ──────────────────────────────────────
-    try:
+    try:    
         weight_lines: List[str] = []
         for p in cfg_patch:
-            if p.get("path") != "CONFLUENCE_WEIGHTS":
+            if p.get("path") != "CONFLUENCE_WEIGHTS" or p.get("_blocked_by_action_gate"):
                 continue
             cur = p.get("current", {}) or {}
             sug = p.get("suggested", {}) or {}
@@ -266,23 +293,29 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     # ── INDICATOR SETTING CHANGES ──────────────────────────────────────
     try:
         setting_lines: List[str] = []
+        blocked_lines: List[str] = []
         for p in cfg_patch:
             if p.get("path") == "CONFLUENCE_WEIGHTS":
                 continue
             cur, sug = p.get("current"), p.get("suggested")
             if cur is None or sug is None:
                 continue
+            if p.get("_blocked_by_action_gate"):
+                # Not vetted by the action gate — don't present it as a
+                # ready change or let it into the copy-paste block below.
+                blocked_lines.append(f"🔬 {p['path']}: candidate {sug} (needs more OOS evidence)")
+                continue
             setting_lines.append(f"🔧 {p['path']}: {cur} → {sug}\n   Why: {p.get('reason', 'data-driven optimum')}")
         if setting_lines:
             sections.append("🎚️ INDICATOR SETTINGS — CHANGE THESE\n\n" + "\n".join(setting_lines))
+        if blocked_lines:
+            sections.append("🔬 UNDER REVIEW — not confident enough to apply yet\n" + "\n".join(blocked_lines))
     except Exception:
         pass
-
     # ── ENTRY GATE THRESHOLD ───────────────────────────────────────────
     gate_rec = None
     try:
-        rec_thr = engine.recommend_threshold(rows, target_winrate=target, min_sample=getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20))
-        if rec_thr.get("valid") and rec_thr.get("recommended") and rec_thr["recommended"] > cfg.CONFLUENCE_MIN_ABS_SCORE:
+        if rec_thr_available:
             gate_rec = rec_thr
             rec_wr_val = rec_thr.get("rec_wr", 0)
             if rec_wr_val > wr:
@@ -309,9 +342,11 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     # `{` becomes `\{` etc., and the user cannot paste the result into a
     # JSON file. Inside a MarkdownV2 code block, only ` and \ need escaping.
     json_block: Optional[str] = None
-    try:
+    try:   
         json_changes: Dict[str, Any] = {}
         for p in cfg_patch:
+            if p.get("_blocked_by_action_gate"):
+                continue  # not vetted — never let it into the paste-ready block
             if p.get("path") == "CONFLUENCE_WEIGHTS":
                 json_changes["CONFLUENCE_WEIGHTS"] = p.get("suggested", {})
             elif p.get("current") is not None and p.get("suggested") is not None:
@@ -819,7 +854,7 @@ class BrainEngineV2(BaseBrainEngine):
                     ),
                 })
 
-        # ── Per-alert breakdown ──────────────────────────────────────────
+        # ─��� Per-alert breakdown ──────────────────────────────────────────
         alert_stats = engine.per_alert_breakdown(real_rows, min_sample=min_sample)
         if alert_stats:
             display = alert_stats if len(alert_stats) <= 10 else alert_stats[:5] + alert_stats[-5:]
