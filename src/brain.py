@@ -219,6 +219,7 @@ class BrainEngine:
         self._quality_cache_ts = 0.0
         self._market_model_cache: Optional[Dict[str, Any]] = None
         self._market_model_cache_ts = 0.0
+        self._cached_real_raw: Optional[List[Dict[str, str]]] = None
 
     async def check_rewardable_override(
         self,
@@ -478,7 +479,7 @@ class BrainEngine:
         except Exception:
             return False
 
-    # ── Stream reading helpers ────────────────────────────────────��─────────
+    # ── Stream reading helpers ────────────────────────────────────�����─────────
 
     async def _read_stream(self, stream_key: str, count: int) -> List[Dict[str, str]]:
         """Read the most recent `count` entries from an outcome stream."""
@@ -588,8 +589,13 @@ class BrainEngine:
                     "fees_paid_pct": _to_opt_float(f, "fees_paid_pct"),
                     "net_pnl_pct": _to_opt_float(f, "net_pnl_pct"),
                     "realized_cost_pct": _to_opt_float(f, "realized_cost_pct"),
-                    "adx_val": _to_opt_float(f, "adx_val"),
-                })
+                    "adx_val": _to_opt_float(f, "adx_val"), 
+                    "effective_score": _to_opt_float(f, "effective_score"),
+                    "effective_required": _to_opt_float(f, "effective_required"),
+                    "macro_multiplier": _to_opt_float(f, "macro_multiplier"),
+                    "cluster_penalty": _to_opt_float(f, "cluster_penalty"),        
+                   "rejection_reason": (row_context or {}).get("rejection_reason"),
+                 })
             except (KeyError, ValueError) as e:
                 logging.getLogger("macd_bot").debug(f"Brain: dropping malformed outcome row: {e}")
                 continue
@@ -600,12 +606,20 @@ class BrainEngine:
         Override in subclasses to read from file archives instead."""
         sample_size = getattr(cfg, "BRAIN_REPORT_STREAM_SAMPLE", 5000)
         window_days = getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30)
+
+        long_sample = getattr(cfg, "BRAIN_LONG_WINDOW_STREAM_SAMPLE", 15000)
+        fetch_size = max(sample_size, long_sample)
+
         real_raw, shadow_raw = await asyncio.gather(
-            self._read_stream(RedisKeyPrefix.OUTCOME_LOG_STREAM, sample_size),
+            self._read_stream(RedisKeyPrefix.OUTCOME_LOG_STREAM, fetch_size),
             self._read_stream(RedisKeyPrefix.SHADOW_LOG_STREAM, sample_size),
         )
+
+        self._cached_real_raw = real_raw  # consumed by _get_layered_window_rows
+
         real_rows = self._parse_rows(real_raw, window_days=window_days)
         shadow_rows = self._parse_rows(shadow_raw, window_days=window_days)
+
         return real_rows, shadow_rows
 
     async def _get_layered_window_rows(
@@ -613,20 +627,28 @@ class BrainEngine:
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Real-outcome rows for the recent/medium/long-history comparison
         (layered_window_analysis). Medium and long are chronological
-        supersets of recent, not separate populations, so this reads the
-        stream once at the long-window sample size and re-filters the
-        same raw rows three ways in Python rather than hitting Redis three
-        times. Runs as its own read (in addition to _get_rows()'s own
-        30-day-scoped read) since the long window generally needs far more
-        raw entries than the default report sample covers."""
-        long_sample = getattr(cfg, "BRAIN_LONG_WINDOW_STREAM_SAMPLE", 15000)
+        supersets of recent, not separate populations, so this re-filters
+        the raw rows already fetched by _get_rows() at
+        max(sample_size, long_sample) three ways in Python, instead of
+        hitting Redis again."""
         recent_days = getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30)
         medium_days = getattr(cfg, "BRAIN_MEDIUM_WINDOW_DAYS", 90)
         long_days = getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180)
-        raw = await self._read_stream(RedisKeyPrefix.OUTCOME_LOG_STREAM, long_sample)
+
+        raw = self._cached_real_raw
+         if raw is None:
+
+            # Fallback: _get_rows() wasn't called first this cycle.
+            long_sample = getattr(cfg, "BRAIN_LONG_WINDOW_STREAM_SAMPLE", 15000)
+            raw = await self._read_stream(
+                RedisKeyPrefix.OUTCOME_LOG_STREAM,
+                long_sample,
+            )
+
         recent_rows = self._parse_rows(raw, window_days=recent_days)
         medium_rows = self._parse_rows(raw, window_days=medium_days)
         long_rows = self._parse_rows(raw, window_days=long_days)
+
         return recent_rows, medium_rows, long_rows
 
     # ── CUSUM drift detection ────────────────────────────────────────────

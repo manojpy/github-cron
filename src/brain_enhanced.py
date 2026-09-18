@@ -193,6 +193,49 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                 sections.append(header + "\n" + "\n".join(dropped_lines[:10]))
     except Exception:
         pass
+    
+    # ── GATE IMPACT (shadow, per-gate counterfactual EV) ────────────────
+    try:
+        shadow_rows = recs.get("_shadow_rows", []) or []
+        gate_groups: Dict[str, list] = defaultdict(list)
+        for r in shadow_rows:
+            reason = r.get("rejection_reason")
+            if reason:
+                gate_groups[reason].append(r)
+
+        min_sample = getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
+        gate_lines = []
+
+        for reason, grows in sorted(gate_groups.items()):
+            ev = engine.ev_first_objective(grows, min_sample=min_sample)
+
+            if not ev.get("valid"):
+                gate_lines.append(
+                    f"⚪ {reason}: n={len(grows)} — below min sample ({min_sample}), no verdict yet"
+                )
+                continue
+
+            net_ev = ev.get("net_ev", 0.0)
+            p_ev = ev.get("p_ev_positive", 0.0)
+
+            verdict = (
+                "would likely have HELPED"
+                if net_ev > 0 and p_ev >= 0.65
+                else "correctly filtering losers"
+            )
+
+            gate_lines.append(
+                f"{'🟡' if net_ev > 0 else '🟢'} {reason}: rejected {len(grows)} signals, "
+                f"their hypothetical net EV was {net_ev:+.2f}% (P>0: {p_ev:.0%}) — {verdict}"
+            )
+
+        if gate_lines:
+            sections.append(
+                "🚧 GATE IMPACT — WHAT EACH FILTER IS COSTING/SAVING YOU\n"
+                + "\n".join(gate_lines)
+            )
+    except Exception:
+        pass
 
     # ── CONFLUENCE WEIGHT CHANGES ──────────────────────────────────────
     try:

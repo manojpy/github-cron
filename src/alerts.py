@@ -1529,11 +1529,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             )     
             if verdict["blocked"]:
                 logger_pair.info(f"[{pair_name}] portfolio_heat: {verdict['reason']}")
-                # Note: at this point `alerts_to_send` has not been computed
-                # yet (we're still in the pre-eval gate stack). The shadow
-                # row is recorded further down, after raw_alerts is known —
-                # see the portfolio_heat shadow write in the confluence
-                # section below.
+                await _record_counterfactual_block(
+                    sdb, pair_name, raw_alerts, ts_curr, gr.close_curr,
+                    block_reason="portfolio_heat",
+                    confluence_scores={ak: _confluence_for(ak) for _, _, ak in raw_alerts},
+                    logger_pair=logger_pair,
+                )
                 return pair_name, {
                     "state": "PORTFOLIO_HEAT",
                     "ts": int(time.time()),
