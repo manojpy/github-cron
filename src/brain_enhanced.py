@@ -846,7 +846,7 @@ class BrainEngineV2(BaseBrainEngine):
                 if changed:
                     change_strs = [f"{k}: {old:.1f}→{new:.1f}" for k, old, new in changed[:6]]
                     extra = f" (+{len(changed)-6} more)" if len(changed) > 6 else ""
-
+                    oos_note = f"\n   {oos_weight_note}" if oos_weight_note else ""
                     recommendations.append({
                         "type": "weight_optimizer",
                         "severity": "high" if conf_score > 0.6 else "medium",
@@ -855,8 +855,9 @@ class BrainEngineV2(BaseBrainEngine):
                             f"confidence {conf_label} {conf_score:.0%}):\n"
                             f"   Changes: {', '.join(change_strs)}{extra}\n"
                             f"   Max delta/cycle: ±{max_weight_delta}"
+                            f"{oos_note}"
                         ),
-                        "delta_ev": 0.0,  # Will be computed by counterfactual
+                        "delta_ev": 0.0,
                         "wilson_lo": max(0.0, 0.5 - conf_score * 0.2),
                         "wilson_hi": min(1.0, 0.5 + conf_score * 0.2),
                     })

@@ -778,15 +778,15 @@ class BrainEngine:
             auto_eligible = auto_disable_on and total >= auto_disable_min
 
             if hi < disable_wr:
-                # ── EV-gated disable: only disable if EV is ALSO negative ──        
+                # ── EV-gated disable: only disable if EV is ALSO negative ──
                 _ev_cache_key = (alert_key, len(s["rows"]))
                 if not hasattr(self, "_ev_obj_cache"):
-                    self._ev_obj_cache = {}
+                    self._ev_obj_cache: Dict[str, Dict[str, Any]] = {}
                 if _ev_cache_key in self._ev_obj_cache:
                     ev_obj = self._ev_obj_cache[_ev_cache_key]
                 else:
                     ev_obj = engine.ev_first_objective(s["rows"], min_sample=min_sample)
-                    self._ev_obj_cache[_ev_cache_key] = ev_obj    
+                    self._ev_obj_cache[_ev_cache_key] = ev_obj
 
                 ev_negative = ev_obj.get("valid") and ev_obj["net_ev"] <= 0
                 if ev_negative:
