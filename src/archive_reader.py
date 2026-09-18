@@ -188,10 +188,9 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
             "effective_required": float(_eff_req) if _eff_req is not None else None,
             "macro_multiplier": float(_macro_mult) if _macro_mult is not None else None,
             "cluster_penalty": float(_cluster_pen) if _cluster_pen is not None else None,
-
             "gate_passed": _coerce_bool(raw.get("gate_passed"), default=None),
             "adx_val": float(_adx_val) if _adx_val is not None and _adx_val != "" else None,
-            "rejection_reason": _rejection reason, 
+            "rejection_reason": _rejection_reason,
             # ── Provenance — lets downstream consumers audit vintage ──
             "schema_version": row_schema,
         }
