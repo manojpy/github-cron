@@ -178,8 +178,11 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
         titles = {"🔴": "DISABLE THESE NOW", "🟡": "IMPROVE THESE", "🟢": "KEEP THESE"}
         block = "🚦 YOUR ALERTS — WHAT TO DO WITH EACH"
         for e in ("🔴", "🟡", "🟢"):
-            if groups[e]:
-                block += f"\n\n{titles[e]}:\n" + "\n".join(groups[e])
+            if groups[bucket]:
+                block += f"\n\n{titles[bucket]}:\n" + "\n".join(groups[bucket])
+
+
+
         if needs_data:
             needs_data.sort(key=lambda t: t[2], reverse=True)
             shown = needs_data[:5]
