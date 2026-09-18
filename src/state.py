@@ -16,7 +16,6 @@ StreamField = Union[bytes, memoryview, str, int, float]
 if TYPE_CHECKING:
     from fetcher import PriceData
 
-
 def _rc(client: "Optional[redis.Redis]") -> "redis.Redis":
     """Narrow an Optional Redis client for mypy at call sites that are
     already guarded by an `if not self._redis: return ...` / `if not
@@ -1474,6 +1473,13 @@ class RedisStateStore:
                         conf_score = result["conf_score"]
                         conf_total = result["conf_total"]
                         conf_votes = result["conf_votes"]
+                        row_context = result.get("context") or {}
+                        shadow_adx_val = row_context.get("adx_val")
+                        shadow_rejection_reason = row_context.get("rejection_reason")
+                        shadow_effective_score = row_context.get("effective_score")
+                        shadow_effective_required = row_context.get("effective_required")
+                        shadow_macro_multiplier = row_context.get("macro_multiplier")
+                        shadow_cluster_penalty = row_context.get("cluster_penalty")
 
                         stats_key = f"{RedisKeyPrefix.SHADOW_STATS}{pair}:{alert_key}"
                         write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
@@ -1512,6 +1518,12 @@ class RedisStateStore:
                                     "votes": json_dumps(conf_votes)
                                     if conf_votes is not None
                                     else "",
+                                    "adx_val": str(shadow_adx_val) if shadow_adx_val is not None else "",
+                                    "rejection_reason": shadow_rejection_reason or "",
+                                    "effective_score": str(shadow_effective_score) if shadow_effective_score is not None else "",
+                                    "effective_required": str(shadow_effective_required) if shadow_effective_required is not None else "",
+                                    "macro_multiplier": str(shadow_macro_multiplier) if shadow_macro_multiplier is not None else "",
+                                    "cluster_penalty": str(shadow_cluster_penalty) if shadow_cluster_penalty is not None else "",
                                 }
                                 write_pipe.xadd(
                                     RedisKeyPrefix.SHADOW_LOG_STREAM,
@@ -1568,11 +1580,13 @@ class RedisStateStore:
                                     "win_weight": result.get("win_weight", 1.0),
                                     "net_pnl_pct": result.get("net_pnl_pct", 0.0),
                                     "realized_cost_pct": result.get("realized_cost_pct", 0.0),
+                                    "adx_val": shadow_adx_val,
+                                    "rejection_reason": shadow_rejection_reason,
                                     "effective_score": result.get("effective_score"),
                                     "effective_required": result.get("effective_required"),
                                     "macro_multiplier": result.get("macro_multiplier"),
                                     "cluster_penalty": result.get("cluster_penalty"),
-                                    "gate_passed": result.get("gate_passed"),
+                                    "gate_passed": result.get("gate_passed")
                                 })
                     except Exception as e:
                         logger_pair.debug(
