@@ -40,7 +40,7 @@ jobs:
           else
             python3 src/cleanup_outcomes.py \
               --data-dir /tmp/data-repo \
-              --max-age-days 60 \
+              --max-age-days 185 \
               --max-size-mb 100 \
               --max-total-mb 400 \
               --no-compress-within-days 30
