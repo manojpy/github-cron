@@ -53,6 +53,21 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     ai = recs.get("ai_metrics", {}) or {}
     sections: List[str] = []
 
+    _GATE_CHECK_LABELS = {
+        "data_quality": "fewer than 100 trades logged",
+        "oos_prediction": "didn't hold up in out-of-sample testing",
+        "profitability": "not confident enough of net profit (P>0 or EV floor)",
+        "stability": "a drift alarm is currently active on one of your alerts",
+        "risk": "recent drawdown exceeds the kill-switch budget",
+        "execution": "fee/slippage assumptions aren't configured",
+    }
+    action_gate = ai.get("action_gate", {}) or {}
+    _failing_checks = [
+        label for key, label in _GATE_CHECK_LABELS.items()
+        if action_gate.get(key) is False
+    ]
+    gate_block_reason = "; ".join(_failing_checks) if _failing_checks else "insufficient evidence"
+
     n = len(rows)
     wins = sum(1 for r in rows if r["win"])
     wr = wins / n if n else 0.0
@@ -265,10 +280,14 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
         pass
 
     # ── CONFLUENCE WEIGHT CHANGES ──────────────────────────────────────
-    try:    
+    blocked_lines: List[str] = []
+    try:
         weight_lines: List[str] = []
         for p in cfg_patch:
-            if p.get("path") != "CONFLUENCE_WEIGHTS" or p.get("_blocked_by_action_gate"):
+            if p.get("path") != "CONFLUENCE_WEIGHTS":
+                continue
+            if p.get("_blocked_by_action_gate"):
+                blocked_lines.append(f"🔬 CONFLUENCE_WEIGHTS: candidate changes — blocked: {gate_block_reason}")
                 continue
             cur = p.get("current", {}) or {}
             sug = p.get("suggested", {}) or {}
@@ -293,7 +312,6 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     # ── INDICATOR SETTING CHANGES ──────────────────────────────────────
     try:
         setting_lines: List[str] = []
-        blocked_lines: List[str] = []
         for p in cfg_patch:
             if p.get("path") == "CONFLUENCE_WEIGHTS":
                 continue
@@ -303,7 +321,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
             if p.get("_blocked_by_action_gate"):
                 # Not vetted by the action gate — don't present it as a
                 # ready change or let it into the copy-paste block below.
-                blocked_lines.append(f"🔬 {p['path']}: candidate {sug} (needs more OOS evidence)")
+                blocked_lines.append(f"🔬 {p['path']}: candidate {sug} — blocked: {gate_block_reason}")
                 continue
             setting_lines.append(f"🔧 {p['path']}: {cur} → {sug}\n   Why: {p.get('reason', 'data-driven optimum')}")
         if setting_lines:
@@ -854,7 +872,7 @@ class BrainEngineV2(BaseBrainEngine):
                     ),
                 })
 
-        # ─��� Per-alert breakdown ──────────────────────────────────────────
+        # ─ Per-alert breakdown ──────────────────────────────────────────
         alert_stats = engine.per_alert_breakdown(real_rows, min_sample=min_sample)
         if alert_stats:
             display = alert_stats if len(alert_stats) <= 10 else alert_stats[:5] + alert_stats[-5:]
