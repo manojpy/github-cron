@@ -164,11 +164,14 @@ jobs:
             echo "::error::Branch 'main' not found in outcome-data repo"
             exit 1
           fi
-
           git sparse-checkout init --no-cone
           {
             echo "brain_state.json"
-            for i in $(seq 0 29); do
+            # ── FIX (Priority 2): Fetch 185 days to cover
+            # BRAIN_LONG_WINDOW_DAYS=180 plus a 5-day buffer.
+            # Previously only 30 days were checked out, starving the
+            # Brain's 90-day and 180-day layered window analysis. ──
+            for i in $(seq 0 184); do
               D=$(date -u -d "-${i} days" +%Y-%m-%d)
               echo "outcomes/${D}.jsonl"
               echo "shadow/${D}.jsonl"
@@ -178,7 +181,6 @@ jobs:
             echo "/outcomes/"
             echo "/shadow/"
           } > .git/info/sparse-checkout
-
           git checkout main
           cd -
 
