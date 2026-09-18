@@ -2674,16 +2674,29 @@ def optimize_vote_weights(
         confidence_score = min(0.3, n / 1000.0)  # No WF = low confidence
 
     # ── Bootstrap stability check (5 resamples) ──
+    voted_rows = sorted(
+        (r for r in rows if isinstance(r.get("votes"), dict)),
+        key=lambda r: r.get("entry_ts", 0),
+    )
+    block_size = max(5, min(20, len(voted_rows) // 10 or 1))
+    blocks = [
+        voted_rows[i:i + block_size]
+        for i in range(0, len(voted_rows), block_size)
+    ]
+    blocks = [b for b in blocks if b]
+
     bootstrap_betas: List[List[float]] = []
     rng = random.Random(42)
-    for _ in range(5):
-        indices = [rng.randint(0, n - 1) for _ in range(n)]
-        X_boot = [X[i] for i in indices]
-        y_boot = [y[i] for i in indices]
-        sw_boot = [sample_weights[i] for i in indices]
-        b = _train_logistic(X_boot, y_boot, sw_boot, max_iter // 2, lr, l2)
-        if b:
-            bootstrap_betas.append(b)
+    if len(blocks) >= 5:
+        for _ in range(5):
+            sampled_blocks = rng.choices(blocks, k=len(blocks))
+            boot_rows = [r for blk in sampled_blocks for r in blk]
+            X_boot, y_boot, sw_boot = _build_vote_dataset(
+                boot_rows, vote_names, use_pnl_weighting=use_pnl_weighting,
+            )
+            b = _train_logistic(X_boot, y_boot, sw_boot, max_iter // 2, lr, l2)
+            if b:
+                bootstrap_betas.append(b)
 
     coeff_stability: Dict[str, float] = {}
     if len(bootstrap_betas) >= 3:
@@ -2904,6 +2917,10 @@ def train_market_state_model(
             "valid": False, "error": "insufficient_split",
             "n_train": len(train_rows), "n_holdout": len(holdout_rows),
         }
+    try:
+        drift_check = detect_feature_drift(rows, recent_n=len(holdout_rows))
+    except Exception:
+        drift_check = {"valid": False, "error": "drift_check_failed"}
 
     X_train, y_train, feat_names = build_market_state_features(train_rows)
     X_hold, y_hold, _ = build_market_state_features(holdout_rows, feat_names)
@@ -2914,7 +2931,7 @@ def train_market_state_model(
     )
     beta = _train_logistic(X_train, y_train, sw_train, max_iter=1500)
     if not beta:
-        return {"valid": False, "error": "training_failed"}
+        return {"valid": False, "error": "training_failed", "drift_check": drift_check}
 
     # OOS acceptance gate: only the trades the model would actually have
     # taken (P(win) >= 0.5) on data it never trained on, evaluated on net
@@ -2927,16 +2944,14 @@ def train_market_state_model(
     if len(kept) < min_kept:
         return {
             "valid": False, "error": "holdout_too_thin_at_decision_boundary",
-            "n_kept": len(kept), "min_kept": min_kept,
+            "n_kept": len(kept), "min_kept": min_kept, "drift_check": drift_check,
         }
-
     holdout_ev_obj = ev_first_objective(kept, min_sample=min_kept)
     if not holdout_ev_obj.get("valid") or holdout_ev_obj["p_ev_positive"] < min_oos_p_ev_positive:
         return {
             "valid": False, "error": "oos_ev_not_convincing",
-            "holdout_ev": holdout_ev_obj,
+            "holdout_ev": holdout_ev_obj, "drift_check": drift_check,
         }
-
     return {
         "valid": True,
         "beta": beta,
@@ -2946,6 +2961,7 @@ def train_market_state_model(
         "n_kept_at_decision": len(kept),
         "holdout_ev": holdout_ev_obj,
         "trained_at": int(time.time()),
+        "drift_check": drift_check,
     }
 
 def predict_market_state_proba(
@@ -3720,34 +3736,57 @@ def build_calibration_curves(
     min_sample: int = 15,
 ) -> Dict[str, Any]:
     """Per-alert-key calibration: bucketed confluence % → observed win rate.
-
     A raw confluence score is a weighted vote total, not a probability.
     This maps what the score DISPLAYS (conf_pct, treated as the implied
     probability claim /100) to what actually HAPPENED, per alert key, so
     the live gate can filter on calibrated probability instead of face
     value. ECE = standard expected calibration error over buckets.
+
+    Buckets are equal-FREQUENCY (quantile), not equal-width: alert
+    dispatch already gates on a confluence floor, so conf_pct is
+    right-truncated/skewed rather than uniform across 0-100%, and fixed
+    bucket_pct-wide bins leave most of them sparse or empty right where
+    the gate threshold lives. bucket_pct still sets the target bin count
+    (100/bucket_pct, capped by how many min_sample-sized groups the data
+    actually supports), so existing CALIBRATION_BUCKET_PCT config values
+    keep behaving the same way in spirit.
     """
     by_ak: Dict[str, List[Row]] = defaultdict(list)
     for r in rows:
         by_ak[r["alert_key"]].append(r)
 
+    target_bins = max(1, round(100.0 / bucket_pct)) if bucket_pct > 0 else 20
+
     curves: Dict[str, Any] = {}
     for ak, ak_rows in by_ak.items():
         if len(ak_rows) < min_sample:
             continue
-        buckets: Dict[int, List[Row]] = defaultdict(list)
-        for r in ak_rows:
-            buckets[int(r["conf_pct"] // bucket_pct)].append(r)
+        ordered = sorted(ak_rows, key=lambda r: r["conf_pct"])
+        n_bins = max(1, min(target_bins, len(ordered) // min_sample))
+        chunk_size = math.ceil(len(ordered) / n_bins)
+        chunks = [ordered[i:i + chunk_size] for i in range(0, len(ordered), chunk_size)]
+        chunks = [c for c in chunks if c]
+
+        # Contiguous 0-100 coverage: each boundary sits halfway between one
+        # chunk's max conf_pct and the next chunk's min, so a live conf_pct
+        # anywhere in 0-100 lands in exactly one bucket (no gaps for
+        # calibration_gate_decision's range lookup to fall through).
+        boundaries = [0.0]
+        for i in range(len(chunks) - 1):
+            boundaries.append(
+                (chunks[i][-1]["conf_pct"] + chunks[i + 1][0]["conf_pct"]) / 2.0
+            )
+        boundaries.append(100.0)
+
         out = []
-        for b in sorted(buckets):
-            chunk = buckets[b]
+        for idx, chunk in enumerate(chunks):
             n = len(chunk)
             wins = sum(r["win"] for r in chunk)
             wr = wins / n
             lo, hi, _ = wilson_ci(wins, n)
             pred = statistics.mean(r["conf_pct"] for r in chunk) / 100.0
             out.append({
-                "lo": b * bucket_pct, "hi": (b + 1) * bucket_pct,
+                "lo": round(boundaries[idx], 2), "hi": round(boundaries[idx + 1], 2),
                 "predicted": round(pred, 4), "observed": round(wr, 4),
                 "n": n, "trusted": n >= min_sample,
                 "wilson_lo": round(lo, 4), "wilson_hi": round(hi, 4),
@@ -3854,7 +3893,7 @@ def portfolio_heat_check(
         return {"blocked": False, "reason": f"gate error (fail-open): {e}", **stats}
 
 
-# ═══════════════���══════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════
 #  KILL SWITCH — fast-failure halt (streak / rolling drawdown)
 # ══════════════════════════════════════════════════════════════════════
 

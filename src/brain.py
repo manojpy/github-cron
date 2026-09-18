@@ -481,7 +481,7 @@ class BrainEngine:
         except Exception:
             return False
 
-    # ── Stream reading helpers ─────────────�����──────────────────────�����─────────
+    # ── Stream reading helpers ───────────────────────────────────�����─────────
 
     async def _read_stream(self, stream_key: str, count: int) -> List[Dict[str, str]]:
         """Read the most recent `count` entries from an outcome stream."""
@@ -1579,7 +1579,7 @@ class BrainEngine:
                         f"OOS P(EV>0)={ms_model['holdout_ev']['p_ev_positive']:.0%} "
                         f"on n_holdout={ms_model['n_holdout']}."
                     ),
-                })
+                })         
             else:
                 recommendations.append({
                     "type": "market_state_model_rejected",
@@ -1589,6 +1589,14 @@ class BrainEngine:
                         f"({ms_model.get('error', 'unknown')}) — previous model, if any, kept live."
                     ),
                 })
+                drift = ms_model.get("drift_check") or {}
+                drifted = drift.get("drifted_features") if drift.get("valid") else None
+                if drifted:
+                    logging.getLogger("macd_bot").warning(
+                        f"Market-state model rejected this cycle AND feature drift detected "
+                        f"({len(drifted)} feature(s), top PSI={drifted[0]['psi']}: {drifted[0]['feature']}) "
+                        f"— the previous model may now be stale against a shifted regime, not just noisy data."
+                    )
 
         # ── Kill switch: fast-failure stop (streak / rolling drawdown) ──
         if getattr(cfg, "ENABLE_KILL_SWITCH", False):

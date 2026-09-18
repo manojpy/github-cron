@@ -131,8 +131,8 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
             + (f"\n{dir_note}" if dir_note else "")
             + f"\n{ev_note}{wr_note}{low_data}"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logging.getLogger("macd_bot").debug(f"Brain report: BOTTOM LINE section failed: {e}")
 
     # ── PER-ALERT HEALTH ───────────────────────────────────────────────
     try:
@@ -190,8 +190,8 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                 nd_block += f"\n…and {remainder} more with too few trades to list."
             block += f"\n\n{nd_block}"
         sections.append(block)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.getLogger("macd_bot").debug(f"Brain report: PER-ALERT HEALTH section failed: {e}")
 
     # ── BLOCKED BY WIN-RATE FILTER (shadow, not dispatched) ─────────────
     try:
@@ -231,10 +231,10 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                     header += (
                         f"\n   ⚠️ {over_blocking} alert(s) blocked at or above target — "
                         f"review MIN_WIN_RATE / MIN_WIN_RATE_SAMPLE for those keys."
-                    )
+                    )          
                 sections.append(header + "\n" + "\n".join(dropped_lines[:10]))
-    except Exception:
-        pass
+    except Exception as e:
+        logging.getLogger("macd_bot").debug(f"Brain report: BLOCKED BY WIN-RATE FILTER section failed: {e}")
     
     # ── GATE IMPACT (shadow, per-gate counterfactual EV) ────────────────
     try:
@@ -276,8 +276,8 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                 "🚧 GATE IMPACT — WHAT EACH FILTER IS COSTING/SAVING YOU\n"
                 + "\n".join(gate_lines)
             )
-    except Exception:
-        pass
+    except Exception as e:
+        logging.getLogger("macd_bot").debug(f"Brain report: GATE IMPACT section failed: {e}")
 
     # ── CONFLUENCE WEIGHT CHANGES ──────────────────────────────────────
     blocked_lines: List[str] = []
@@ -306,8 +306,9 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
             )
         else:
             sections.append("⚖️ CONFLUENCE WEIGHTS\nNo safe weight changes yet — need more trade history before the Brain will move them.")
-    except Exception:
-        pass
+    except Exception as e:
+        logging.getLogger("macd_bot").debug(f"Brain report: CONFLUENCE WEIGHT CHANGES section failed: {e}")
+
 
     # ── INDICATOR SETTING CHANGES ──────────────────────────────────────
     try:
@@ -326,10 +327,11 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
             setting_lines.append(f"🔧 {p['path']}: {cur} → {sug}\n   Why: {p.get('reason', 'data-driven optimum')}")
         if setting_lines:
             sections.append("🎚️ INDICATOR SETTINGS — CHANGE THESE\n\n" + "\n".join(setting_lines))
-        if blocked_lines:
+        if blocked_lines:    
             sections.append("🔬 UNDER REVIEW — not confident enough to apply yet\n" + "\n".join(blocked_lines))
-    except Exception:
-        pass
+    except Exception as e:
+        logging.getLogger("macd_bot").debug(f"Brain report: INDICATOR SETTING CHANGES section failed: {e}")
+
     # ── ENTRY GATE THRESHOLD ───────────────────────────────────────────
     gate_rec = None
     try:
@@ -348,10 +350,10 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                 f"🚪 ENTRY BAR — RAISE IT\n"
                 f"CONFLUENCE_MIN_ABS_SCORE: {cfg.CONFLUENCE_MIN_ABS_SCORE:.1f} → {rec_thr['recommended']:.1f}\n"
                 f"   This alone filters out {rec_thr.get('dropped', 0)} weak trades "
-                f"({rec_thr.get('dropped_pct', 0):.0%}) and {outcome_line}."
+                ({rec_thr.get('dropped_pct', 0):.0%}) and {outcome_line}."
             )
-    except Exception:
-        pass
+    except Exception as e:
+        logging.getLogger("macd_bot").debug(f"Brain report: ENTRY GATE THRESHOLD section failed: {e}")
 
     # ── COPY-PASTE CONFIG BLOCK ────────────────────────────────────────
     # Kept OUT of `sections` so it can be emitted as a real Telegram code
@@ -374,9 +376,10 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
         if json_changes:
             raw_json = json.dumps(json_changes, indent=1)
             code_safe = raw_json.replace("\\", "\\\\").replace("`", "\\`")
+            
             json_block = "```json\n" + code_safe + "\n```"
-    except Exception:
-        pass
+    except Exception as e:
+        logging.getLogger("macd_bot").debug(f"Brain report: COPY-PASTE CONFIG BLOCK section failed: {e}")
 
     # ── BEST / WORST CONDITIONS ────────────────────────────────────
     try:
@@ -390,9 +393,10 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
             if len(sess) >= 2:
                 line += (f"\n⏰ Best session: {sess[-1][0]} ({sess[-1][1]:.0%}, n={sess[-1][2]}) "
                          f"| Worst: {sess[0][0]} ({sess[0][1]:.0%}, n={sess[0][2]})")
+            
             sections.append(line)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.getLogger("macd_bot").debug(f"Brain report: BEST/WORST CONDITIONS section failed: {e}")
 
     if not sections and json_block is None:
         return []
