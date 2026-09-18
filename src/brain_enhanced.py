@@ -843,6 +843,57 @@ class BrainEngineV2(BaseBrainEngine):
                 conf_label = wopt.get("confidence_label", "LOW")
                 conf_score = wopt.get("confidence", 0.0)
 
+                # FIX: read the configured floor instead of hardcoding 0.4
+                min_conf = getattr(cfg, "BRAIN_WEIGHT_OPTIMIZER_MIN_CONFIDENCE", 0.4)
+
+                # ── FIX (Priority 4): Direct OOS comparison of current
+                # vs suggested weights using chronological holdout. ──
+                # (Must be calculated BEFORE the recommendation message uses it)
+                oos_weight_ok = True
+                oos_weight_note = ""
+                if wopt.get("walk_forward_passed") and len(real_rows) >= 200:
+                    train_rows_wf, holdout_rows_wf = engine.walk_forward_split(real_rows)
+                    if len(holdout_rows_wf) >= 20:
+                        # Score holdout under current weights
+                        cur_kept = [
+                            r for r in holdout_rows_wf
+                            if r.get("votes") and sum(
+                                CONFLUENCE_WEIGHTS.get(vn, 0)
+                                for vn, v in r["votes"].items() if v
+                            ) >= cfg.CONFLUENCE_MIN_ABS_SCORE
+                        ]
+                        sug_kept = [
+                            r for r in holdout_rows_wf
+                            if r.get("votes") and sum(
+                                wopt["suggested_weights"].get(vn, 0)
+                                for vn, v in r["votes"].items() if v
+                            ) >= cfg.CONFLUENCE_MIN_ABS_SCORE
+                        ]
+                        if len(cur_kept) >= 10 and len(sug_kept) >= 10:
+                            cur_ev_oos, _, _ = engine.ev_and_kelly_for(cur_kept)
+                            sug_ev_oos, _, _ = engine.ev_and_kelly_for(sug_kept)
+                            if sug_ev_oos < cur_ev_oos - 0.01:
+                                oos_weight_ok = False
+                                oos_weight_note = (
+                                    f"OOS veto: suggested EV {sug_ev_oos:+.3f}% < "
+                                    f"current {cur_ev_oos:+.3f}%"
+                                )
+                            else:
+                                oos_weight_note = (
+                                    f"OOS pass: suggested EV {sug_ev_oos:+.3f}% vs "
+                                    f"current {cur_ev_oos:+.3f}%"
+                                )
+
+                # ── Shadow out-of-sample veto ──────────────────────
+                shadow_weight_ok, shadow_weight_note = True, ""
+                if (wopt.get("walk_forward_passed") and conf_score >= min_conf
+                        and len(shadow_rows) >= 15 and oos_weight_ok):
+                    shadow_weight_ok, shadow_weight_note = self._shadow_weight_check(
+                        shadow_rows, CONFLUENCE_WEIGHTS,
+                        wopt["suggested_weights"], cfg.CONFLUENCE_MIN_ABS_SCORE,
+                    )
+
+                # ── Emit recommendation (NOW oos_weight_note is defined) ──
                 if changed:
                     change_strs = [f"{k}: {old:.1f}→{new:.1f}" for k, old, new in changed[:6]]
                     extra = f" (+{len(changed)-6} more)" if len(changed) > 6 else ""
@@ -861,54 +912,6 @@ class BrainEngineV2(BaseBrainEngine):
                         "wilson_lo": max(0.0, 0.5 - conf_score * 0.2),
                         "wilson_hi": min(1.0, 0.5 + conf_score * 0.2),
                     })
-                    # FIX: read the configured floor instead of hardcoding 0.4
-                    min_conf = getattr(cfg, "BRAIN_WEIGHT_OPTIMIZER_MIN_CONFIDENCE", 0.4)
-
-                    # ── FIX (Priority 4): Direct OOS comparison of current
-                    # vs suggested weights using chronological holdout. ──
-                    oos_weight_ok = True
-                    oos_weight_note = ""
-                    if wopt.get("walk_forward_passed") and len(real_rows) >= 200:
-                        train_rows_wf, holdout_rows_wf = engine.walk_forward_split(real_rows)
-                        if len(holdout_rows_wf) >= 20:
-                            # Score holdout under current weights
-                            cur_kept = [
-                                r for r in holdout_rows_wf
-                                if r.get("votes") and sum(
-                                    CONFLUENCE_WEIGHTS.get(vn, 0)
-                                    for vn, v in r["votes"].items() if v
-                                ) >= cfg.CONFLUENCE_MIN_ABS_SCORE
-                            ]
-                            sug_kept = [
-                                r for r in holdout_rows_wf
-                                if r.get("votes") and sum(
-                                    wopt["suggested_weights"].get(vn, 0)
-                                    for vn, v in r["votes"].items() if v
-                                ) >= cfg.CONFLUENCE_MIN_ABS_SCORE
-                            ]
-                            if len(cur_kept) >= 10 and len(sug_kept) >= 10:
-                                cur_ev_oos, _, _ = engine.ev_and_kelly_for(cur_kept)
-                                sug_ev_oos, _, _ = engine.ev_and_kelly_for(sug_kept)
-                                if sug_ev_oos < cur_ev_oos - 0.01:
-                                    oos_weight_ok = False
-                                    oos_weight_note = (
-                                        f"OOS veto: suggested EV {sug_ev_oos:+.3f}% < "
-                                        f"current {cur_ev_oos:+.3f}%"
-                                    )
-                                else:
-                                    oos_weight_note = (
-                                        f"OOS pass: suggested EV {sug_ev_oos:+.3f}% vs "
-                                        f"current {cur_ev_oos:+.3f}%"
-                                    )
-
-                    # ── Shadow out-of-sample veto ──────────────────────
-                    shadow_weight_ok, shadow_weight_note = True, ""
-                    if (wopt.get("walk_forward_passed") and conf_score >= min_conf
-                            and len(shadow_rows) >= 15 and oos_weight_ok):
-                        shadow_weight_ok, shadow_weight_note = self._shadow_weight_check(
-                            shadow_rows, CONFLUENCE_WEIGHTS,
-                            wopt["suggested_weights"], cfg.CONFLUENCE_MIN_ABS_SCORE,
-                        )
                     # Only emit config patch if walk-forward passed AND
                     # confidence is decent AND shadow sample doesn't veto.
                     if (wopt.get("walk_forward_passed") and conf_score >= min_conf
