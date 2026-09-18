@@ -994,11 +994,7 @@ class RedisStateStore:
                 return None, "ts_mismatch"
             entry_idx = int(exact_matches[-1])
 
-        # ── Simulated executable fill: no live order exists, so use the
-        # open of the candle OUTCOME_FILL_DELAY_CANDLES after entry as
-        # the assumed fill. This gives entry_slip_pct a real, direction-
-        # aware number (buy fills above signal, sell below) instead of
-        # collapsing to zero and hiding execution cost. ──
+        # ── Simulated executable fill: no live order exists, so use the     
         data.setdefault("signal_price", entry_price)
         fill_delay = max(0, int(getattr(cfg, "OUTCOME_FILL_DELAY_CANDLES", 1)))
         fill_idx = entry_idx + fill_delay
@@ -1007,14 +1003,17 @@ class RedisStateStore:
         else:
             data["fill_price"] = data.get("fill_price") or entry_price
 
+        # ── FIX (Priority 1): Use fill_price as the anchor for all
+        anchor_price = float(data["fill_price"])
+
         target_idx = entry_idx + cfg.OUTCOME_LOOKAHEAD_CANDLES
         if target_idx > i15:
             return None, "not_ready"
 
         future_price = float(data_15m.close[target_idx])
-        pct_move = (future_price - entry_price) / entry_price * 100.0
+        pct_move = (future_price - anchor_price) / anchor_price * 100.0
 
-        # ── R:R-BASED THRESHOLDS ──
+        # ── R:R-BASED THRESHOLDS (anchored to fill_price) ──
         risk_pct = cfg.OUTCOME_MAE_LOSS_PCT / 100.0            # e.g. 0.005
         target_pct = risk_pct * cfg.OUTCOME_RR_TARGET           # e.g. 0.010 (1.0%)
         bonus_pct = risk_pct * cfg.OUTCOME_BONUS_RR             # e.g. 0.015 (1.5%)
@@ -1026,7 +1025,20 @@ class RedisStateStore:
             else pct_move <= -cfg.OUTCOME_FAVORABLE_MOVE_PCT
         )
 
-        # ── MAE / MFE from price path ──
+        # ── MAE / MFE from price path (anchored to fill_price) ──
+        path_start = fill_idx + 1 if fill_delay > 0 else entry_idx + 1
+        path_end = min(target_idx + 1, len(data_15m.low))
+        path_low = data_15m.low[path_start:path_end]
+        path_high = data_15m.high[path_start:path_end]
+        mae = mfe = None
+        if len(path_low) and len(path_high):
+            if is_buy:
+                mae = max(0.0, (anchor_price - float(np.min(path_low))) / anchor_price)
+                mfe = max(0.0, (float(np.max(path_high)) - anchor_price) / anchor_price)
+            else:
+                mae = max(0.0, (float(np.max(path_high)) - anchor_price) / anchor_price)
+                mfe = max(0.0, (anchor_price - float(np.min(path_low))) / anchor_price)
+
         path_start = entry_idx + 1
         path_end = min(target_idx + 1, len(data_15m.low))
         path_low = data_15m.low[path_start:path_end]
@@ -1053,12 +1065,12 @@ class RedisStateStore:
         # ── R-MULTIPLE ACHIEVED ──
         rr_achieved = (mfe / risk_pct) if (mfe is not None and risk_pct > 0) else 0.0
 
-        # ── BONUS: tp_first ordering (candle-by-candle) ──
+        # ── BONUS: tp_first ordering (candle-by-candle, anchored to fill_price) ──
         tp_first: Optional[bool] = None
         ambiguous_same_candle = False          # ← initialized BEFORE the loop
         if len(path_low) and len(path_high):
-            tp_level = entry_price * (1 + target_pct) if is_buy else entry_price * (1 - target_pct)
-            sl_level = entry_price * (1 - risk_pct) if is_buy else entry_price * (1 + risk_pct)
+            tp_level = anchor_price * (1 + target_pct) if is_buy else anchor_price * (1 - target_pct)
+            sl_level = anchor_price * (1 - risk_pct) if is_buy else anchor_price * (1 + risk_pct)
 
             tp_hit_idx = None
             sl_hit_idx = None
@@ -1129,13 +1141,15 @@ class RedisStateStore:
         win_weight = _compute_win_weight(rr_achieved, win)
 
         # ── NET P&L (cost-adjusted, fill-aware when available) ──
+        # ── NET P&L (cost-adjusted, fill-aware when available) ──
+        # FIX (Priority 1): pct_move is already computed from anchor_price
+        # (fill_price), so net_pnl_pct is consistent.
         fee_pct = getattr(cfg, "BRAIN_FEE_PCT", 0.0006)
         slip_pct = getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003)
         base_cost_pct = (fee_pct * 2 + slip_pct * 2) * 100  # round-trip, in %
 
         sig_p = data.get("signal_price")
         fill_p = data.get("fill_price")
-
         if sig_p and fill_p and float(sig_p) > 0:
             sig_p = float(sig_p)
             fill_p = float(fill_p)
@@ -1143,6 +1157,8 @@ class RedisStateStore:
                 entry_slip_pct = (fill_p - sig_p) / sig_p * 100
             else:
                 entry_slip_pct = (sig_p - fill_p) / sig_p * 100
+            # Naming fix (Secondary): this is measured entry slippage +
+            # assumed exit slippage, not "realized" exit slippage.
             realized_cost = (fee_pct * 2) * 100 + abs(entry_slip_pct) * 2
         else:
             realized_cost = base_cost_pct
@@ -1158,6 +1174,7 @@ class RedisStateStore:
             "entry_ts": entry_ts,
             "is_buy": is_buy,
             "pct_move": pct_move,
+            "anchor_price": anchor_price,  # NEW: the fill_price used as measurement anchor
             # ── Primary win (used by ALL downstream: threshold_engine, CUSUM, brain) ──
             "win": win,
             # ── Three-metric breakdown (for reporting) ──
@@ -1182,6 +1199,7 @@ class RedisStateStore:
             "fees_paid_pct": data.get("fees_paid_pct"),
             "net_pnl_pct": round(net_pnl_pct, 6),
             "realized_cost_pct": round(realized_cost, 6),
+            "cost_basis": "measured_entry_slippage_plus_assumed_exit" if (sig_p and fill_p) else "flat_estimate",
             "effective_score": data.get("effective_score"),
             "effective_required": data.get("effective_required"),
             "macro_multiplier": data.get("macro_multiplier"),

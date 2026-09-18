@@ -640,8 +640,9 @@ def rolling_walk_forward(
         "oos_wr_std": statistics.pstdev(oos_wr_list),
         "oos_ev_mean": statistics.fmean(oos_ev_list),
         "oos_ev_std": statistics.pstdev(oos_ev_list),
-        "oos_ev_p5": min(oos_ev_list),
-        "p_ev_positive": sum(1 for e in oos_ev_list if e > 0) / len(oos_ev_list),
+        "oos_ev_p5": min(oos_ev_list), 
+        "positive_fold_rate": sum(1 for e in oos_ev_list if e > 0) / len(oos_ev_list),
+        "p_ev_positive": sum(1 for e in oos_ev_list if e > 0) / len(oos_ev_list),  # alias for back-compat
         "oos_total_n": sum(oos_n_list),
         "threshold_mean": statistics.fmean(thresholds),
         "threshold_std": statistics.pstdev(thresholds) if len(thresholds) > 1 else 0.0,
@@ -2201,6 +2202,38 @@ def hash_config_state(
     """
     if extra_fields is None:
         extra_fields = {}
+
+    # ── FIX (Priority 7): Programmatically include ALL BotConfig fields
+    # that affect behavior, excluding only infrastructure/credential fields.
+    # This is safer than maintaining a manual tuple — new fields auto-enter. ──
+    _NON_BEHAVIORAL_FIELDS = frozenset({
+        "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "REDIS_URL",
+        "DELTA_API_BASE", "LOG_LEVEL", "DEBUG_MODE", "SEND_TEST_MESSAGE",
+        "BOT_NAME", "DRY_RUN_MODE", "SKIP_WARMUP", "FAIL_ON_REDIS_DOWN",
+        "FAIL_ON_TELEGRAM_DOWN", "TELEGRAM_RATE_LIMIT_PER_MINUTE",
+        "TELEGRAM_BURST_SIZE", "REDIS_CONNECTION_RETRIES", "REDIS_RETRY_DELAY",
+        "HTTP_TIMEOUT", "CANDLE_FETCH_RETRIES", "CANDLE_FETCH_BACKOFF",
+        "MAX_PARALLEL_FETCH", "TCP_CONN_LIMIT", "TCP_CONN_LIMIT_PER_HOST",
+        "MEMORY_LIMIT_BYTES", "TELEGRAM_RETRIES", "TELEGRAM_BACKOFF_BASE",
+        "RUN_TIMEOUT_SECONDS", "FETCH_PHASE_TIMEOUT_SEC",
+        "EVAL_CONCURRENCY_LIMIT", "MIN_RUN_TIMEOUT",
+        "BRAIN_USE_FILE_STORAGE", "OUTCOME_DATA_DIR",
+        "BRAIN_REPORT_ON_DEMAND", "BRAIN_REPORT_INTERVAL_RUNS",
+        "BRAIN_REPORT_STREAM_SAMPLE", "BRAIN_LONG_WINDOW_STREAM_SAMPLE",
+    })
+
+    try:
+        for field_name in type(cfg).model_fields:
+            if field_name in _NON_BEHAVIORAL_FIELDS:
+                continue
+            if field_name in extra_fields:
+                continue  # Caller already provided it
+            try:
+                extra_fields[field_name] = getattr(cfg, field_name, None)
+            except Exception:
+                pass
+    except Exception:
+        # Fallback to the manual tuple if model_fields isn't available
         for field in _STRUCTURAL_CONFIG_FIELDS:
             try:
                 extra_fields[field] = getattr(cfg, field, None)
@@ -3734,6 +3767,7 @@ def build_calibration_curves(
     rows: List[Row],
     bucket_pct: float = 5.0,
     min_sample: int = 15,
+    shadow_rows: Optional[List[Row]] = None,
 ) -> Dict[str, Any]:
     """Per-alert-key calibration: bucketed confluence % → observed win rate.
     A raw confluence score is a weighted vote total, not a probability.
@@ -3754,6 +3788,14 @@ def build_calibration_curves(
     by_ak: Dict[str, List[Row]] = defaultdict(list)
     for r in rows:
         by_ak[r["alert_key"]].append(r)
+
+    # ── FIX (Priority 6): Merge shadow rows into the calibration
+    if shadow_rows:
+        for r in shadow_rows:
+            rejection = (r.get("context") or {}).get("rejection_reason", "")
+            if rejection == "calibration_gate":
+                continue  # Avoid selection leakage
+            by_ak[r["alert_key"]].append(r)
 
     target_bins = max(1, round(100.0 / bucket_pct)) if bucket_pct > 0 else 20
 

@@ -44,17 +44,32 @@ def initialize_compiled() -> Tuple[bool, Optional[str]]:
     global _compiled_module
     try:
         import cython_functions as _mod          # ← the compiled .so / .pyd
+    missing = [fn for fn in REQUIRED_AOT_FUNCTIONS
+               if not hasattr(_mod, fn)]
+    if missing:
+        return False, (
+            f"Cython module loaded but is missing "
+            f"{len(missing)} function(s): {missing}"
+        )
 
-        missing = [fn for fn in REQUIRED_AOT_FUNCTIONS
-                   if not hasattr(_mod, fn)]
-        if missing:
+    # ── FIX (Priority 10): Compare compiled SOURCE_VERSION against
+    # aot_meta.SOURCE_VERSION before accepting the backend. This
+    # catches a stale .so that has all the right function names but
+    # was built from an older source revision. ──
+    try:
+        from aot_meta import SOURCE_VERSION as EXPECTED_VERSION
+        compiled_version = getattr(_mod, "SOURCE_VERSION", None)
+        if compiled_version is not None and compiled_version != EXPECTED_VERSION:
             return False, (
-                f"Cython module loaded but is missing "
-                f"{len(missing)} function(s): {missing}"
+                f"SOURCE_VERSION mismatch: compiled .so reports "
+                f"'{compiled_version}' but aot_meta expects "
+                f"'{EXPECTED_VERSION}'. Stale artifact rejected."
             )
-        _compiled_module = _mod
-        return True, None
+    except ImportError:
+        pass  # aot_meta not available; skip version check
 
+    _compiled_module = _mod
+    return True, None
     except ImportError as exc:
         return False, f"Cython module not importable: {exc}"
     except Exception as exc:

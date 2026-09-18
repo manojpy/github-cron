@@ -778,8 +778,16 @@ class BrainEngine:
             auto_eligible = auto_disable_on and total >= auto_disable_min
 
             if hi < disable_wr:
-                # ── EV-gated disable: only disable if EV is ALSO negative ──
-                ev_obj = engine.ev_first_objective(s["rows"], min_sample=min_sample)
+                # ── EV-gated disable: only disable if EV is ALSO negative ──        
+                _ev_cache_key = (alert_key, len(s["rows"]))
+                if not hasattr(self, "_ev_obj_cache"):
+                    self._ev_obj_cache = {}
+                if _ev_cache_key in self._ev_obj_cache:
+                    ev_obj = self._ev_obj_cache[_ev_cache_key]
+                else:
+                    ev_obj = engine.ev_first_objective(s["rows"], min_sample=min_sample)
+                    self._ev_obj_cache[_ev_cache_key] = ev_obj    
+
                 ev_negative = ev_obj.get("valid") and ev_obj["net_ev"] <= 0
                 if ev_negative:
                     alert_verdicts[alert_key] = "disable"
@@ -814,16 +822,21 @@ class BrainEngine:
 
                 # Auto-disable ONLY on the EV-negative branch.
                 if auto_eligible and ev_negative and alert_key not in current_disabled_keys:
-                    if await self.sdb.set_alert_key_disabled(alert_key, True):
-                        recommendations.append({
-                            "type": "auto_disabled", "severity": "high", "alert": alert_key,
-                            "message": (
-                                f"🔒 Auto-disabled {alert_key}: {wr:.0%} WR over "
-                                f"{sample_label}, net EV "
-                                f"{ev_obj.get('net_ev', 0):+.3f}%/trade, "
-                                f"(≥{auto_disable_min} required)."
-                            ),
-                        })
+                    # FIX (Priority 3): Do NOT mutate here. Tag the
+                    # recommendation so brain_enhanced can execute it
+                    # after the action gate passes.
+                    recommendations.append({
+                        "type": "auto_disabled", "severity": "high", "alert": alert_key,
+                        "pending_auto_action": True,
+                        "pending_action": "disable",
+                        "message": (
+                            f"🔒 Auto-disable CANDIDATE {alert_key}: {wr:.0%} WR over "
+                            f"{sample_label}, net EV "
+                            f"{ev_obj.get('net_ev', 0):+.3f}%/trade, "
+                            f"(≥{auto_disable_min} required). "
+                            f"[Pending action gate]"
+                        ),
+                    })
             elif lo >= cfg.MIN_WIN_RATE:
                 alert_verdicts[alert_key] = "recovered"
                 recommendations.append({
@@ -835,11 +848,18 @@ class BrainEngine:
                     ),
                 })
                 if auto_eligible and alert_key in current_disabled_keys:
-                    if await self.sdb.set_alert_key_disabled(alert_key, False):
-                        recommendations.append({
-                            "type": "auto_reenabled", "severity": "medium", "alert": alert_key,
-                            "message": f"🔓 Re-enabled {alert_key}: recovered to {wr:.0%} WR over {sample_label}.",
-                        })
+                    # FIX (Priority 3): Do NOT mutate here. Tag for
+                    # post-gate execution.
+                    recommendations.append({
+                        "type": "auto_reenabled", "severity": "medium", "alert": alert_key,
+                        "pending_auto_action": True,
+                        "pending_action": "enable",
+                        "message": (
+                            f"🔓 Re-enable CANDIDATE {alert_key}: recovered to "
+                            f"{wr:.0%} WR over {sample_label}. "
+                            f"[Pending action gate]"
+                        ),
+                    })
             else:
                 alert_verdicts[alert_key] = "monitor"
                 recommendations.append({
@@ -1253,10 +1273,14 @@ class BrainEngine:
                 f" Clean Win (TP w/o SL):   {clean_wr:.0%}"
             )
             if gap > 0.05:
+                # FIX (Priority 8): MFE is opportunity/target-reach rate,
+                # not "true profitability". tp_first is the defensible proxy.
                 summary_msg += (
-                    f"\n⚠️ Gap: {gap:+.0%} of trades hit TP but reversed before "
-                    f"candle {cfg.OUTCOME_LOOKAHEAD_CANDLES}. "
-                    f"The close-based WR underestimates true profitability by {gap:.0%}."
+                    f"\n⚠️ Gap: {gap:+.0%} of trades reached TP level but reversed "
+                    f"before candle {cfg.OUTCOME_LOOKAHEAD_CANDLES}. "
+                    f"MFE target-reach rate exceeds close-based WR by {gap:.0%} — "
+                    f"this represents opportunities reached, not necessarily captured. "
+                    f"The tp_first ordering metric is the more defensible execution proxy."
                 )
             if mm_summary.get("tp_before_sl_rate") is not None:
                 summary_msg += (
@@ -1517,6 +1541,7 @@ class BrainEngine:
             real_rows,
             bucket_pct=getattr(cfg, "CALIBRATION_BUCKET_PCT", 5.0),
             min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
+            shadow_rows=shadow_rows,
         )
         if calib.get("curves"):
             await self._persist_calibration_curves(calib)
@@ -1979,7 +2004,7 @@ class BrainEngine:
                     ))
                 lines.append("")
 
-        # ── 🤖 AI INSIGHTS ���─
+        # ── 🤖 AI INSIGHTS ─
         ai_lines = []
 
         # Synergy / Poison

@@ -1942,7 +1942,18 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     ),
                     "rejection_reason": "win_rate_filter",
                     "failing_wr": failing_rate,
-                    "fail_note": fail_note,
+                    "fail_note": fail_note,      
+                    # ── FIX (Priority 5): Same numeric state as real rows ──
+                    "ppo_gate_curr": gr.ppo_gate_curr,
+                    "rsi_guard_smooth_curr": gr.rsi_guard_smooth_curr,
+                    "rma_cloud_fast_curr": gr.rma_cloud_fast_curr,
+                    "tk_conversion_curr": gr.tk_conversion_curr,
+                    "tk_base_curr": gr.tk_base_curr,
+                    "adx_adaptive_threshold": gr.adx_adaptive_threshold,
+                    "momentum_count": gr.momentum_count,
+                    "atr_pctl": gr.atr_pctl,
+                    "volume_pctl": gr.volume_pctl,
+                    "adx_pctl": gr.adx_pctl,
                 }
 
                 if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
@@ -1996,8 +2007,19 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     "macro_correlation": macro_shadow.get("correlation") if macro_shadow else None,
                     "macro_relative_strength": macro_shadow.get("relative_strength") if macro_shadow else None,
                     "macro_multiplier": macro_shadow.get("multiplier") if macro_shadow else None,
-                    "macro_would_block": macro_shadow.get("would_block") if macro_shadow else None,
-                }
+                    "macro_would_block": macro_shadow.get("would_block") if macro_shadow else None,          
+                    # indicators — just preserving existing values. ──
+                    "ppo_gate_curr": gr.ppo_gate_curr,
+                    "rsi_guard_smooth_curr": gr.rsi_guard_smooth_curr,
+                    "rma_cloud_fast_curr": gr.rma_cloud_fast_curr,
+                    "tk_conversion_curr": gr.tk_conversion_curr,
+                    "tk_base_curr": gr.tk_base_curr,
+                    "adx_adaptive_threshold": gr.adx_adaptive_threshold,
+                    "momentum_count": gr.momentum_count,
+                    "atr_pctl": gr.atr_pctl,
+                    "volume_pctl": gr.volume_pctl,
+                    "adx_pctl": gr.adx_pctl,
+                }                  
                 # ── NEW: compute effective score after macro/cluster ──
                 eff_score = s
                 eff_required = None

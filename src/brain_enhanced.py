@@ -171,9 +171,11 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                     f"— below target; tighten its filter"
                 )
             else:
+                _lo, _hi, _ = engine.wilson_ci(int(awr * cnt), cnt)
+                _conf = engine.confidence_label(cnt, _lo, _hi)
                 groups["🔴"].append(
-                    f"🔴 {ak}: EV {ak_net_ev:+.2f}%, WR {awr:.0%} (n={cnt}) "
-                    f"— losing money, disable it"
+                    f"🔴 {ak}: EV {ak_net_ev:+.2f}%, WR {awr:.0%} (n={cnt}, "
+                    f"confidence: {_conf}) — negative EV, consider disabling"
                 )
         titles = {"🔴": "DISABLE THESE NOW", "🟡": "IMPROVE THESE", "🟢": "KEEP THESE"}
         block = "🚦 YOUR ALERTS — WHAT TO DO WITH EACH"
@@ -389,9 +391,26 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
         pair_stats = engine.per_pair_breakdown(rows, min_sample=5)  # worst-first
         if len(pair_stats) >= 2:
             worst, best = pair_stats[0], pair_stats[-1]
+            # FIX (Priority 8): Qualify with confidence label instead of
+            # raw WR ranking. A 70% WR on n=5 is NOT stronger evidence
+            # than 60% WR on n=150.
+            best_lo, best_hi, _ = engine.wilson_ci(
+                int(best[1] * best[2]), best[2]
+            )
+            worst_lo, worst_hi, _ = engine.wilson_ci(
+                int(worst[1] * worst[2]), worst[2]
+            )
+            best_conf = engine.confidence_label(best[2], best_lo, best_hi)
+            worst_conf = engine.confidence_label(worst[2], worst_lo, worst_hi)
             line = (f"🌍 WHERE YOU WIN & LOSE\n"
-                    f"🏆 Best: {best[0]} at {best[1]:.0%} WR (n={best[2]})\n"
-                    f"💀 Worst: {worst[0]} at {worst[1]:.0%} WR (n={worst[2]}) — consider removing this pair")
+                    f"🏆 Best: {best[0]} at {best[1]:.0%} WR "
+                    f"(n={best[2]}, confidence: {best_conf})\n"
+                    f"💀 Worst: {worst[0]} at {worst[1]:.0%} WR "
+                    f"(n={worst[2]}, confidence: {worst_conf})")
+            if worst_conf in ("LOW", "MEDIUM"):
+                line += " — insufficient evidence to remove; monitor"
+            else:
+                line += " — consider removing this pair"
             sess = engine.session_breakdown(rows, min_sample=5)
             if len(sess) >= 2:
                 line += (f"\n⏰ Best session: {sess[-1][0]} ({sess[-1][1]:.0%}, n={sess[-1][2]}) "
@@ -451,29 +470,55 @@ class BrainEngineV2(BaseBrainEngine):
         shadow_rows, current_weights, suggested_weights,
         threshold, min_n=15, max_wr_drop=0.05,
     ):
-        """Out-of-sample veto on proposed weight changes. Shadow rows are
-        alerts the live system REJECTED — an independent sample from the
-        same window. Score them under current vs suggested weights (same
-        scoring rule both times, so the comparison is apples-to-apples
-        even though this reconstruction omits gate-level score
-        components) and veto if the proposal materially degrades WR."""
-        def _wr_at(rows, weights):
-            kept = [
-                r for r in rows
-                if r.get("votes") and
-                sum(w for vn, w in weights.items() if r["votes"].get(vn)) >= threshold
-            ]
-            if len(kept) < min_n:
-                return None, len(kept)
-            return sum(r["win"] for r in kept) / len(kept), len(kept)
+        """Out-of-sample veto on proposed weight changes.
 
-        cur_wr, cur_n = _wr_at(shadow_rows, current_weights)
-        new_wr, new_n = _wr_at(shadow_rows, suggested_weights)
+        FIX (Priority 4): Reproduces the ACTUAL live confluence gate:
+            required = max(CONFLUENCE_MIN_ABS_SCORE,
+                           CONFLUENCE_MIN_PCT / 100 * total)
+        instead of the old approximation:
+            sum(weight for active votes) >= threshold
+
+        Shadow rows are alerts the live system REJECTED — an independent
+        sample from the same window. Score them under current vs suggested
+        weights and veto if the proposal materially degrades WR or net EV.
+        """
+        min_pct = getattr(cfg, "CONFLUENCE_MIN_PCT", 60.0)
+        abs_floor = getattr(cfg, "CONFLUENCE_MIN_ABS_SCORE", 18.0)
+
+        def _wr_and_ev_at(rows, weights):
+            kept = []
+            for r in rows:
+                votes = r.get("votes")
+                if not votes:
+                    continue
+                # Compute score and total the same way the live path does
+                score = sum(w for vn, w in weights.items() if votes.get(vn))
+                total = sum(w for vn, w in weights.items() if vn in votes)
+                if total <= 0:
+                    continue
+                # Reproduce the actual gate: max(abs_floor, min_pct% of total)
+                required = max(abs_floor, total * (min_pct / 100.0))
+                if score >= required:
+                    kept.append(r)
+            if len(kept) < min_n:
+                return None, None, len(kept)
+            wr = sum(r["win"] for r in kept) / len(kept)
+            ev, _hk, _wr = engine.ev_and_kelly_for(kept)
+            return wr, ev, len(kept)
+
+        cur_wr, cur_ev, cur_n = _wr_and_ev_at(shadow_rows, current_weights)
+        new_wr, new_ev, new_n = _wr_and_ev_at(shadow_rows, suggested_weights)
+
         if cur_wr is None or new_wr is None:
             return True, f"shadow too thin to veto (cur n={cur_n}, new n={new_n})"
+
         if new_wr < cur_wr - max_wr_drop:
             return False, f"suggested weights degrade shadow WR {cur_wr:.0%}→{new_wr:.0%} (n={new_n})"
-        return True, f"shadow WR stable {cur_wr:.0%}→{new_wr:.0%} (n={new_n})"
+
+        if new_ev is not None and cur_ev is not None and new_ev < cur_ev - 0.02:
+            return False, f"suggested weights degrade shadow EV {cur_ev:+.3f}%→{new_ev:+.3f}% (n={new_n})"
+
+        return True, f"shadow WR stable {cur_wr:.0%}→{new_wr:.0%}, EV {cur_ev:+.3f}%→{new_ev:+.3f}% (n={new_n})"
 
     @staticmethod
     def _action_gate_check(
@@ -550,11 +595,7 @@ class BrainEngineV2(BaseBrainEngine):
         """Override base class: read the recent/medium/long layered
         windows from the file archive first (mirrors _load_rows()'s
         file-storage branching), falling back to the base class's
-        Redis-stream path only when no archive directory is configured.
-        The base class implementation reads OUTCOME_LOG_STREAM directly,
-        which state.py never writes to when BRAIN_USE_FILE_STORAGE is
-        True — without this override, layered_window_analysis silently
-        gets zero rows in that configuration."""
+        Redis-stream path only when no archive directory is configured."""
         cached = getattr(self, "_layered_rows_cache", None)
         if cached is not None:
             return cached
@@ -564,10 +605,27 @@ class BrainEngineV2(BaseBrainEngine):
         long_days = getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180)
 
         data_dir = getattr(cfg, "OUTCOME_DATA_DIR", None) or os.environ.get("OUTCOME_DATA_DIR")
+
         if data_dir and Path(data_dir).exists():
             recent_rows = load_archived_outcomes(data_dir, window_days=recent_days, shadow=False)
             medium_rows = load_archived_outcomes(data_dir, window_days=medium_days, shadow=False)
             long_rows = load_archived_outcomes(data_dir, window_days=long_days, shadow=False)
+
+            # ── FIX (Priority 2): Warn when actual data range is shorter
+            # than configured, so pipeline regressions are visible. ──
+            _logger = logging.getLogger("macd_bot")
+            now_ts = time.time()
+            if long_rows:
+                oldest_ts = min(r.get("entry_ts", now_ts) for r in long_rows)
+                actual_days = (now_ts - oldest_ts) / 86400.0
+                if actual_days < long_days * 0.8:
+                    _logger.warning(
+                        f"⚠️ Brain history shortfall: configured "
+                        f"BRAIN_LONG_WINDOW_DAYS={long_days} but oldest row is "
+                        f"only {actual_days:.0f} days old. Layered window "
+                        f"analysis will be degraded."
+                    )
+
             result = (recent_rows, medium_rows, long_rows)
             self._layered_rows_cache = result
             return result
@@ -805,19 +863,55 @@ class BrainEngineV2(BaseBrainEngine):
                     # FIX: read the configured floor instead of hardcoding 0.4
                     min_conf = getattr(cfg, "BRAIN_WEIGHT_OPTIMIZER_MIN_CONFIDENCE", 0.4)
 
+                    # ── FIX (Priority 4): Direct OOS comparison of current
+                    # vs suggested weights using chronological holdout. ──
+                    oos_weight_ok = True
+                    oos_weight_note = ""
+                    if wopt.get("walk_forward_passed") and len(real_rows) >= 200:
+                        train_rows_wf, holdout_rows_wf = engine.walk_forward_split(real_rows)
+                        if len(holdout_rows_wf) >= 20:
+                            # Score holdout under current weights
+                            cur_kept = [
+                                r for r in holdout_rows_wf
+                                if r.get("votes") and sum(
+                                    CONFLUENCE_WEIGHTS.get(vn, 0)
+                                    for vn, v in r["votes"].items() if v
+                                ) >= cfg.CONFLUENCE_MIN_ABS_SCORE
+                            ]
+                            sug_kept = [
+                                r for r in holdout_rows_wf
+                                if r.get("votes") and sum(
+                                    wopt["suggested_weights"].get(vn, 0)
+                                    for vn, v in r["votes"].items() if v
+                                ) >= cfg.CONFLUENCE_MIN_ABS_SCORE
+                            ]
+                            if len(cur_kept) >= 10 and len(sug_kept) >= 10:
+                                cur_ev_oos, _, _ = engine.ev_and_kelly_for(cur_kept)
+                                sug_ev_oos, _, _ = engine.ev_and_kelly_for(sug_kept)
+                                if sug_ev_oos < cur_ev_oos - 0.01:
+                                    oos_weight_ok = False
+                                    oos_weight_note = (
+                                        f"OOS veto: suggested EV {sug_ev_oos:+.3f}% < "
+                                        f"current {cur_ev_oos:+.3f}%"
+                                    )
+                                else:
+                                    oos_weight_note = (
+                                        f"OOS pass: suggested EV {sug_ev_oos:+.3f}% vs "
+                                        f"current {cur_ev_oos:+.3f}%"
+                                    )
+
                     # ── Shadow out-of-sample veto ──────────────────────
                     shadow_weight_ok, shadow_weight_note = True, ""
                     if (wopt.get("walk_forward_passed") and conf_score >= min_conf
-                            and len(shadow_rows) >= 15):
+                            and len(shadow_rows) >= 15 and oos_weight_ok):
                         shadow_weight_ok, shadow_weight_note = self._shadow_weight_check(
                             shadow_rows, CONFLUENCE_WEIGHTS,
                             wopt["suggested_weights"], cfg.CONFLUENCE_MIN_ABS_SCORE,
                         )
-
                     # Only emit config patch if walk-forward passed AND
                     # confidence is decent AND shadow sample doesn't veto.
                     if (wopt.get("walk_forward_passed") and conf_score >= min_conf
-                            and shadow_weight_ok):
+                            and shadow_weight_ok and oos_weight_ok):
                         config_patch.append({
                             "path": "CONFLUENCE_WEIGHTS",
                             "current": dict(CONFLUENCE_WEIGHTS),
@@ -1308,7 +1402,9 @@ class BrainEngineV2(BaseBrainEngine):
             )
         else:
             action_gate = {"actionable": True, "disabled": True}
+
         ai_metrics["action_gate"] = action_gate
+
         if not action_gate.get("actionable", False):
             # Downgrade all config patches to informational
             for patch in config_patch:
@@ -1317,11 +1413,45 @@ class BrainEngineV2(BaseBrainEngine):
                     f"[GATE BLOCKED] {patch.get('reason', '')} "
                     f"— OOS EV evidence insufficient"
                 )
+            # FIX (Priority 3): Also suppress pending auto-actions
+            for rec in recommendations:
+                if rec.get("pending_auto_action"):
+                    rec["pending_auto_action"] = False
+                    rec["message"] += " [BLOCKED by action gate]"
             logger.info(
-                f"🚫 Action gate BLOCKED config patches: {action_gate}"
+                f"🚫 Action gate BLOCKED config patches and auto-actions: {action_gate}"
             )
+        else:
+            # ── FIX (Priority 3): Execute deferred auto-actions NOW,
+            # after the gate has passed. ──
+            for rec in recommendations:
+                if not rec.get("pending_auto_action"):
+                    continue
+                ak = rec.get("alert")
+                action = rec.get("pending_action")
+                if not ak or not action:
+                    continue
+                try:
+                    if action == "disable":
+                        ok = await self.sdb.set_alert_key_disabled(ak, True)
+                        if ok:
+                            rec["message"] = rec["message"].replace(
+                                "[Pending action gate]", "[APPLIED]"
+                            )
+                            logger.info(f"🔒 Post-gate auto-disabled: {ak}")
+                    elif action == "enable":
+                        ok = await self.sdb.set_alert_key_disabled(ak, False)
+                        if ok:
+                            rec["message"] = rec["message"].replace(
+                                "[Pending action gate]", "[APPLIED]"
+                            )
+                            logger.info(f"🔓 Post-gate auto-re-enabled: {ak}")
+                except Exception as e:
+                    logger.warning(f"Post-gate auto-action failed for {ak}: {e}")
+                # Mark as consumed regardless of success
+                rec["pending_auto_action"] = False
 
-        # ─ Re-assemble ───────────────────���──────────────────────────────
+        # ─ Re-assemble ─────────────────────────────────────────────────
         result = dict(base_recs)
         result["recommendations"] = recommendations
         result["recommendation_count"] = len(recommendations)
@@ -1360,8 +1490,9 @@ class BrainEngineV2(BaseBrainEngine):
                 elif rec_type in ("reinstate_alert", "recovered_alert", "auto_reenabled"):
                     # brain.py emits recovered alerts as "recovered_alert" /
                     # "auto_reenabled", not "reinstate_alert".
+                    # FIX (Priority 3): Only include if action gate passed.
                     ak = rec.get("alert") or rec.get("alert_key")
-                    if ak:
+                    if ak and not rec.get("_blocked_by_action_gate"):
                         reinstate_alerts.append(ak)
                 elif rec_type == "repair_shop" and rec.get("category") == "root_cause":
                     # Wiring #1: turn the root-cause segment into an
