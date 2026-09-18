@@ -1858,10 +1858,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     # ── Trade-quality label (report-only, never gates dispatch) ──
                     if brain_engine and alert_total and alert_total > 0 and alert_score is not None:
                         try:
-                            # Same fields _record_win_rates() persists as
-                            # trigger_context — reused here so the live
-                            # prediction sees the same feature set the
-                            # model was trained on (rsi/ppo/wick/macro).
                             live_context = {
                                 "rsi_curr": context.get("rsi_curr"),
                                 "rsi_adaptive_buy": gr.rsi_adaptive_buy,
@@ -1954,6 +1950,13 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     "atr_pctl": gr.atr_pctl,
                     "volume_pctl": gr.volume_pctl,
                     "adx_pctl": gr.adx_pctl,
+                    "equilibrium_curr": context.get("equilibrium_curr"),
+                    "cloud_upper_curr": context.get("cloud_upper_curr"),
+                    "cloud_lower_curr": context.get("cloud_lower_curr"),
+                    "rsi_guard_ema_curr": gr.rsi_guard_ema_curr,
+                    "rvol_ok": gr.rvol_ok,
+                    "ichimoku_gate_ok_buy": gr.ichimoku_gate_ok_buy,
+                    "ichimoku_gate_ok_sell": gr.ichimoku_gate_ok_sell,
                 }
 
                 if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
@@ -2019,7 +2022,19 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     "atr_pctl": gr.atr_pctl,
                     "volume_pctl": gr.volume_pctl,
                     "adx_pctl": gr.adx_pctl,
-                }                  
+                    # ── FIX (Priority 5): preserve already-computed state.
+                    # No new indicators — these values already exist on
+                    # GateResult or in the local `context` dict. Feeding
+                    # them to build_market_state_features() gives the model
+                    # richer numeric state without expanding the indicator set.
+                    "equilibrium_curr": context.get("equilibrium_curr"),
+                    "cloud_upper_curr": context.get("cloud_upper_curr"),
+                    "cloud_lower_curr": context.get("cloud_lower_curr"),
+                    "rsi_guard_ema_curr": gr.rsi_guard_ema_curr,
+                    "rvol_ok": gr.rvol_ok,
+                    "ichimoku_gate_ok_buy": gr.ichimoku_gate_ok_buy,
+                    "ichimoku_gate_ok_sell": gr.ichimoku_gate_ok_sell,
+                }
                 # ── NEW: compute effective score after macro/cluster ──
                 eff_score = s
                 eff_required = None

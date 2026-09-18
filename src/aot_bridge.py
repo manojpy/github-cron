@@ -53,20 +53,31 @@ def initialize_compiled() -> Tuple[bool, Optional[str]]:
                 f"Cython module loaded but is missing "
                 f"{len(missing)} function(s): {missing}"
             )
-
-        # ── FIX (Priority 10): Compare compiled SOURCE_VERSION against
-        # aot_meta.SOURCE_VERSION before accepting the backend. This
-        # catches a stale .so that has all the right function names but
-        # was built from an older source revision. ──
+   
+        # ── FIX (Priority 10): fail closed. A compiled .so that doesn't
+        # expose SOURCE_VERSION, or an environment where aot_meta is
+        # missing, means we CANNOT prove freshness — reject the Cython
+        # backend and let JIT fallback take over.
         try:
             from aot_meta import SOURCE_VERSION as EXPECTED_VERSION
-            compiled_version = getattr(_mod, "SOURCE_VERSION", None)
-            if compiled_version is not None and compiled_version != EXPECTED_VERSION:
-                return False, (
-                    f"SOURCE_VERSION mismatch: compiled .so reports "
-                    f"'{compiled_version}' but aot_meta expects "
-                    f"'{EXPECTED_VERSION}'. Stale artifact rejected."
-                )
+        except ImportError:
+            return False, (
+                "aot_meta.SOURCE_VERSION unavailable — cannot verify compiled "
+                "artifact freshness. Refusing to accept Cython backend."
+            )
+
+        compiled_version = getattr(_mod, "SOURCE_VERSION", None)
+        if compiled_version is None:
+            return False, (
+                "Compiled .so does not expose SOURCE_VERSION — cannot verify "
+                "freshness. Rebuild the Cython extension."
+            )
+        if compiled_version != EXPECTED_VERSION:
+            return False, (
+                f"SOURCE_VERSION mismatch: compiled .so reports "
+                f"'{compiled_version}' but aot_meta expects "
+                f"'{EXPECTED_VERSION}'. Stale artifact rejected."
+            )
         except ImportError:
             pass  # aot_meta not available; skip version check
 

@@ -794,18 +794,20 @@ class BrainEngine:
                 else:
                     alert_verdicts[alert_key] = "monitor"
 
-                if ev_negative:
-                    recommendations.append({
-                        "type": "disable_alert", "severity": "high", "alert": alert_key,
-                        "win_rate": round(wr, 3), "sample_size": total,
-                        "pairs_affected": len(s["pairs"]),
-                        "message": (
-                            f"DISABLE {alert_key}: {wr:.0%} WR over {sample_label} across "
-                            f"{len(s['pairs'])} pairs (95% CI upper bound {hi:.0%}, still below "
-                            f"{disable_wr:.0%}) — net EV "
-                            f"{ev_obj.get('net_ev', 0):+.3f}%/trade, negative."
-                        ),
-                    })
+                    if ev_negative:
+                        alert_verdicts[alert_key] = "disable"
+                        recommendations.append({
+                            "type": "disable_alert", "severity": "high", "alert": alert_key,
+                            "win_rate": round(wr, 3), "sample_size": total,
+                            "pairs_affected": len(s["pairs"]),
+                            "message": (
+                                f"LOW WR / NEGATIVE EV {alert_key}: {wr:.0%} WR over "
+                                f"{sample_label} across {len(s['pairs'])} pairs "
+                                f"(95% CI upper bound {hi:.0%} < {disable_wr:.0%}); "
+                                f"net EV {ev_obj.get('net_ev', 0):+.3f}%/trade. "
+                                f"Evidence supports disabling — review before applying."
+                            ),
+                        })
                 else:
                     recommendations.append({
                         "type": "low_wr_but_ev_positive", "severity": "medium",
@@ -868,12 +870,17 @@ class BrainEngine:
                     "message": f"{alert_key} viable ({wr:.0%} WR, {sample_label}).",
                 })
                 if auto_eligible and alert_key in current_disabled_keys:
-                    if await self.sdb.set_alert_key_disabled(alert_key, False):
-                        recommendations.append({
-                            "type": "auto_reenabled", "severity": "medium", "alert": alert_key,
-                            "message": f"🔓 Re-enabled {alert_key}: recovered to {wr:.0%} WR over {sample_label}.",
-                        })
-
+                    # FIX (Priority 3): do NOT mutate here. Tag for post-gate
+                    # execution — the action gate must be the sole authorizer.
+                    recommendations.append({
+                        "type": "auto_reenabled", "severity": "medium", "alert": alert_key,
+                        "pending_auto_action": True,
+                        "pending_action": "enable",
+                        "message": (
+                            f"🔓 Re-enable CANDIDATE {alert_key}: viable at "
+                            f"{wr:.0%} WR over {sample_label}. [Pending action gate]"
+                        ),
+                    })
         path_to_keys: Dict[str, List[str]] = defaultdict(list)
         for alert_key in alert_stats:
             path = _resolve_config_path(alert_key)
@@ -2051,7 +2058,7 @@ class BrainEngine:
         # ── 📉 WEAK / AVOID ──
         disable_alerts = [r for r in recs["recommendations"] if r["type"] == "disable_alert"]
         if disable_alerts:
-            lines.append("*📉 WEAK / AVOID*")
+            lines.append("*📉 UNDERPERFORMING (candidate for disable)*")
             for r in disable_alerts[:3]:
                 lines.append(escape_markdown_v2(f"• {r['message'][:130]}"))
             lines.append("")

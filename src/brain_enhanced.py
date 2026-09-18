@@ -177,13 +177,15 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                     f"🔴 {ak}: EV {ak_net_ev:+.2f}%, WR {awr:.0%} (n={cnt}, "
                     f"confidence: {_conf}) — negative EV, consider disabling"
                 )
-        titles = {"🔴": "DISABLE THESE NOW", "🟡": "IMPROVE THESE", "🟢": "KEEP THESE"}
-        block = "🚦 YOUR ALERTS — WHAT TO DO WITH EACH"
+        titles = {
+            "🔴": "NEGATIVE EV — REVIEW FOR DISABLE",
+            "🟡": "MIXED / MONITOR",
+            "🟢": "POSITIVE EV — KEEP",
+        }
+        block = "🚦 YOUR ALERTS — EVIDENCE BY BUCKET"
         for bucket in ("🔴", "🟡", "🟢"):
             if groups[bucket]:
                 block += f"\n\n{titles[bucket]}:\n" + "\n".join(groups[bucket])
-
-
 
         if needs_data:
             needs_data.sort(key=lambda t: t[2], reverse=True)
@@ -846,29 +848,32 @@ class BrainEngineV2(BaseBrainEngine):
                 # FIX: read the configured floor instead of hardcoding 0.4
                 min_conf = getattr(cfg, "BRAIN_WEIGHT_OPTIMIZER_MIN_CONFIDENCE", 0.4)
 
-                # ── FIX (Priority 4): Direct OOS comparison of current
-                # vs suggested weights using chronological holdout. ──
-                # (Must be calculated BEFORE the recommendation message uses it)
+                # ── FIX (Priority 4): OOS veto through the SAME effective
                 oos_weight_ok = True
                 oos_weight_note = ""
                 if wopt.get("walk_forward_passed") and len(real_rows) >= 200:
                     train_rows_wf, holdout_rows_wf = engine.walk_forward_split(real_rows)
                     if len(holdout_rows_wf) >= 20:
-                        # Score holdout under current weights
-                        cur_kept = [
-                            r for r in holdout_rows_wf
-                            if r.get("votes") and sum(
-                                CONFLUENCE_WEIGHTS.get(vn, 0)
-                                for vn, v in r["votes"].items() if v
-                            ) >= cfg.CONFLUENCE_MIN_ABS_SCORE
-                        ]
-                        sug_kept = [
-                            r for r in holdout_rows_wf
-                            if r.get("votes") and sum(
-                                wopt["suggested_weights"].get(vn, 0)
-                                for vn, v in r["votes"].items() if v
-                            ) >= cfg.CONFLUENCE_MIN_ABS_SCORE
-                        ]
+                        min_pct = getattr(cfg, "CONFLUENCE_MIN_PCT", 60.0)
+                        abs_floor = getattr(cfg, "CONFLUENCE_MIN_ABS_SCORE", 18.0)
+
+                        def _kept_at(rows, weights):
+                            kept = []
+                            for r in rows:
+                                votes = r.get("votes")
+                                if not votes:
+                                    continue
+                                score = sum(w for vn, w in weights.items() if votes.get(vn))
+                                total = sum(w for vn, w in weights.items() if vn in votes)
+                                if total <= 0:
+                                    continue
+                                required = max(abs_floor, total * (min_pct / 100.0))
+                                if score >= required:
+                                    kept.append(r)
+                            return kept
+
+                        cur_kept = _kept_at(holdout_rows_wf, CONFLUENCE_WEIGHTS)
+                        sug_kept = _kept_at(holdout_rows_wf, wopt["suggested_weights"])
                         if len(cur_kept) >= 10 and len(sug_kept) >= 10:
                             cur_ev_oos, _, _ = engine.ev_and_kelly_for(cur_kept)
                             sug_ev_oos, _, _ = engine.ev_and_kelly_for(sug_kept)
@@ -1481,29 +1486,47 @@ class BrainEngineV2(BaseBrainEngine):
             disable_alerts = []
             reinstate_alerts = []
             weight_adjustments = []
+
+            # FIX (Priority 3): the action gate is authoritative. `_blocked_by_action_gate`
+            # is only ever set on config_patch dicts, never on recommendations — so the
+            # old check here was a no-op. Read the gate verdict directly.
+            action_gate_passed = bool(
+                recs.get("ai_metrics", {})
+                    .get("action_gate", {})
+                    .get("actionable", False)
+            )
+
             for rec in recs.get("recommendations", []):
                 rec_type = rec.get("type")
+                
+                # FIX: Skip any auto-actions that were already handled (applied or blocked) 
+                # by the post-gate executor in _generate_recommendations_full.
+                # The executor modifies the message to include [APPLIED] or [BLOCKED].
+                msg = rec.get("message", "")
+                if "[APPLIED]" in msg or "[BLOCKED" in msg:
+                    continue
+
                 if rec_type == "disable_alert":
-      
-                    if rec.get("_blocked_by_action_gate"):
+                    if not action_gate_passed:
                         continue
                     ak = rec.get("alert") or rec.get("alert_key")
                     if ak:
                         disable_alerts.append(ak)
 
                 elif rec_type in ("reinstate_alert", "recovered_alert", "auto_reenabled"):
-                    # brain.py emits recovered alerts as "recovered_alert" /
-                    # "auto_reenabled", not "reinstate_alert".
-                    # FIX (Priority 3): Only include if action gate passed.
+                    if not action_gate_passed:
+                        continue
                     ak = rec.get("alert") or rec.get("alert_key")
-                    if ak and not rec.get("_blocked_by_action_gate"):
+                    if ak:
                         reinstate_alerts.append(ak)
+
                 elif rec_type == "repair_shop" and rec.get("category") == "root_cause":
                     # Wiring #1: turn the root-cause segment into an
                     # actionable weight reduction instead of leaving it prose.
                     adj = self._root_cause_to_weight_adjustment(rec)
                     if adj:
                         weight_adjustments.append(adj)
+                        
                 elif rec_type == "repair_shop" and rec.get("category") == "threshold_too_low":
                     # Wiring #4: this repair is already just "set the field
                     # to this value" — hand it straight to the patch
@@ -1589,6 +1612,7 @@ class BrainEngineV2(BaseBrainEngine):
 
             plan_data = {
                 "generated_at": int(time.time()),
+                "_action_gate_passed": action_gate_passed,
                 "config_patch": config_patches,
                 "disable_alerts": disable_alerts,
                 "reinstate_alerts": reinstate_alerts,
@@ -1739,25 +1763,32 @@ class BrainEngineV2(BaseBrainEngine):
                     continue
                 field = patch.get("path")
                 value = patch.get("suggested")
-
                 if field in CONFIG_OVERRIDE_ALLOWED_FIELDS:
                     ok = await self.sdb.write_config_override(field, value)
                     if ok:
                         applied.append(f"✅ {field}: {value}")
                         logger_run.info(f"Applied brain config: {field} = {value}")
-            
-            # Apply alert disables
-            for ak in plan.get("disable_alerts", []):
-                ok = await self.sdb.set_alert_key_disabled(ak, True)
-                if ok:
-                    applied.append(f"🔴 Disabled: {ak}")
-                    logger_run.info(f"Applied brain disable: {ak}")
-            # Apply alert reinstates
-            for ak in plan.get("reinstate_alerts", []):
-                ok = await self.sdb.set_alert_key_disabled(ak, False)
-                if ok:
-                    applied.append(f"🟢 Reinstated: {ak}")
-                    logger_run.info(f"Applied brain reinstate: {ak}")
+
+            # FIX (Priority 3): re-verify the gate at apply time. A plan written
+            # by an older build (or a mid-upgrade race) may carry disable/reinstate
+            # entries that bypassed the gate.
+            plan_gate_passed = bool(plan.get("_action_gate_passed", True))
+
+            if plan_gate_passed:
+                for ak in plan.get("disable_alerts", []):
+                    ok = await self.sdb.set_alert_key_disabled(ak, True)
+                    if ok:
+                        applied.append(f"🔴 Disabled: {ak}")
+                        logger_run.info(f"Applied brain disable: {ak}")
+                for ak in plan.get("reinstate_alerts", []):
+                    ok = await self.sdb.set_alert_key_disabled(ak, False)
+                    if ok:
+                        applied.append(f"🟢 Reinstated: {ak}")
+                        logger_run.info(f"Applied brain reinstate: {ak}")
+            else:
+                logger_run.warning(
+                    "Skipping disable/reinstate entries — plan did not pass action gate"
+                )
 
             # Apply root-cause weight adjustments via dynamic weights
             weight_adj = plan.get("weight_adjustments", [])

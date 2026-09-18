@@ -2204,9 +2204,8 @@ def hash_config_state(
         extra_fields = {}
 
     # ── FIX (Priority 7): Programmatically include ALL BotConfig fields
-    # that affect behavior, excluding only infrastructure/credential fields.
-    # This is safer than maintaining a manual tuple — new fields auto-enter. ──
     _NON_BEHAVIORAL_FIELDS = frozenset({
+        # ── infra / credentials / rate limits (unchanged) ──
         "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "REDIS_URL",
         "DELTA_API_BASE", "LOG_LEVEL", "DEBUG_MODE", "SEND_TEST_MESSAGE",
         "BOT_NAME", "DRY_RUN_MODE", "SKIP_WARMUP", "FAIL_ON_REDIS_DOWN",
@@ -2220,8 +2219,36 @@ def hash_config_state(
         "BRAIN_USE_FILE_STORAGE", "OUTCOME_DATA_DIR",
         "BRAIN_REPORT_ON_DEMAND", "BRAIN_REPORT_INTERVAL_RUNS",
         "BRAIN_REPORT_STREAM_SAMPLE", "BRAIN_LONG_WINDOW_STREAM_SAMPLE",
+        # ── FIX (Priority 7): report-only Brain flags. Toggling any of
+        # these changes nothing about which trades fire or what's stored
+        # on the outcome row — only the analysis/report output. Without
+        # this, flipping a report flag emits a spurious 'regression' in
+        # compare_config_versions() / config_regression_pinpoint. ──
+        "BRAIN_MC_SIMULATIONS",
+        "BRAIN_PERMUTATION_IMPORTANCE",
+        "BRAIN_MAX_PLAN_ENTRIES",
+        "BRAIN_REPAIR_SHOP_MAX",
+        "ENABLE_LAYERED_WINDOW_ANALYSIS",
+        "BRAIN_CONFLUENCE_BUCKET_PCT",
+        "ENABLE_HIERARCHICAL_COMBINATION_ANALYSIS",
+        "HIERARCHICAL_MIN_LEAF_SAMPLE",
+        "HIERARCHICAL_SHRINKAGE_K",
+        "BRAIN_WEIGHT_OPTIMIZER_MAX_DELTA",
+        "BRAIN_WEIGHT_OPTIMIZER_WALK_FORWARD",
+        "BRAIN_WEIGHT_OPTIMIZER_MIN_CONFIDENCE",
+        "BRAIN_STABILITY_MIN_HISTORY",
+        "BRAIN_STABILITY_MAX_JUMP",
+        "BRAIN_CUSUM_DRIFT_DELTA",
+        "BRAIN_CUSUM_THRESHOLD",
+        "BRAIN_EV_GATE_P_THRESHOLD",
+        "BRAIN_EV_GATE_P5_FLOOR",
+        "ENABLE_MARKET_STATE_MODEL",
+        "MARKET_STATE_MODEL_MIN_SAMPLE",
+        "MARKET_STATE_MODEL_MIN_OOS_P",
+        "ENABLE_MARKET_STATE_LIVE_SCORE",
+        "ENABLE_PNL_WEIGHTED_TRAINING",
+        "ENABLE_FILL_RECONCILIATION",
     })
-
     try:
         for field_name in type(cfg).model_fields:
             if field_name in _NON_BEHAVIORAL_FIELDS:
