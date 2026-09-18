@@ -714,9 +714,13 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 else:
                     btc_daily = btc_daily_pd.as_dict() if btc_daily_pd is not None else None
                     btc_oi = oi_gate_data.get(ref_pair) if cfg.ENABLE_OI_FUNDING_FILTER else None
-                    btc_gr = await _eval_gate(
-                        ref_pair, btc_15m, btc_5m, btc_daily, state_db, correlation_id, reference_time, btc_oi,
-                    )
+                    _cached_btc = gate_cache.get(ref_pair, _CLUSTER_CACHE_MISS)
+                    if _cached_btc is not _CLUSTER_CACHE_MISS and not isinstance(_cached_btc, tuple) and _cached_btc is not None:
+                        btc_gr = _cached_btc
+                    else:
+                        btc_gr = await _eval_gate(
+                            ref_pair, btc_15m, btc_5m, btc_daily, state_db, correlation_id, reference_time, btc_oi,
+                        )
                     if btc_gr is not None and not isinstance(btc_gr, tuple):
                         btc_context = BtcMacroContext(
                             confirmation_buy=btc_gr.confirmation_buy,

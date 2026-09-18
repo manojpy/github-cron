@@ -51,10 +51,6 @@ from indicators import (
 
 from threshold_engine import hash_config_state
 
-# Runtime override for CONFLUENCE_WEIGHTS (loaded from Redis at startup)
-# Falls back to static cfg.CONFLUENCE_WEIGHTS if not set
-RUNTIME_CONFLUENCE_WEIGHTS: Dict[str, float] = dict(CONFLUENCE_WEIGHTS)
-
 def escape_markdown_v2(text: str) -> str:
     return CompiledPatterns.ESCAPE_MARKDOWN.sub(r'\\\g<0>', str(text))
 
@@ -886,6 +882,26 @@ def validate_alert_definitions() -> None:
             errors.append(f"Alert key {def_.key} missing from ALERT_KEYS mapping")
         if def_.key not in BUY_ALERT_KEYS and def_.key not in SELL_ALERT_KEYS:
             errors.append(f"Alert key {def_.key} missing from BUY_ALERT_KEYS/SELL_ALERT_KEYS")
+
+    # ── FIX: cross-check that every alert key resolves to a config path
+    try:
+        from brain import _resolve_config_path  # local import avoids a cycle
+    except Exception:
+        _resolve_config_path = None  # type: ignore[assignment]
+
+    if _resolve_config_path is not None:
+        unmapped = [
+            d.key for d in ALERT_DEFINITIONS
+            if _resolve_config_path(d.key) is None
+        ]
+        if unmapped:
+            # Downgrade to a warning, not a hard error — the BotConfig
+            # doesn't yet forbid these, and existing deployments shouldn't
+            # crash on upgrade.
+            logger.warning(
+                f"⚠️ {len(unmapped)} alert key(s) have no _ALERT_CONFIG_MAP entry "
+                f"(Brain cannot auto-disable/reinstate them): {sorted(unmapped)}"
+            )
 
     if errors:
         error_msg = "❌ ALERT DEFINITION VALIDATION FAILED:\n" + "\n".join(f"  - {e}" for e in errors)

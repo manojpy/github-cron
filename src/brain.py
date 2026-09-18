@@ -53,6 +53,8 @@ _ALERT_CONFIG_MAP = {
     "kijun_cross_down":     "ENABLE_KIJUN_CROSS",
     "hist_rma_buy":         "ENABLE_HIST_RMA",
     "hist_rma_sell":        "ENABLE_HIST_RMA",
+    "equilibrium_cross_up":   "ENABLE_EQUILIBRIUM_CROSS",
+    "equilibrium_cross_down": "ENABLE_EQUILIBRIUM_CROSS",
 }
 # pivot_up_r1 / pivot_down_s2 / etc. — variable-suffix family, matched by prefix
 _ALERT_CONFIG_PREFIX_MAP = {
@@ -479,7 +481,7 @@ class BrainEngine:
         except Exception:
             return False
 
-    # ── Stream reading helpers ─────────────����──────────────────────�����─────────
+    # ── Stream reading helpers ─────────────�����──────────────────────�����─────────
 
     async def _read_stream(self, stream_key: str, count: int) -> List[Dict[str, str]]:
         """Read the most recent `count` entries from an outcome stream."""

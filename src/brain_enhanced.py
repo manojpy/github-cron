@@ -795,10 +795,12 @@ class BrainEngineV2(BaseBrainEngine):
                         "wilson_lo": max(0.0, 0.5 - conf_score * 0.2),
                         "wilson_hi": min(1.0, 0.5 + conf_score * 0.2),
                     })
+                    # FIX: read the configured floor instead of hardcoding 0.4
+                    min_conf = getattr(cfg, "BRAIN_WEIGHT_OPTIMIZER_MIN_CONFIDENCE", 0.4)
 
                     # ── Shadow out-of-sample veto ──────────────────────
                     shadow_weight_ok, shadow_weight_note = True, ""
-                    if (wopt.get("walk_forward_passed") and conf_score >= 0.4
+                    if (wopt.get("walk_forward_passed") and conf_score >= min_conf
                             and len(shadow_rows) >= 15):
                         shadow_weight_ok, shadow_weight_note = self._shadow_weight_check(
                             shadow_rows, CONFLUENCE_WEIGHTS,
@@ -807,7 +809,7 @@ class BrainEngineV2(BaseBrainEngine):
 
                     # Only emit config patch if walk-forward passed AND
                     # confidence is decent AND shadow sample doesn't veto.
-                    if (wopt.get("walk_forward_passed") and conf_score >= 0.4
+                    if (wopt.get("walk_forward_passed") and conf_score >= min_conf
                             and shadow_weight_ok):
                         config_patch.append({
                             "path": "CONFLUENCE_WEIGHTS",
@@ -825,12 +827,12 @@ class BrainEngineV2(BaseBrainEngine):
                                     "type": "dynamic_weights_applied",
                                     "severity": "medium",
                                     "message": f"💾 Dynamic weights persisted ({len(changed)} votes updated).",
-                                })
+                                })           
                     else:
                         if not wopt.get("walk_forward_passed"):
                             reason = "walk-forward FAILED"
-                        elif conf_score < 0.4:
-                            reason = f"confidence too low ({conf_score:.2f})"
+                        elif conf_score < min_conf:
+                            reason = f"confidence too low ({conf_score:.2f} < {min_conf:.2f})"
                         else:
                             reason = f"shadow-sample veto — {shadow_weight_note}"
                         recommendations.append({
@@ -1183,7 +1185,9 @@ class BrainEngineV2(BaseBrainEngine):
         ai_metrics["config_comparisons"] = version_comparisons
 
         # ── AI/ML: OOS Permutation Importance (EV-based, walk-forward) ────
-        if len(real_rows) >= min_sample * 3:
+        # FIX: honor cfg.BRAIN_PERMUTATION_IMPORTANCE — previously this
+        # ran whenever sample size was sufficient, regardless of the flag.
+        if getattr(cfg, "BRAIN_PERMUTATION_IMPORTANCE", True) and len(real_rows) >= min_sample * 3:
             _perm_n = 15
             perm_imp = engine.oos_permutation_importance(
                 real_rows, min_sample=min_sample, n_permutations=_perm_n
@@ -1394,6 +1398,25 @@ class BrainEngineV2(BaseBrainEngine):
                             or self._infer_patch_category(field)
                         ),
                     })
+
+            # ── FIX: dedupe by field. Both repair_shop_diagnosis()
+            def _delta(p: Dict[str, Any]) -> float:
+                cur, sug = p.get("current"), p.get("suggested")
+                if isinstance(cur, (int, float)) and isinstance(sug, (int, float)):
+                    return abs(float(sug) - float(cur))
+                return 0.0
+
+            def _pref(p: Dict[str, Any]) -> tuple:
+                # (has_source_category, |delta|) — lexicographic, higher wins
+                return (1 if p.get("_source_category") else 0, _delta(p))
+
+            deduped: Dict[str, Dict[str, Any]] = {}
+            for p in config_patches:
+                existing = deduped.get(p["path"])
+                if existing is None or _pref(p) > _pref(existing):
+                    deduped[p["path"]] = p
+            config_patches = list(deduped.values())
+
             # ── Optional budget: cap total entries per plan ──
             budget = getattr(cfg, "BRAIN_MAX_PLAN_ENTRIES", 0)
             if budget > 0:

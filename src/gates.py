@@ -769,10 +769,9 @@ async def _eval_gate(
       
         dynamic_flow_curr = dynamic_flow_trend_arr[i15]
         if cfg.DYNAMIC_FLOW_RIBBON_ENABLED and not np.isnan(dynamic_flow_curr):
-            dynamic_flow_ok_buy = bool(dynamic_flow_curr == -1.0)
-            dynamic_flow_ok_sell = bool(dynamic_flow_curr == 1.0)
+            dynamic_flow_ok_buy = bool(np.isclose(dynamic_flow_curr, -1.0, atol=1e-9))
+            dynamic_flow_ok_sell = bool(np.isclose(dynamic_flow_curr, 1.0, atol=1e-9))
         else:
-            # This single else block now handles both "disabled" and "NaN" scenarios
             dynamic_flow_ok_buy = None
             dynamic_flow_ok_sell = None
 
