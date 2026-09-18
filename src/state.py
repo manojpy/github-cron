@@ -1039,20 +1039,6 @@ class RedisStateStore:
                 mae = max(0.0, (float(np.max(path_high)) - anchor_price) / anchor_price)
                 mfe = max(0.0, (anchor_price - float(np.min(path_low))) / anchor_price)
 
-        path_start = entry_idx + 1
-        path_end = min(target_idx + 1, len(data_15m.low))
-        path_low = data_15m.low[path_start:path_end]
-        path_high = data_15m.high[path_start:path_end]
-
-        mae = mfe = None
-        if len(path_low) and len(path_high):
-            if is_buy:
-                mae = max(0.0, (entry_price - float(np.min(path_low))) / entry_price)
-                mfe = max(0.0, (float(np.max(path_high)) - entry_price) / entry_price)
-            else:
-                mae = max(0.0, (float(np.max(path_high)) - entry_price) / entry_price)
-                mfe = max(0.0, (entry_price - float(np.min(path_low))) / entry_price)
-
         # ── METRIC 2: mfe_win (TP hit at 1:2 R:R) ──
         mfe_win = mfe is not None and mfe >= target_pct
 
