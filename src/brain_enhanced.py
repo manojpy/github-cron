@@ -177,7 +177,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                 )
         titles = {"🔴": "DISABLE THESE NOW", "🟡": "IMPROVE THESE", "🟢": "KEEP THESE"}
         block = "🚦 YOUR ALERTS — WHAT TO DO WITH EACH"
-        for e in ("🔴", "🟡", "🟢"):
+        for bucket in ("🔴", "🟡", "🟢"):
             if groups[bucket]:
                 block += f"\n\n{titles[bucket]}:\n" + "\n".join(groups[bucket])
 
