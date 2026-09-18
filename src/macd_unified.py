@@ -692,6 +692,29 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     logger_main.debug(f"Ready to evaluate {len(prepared_tasks)} pairs")
 
+    # ── Correlation Cluster Detection (LIVE — see ClusterContext docstring) ──
+    # FIX: this block runs BEFORE the macro-context block below, because it
+    # is what populates gate_cache. The macro block reuses the cached BTCUSD
+    # GateResult to avoid a redundant _eval_gate() call when both gates are on.
+    cluster_context: Optional[ClusterContext] = None
+    gate_cache: Dict[str, Any] = {}
+    if cfg.ENABLE_CLUSTER_GATE:
+        try:
+            cluster_context, gate_cache = await _compute_directional_cluster(
+                prepared_tasks, state_db, correlation_id, reference_time, oi_gate_data, parsed_cache,
+            )
+            if cluster_context:
+                logger_main.info(
+                    f"📊 Directional cluster: buy={cluster_context.buy_count}/{cluster_context.total_pairs} "
+                    f"({cluster_context.buy_pct:.0%}), sell={cluster_context.sell_count}/{cluster_context.total_pairs} "
+                    f"({cluster_context.sell_pct:.0%}) | "
+                    f"gate-cache: {len(gate_cache)}/{len(prepared_tasks)} pairs"
+                )
+        except Exception as e:
+            logger_main.warning(f"Cluster pre-pass failed, disabling cluster gate this run: {e}")
+            cluster_context = None
+            gate_cache = {}
+
     # ── Macro Context (BTC trend-alignment gate — shadow mode) ─────────
     btc_context: Optional[BtcMacroContext] = None
     if cfg.ENABLE_MACRO_CONTEXT_GATE:
@@ -714,13 +737,23 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 else:
                     btc_daily = btc_daily_pd.as_dict() if btc_daily_pd is not None else None
                     btc_oi = oi_gate_data.get(ref_pair) if cfg.ENABLE_OI_FUNDING_FILTER else None
+
+                    # Reuse the cluster pre-pass's GateResult for the reference
+                    # pair when it's already cached. With both ENABLE_CLUSTER_GATE
+                    # and ENABLE_MACRO_CONTEXT_GATE on, this avoids evaluating
+                    # BTC's gate a second time in the same run.
                     _cached_btc = gate_cache.get(ref_pair, _CLUSTER_CACHE_MISS)
-                    if _cached_btc is not _CLUSTER_CACHE_MISS and not isinstance(_cached_btc, tuple) and _cached_btc is not None:
+                    if (
+                        _cached_btc is not _CLUSTER_CACHE_MISS
+                        and _cached_btc is not None
+                        and not isinstance(_cached_btc, tuple)
+                    ):
                         btc_gr = _cached_btc
                     else:
                         btc_gr = await _eval_gate(
                             ref_pair, btc_15m, btc_5m, btc_daily, state_db, correlation_id, reference_time, btc_oi,
                         )
+
                     if btc_gr is not None and not isinstance(btc_gr, tuple):
                         btc_context = BtcMacroContext(
                             confirmation_buy=btc_gr.confirmation_buy,
@@ -737,26 +770,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             except Exception as e:
                 logger_main.warning(f"Macro context ({ref_pair}) eval failed, disabling macro gate this run: {e}")
                 btc_context = None
-
-    # ── Correlation Cluster Detection (LIVE — see ClusterContext docstring) ──
-    cluster_context: Optional[ClusterContext] = None
-    gate_cache: Dict[str, Any] = {}
-    if cfg.ENABLE_CLUSTER_GATE:
-        try:
-            cluster_context, gate_cache = await _compute_directional_cluster(
-                prepared_tasks, state_db, correlation_id, reference_time, oi_gate_data, parsed_cache, 
-            )
-            if cluster_context:
-                logger_main.info(
-                    f"📊 Directional cluster: buy={cluster_context.buy_count}/{cluster_context.total_pairs} "
-                    f"({cluster_context.buy_pct:.0%}), sell={cluster_context.sell_count}/{cluster_context.total_pairs} "
-                    f"({cluster_context.sell_pct:.0%}) | "
-                    f"gate-cache: {len(gate_cache)}/{len(prepared_tasks)} pairs"
-                )
-        except Exception as e:
-            logger_main.warning(f"Cluster pre-pass failed, disabling cluster gate this run: {e}")
-            cluster_context = None
-            gate_cache = {}
 
     # ── Pair-Universe Ichimoku Bias Header (cosmetic only — see BiasContext docstring) ──
     bias_context: Optional[BiasContext] = None
