@@ -348,7 +348,7 @@ class BotConfig(BaseModel):
     MIN_WIN_RATE_SESSION_SAMPLE: int = Field(default=15, ge=1, description="Minimum resolved-outcome sample size for a pair:alert_key:session combo before its win rate is trusted enough to block dispatch")
     ENABLE_BRAIN: bool = Field(default=False, description="Master switch for the Brain analysis/shadow-mode/reporting layer. Requires ENABLE_WIN_RATE_FILTER to be meaningful")
     BRAIN_SHADOW_MODE: bool = Field(default=True, description="When an alert is rejected by the win-rate filter, keep tracking what would have happened instead of discarding it")
-    BRAIN_REPORT_INTERVAL_RUNS: int = Field(default=48, ge=1, le=2000, description="Send a Telegram analysis report every N cron runs (default 48 runs ≈ 12h at 15m cadence)")
+    BRAIN_REPORT_INTERVAL_RUNS: int = Field(default=16, ge=1, le=2000, description="Send a Telegram analysis report every N cron runs (default 16 runs ≈ 4h at 15m cadence)")
     BRAIN_REWARDABLE_MIN_CONFLUENCE_PCT: float = Field(default=80.0, ge=50.0, le=100.0, description="Min confluence % required for a win-rate-rejected alert to be eligible for a rewardable override")
     BRAIN_REWARDABLE_MIN_SHADOW_SAMPLE: int = Field(default=10, ge=3, description="Min resolved shadow samples in the high-confluence bucket for this alert_key before an override is trusted")
     BRAIN_REWARDABLE_MIN_SHADOW_WR: float = Field(default=0.60, ge=0.5, le=1.0, description="Shadow win rate required in the high-confluence bucket to allow rewardable overrides through")
@@ -423,7 +423,7 @@ class BotConfig(BaseModel):
     FIB_REVERSAL_VOL_SPIKE_MULT: float = Field(default=1.3, ge=1.0, le=5.0, description="Touch candle's volume must exceed its volume EMA by this multiple to count as an exhaustion/reversal spike") 
     FIB_REVERSAL_MAX_DIVERGENCE_AGE_BARS: int = Field(default=50, ge=5, le=500, description="Max bars between the anchor swing and the prior swing for divergence comparison")
     FIB_REVERSAL_MAJOR_SWING_LENGTH: int = Field(default=50, ge=2, le=200, description="Fallback only when no minor pivot exists...")
-    EVAL_CONCURRENCY_LIMIT: int = Field(default=5, ge=1, le=30, description="Max pairs evaluated concurrently")
+    EVAL_CONCURRENCY_LIMIT: int = Field(default=2, ge=1, le=30, description="Max pairs evaluated concurrently")
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
     MAX_ALERTS_PER_RUN: int = Field(default=50, ge=10, le=200)  

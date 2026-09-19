@@ -48,7 +48,6 @@ def format_size(bytes: int) -> str:
         bytes /= 1024.0
     return f"{bytes:.2f} TB"
 
-
 def cleanup_by_age(data_dir: Path, max_age_days: int, dry_run: bool = False) -> int:
     """Remove files older than max_age_days."""
     removed = 0
@@ -74,9 +73,7 @@ def cleanup_by_age(data_dir: Path, max_age_days: int, dry_run: bool = False) -> 
     return removed
 
 def compress_large_files(data_dir: Path, max_size_mb: int, dry_run: bool = False,
-                          no_compress_within_days: int = 0) -> int:
-    """Compress files that exceed max_size_mb, but aren't old enough to delete —
-    and aren't inside the brain's live analysis window (no_compress_within_days)."""
+                         no_compress_within_days: int = 0) -> int:
     compressed = 0
     max_size_bytes = max_size_mb * 1024 * 1024
     cutoff = datetime.now(timezone.utc) - timedelta(days=no_compress_within_days)
@@ -85,10 +82,22 @@ def compress_large_files(data_dir: Path, max_size_mb: int, dry_run: bool = False
         label_dir = data_dir / label
         if not label_dir.exists():
             continue
-        
         for month_file in label_dir.glob("*.jsonl"):
             if no_compress_within_days > 0:
-                mtime = datetime.fromtimestamp(month_file.stat().st_mtime, tz=timezone.utc)
+                # Use the same filename-date-aware age check as
+                # cleanup_by_age(). st_mtime is unreliable on fresh
+                # git clones (every file's mtime = clone time).
+                age_ref = file_age_reference(month_file)
+                if age_ref >= cutoff:
+                    continue  # still inside the live analysis window 
+
+        label_dir = data_dir / label
+        if not label_dir.exists():
+            continue
+        
+        for month_file in label_dir.glob("*.jsonl"):     
+            if no_compress_within_days > 0:
+                mtime = file_age_reference(month_file)
                 if mtime >= cutoff:
                     continue  # still inside the live analysis window — leave uncompressed
             if month_file.stat().st_size > max_size_bytes:
