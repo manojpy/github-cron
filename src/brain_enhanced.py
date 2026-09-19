@@ -990,7 +990,7 @@ class BrainEngineV2(BaseBrainEngine):
                     elif conf_score < min_conf:
                         reason = f"confidence too low ({conf_score:.2f} < {min_conf:.2f})"
                     else:
-                        reason = f"unknown — all gates passed but patch not emitted"
+                        reason = "unknown — all gates passed but patch not emitted"
                     recommendations.append({
                         "type": "weight_optimizer_blocked",
                         "severity": "low",
@@ -1171,7 +1171,7 @@ class BrainEngineV2(BaseBrainEngine):
                         "p_value": inter.get("p_value"),
                     })
 
-        # ─��� Phase 5: Counterfactual Simulator (shadow-validated) ──────
+        # ─ Phase 5: Counterfactual Simulator (shadow-validated) ──────
         baseline_ev = ai_metrics.get("net_ev") or 0.0
         min_cf = self._phase_samples["counterfactual"]
         if real_rows and len(real_rows) >= min_cf:
@@ -1367,7 +1367,7 @@ class BrainEngineV2(BaseBrainEngine):
                     _rec["n_permutations"] = _perm_n
                 recommendations.append(_rec)
 
-        # ── Benjamini-Hochberg FDR correction ────────────────────���───────
+        # ── Benjamini-Hochberg FDR correction ─────────────────��──���───────
         p_val_indices: List[int] = []
         p_vals: List[float] = []
         for idx, r in enumerate(recommendations):
