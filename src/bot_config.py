@@ -126,8 +126,8 @@ class Constants:
     PPO_RSI_GUARD_SELL = -0.50
     PPO_SIGNAL_CROSS_MAX_BUY = 0.30
     PPO_SIGNAL_CROSS_MIN_SELL = -0.30
-    RSI_SIGNAL_CROSS_MAX_BUY = 60
-    RSI_SIGNAL_CROSS_MIN_SELL = 40
+    RSI_SIGNAL_CROSS_MAX_BUY = 65
+    RSI_SIGNAL_CROSS_MIN_SELL = 35
     CIRCUIT_BREAKER_MAX_WAIT = 300
     INFINITY_CLAMP = 1e8
     VWAP_MAX_DISTANCE_PCT = 2.0
@@ -348,7 +348,7 @@ class BotConfig(BaseModel):
     MIN_WIN_RATE_SESSION_SAMPLE: int = Field(default=15, ge=1, description="Minimum resolved-outcome sample size for a pair:alert_key:session combo before its win rate is trusted enough to block dispatch")
     ENABLE_BRAIN: bool = Field(default=False, description="Master switch for the Brain analysis/shadow-mode/reporting layer. Requires ENABLE_WIN_RATE_FILTER to be meaningful")
     BRAIN_SHADOW_MODE: bool = Field(default=True, description="When an alert is rejected by the win-rate filter, keep tracking what would have happened instead of discarding it")
-    BRAIN_REPORT_INTERVAL_RUNS: int = Field(default=16, ge=1, le=2000, description="Send a Telegram analysis report every N cron runs (default 16 runs ≈ 4h at 15m cadence)")
+    BRAIN_REPORT_INTERVAL_RUNS: int = Field(default=1, ge=1, le=2000) 
     BRAIN_REWARDABLE_MIN_CONFLUENCE_PCT: float = Field(default=80.0, ge=50.0, le=100.0, description="Min confluence % required for a win-rate-rejected alert to be eligible for a rewardable override")
     BRAIN_REWARDABLE_MIN_SHADOW_SAMPLE: int = Field(default=10, ge=3, description="Min resolved shadow samples in the high-confluence bucket for this alert_key before an override is trusted")
     BRAIN_REWARDABLE_MIN_SHADOW_WR: float = Field(default=0.60, ge=0.5, le=1.0, description="Shadow win rate required in the high-confluence bucket to allow rewardable overrides through")
