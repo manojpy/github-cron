@@ -41,7 +41,9 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
   BOT_TIMEOUT: 660
-  BRAIN_REPORT_ON_DEMAND: ${{ inputs.brain_report }}
+  # BRAIN_REPORT_ON_DEMAND is set per-run inside the bot_run step
+  # via .bot_env (BRAIN_FULL), not here — the workflow's 4-hour
+  # archive-depth decision is the real cadence control.
   CLEAR_REDIS: ${{ inputs.clear_redis }}
   CLEAR_KILL_SWITCH: ${{ inputs.clear_kill_switch }}
 
@@ -149,23 +151,19 @@ jobs:
         if: inputs.apply_brain_plan != true
         id: brain_depth
         run: |
-          # The alert engine only needs today's outcome/shadow files (pending
-          # outcome resolution appends to today's JSONL; win-rates, calibration
-          # curves and pending state all come from Redis). Only the Brain needs
-          # the long history. So the full archive is materialised only on the
-          # run that produces a Brain report:
-          #   * manual dispatch with brain_report=true, or
-          #   * the first 15-min slot of each 4h UTC block (00/04/08/12/16/20).
-          # The :01 cron leaves ~14 min of margin for scheduler jitter.
           NOW=$(date -u +%s)
-          if [ "${{ inputs.brain_report }}" = "true" ] || [ $(( (NOW / 900) % 16 )) -eq 0 ]; then
+          SLOT=$(( (NOW / 900) % 16 ))
+          # Slot 0 = the :00 boundary of each 4h block. Slots 0-1 = :00 to :29.
+          # Widened from slot==0 to slot<=1 so a cron delayed up to ~29 min
+          # still lands in the full-archive window.
+          if [ "${{ inputs.brain_report }}" = "true" ] || [ "$SLOT" -le 1 ]; then
             echo "brain_full=true"  >> "$GITHUB_OUTPUT"
             echo "archive_days=185" >> "$GITHUB_OUTPUT"
-            echo "🧠 Brain-report run: full 185-day archive"
+            echo "🧠 Brain-report run: full 185-day archive (slot=$SLOT)"
           else
             echo "brain_full=false" >> "$GITHUB_OUTPUT"
             echo "archive_days=3"   >> "$GITHUB_OUTPUT"
-            echo "⚡ Alert-only run: 3-day archive"
+            echo "⚡ Alert-only run: 3-day archive (slot=$SLOT)"
           fi
 
       - name: 📦 Checkout outcome-data archive
@@ -195,14 +193,10 @@ jobs:
           git sparse-checkout init --no-cone
           {
             echo "brain_state.json"
-            # ARCHIVE_DAYS is 185 on Brain-report runs (BRAIN_LONG_WINDOW_DAYS=180
-            # plus a 5-day buffer) and 3 on alert-only runs. Both the .jsonl and
-            # the .jsonl.gz spelling are listed because cleanup_outcomes.py may
-            # compress a day and archive_reader.py reads either.
-            # NOTE: do NOT add "/outcomes/" or "/shadow/" directory patterns
-            # here: in --no-cone mode they match every file beneath them and
-            # silently defeat the per-day list. The directories are created by
-            # the mkdir -p below.
+            # Track .gitkeep so wiped-but-tracked directories materialise
+            echo "outcomes/.gitkeep"
+            echo "shadow/.gitkeep"
+            echo "reports/.gitkeep"
             for i in $(seq 0 $(( ARCHIVE_DAYS - 1 ))); do
               D=$(date -u -d "-${i} days" +%Y-%m-%d)
               echo "outcomes/${D}.jsonl"
@@ -211,7 +205,6 @@ jobs:
               echo "shadow/${D}.jsonl.gz"
             done
           } > .git/info/sparse-checkout
-
           git checkout main
           cd -
 
