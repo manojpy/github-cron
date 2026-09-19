@@ -473,6 +473,7 @@ class BotConfig(BaseModel):
     BRAIN_SLIPPAGE_PCT: float = Field(default=0.0003, ge=0.0, le=0.01, description="Estimated slippage per side used in EV/Kelly calculations")
     BRAIN_OOD_ENABLED: bool = Field(default=True, description="Vote-count OOD gate on/off")
     BRAIN_REPORT_ON_DEMAND: bool = Field(default=False, description="If true, force a brain report to be generated and sent on this run regardless of the normal BRAIN_REPORT_INTERVAL_RUNS cadence")
+    BRAIN_ARCHIVE_SHALLOW: bool = Field(default=False, description="Set by the workflow on alert-only runs that check out just a few days of the outcome archive. The Brain must never analyse a truncated archive, so report generation is skipped when this is true")
     BRAIN_MAX_PLAN_ENTRIES: int = Field(default=3, ge=0, le=50) 
     BRAIN_REPAIR_SHOP_MAX: int = Field(default=3, ge=1, le=10) 
     BRAIN_EV_GATE_P_THRESHOLD: float = Field(default=0.85, ge=0.5, le=1.0, description="Min P(EV>0) required for a threshold to clear the EV gate")

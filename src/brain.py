@@ -1808,11 +1808,20 @@ class BrainEngine:
                 "ENABLE_BRAIN is on but ENABLE_WIN_RATE_FILTER is off — brain has no data source, skipping report."
             )
             return
+        
         if getattr(cfg, "DRY_RUN_MODE", False):
             logger_run.info("DRY_RUN_MODE is on — skipping brain report (outcome data would be synthetic).")
             return
 
+        # Alert-only run: only a few days of archive were checked out, so
+        # analysing it would produce a misleading report. Return BEFORE
+        # _next_run_count() so the counter is not consumed either.
+        if getattr(cfg, "BRAIN_ARCHIVE_SHALLOW", False):
+            logger_run.debug("Brain: shallow archive this run — report deferred to the full-archive run.")
+            return
+
         run_count = await self._next_run_count()
+
         if run_count is None or run_count % interval != 0:
             return
 
@@ -1836,6 +1845,10 @@ class BrainEngine:
 
         if getattr(cfg, "DRY_RUN_MODE", False):
             logger_run.info("DRY_RUN_MODE is on — skipping brain report (outcome data would be synthetic).")
+            return True
+
+        if getattr(cfg, "BRAIN_ARCHIVE_SHALLOW", False):
+            logger_run.warning("Brain report requested but this run has a shallow archive checkout — skipping.")
             return True
 
         return await self._deliver_report(pairs, telegram_queue, logger_run)

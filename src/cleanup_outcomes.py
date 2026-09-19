@@ -5,9 +5,29 @@ cleanup_outcomes.py — Auto-clean old outcome archive files based on configurab
 
 import argparse
 import gzip
+import re
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+_DATE_IN_NAME = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+
+def file_age_reference(path: Path) -> datetime:
+    """UTC timestamp used to judge a file's age.
+
+    Uses the YYYY-MM-DD in the file name (outcomes/2026-03-04.jsonl,
+    reports/2026-03-04_12-30.md). st_mtime is only a fallback: on a fresh
+    `git clone` every file's mtime is the clone time, so mtime-based age
+    checks never fire in CI.
+    """
+    m = _DATE_IN_NAME.search(path.name)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                            23, 59, 59, tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
 
 def get_dir_size(path: Path) -> int:
     """Calculate total size of a directory in bytes."""
@@ -40,8 +60,8 @@ def cleanup_by_age(data_dir: Path, max_age_days: int, dry_run: bool = False) -> 
             continue
         
         for file_path in label_dir.glob(pattern):
-            try:
-                mtime = datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc)
+            try:         
+                mtime = file_age_reference(file_path)
                 if mtime < cutoff:
                     prefix = "🔎 [DRY RUN] Would remove" if dry_run else "🗑️ Removing"
                     print(f"{prefix} old file: {file_path}")

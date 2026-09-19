@@ -2224,7 +2224,7 @@ def hash_config_state(
         "RUN_TIMEOUT_SECONDS", "FETCH_PHASE_TIMEOUT_SEC",
         "EVAL_CONCURRENCY_LIMIT", "MIN_RUN_TIMEOUT",
         "BRAIN_USE_FILE_STORAGE", "OUTCOME_DATA_DIR",
-        "BRAIN_REPORT_ON_DEMAND", "BRAIN_REPORT_INTERVAL_RUNS",
+        "BRAIN_REPORT_ON_DEMAND", "BRAIN_REPORT_INTERVAL_RUNS", "BRAIN_ARCHIVE_SHALLOW",
         "BRAIN_REPORT_STREAM_SAMPLE", "BRAIN_LONG_WINDOW_STREAM_SAMPLE",
         # ── FIX (Priority 7): report-only Brain flags. Toggling any of
         # these changes nothing about which trades fire or what's stored
@@ -3099,9 +3099,6 @@ def _prob_ev_negative(rows: List[Row], n_sims: int = 400) -> float:
         return 0.5
     z = (0.0 - ev_mean) / ev_std
     return 0.5 * math.erfc(-z / math.sqrt(2.0))
-
-
-
 
 def _prob_ev_positive(ev_mean: float, ev_std: float) -> float:
     if ev_std <= 0:
@@ -4239,7 +4236,7 @@ def trade_quality_score(
             result["reason"] = f"calibration_gate: {reason}"
             return result
 
-    # ── Layer 4: Regime compatibility ─���
+    # ── Layer 4: Regime compatibility ─
     regime_ok = True
     if regime_info and regime_info.get("valid"):
         adx = (row.get("context") or {}).get("adx_val")
