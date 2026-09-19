@@ -219,6 +219,8 @@ async def _record_counterfactual_block(
     cluster_penalty: Optional[float] = None,
     effective_score: Optional[float] = None,
     effective_required: Optional[float] = None,
+    gr: Optional[GateResult] = None,
+    context: Optional[Dict[str, Any]] = None,
     logger_pair: Optional[logging.Logger] = None,
 ) -> None:
     """Shadow-log every alert that reached the dispatch stage but was then
@@ -233,6 +235,38 @@ async def _record_counterfactual_block(
     if not alerts_to_send:
         return
     try:
+        rich_fields: Dict[str, Any] = {}
+        if gr is not None:
+            rich_fields.update({
+                "rsi_curr": (context or {}).get("rsi_curr"),
+                "rsi_adaptive_buy": gr.rsi_adaptive_buy,
+                "rsi_adaptive_sell": gr.rsi_adaptive_sell,
+                "ppo_curr": (context or {}).get("ppo_curr"),
+                "ppo_adaptive_threshold": gr.ppo_adaptive_threshold,
+                "buy_wick_ratio": gr.buy_wick_ratio,
+                "sell_wick_ratio": gr.sell_wick_ratio,
+                "adx_val": gr.adx_val,
+                "config_version": hash_config_state(
+                    CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
+                ),
+                "ppo_gate_curr": gr.ppo_gate_curr,
+                "rsi_guard_smooth_curr": gr.rsi_guard_smooth_curr,
+                "rma_cloud_fast_curr": gr.rma_cloud_fast_curr,
+                "tk_conversion_curr": gr.tk_conversion_curr,
+                "tk_base_curr": gr.tk_base_curr,
+                "adx_adaptive_threshold": gr.adx_adaptive_threshold,
+                "momentum_count": gr.momentum_count,
+                "atr_pctl": gr.atr_pctl,
+                "volume_pctl": gr.volume_pctl,
+                "adx_pctl": gr.adx_pctl,
+                "equilibrium_curr": (context or {}).get("equilibrium_curr"),
+                "cloud_upper_curr": (context or {}).get("cloud_upper_curr"),
+                "cloud_lower_curr": (context or {}).get("cloud_lower_curr"),
+                "rsi_guard_ema_curr": gr.rsi_guard_ema_curr,
+                "rvol_ok": gr.rvol_ok,
+                "ichimoku_gate_ok_buy": gr.ichimoku_gate_ok_buy,
+                "ichimoku_gate_ok_sell": gr.ichimoku_gate_ok_sell,
+            })
         for _, _, alert_key in alerts_to_send:
             direction = "buy" if alert_key in BUY_ALERT_KEYS else "sell"
             score: Optional[float] = None
@@ -251,6 +285,7 @@ async def _record_counterfactual_block(
                     "cluster_penalty": cluster_penalty,
                     "effective_score": effective_score,
                     "effective_required": effective_required,
+                    **rich_fields,
                 },
             )
     except Exception as e:
@@ -1549,6 +1584,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     sdb, pair_name, raw_alerts, ts_curr, gr.close_curr,
                     block_reason="portfolio_heat",
                     confluence_scores={ak: _confluence_for(ak) for _, _, ak in raw_alerts},
+                    gr=gr, context=context,
                     logger_pair=logger_pair,
                 )
                 return pair_name, {
@@ -1749,6 +1785,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         macro_shadow=macro_shadow,
                         effective_score=confluence_score,
                         effective_required=required,
+                        gr=gr, context=context,
                         logger_pair=logger_pair,
                     )
                     alerts_to_send = []
@@ -1783,6 +1820,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         ts_curr, close_curr,
                         block_reason="ood_gate",
                         confluence_scores={alert_key: _confluence_for(alert_key)},
+                        gr=gr, context=context,
                         logger_pair=logger_pair,
                     )
                     continue
@@ -1849,6 +1887,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 ts_curr, close_curr,
                                 block_reason="calibration_gate",
                                 confluence_scores={alert_key: _confluence_for(alert_key)},
+                                gr=gr, context=context,
                                 logger_pair=logger_pair,
                             )
                             continue
@@ -1867,8 +1906,35 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 "buy_wick_ratio": gr.buy_wick_ratio,
                                 "sell_wick_ratio": gr.sell_wick_ratio,
                                 "adx_val": adx_val,
+                                "config_version": hash_config_state(
+                                    CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
+                                ),
                                 "macro_correlation": macro_shadow.get("correlation") if macro_shadow else None,
                                 "macro_relative_strength": macro_shadow.get("relative_strength") if macro_shadow else None,
+                                "macro_multiplier": macro_shadow.get("multiplier") if macro_shadow else None,
+                                "macro_would_block": macro_shadow.get("would_block") if macro_shadow else None,
+                                # ── FIX (pending item): match trigger_context's field set so
+                                # live dispatch-time scoring uses the same features the
+                                # market-state model is actually trained on. No new
+                                # indicators — same values already on GateResult/context
+                                # that trigger_context/shadow_context already carry. ──
+                                "ppo_gate_curr": gr.ppo_gate_curr,
+                                "rsi_guard_smooth_curr": gr.rsi_guard_smooth_curr,
+                                "rma_cloud_fast_curr": gr.rma_cloud_fast_curr,
+                                "tk_conversion_curr": gr.tk_conversion_curr,
+                                "tk_base_curr": gr.tk_base_curr,
+                                "adx_adaptive_threshold": gr.adx_adaptive_threshold,
+                                "momentum_count": gr.momentum_count,
+                                "atr_pctl": gr.atr_pctl,
+                                "volume_pctl": gr.volume_pctl,
+                                "adx_pctl": gr.adx_pctl,
+                                "equilibrium_curr": context.get("equilibrium_curr"),
+                                "cloud_upper_curr": context.get("cloud_upper_curr"),
+                                "cloud_lower_curr": context.get("cloud_lower_curr"),
+                                "rsi_guard_ema_curr": gr.rsi_guard_ema_curr,
+                                "rvol_ok": gr.rvol_ok,
+                                "ichimoku_gate_ok_buy": gr.ichimoku_gate_ok_buy,
+                                "ichimoku_gate_ok_sell": gr.ichimoku_gate_ok_sell,
                             }
                             tq = await brain_engine.get_trade_quality(
                                 pair_name, alert_key, direction,
