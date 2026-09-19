@@ -384,7 +384,7 @@ def build_caps_data(rows: List[Row], min_sample: int = 20) -> Tuple[List[float],
 def walk_forward_split(
     rows: List[Row],
     train_frac: float = 0.67,
-    lookahead_sec: int = 8 * 900,   # OUTCOME_LOOKAHEAD_CANDLES * 900
+    lookahead_sec: Optional[int] = None,   # None → (fill delay + lookahead + 1) candles * 900
     embargo_sec: int = 900,          # one candle of buffer
 ) -> Tuple[List[Row], List[Row]]:
     """Chronological split by entry_ts with purge + embargo.
@@ -400,6 +400,13 @@ def walk_forward_split(
 
     Rows missing entry_ts (0) sort first, into the train side (unchanged).
     """
+    if lookahead_sec is None:
+        lookahead_sec = (
+            max(0, int(getattr(cfg, "OUTCOME_FILL_DELAY_CANDLES", 1)))
+            + int(cfg.OUTCOME_LOOKAHEAD_CANDLES)
+            + 1
+        ) * 900
+
     ordered = sorted(rows, key=lambda r: r.get("entry_ts", 0))
     if not ordered:
         return [], []
@@ -3076,6 +3083,13 @@ def _prob_edge_broken(wins: int, n: int, target_wr: float,
     return 0.5 * math.erfc(-z / math.sqrt(2.0)) 
 
 def _prob_ev_negative(rows: List[Row], n_sims: int = 400) -> float:
+    """P(true EV <= 0) via block-bootstrap.
+    
+    WARNING: Returns 0.5 (neutral) when len(rows) < 60 because
+    bootstrap_ev_ci requires block_size * 3 = 60 rows minimum.
+    Callers with fewer rows should fall back to the point estimate
+    (net_ev <= 0) instead of trusting this return value.
+    """
     bs = bootstrap_ev_ci(rows, n_sims=n_sims)
     if not bs.get("valid"):
         return 0.5
@@ -3085,6 +3099,9 @@ def _prob_ev_negative(rows: List[Row], n_sims: int = 400) -> float:
         return 0.5
     z = (0.0 - ev_mean) / ev_std
     return 0.5 * math.erfc(-z / math.sqrt(2.0))
+
+
+
 
 def _prob_ev_positive(ev_mean: float, ev_std: float) -> float:
     if ev_std <= 0:

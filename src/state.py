@@ -1005,11 +1005,12 @@ class RedisStateStore:
 
         # ── FIX (Priority 1): Use fill_price as the anchor for all
         anchor_price = float(data["fill_price"])
-
-        target_idx = entry_idx + cfg.OUTCOME_LOOKAHEAD_CANDLES
+        
+        # FIX (Issue 2): Anchor lookahead horizon to the fill candle, not the signal candle.
+        # This ensures the trade is evaluated over the full N candles post-execution.
+        target_idx = fill_idx + cfg.OUTCOME_LOOKAHEAD_CANDLES
         if target_idx > i15:
             return None, "not_ready"
-
         future_price = float(data_15m.close[target_idx])
         pct_move = (future_price - anchor_price) / anchor_price * 100.0
 
@@ -1024,9 +1025,11 @@ class RedisStateStore:
             if is_buy
             else pct_move <= -cfg.OUTCOME_FAVORABLE_MOVE_PCT
         )
-
         # ── MAE / MFE from price path (anchored to fill_price) ──
-        path_start = fill_idx + 1 if fill_delay > 0 else entry_idx + 1
+        # FIX (Issue 1): Include the fill candle in the path. Since the simulated 
+        # fill occurs at the open of fill_idx, the remainder of that candle's 
+        # high/low is tradable and must be evaluated for TP/SL/MFE/MAE.
+        path_start = fill_idx if fill_delay > 0 else entry_idx + 1
         path_end = min(target_idx + 1, len(data_15m.low))
         path_low = data_15m.low[path_start:path_end]
         path_high = data_15m.high[path_start:path_end]

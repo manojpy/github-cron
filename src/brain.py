@@ -99,12 +99,14 @@ def _to_opt_float(f: Dict[str, str], key: str) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
-def _extract_p_value_for_fdr(
-    rec: Dict[str, Any],
-    real_rows: List[Dict[str, Any]],
-    min_sample: int,
-) -> Optional[float]:
-  
+def _extract_p_value_for_fdr(rec: Dict[str, Any]) -> Optional[float]:
+    """Extract a single-hypothesis p-value from a recommendation for the
+    Benjamini-Hochberg FDR pass.
+
+    FIX (Issue 5 cleanup): dropped `real_rows` and `min_sample` —
+    neither was read anywhere in this function's body. All p-values
+    are reconstructed from fields already stamped on the rec itself.
+    """
     rtype = rec.get("type")
 
     # ── Interactions: p_value already stamped by the miner ──
@@ -595,9 +597,9 @@ class BrainEngine:
                     "effective_score": _to_opt_float(f, "effective_score"),
                     "effective_required": _to_opt_float(f, "effective_required"),
                     "macro_multiplier": _to_opt_float(f, "macro_multiplier"),
-                    "cluster_penalty": _to_opt_float(f, "cluster_penalty"),        
-                   "rejection_reason": (row_context or {}).get("rejection_reason"),
-                 })
+                    "cluster_penalty": _to_opt_float(f, "cluster_penalty"),
+                    "rejection_reason": (row_context or {}).get("rejection_reason"),
+                })
             except (KeyError, ValueError) as e:
                 logging.getLogger("macd_bot").debug(f"Brain: dropping malformed outcome row: {e}")
                 continue
