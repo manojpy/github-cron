@@ -152,18 +152,14 @@ jobs:
         id: brain_depth
         run: |
           NOW=$(date -u +%s)
-          SLOT=$(( (NOW / 900) % 16 ))
-          # Slot 0 = the :00 boundary of each 4h block. Slots 0-1 = :00 to :29.
-          # Widened from slot==0 to slot<=1 so a cron delayed up to ~29 min
-          # still lands in the full-archive window.
-          if [ "${{ inputs.brain_report }}" = "true" ] || [ "$SLOT" -le 1 ]; then
+          if [ "${{ inputs.brain_report }}" = "true" ] || [ $(( (NOW / 900) % 16 )) -eq 0 ]; then
             echo "brain_full=true"  >> "$GITHUB_OUTPUT"
             echo "archive_days=185" >> "$GITHUB_OUTPUT"
-            echo "🧠 Brain-report run: full 185-day archive (slot=$SLOT)"
+            echo "🧠 Brain-report run: full 185-day archive"
           else
             echo "brain_full=false" >> "$GITHUB_OUTPUT"
             echo "archive_days=3"   >> "$GITHUB_OUTPUT"
-            echo "⚡ Alert-only run: 3-day archive (slot=$SLOT)"
+            echo "⚡ Alert-only run: 3-day archive"
           fi
 
       - name: 📦 Checkout outcome-data archive
