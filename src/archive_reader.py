@@ -8,10 +8,11 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# Single source of truth for "current schema" — importing from the writer
-# guarantees reader and writer can never drift.
-from outcome_storage import OUTCOME_SCHEMA_VERSION as CURRENT_SCHEMA_VERSION
-
+from outcome_storage import (
+    OUTCOME_SCHEMA_VERSION as CURRENT_SCHEMA_VERSION,
+    MINIMUM_VIABLE_FIELDS,
+    NULLABLE_MIGRATION_FIELDS,
+)
 _log = logging.getLogger("macd_bot")
 
 def _coerce_bool(val, default=None):
@@ -70,11 +71,21 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
         if "win" not in raw:
             return None
 
-        # ── Class 2: reject rows written under an older schema ──
+        # ── Class 2: migrate rows written under an older schema ──
         # Missing schema_version means pre-versioning (implicit v1).
         row_schema = int(raw.get("schema_version", 1))
+        is_migrated = False
         if drop_stale_schema and row_schema != CURRENT_SCHEMA_VERSION:
-            return None
+            # ── Migration viability check ──
+            # A stale row is migratable ONLY if it carries the minimum
+            # viable fields. Without win + pct_move + score + total,
+            # it cannot contribute to ANY Brain analysis.
+            missing_viable = MINIMUM_VIABLE_FIELDS - set(raw.keys())
+            if missing_viable:
+                # Genuinely unusable — discard.
+                return None
+            # Migratable: proceed with None-fill for missing enrichment fields.
+            is_migrated = True
 
         entry_ts = int(raw.get("entry_ts", 0))
         if entry_ts <= 0:
@@ -193,6 +204,7 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
             "rejection_reason": _rejection_reason,
             # ── Provenance — lets downstream consumers audit vintage ──
             "schema_version": row_schema,
+            "migrated": is_migrated,
         }
     except Exception:
         return None
@@ -231,11 +243,12 @@ def load_archived_outcomes(
         "lines_malformed": 0,
         "dropped_missing_win": 0,
         "dropped_stale_schema": 0,
+        "dropped_unmigratable": 0,
+        "migrated_forward": 0,
         "dropped_before_window": 0,
         "dropped_duplicate_sid": 0,
         "kept": 0,
     }
-
     if not root.exists():
         return ([], stats) if return_stats else []
 
@@ -288,18 +301,20 @@ def load_archived_outcomes(
                         stats["dropped_before_window"] += 1
                         continue
 
-                    # Pre-classify drop reasons so the counters are
-                    # attributable. _parse_jsonl_row also filters these,
-                    # but returns a single None with no cause, which
-                    # makes debugging schema issues slow.
+             
                     if "win" not in raw:
                         stats["dropped_missing_win"] += 1
                         continue
                     if drop_stale_schema:
                         row_schema = int(raw.get("schema_version", 1))
                         if row_schema != CURRENT_SCHEMA_VERSION:
-                            stats["dropped_stale_schema"] += 1
-                            continue
+                            # Check if migratable before counting as dropped
+                            missing_viable = MINIMUM_VIABLE_FIELDS - set(raw.keys())
+                            if missing_viable:
+                                stats["dropped_unmigratable"] += 1
+                                continue
+                            # Migratable — let _parse_jsonl_row handle it
+                            stats["migrated_forward"] += 1
 
                     parsed = _parse_jsonl_row(raw, drop_stale_schema=drop_stale_schema)
                     if parsed:
@@ -311,16 +326,17 @@ def load_archived_outcomes(
     dropped_total = (
         stats["dropped_missing_win"]
         + stats["dropped_stale_schema"]
+        + stats["dropped_unmigratable"]
         + stats["dropped_before_window"]
         + stats["dropped_duplicate_sid"]
         + stats["lines_malformed"]
     )
-
-    if dropped_total > 0:
+    if dropped_total > 0 or stats["migrated_forward"] > 0:
         _log.info(
             f"📚 archive_reader ({label}): kept {stats['kept']} rows | "
+            f"migrated_forward={stats['migrated_forward']}, "
             f"dropped signal-only={stats['dropped_missing_win']}, "
-            f"stale-schema={stats['dropped_stale_schema']}, "
+            f"unmigratable={stats['dropped_unmigratable']}, "
             f"out-of-window={stats['dropped_before_window']}, "
             f"dup-sid={stats['dropped_duplicate_sid']}, "
             f"malformed={stats['lines_malformed']}"

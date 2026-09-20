@@ -69,12 +69,15 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
         header_lines.append("")
         header_lines.extend(audit.build_action_gate_summary(action_gate))
 
+
     # Schema migration advisory
     archive_stats = recs.get("_archive_stats", {})
     if archive_stats:
         advisory = audit.schema_migration_advisory(
             current_version=4,
             stale_count=archive_stats.get("dropped_stale_schema", 0),
+            migrated_count=archive_stats.get("migrated_forward", 0),
+            unmigratable_count=archive_stats.get("dropped_unmigratable", 0),
             total_archive_rows=archive_stats.get("lines_total", 0),
         )
         if advisory:

@@ -767,26 +767,34 @@ class BrainAuditLayer:
         self,
         current_version: int,
         stale_count: int,
+        migrated_count: int,
+        unmigratable_count: int,
         total_archive_rows: int,
     ) -> Optional[str]:
-        """Advise on schema migration when significant history is locked
-        behind an older schema version."""
-        if stale_count == 0:
+        """Advise on schema migration health. With the migration layer active,
+        stale rows are mapped forward rather than dropped. This advisory now
+        reports migration success and flags genuinely lost rows."""
+        if stale_count == 0 and migrated_count == 0:
             return None
 
-        pct_lost = stale_count / max(total_archive_rows, 1) * 100
-        if pct_lost < 5:
-            return None  # Not worth flagging
+        if unmigratable_count > 0:
+            pct_lost = unmigratable_count / max(total_archive_rows, 1) * 100
+            return (
+                f"⚠️ SCHEMA MIGRATION: {migrated_count} rows successfully "
+                f"migrated from v<{current_version}. "
+                f"{unmigratable_count} rows ({pct_lost:.0f}%) were genuinely "
+                f"unusable (missing win/pct_move/score) and discarded."
+            )
 
-        return (
-            f"⚠️ SCHEMA MIGRATION ADVISORY: {stale_count} rows "
-            f"({pct_lost:.0f}% of archive) are locked behind schema "
-            f"v<{current_version}. These contain valid trade outcomes "
-            f"that the Brain cannot use. Consider implementing a "
-            f"migration/normalization layer to recover safely-mappable "
-            f"fields (win, pct_move, entry_ts, score, alert_key) from "
-            f"older schema rows."
-        )
+        if migrated_count > 0:
+            return (
+                f"✅ SCHEMA MIGRATION: {migrated_count} historical rows "
+                f"migrated forward from v<{current_version}. "
+                f"Three-metric and R:R analyses will show reduced coverage "
+                f"for these rows (fields set to None)."
+            )
+
+        return None
 
     # ── Full Audit Summary ────────────────────────────────────────────
 

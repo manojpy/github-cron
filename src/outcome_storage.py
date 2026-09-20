@@ -16,6 +16,53 @@ from bot_config import cfg
 
 OUTCOME_SCHEMA_VERSION = 4
 
+# ── Schema field registry ────────────────────────────────────────────
+# Defines which fields were INTRODUCED in each schema version.
+# Used by archive_reader.py's migration layer to determine whether
+# a stale-schema row can be safely mapped forward.
+#
+# A row is migratable if it carries the MINIMUM_VIABLE_FIELDS.
+# Missing fields from later schemas are set to None (never fabricated).
+SCHEMA_FIELD_REGISTRY: Dict[int, List[str]] = {
+    1: [
+        "pair", "alert_key", "direction", "entry_ts", "score", "total",
+        "win", "pct_move", "session", "votes", "context",
+    ],
+    2: [
+        "mae", "mfe", "close_win", "mfe_win", "mae_loss", "tp_first",
+        "outcome_reason",
+    ],
+    3: [
+        "bonus_win", "rr_achieved", "win_weight",
+    ],
+    4: [
+        "signal_price", "fill_price", "fees_paid_pct",
+        "net_pnl_pct", "realized_cost_pct",
+        "adx_val", "effective_score", "effective_required",
+        "macro_multiplier", "cluster_penalty", "gate_passed",
+    ],
+}
+
+# The absolute minimum fields a row must carry to be useful for ANY
+# Brain analysis. Without these, the row is genuinely unusable.
+MINIMUM_VIABLE_FIELDS = frozenset({
+    "pair", "alert_key", "direction", "entry_ts", "score", "total",
+    "win", "pct_move",
+})
+
+# Fields that are safe to default to None when missing from older schemas.
+# These are informational/enrichment fields — their absence degrades
+# specific analyses but doesn't corrupt core WR/EV/threshold math.
+NULLABLE_MIGRATION_FIELDS = frozenset({
+    "mae", "mfe", "close_win", "mfe_win", "mae_loss", "tp_first",
+    "outcome_reason", "bonus_win", "rr_achieved", "win_weight",
+    "signal_price", "fill_price", "fees_paid_pct",
+    "net_pnl_pct", "realized_cost_pct",
+    "adx_val", "effective_score", "effective_required",
+    "macro_multiplier", "cluster_penalty", "gate_passed",
+    "votes", "context", "session",
+})
+
 _OUTCOME_DIR = getattr(cfg, "OUTCOME_DATA_DIR", "outcome-data")
 os.makedirs(os.path.join(_OUTCOME_DIR, "outcomes"), exist_ok=True)
 os.makedirs(os.path.join(_OUTCOME_DIR, "shadow"), exist_ok=True)
