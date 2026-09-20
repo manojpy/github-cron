@@ -68,6 +68,23 @@ os.makedirs(os.path.join(_OUTCOME_DIR, "outcomes"), exist_ok=True)
 os.makedirs(os.path.join(_OUTCOME_DIR, "shadow"), exist_ok=True)
 os.makedirs(os.path.join(_OUTCOME_DIR, "reports"), exist_ok=True)
 
+# ── Fail fast if the archive is not writable ──────────────────────────
+# makedirs(exist_ok=True) succeeds on an existing-but-unwritable dir, so
+# it cannot catch the container-appuser/runner-uid mismatch. Probe each
+# subdir with a real write so the failure is loud at import time instead
+# of a swallowed warning inside resolve_shadow_pending_outcomes().
+for _sub in ("outcomes", "shadow", "reports"):
+    _probe = os.path.join(_OUTCOME_DIR, _sub, ".write_probe")
+    try:
+        with open(_probe, "w") as _f:
+            _f.write("ok")
+        os.remove(_probe)
+    except OSError as _e:
+        raise RuntimeError(
+            f"OUTCOME_DATA_DIR/{_sub} is not writable ({_e}). "
+            f"Fix the container mount/perms before dispatching — "
+            f"silent archive loss corrupts every downstream analysis."
+        )
 _write_locks: Dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
 
