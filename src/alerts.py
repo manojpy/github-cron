@@ -1394,7 +1394,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             if not def_:
                 continue
 
-        _brain_disabled = alert_key in disabled_alert_keys
+            _brain_disabled = alert_key in disabled_alert_keys
             if _brain_disabled and not _track_disabled:
                 if cfg.DEBUG_MODE:
                     logger_pair.debug(f"Skipping {alert_key}: brain-disabled (underperforming, per-key)")
