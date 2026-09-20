@@ -1139,7 +1139,7 @@ class BrainEngineV2(BaseBrainEngine):
                         f"Current weights are better. No changes applied."
                     ),
                 })
-       _phase_mark("weight_optimizer")
+        _phase_mark("weight_optimizer")
 
         # ─ Per-alert breakdown ──────────────────────────────────────────
         alert_stats = engine.per_alert_breakdown(real_rows, min_sample=min_sample)
