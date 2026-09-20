@@ -1576,9 +1576,10 @@ class BrainEngineV2(BaseBrainEngine):
                 sum(1 for r in shadow_rows if r["win"]) / len(shadow_rows), 4
             )
 
-        # ── Action gate: suppress config patches unless evidence is strong ──
+        # ─ Action gate: suppress config patches unless evidence is strong ──      
         _active_drift_keys: List[str] = []
-        _below_floor_drift: List[str] = []
+        _below_floor_drift: List[Tuple[str, int]] = []
+
         if getattr(cfg, "BRAIN_ACTION_GATE_ENABLED", True):
             _cusum_min_n = int(getattr(cfg, "BRAIN_CUSUM_MIN_SAMPLE", 30))
             try:
