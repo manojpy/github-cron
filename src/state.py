@@ -12,6 +12,7 @@ from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError, CON
 from fetcher import compute_backoff
 
 StreamField = Union[bytes, memoryview, str, int, float]
+BRAIN_KEY_HISTORY_METADATA_KEY = "brain_alert_key_history"
 
 if TYPE_CHECKING:
     from fetcher import PriceData

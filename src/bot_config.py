@@ -119,7 +119,6 @@ CONFIG_OVERRIDE_ALLOWED_FIELDS: Set[str] = {
 BRAIN_DISABLED_KEYS_METADATA_KEY = "brain_disabled_alert_keys"
 CONFIG_OVERRIDE_METADATA_KEY = "config_override"
 PAIR_THRESHOLDS_METADATA_KEY = "pair_confluence_thresholds"
-BRAIN_KEY_HISTORY_METADATA_KEY = "brain_alert_key_history"
 
 
 class Constants:
