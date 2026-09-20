@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional
 from outcome_storage import (
     OUTCOME_SCHEMA_VERSION as CURRENT_SCHEMA_VERSION,
     MINIMUM_VIABLE_FIELDS,
-    NULLABLE_MIGRATION_FIELDS,
 )
 _log = logging.getLogger("macd_bot")
 

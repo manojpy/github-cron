@@ -13,9 +13,9 @@ import os
 from pathlib import Path
 
 from brain_audit import (
-    BrainAuditLayer, HealthStatus, DataCoverage, RecommendationTier,
-    get_audit, reset_audit,
+    DataCoverage, RecommendationTier, get_audit, reset_audit,
 )
+
 from archive_reader import load_archived_outcomes
 from bot_config import cfg, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS, json_dumps, json_loads
 from state import RedisKeyPrefix, RedisStateStore
@@ -123,11 +123,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     # ── BOTTOM LINE ────────────────────────────────────────────────────
     try:
         buy_wr, buy_n, sell_wr, sell_n = engine.direction_split(rows)    
-        ev_obj = engine.ev_first_objective(rows, min_sample=10) if rows else None
-        ev_positive = (
-            ev_obj.get("p_ev_positive", 0) >= 0.85
-            if ev_obj and ev_obj.get("valid") else False
-        )
+        ev_obj = engine.ev_first_objective(rows, min_sample=10) if rows else None    
         verdict = audit.qualify_verdict(
             net_ev=net_ev, wr=wr, n=n,
             p_ev_positive=ev_obj.get("p_ev_positive", 0) if ev_obj else 0.0,

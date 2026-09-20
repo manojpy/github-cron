@@ -303,8 +303,6 @@ class BrainAuditLayer:
         """Compute and store history coverage from loaded rows."""
         if requested_days is None:
             requested_days = getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180)
-
-        now_ts = time.time()
         n = len(rows)
         self._n_rows = n
 
@@ -599,7 +597,7 @@ class BrainAuditLayer:
         # Outcome reconciliation
         if self._reconciliation:
             recon = self._reconciliation
-            lines.append(f"   Outcome reconciliation:")
+            lines.append("   Outcome reconciliation:")
             for line in recon.to_report_lines():
                 lines.append(line)
             if recon.notes:
