@@ -1584,35 +1584,28 @@ class BrainEngine:
             pair_recs = engine.per_pair_thresholds(
                 real_rows, target_winrate=target_wr, min_sample=pair_min_sample,
             )
-            
-            # Walk-forward validation is computed once globally for real_rows
-            _wf_allowed, _wf_reason = audit.can_run("walk_forward")
-            if _wf_allowed:
-                wf = engine.validate_threshold_walk_forward(
-                    real_rows, target_winrate=target_wr, min_sample=min_sample,
-                )
-            else:
-                wf = {"valid": False, "error": "audit_gate", "audit_reason": _wf_reason}
-
             current_pair_thresholds = await self.sdb.get_pair_thresholds()
-
             pair_threshold_lines = []
-            
+
             for pair, prec in pair_recs.items():
                 suggested = prec["recommended"]
                 current = current_pair_thresholds.get(pair, cfg.CONFLUENCE_MIN_ABS_SCORE)
                 if abs(suggested - current) < 0.5:
                     continue
-                
+
                 pair_rows = [r for r in real_rows if r["pair"] == pair]
-                
-                if wf["valid"] and wf.get("passed") is False:
+                pair_wf = engine.validate_threshold_walk_forward(
+                    pair_rows, target_winrate=target_wr, min_sample=pair_min_sample,
+                )
+
+                if pair_wf.get("valid") and pair_wf.get("passed") is False:
                     pair_threshold_lines.append(
                         f"  • {pair}: suggested {suggested:.1f} (was {current:.1f}) — "
-                        f"NOT applied, failed walk-forward ({wf['holdout_wr']:.0%} holdout WR)"
+                        f"NOT applied, failed walk-forward "
+                        f"({pair_wf['holdout_wr']:.0%} holdout WR on n={len(pair_rows)})"
                     )
                     continue
-                
+
                 history = await self.sdb.load_threshold_history(key_suffix=pair)
                 gate_ok, gate_reason = self.stability_gate.approve(suggested, history)
                 if not gate_ok:
@@ -1621,15 +1614,20 @@ class BrainEngine:
                         f"NOT applied, stability gate: {gate_reason}"
                     )
                     continue
-                
+
                 await self.sdb.save_threshold_value(suggested, key_suffix=pair)
                 applied = await self.sdb.set_pair_threshold(pair, suggested)
                 if applied:
+                    _wf_tag = (
+                        f", WF {pair_wf['holdout_wr']:.0%} holdout WR"
+                        if pair_wf.get("valid") and pair_wf.get("passed") is True
+                        else ", WF provisional"
+                    )
                     pair_threshold_lines.append(
                         f"  • {pair}: {current:.1f} -> {suggested:.1f} "
-                        f"({prec['rec_wr']:.0%} WR, n={prec['rec_n']}) [applied]"
+                        f"({prec['rec_wr']:.0%} WR, n={prec['rec_n']}{_wf_tag}) [applied]"
                     )
-            
+
             if pair_threshold_lines:
                 recommendations.append({
                     "type": "pair_thresholds", "severity": "medium",
