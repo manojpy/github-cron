@@ -204,8 +204,8 @@ jobs:
           git checkout main
           cd -
 
-          chmod -R 777 /tmp/data-repo
           mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
+          chmod -R 777 /tmp/data-repo
 
           # ── AUDIT: prove what actually landed on disk ──
           echo "=== /tmp/data-repo top level ==="
