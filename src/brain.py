@@ -1459,7 +1459,7 @@ class BrainEngine:
                 "bonus_rate": round(mm_summary.get("bonus_rate", 0.0), 4),
                 "avg_rr_achieved": round(mm_summary.get("avg_rr_achieved", 0.0), 2),
                 "weighted_wr": round(mm_summary.get("weighted_wr", 0.0), 4),
-                # ��─ FDR: exact McNemar on the discordant 2×2 cells ──
+                # ─ FDR: exact McNemar on the discordant 2×2 cells ──
                 # Not a two-proportion test — see mcnemar_exact_p docstring.
                 "n": mm_summary["n"],
                 "mfe_only": mm_summary.get("mfe_only", 0),
@@ -1593,7 +1593,7 @@ class BrainEngine:
                 )
             else:
                 wf = {"valid": False, "error": "audit_gate", "audit_reason": _wf_reason}
-            if wf["valid"] and wf.get("passed") is False:
+             if wf["valid"] and wf.get("passed") is False:
 
             current_pair_thresholds = await self.sdb.get_pair_thresholds()
             pair_threshold_lines = []
