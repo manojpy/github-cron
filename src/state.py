@@ -1170,7 +1170,6 @@ class RedisStateStore:
         win_weight = _compute_win_weight(rr_achieved, win)
 
         # ── NET P&L (cost-adjusted, fill-aware when available) ──
-        # ── NET P&L (cost-adjusted, fill-aware when available) ──
         # FIX (Priority 1): pct_move is already computed from anchor_price
         # (fill_price), so net_pnl_pct is consistent.
         fee_pct = getattr(cfg, "BRAIN_FEE_PCT", 0.0006)
@@ -1881,6 +1880,57 @@ class RedisStateStore:
             )
         except Exception:
             pass
+
+    async def load_cusum_bulk(
+        self, alert_keys: List[str],
+    ) -> Optional[Dict[str, Tuple[int, Optional[Dict[str, Any]]]]]:
+        """(watermark, persisted_state) for every alert_key in ONE pipelined
+        round-trip. Returns None when the read fails or Redis is degraded:
+        callers must then skip the CUSUM update, because a fabricated 0
+        watermark would replay the whole window into the detectors."""
+        if not alert_keys:
+            return {}
+        if self.degraded or not self._redis:
+            return None
+        try:
+            async with self._redis.pipeline() as pipe:
+                for ak in alert_keys:
+                    pipe.get(f"{RedisKeyPrefix.CUSUM_WATERMARK}{ak}")
+                    pipe.get(f"{RedisKeyPrefix.CUSUM_STATE}{ak}")
+                raw = await asyncio.wait_for(_execute_pipeline(pipe), timeout=5.0)
+        except Exception as e:
+            logger.warning(f"CUSUM bulk load failed: {e}")
+            return None
+        out: Dict[str, Tuple[int, Optional[Dict[str, Any]]]] = {}
+        for idx, ak in enumerate(alert_keys):
+            wm_raw, st_raw = raw[2 * idx], raw[2 * idx + 1]
+            try:
+                wm = int(wm_raw) if wm_raw else 0
+            except (TypeError, ValueError):
+                wm = 0
+            try:
+                st = json_loads(st_raw) if st_raw else None
+            except Exception:
+                st = None
+            out[ak] = (wm, st)
+        return out
+
+    async def save_cusum_bulk(
+        self, items: List[Tuple[str, Dict[str, Any], int]],
+    ) -> bool:
+        """Persist (alert_key, state, watermark) triples in ONE round-trip."""
+        if not items or self.degraded or not self._redis:
+            return False
+        try:
+            async with self._redis.pipeline() as pipe:
+                for ak, st, wm in items:
+                    pipe.set(f"{RedisKeyPrefix.CUSUM_STATE}{ak}", json_dumps(st), ex=30 * 86400)
+                    pipe.set(f"{RedisKeyPrefix.CUSUM_WATERMARK}{ak}", str(int(wm)), ex=30 * 86400)
+                await asyncio.wait_for(_execute_pipeline(pipe), timeout=5.0)
+            return True
+        except Exception as e:
+            logger.warning(f"CUSUM bulk save failed: {e}")
+            return False
 
     async def load_threshold_history(self, key_suffix: str = "") -> List[float]:
         """key_suffix="" (default) is the existing global CONFLUENCE_MIN_ABS_SCORE

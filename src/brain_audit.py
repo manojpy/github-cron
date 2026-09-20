@@ -562,30 +562,31 @@ class BrainAuditLayer:
     def validate_cusum_watermark(
         self,
         alert_key: str,
-        old_watermark: int,
-        new_watermark: int,
+        watermark: int,
+        newest_row_ts: int,
         rows_consumed: int,
+        state_n: int = 0,
     ) -> Optional[str]:
-        """Verify monotonic watermark advancement. Returns warning or None."""
-        if new_watermark < old_watermark:
+        """Sanity-check a CUSUM watermark against the data actually loaded.
+        (Comparing old vs new watermark is vacuous: new rows are already
+        filtered to entry_ts > watermark.) Returns a warning or None."""
+        if watermark > newest_row_ts:
             msg = (
-                f"CUSUM watermark REGRESSION for {alert_key}: "
-                f"{old_watermark} → {new_watermark}. "
-                f"History replay risk."
+                f"CUSUM watermark AHEAD of data for {alert_key}: "
+                f"{watermark} > newest row {newest_row_ts}. New outcomes "
+                f"will be ignored (archive reset or corrupted watermark)."
             )
-            _log.warning(f"Brain audit: {msg}")
-            self.record_analysis(
-                "cusum", HealthStatus.DEGRADED, detail=msg
-            )
-            return msg
-        if rows_consumed > 0 and new_watermark == old_watermark:
+        elif watermark == 0 and state_n > 0 and rows_consumed > 0:
             msg = (
-                f"CUSUM watermark STALLED for {alert_key}: "
-                f"consumed {rows_consumed} rows but watermark unchanged."
+                f"CUSUM watermark MISSING for {alert_key} while detector "
+                f"has n={state_n}: replaying {rows_consumed} rows risks "
+                f"double-counting."
             )
-            _log.warning(f"Brain audit: {msg}")
-            return msg
-        return None
+        else:
+            return None
+        _log.warning(f"Brain audit: {msg}")
+        self.record_analysis("cusum", HealthStatus.DEGRADED, detail=msg)
+        return msg
 
     # ── Report Generation ─────────────────────────────────────────────
 

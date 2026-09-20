@@ -685,22 +685,44 @@ class BrainEngine:
         for r in real_rows:
             by_alert[r["alert_key"]].append(r)
 
+        if not by_alert:
+            return drift_alerts
+
+        audit = get_audit()
+        # ONE pipelined read for every key's watermark + persisted state
+        # (was 2-4 sequential round-trips per key). None = read failed:
+        # skip the update rather than replay history from a fake 0 watermark.
+        bulk = await self.sdb.load_cusum_bulk(list(by_alert))
+        if bulk is None:
+            audit.record_analysis(
+                "cusum", HealthStatus.UNAVAILABLE,
+                detail="Redis read failed — CUSUM update skipped this cycle",
+            )
+            return drift_alerts
+
+        to_save: List[Tuple[str, Dict[str, Any], int]] = []
         for alert_key, rows in by_alert.items():
-            watermark = await self.sdb.load_cusum_watermark(alert_key)
+            watermark, saved = bulk[alert_key]
+            if alert_key not in self._cusum_detectors:
+                self._cusum_detectors[alert_key] = (
+                    CUSUMDetector.from_dict(saved) if saved else CUSUMDetector(
+                        target_wr=cfg.MIN_WIN_RATE,
+                        drift_delta=getattr(cfg, "BRAIN_CUSUM_DRIFT_DELTA", 0.10),
+                        threshold=getattr(cfg, "BRAIN_CUSUM_THRESHOLD", 2.0),
+                    )
+                )
+            det = self._cusum_detectors[alert_key]
             rows_sorted = sorted(
                 (r for r in rows if r.get("entry_ts", 0) > watermark),
                 key=lambda r: r.get("entry_ts", 0),
             )
-            if not rows_sorted:
-                continue
-        # ── AUDIT: validate watermark monotonicity ──
-            audit = get_audit()
-            new_watermark = rows_sorted[-1]["entry_ts"]
+            # ── AUDIT: watermark sanity vs the data actually loaded ──
             wm_warning = audit.validate_cusum_watermark(
                 alert_key=alert_key,
-                old_watermark=watermark,
-                new_watermark=new_watermark,
+                watermark=watermark,
+                newest_row_ts=max(r.get("entry_ts", 0) for r in rows),
                 rows_consumed=len(rows_sorted),
+                state_n=det.n,
             )
             if wm_warning:
                 drift_alerts.append({
@@ -709,10 +731,10 @@ class BrainEngine:
                     "alert": alert_key,
                     "message": f"⚠️ {wm_warning}",
                 })
+            if not rows_sorted:
+                continue
 
-            det = await self._load_or_create_cusum(alert_key)
             for r in rows_sorted:
-
                 # Deliberately binary: CUSUM detects edge DECAY. s_neg only
                 # accumulates on losses (x < mu), so bonus-weighting wins
                 # cannot change decay detection — keep raw win/loss here.
@@ -734,8 +756,8 @@ class BrainEngine:
                         ),
                     })
                     break
-            await self.sdb.save_cusum_state(alert_key, det.to_dict())
-            await self.sdb.save_cusum_watermark(alert_key, rows_sorted[-1]["entry_ts"])
+            to_save.append((alert_key, det.to_dict(), rows_sorted[-1]["entry_ts"]))
+        await self.sdb.save_cusum_bulk(to_save)
         return drift_alerts
 
     @staticmethod

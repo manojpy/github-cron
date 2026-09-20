@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 
 from brain_audit import (
-    DataCoverage, RecommendationTier, get_audit, reset_audit,
+    DataCoverage, HealthStatus, RecommendationTier, get_audit, reset_audit,
 )
 
 from archive_reader import load_archived_outcomes
@@ -683,21 +683,6 @@ class BrainEngineV2(BaseBrainEngine):
             medium_rows = load_archived_outcomes(data_dir, window_days=medium_days, shadow=False)
             long_rows = load_archived_outcomes(data_dir, window_days=long_days, shadow=False)
 
-            # ── FIX (Priority 2): Warn when actual data range is shorter
-            # than configured, so pipeline regressions are visible. ──
-            _logger = logging.getLogger("macd_bot")
-            now_ts = time.time()
-            if long_rows:
-                oldest_ts = min(r.get("entry_ts", now_ts) for r in long_rows)
-                actual_days = (now_ts - oldest_ts) / 86400.0
-                if actual_days < long_days * 0.8:
-                    _logger.warning(
-                        f"⚠️ Brain history shortfall: configured "
-                        f"BRAIN_LONG_WINDOW_DAYS={long_days} but oldest row is "
-                        f"only {actual_days:.0f} days old. Layered window "
-                        f"analysis will be degraded."
-                    )
-
             result = (recent_rows, medium_rows, long_rows)
             self._layered_rows_cache = result
             return result
@@ -801,8 +786,8 @@ class BrainEngineV2(BaseBrainEngine):
         shadow_rows = base_recs.get("_shadow_rows", [])
         # ══════════════════════════════════════════════════════════════════
         #  BRAIN AUDIT LAYER — initialize and validate data population
-        # ══════════════════════════════════════════════════════════════════
-        audit = reset_audit()
+        # ══════════════════════════════════════════════════════════════════  
+        audit = get_audit()  # keep coverage/reconciliation set during baseline
 
         # History coverage was already set in _generate_baseline_recommendations
         long_days = getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180)
@@ -964,7 +949,13 @@ class BrainEngineV2(BaseBrainEngine):
         _phase_mark("wiring_and_config_regression")
 
         # ── Phase 1.5: Vote Weight Optimizer (FIXED) ─────────────────────
-        if len(real_rows) >= self._phase_samples["weight_optimizer"]:
+        _wopt_ok, _wopt_why = audit.can_run("weight_optimizer")
+        if not _wopt_ok:
+            audit.record_analysis(
+                "weight_optimizer", HealthStatus.INSUFFICIENT_DATA,
+                detail=_wopt_why,
+            )
+        if _wopt_ok and len(real_rows) >= self._phase_samples["weight_optimizer"]:
             wopt = optimize_vote_weights(
                 real_rows, CONFLUENCE_WEIGHTS,
                 min_sample=self._phase_samples["weight_optimizer"],
@@ -1590,11 +1581,20 @@ class BrainEngineV2(BaseBrainEngine):
             _cusum_min_n = int(getattr(cfg, "BRAIN_CUSUM_MIN_SAMPLE", 30))
             try:
                 _seen_aks = {r["alert_key"] for r in real_rows}
-                for _ak in _seen_aks:
-                    _cusum_state = await self.sdb.load_cusum_state(_ak)
-                    if not _cusum_state:
-                        continue
+                # Detectors were loaded + updated by _check_cusum_drift, so
+                # reuse them; bulk-read (one round-trip) only what is missing.
+                _states: Dict[str, Dict[str, Any]] = {
+                    ak: self._cusum_detectors[ak].to_dict()
+                    for ak in _seen_aks if ak in self._cusum_detectors
+                }
+                _missing = [ak for ak in _seen_aks if ak not in _states]
+                if _missing:
+                    for _ak, (_wm, _st) in ((await self.sdb.load_cusum_bulk(_missing)) or {}).items():
+                        if _st:
+                            _states[_ak] = _st
+                for _ak, _cusum_state in _states.items():
                     if _cusum_state.get("s_neg", 0.0) <= _cusum_state.get("h", 2.0):
+
                         continue
                     _n_seen = int(_cusum_state.get("n", 0))
                     if _n_seen >= _cusum_min_n:
