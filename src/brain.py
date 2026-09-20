@@ -1176,34 +1176,45 @@ class BrainEngine:
                     "note": "Derived from suggested abs score / avg total this window — informational, "
                     "the abs score patch above is the one that reliably binds.",
                 })
-
         if cfg.BRAIN_MC_SIMULATIONS > 0:
-            _mc_seed = int(
-                engine.hash_config_state(
-                    CONFLUENCE_WEIGHTS,
-                    cfg.CONFLUENCE_MIN_ABS_SCORE,
-                    cfg.CONFLUENCE_MIN_PCT,
-                ),
-                16,
-            ) & 0xFFFFFFFF
-            mc = engine.monte_carlo_walk_forward(
-                real_rows, n_simulations=cfg.BRAIN_MC_SIMULATIONS,
-                min_sample=min_sample, target_winrate=target_wr,
-                seed=_mc_seed,
-            )
-
-            if mc["valid"]:
-                robust_icon = "✅ ROBUST" if mc["robustness_score"] > 2.0 else "⚠️ FRAGILE"
-                recommendations.append({
-                    "type": "monte_carlo_robustness", "severity": "low",
-                    "message": (
-                        f"Monte Carlo ({mc['n_simulations']} block-bootstrap sims): "
-                        f"OOS WR mean {mc['oos_wr_mean']:.0%} ±{mc['oos_wr_std']:.0%}, "
-                        f"worst-case (5th pct) {mc['oos_wr_p5']:.0%}. "
-                        f"Robustness {mc['robustness_score']:.2f} — {robust_icon}\n"
-                        f"Diagnostic only — does not change the config patch above."
+            # ── Audit gate: MC is O(BRAIN_MC_SIMULATIONS × caps) bootstraps
+            # against the same rows. On a 2-day archive it burns ~15s to
+            # produce a statistic the audit layer already knows is
+            # unreliable. Consult can_run() first; if it says the sample
+            # or history is insufficient, record the skip and move on. ──
+            _mc_allowed, _mc_reason = audit.can_run("monte_carlo")
+            if _mc_allowed:
+                _mc_seed = int(
+                    engine.hash_config_state(
+                        CONFLUENCE_WEIGHTS,
+                        cfg.CONFLUENCE_MIN_ABS_SCORE,
+                        cfg.CONFLUENCE_MIN_PCT,
                     ),
-                })
+                    16,
+                ) & 0xFFFFFFFF
+                mc = engine.monte_carlo_walk_forward(
+                    real_rows, n_simulations=cfg.BRAIN_MC_SIMULATIONS,
+                    min_sample=min_sample, target_winrate=target_wr,
+                    seed=_mc_seed,
+                )
+
+                if mc["valid"]:
+                    robust_icon = "✅ ROBUST" if mc["robustness_score"] > 2.0 else "⚠️ FRAGILE"
+                    recommendations.append({
+                        "type": "monte_carlo_robustness", "severity": "low",
+                        "message": (
+                            f"Monte Carlo ({mc['n_simulations']} block-bootstrap sims): "
+                            f"OOS WR mean {mc['oos_wr_mean']:.0%} ±{mc['oos_wr_std']:.0%}, "
+                            f"worst-case (5th pct) {mc['oos_wr_p5']:.0%}. "
+                            f"Robustness {mc['robustness_score']:.2f} — {robust_icon}\n"
+                            f"Diagnostic only — does not change the config patch above."
+                        ),
+                    })
+            else:
+                audit.record_analysis(
+                    "monte_carlo", HealthStatus.INSUFFICIENT_DATA,
+                    detail=_mc_reason,
+                )
 
         rb = engine.regime_breakdown(real_rows, min_sample=min_sample)
         if rb["valid"] and "wr_gap" in rb:
@@ -1573,23 +1584,34 @@ class BrainEngine:
             pair_recs = engine.per_pair_thresholds(
                 real_rows, target_winrate=target_wr, min_sample=pair_min_sample,
             )
+            
+            # Walk-forward validation is computed once globally for real_rows
+            _wf_allowed, _wf_reason = audit.can_run("walk_forward")
+            if _wf_allowed:
+                wf = engine.validate_threshold_walk_forward(
+                    real_rows, target_winrate=target_wr, min_sample=min_sample,
+                )
+            else:
+                wf = {"valid": False, "error": "audit_gate", "audit_reason": _wf_reason}
+
             current_pair_thresholds = await self.sdb.get_pair_thresholds()
             pair_threshold_lines = []
+            
             for pair, prec in pair_recs.items():
                 suggested = prec["recommended"]
                 current = current_pair_thresholds.get(pair, cfg.CONFLUENCE_MIN_ABS_SCORE)
                 if abs(suggested - current) < 0.5:
                     continue
+                
                 pair_rows = [r for r in real_rows if r["pair"] == pair]
-                wf = engine.validate_threshold_walk_forward(
-                    pair_rows, target_winrate=target_wr, min_sample=pair_min_sample,
-                )
+                
                 if wf["valid"] and wf.get("passed") is False:
                     pair_threshold_lines.append(
                         f"  • {pair}: suggested {suggested:.1f} (was {current:.1f}) — "
                         f"NOT applied, failed walk-forward ({wf['holdout_wr']:.0%} holdout WR)"
                     )
                     continue
+                
                 history = await self.sdb.load_threshold_history(key_suffix=pair)
                 gate_ok, gate_reason = self.stability_gate.approve(suggested, history)
                 if not gate_ok:
@@ -1598,6 +1620,7 @@ class BrainEngine:
                         f"NOT applied, stability gate: {gate_reason}"
                     )
                     continue
+                
                 await self.sdb.save_threshold_value(suggested, key_suffix=pair)
                 applied = await self.sdb.set_pair_threshold(pair, suggested)
                 if applied:
@@ -1605,6 +1628,7 @@ class BrainEngine:
                         f"  • {pair}: {current:.1f} -> {suggested:.1f} "
                         f"({prec['rec_wr']:.0%} WR, n={prec['rec_n']}) [applied]"
                     )
+            
             if pair_threshold_lines:
                 recommendations.append({
                     "type": "pair_thresholds", "severity": "medium",
@@ -1857,7 +1881,9 @@ class BrainEngine:
                 # ── NEW: rolling walk-forward ─
                 "rolling_wf": (
                     engine.rolling_walk_forward(real_rows, n_folds=5)
-                    if len(real_rows) >= min_sample * 6 else None
+                    if audit.can_run("walk_forward")[0]
+                    and len(real_rows) >= min_sample * 6
+                    else None
                 ),
             },
         }
