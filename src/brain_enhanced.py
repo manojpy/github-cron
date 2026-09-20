@@ -603,13 +603,23 @@ class BrainEngineV2(BaseBrainEngine):
             "execution": True,
         }
 
-        # OOS prediction: rolling walk-forward must pass
-        rwc = engine.rolling_walk_forward(real_rows, n_folds=5)
-        if rwc.get("valid"):
-            gate["oos_prediction"] = rwc["p_ev_positive"] >= 0.70
+        # OOS prediction: rolling walk-forward must pass.
+        # Audit-gated: on thin archives the audit's sample/history check
+        # is equivalent to rolling_walk_forward's internal guards, and free.
+        _rwc_allowed = True
+        try:
+            _rwc_allowed, _ = get_audit().can_run("walk_forward")
+        except Exception:
+            pass  # fail-open: run the real check if audit is unavailable
+
+        if _rwc_allowed:
+            rwc = engine.rolling_walk_forward(real_rows, n_folds=5)
+            if rwc.get("valid"):
+                gate["oos_prediction"] = rwc["p_ev_positive"] >= 0.70
 
         # Profitability: net EV must be positive with high confidence
         ev_obj = engine.ev_first_objective(real_rows, min_sample=min_sample)
+
         if ev_obj.get("valid"):
             gate["profitability"] = (
                 ev_obj["p_ev_positive"] >= getattr(cfg, "BRAIN_EV_GATE_P_THRESHOLD", 0.85)
