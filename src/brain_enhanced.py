@@ -1501,7 +1501,8 @@ class BrainEngineV2(BaseBrainEngine):
 
         _phase_mark("permutation_importance")
 
-        # ── Benjamini-Hochberg FDR correction ─────────────────��──���───────
+# ── Benjamini-Hochberg FDR correction ────────────────────────
+        _fdr_t0 = time.time()
         p_val_indices: List[int] = []
         p_vals: List[float] = []
         for idx, r in enumerate(recommendations):
@@ -1534,8 +1535,10 @@ class BrainEngineV2(BaseBrainEngine):
                         f"claims are downgraded to low severity."
                     ),
                 })
+        logger.info(f"⏱️   └ fdr_block: {time.time() - _fdr_t0:.2f}s")
 
         # ─ Actionability scoring (blended with empirical repair outcomes) ──
+        _act_t0 = time.time()
         for rec in recommendations:
             rec["actionability_score"] = round(
                 learned_actionability(rec, self._repair_success_rates), 3
@@ -1552,13 +1555,16 @@ class BrainEngineV2(BaseBrainEngine):
             severity_order.get(x.get("severity", ""), 4),
             -x.get("actionability_score", 0),
         ))
+    
+        logger.info(f"⏱️   └ actionability_block: {time.time() - _act_t0:.2f}s")
+
         # ── Config version hash ──────────────────────────────────────────
+        _hash_t0 = time.time()
         ai_metrics["config_version"] = hash_config_state(
             CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
         )
-        # Wiring #3: persist this version's overridable values so a future
-        # regression can be reverted back to them.
         await self._remember_config_version(ai_metrics["config_version"])
+        logger.info(f"⏱️   └ hash_and_remember: {time.time() - _hash_t0:.2f}s")
 
         # ── Bonus-aware metrics ──────────────────────────────────────────
         if real_rows:
