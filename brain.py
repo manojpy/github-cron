@@ -809,6 +809,7 @@ class BrainEngine:
         threshold suggestion, shadow-mode insight, and a machine-readable
         config patch."""
         real_rows, shadow_rows = await self._get_rows()
+        audit = get_audit() 
         recommendations: List[Dict[str, Any]] = []
         config_patch: List[Dict[str, Any]] = []
         ai_metrics: Dict[str, Any] = {}
@@ -1237,8 +1238,7 @@ class BrainEngine:
         # ── Layered recent/medium/long-history comparison ──
         if getattr(cfg, "ENABLE_LAYERED_WINDOW_ANALYSIS", True):
             recent_days = getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30)
-            long_days = getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180)
-            audit = get_audit()
+            long_days = getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180)      
             can_run_lw, lw_reason = audit.can_run("layered_window")
             if can_run_lw:
                 _t0_lw = time.time()
@@ -1459,7 +1459,7 @@ class BrainEngine:
                 "bonus_rate": round(mm_summary.get("bonus_rate", 0.0), 4),
                 "avg_rr_achieved": round(mm_summary.get("avg_rr_achieved", 0.0), 2),
                 "weighted_wr": round(mm_summary.get("weighted_wr", 0.0), 4),
-                # ��─ FDR: exact McNemar on the discordant 2×2 cells ──
+                # ─ FDR: exact McNemar on the discordant 2×2 cells ──
                 # Not a two-proportion test — see mcnemar_exact_p docstring.
                 "n": mm_summary["n"],
                 "mfe_only": mm_summary.get("mfe_only", 0),
@@ -1584,29 +1584,35 @@ class BrainEngine:
             pair_recs = engine.per_pair_thresholds(
                 real_rows, target_winrate=target_wr, min_sample=pair_min_sample,
             )
+            
+            # Walk-forward validation is computed once globally for real_rows
+            _wf_allowed, _wf_reason = audit.can_run("walk_forward")
+            if _wf_allowed:
+                wf = engine.validate_threshold_walk_forward(
+                    real_rows, target_winrate=target_wr, min_sample=min_sample,
+                )
+            else:
+                wf = {"valid": False, "error": "audit_gate", "audit_reason": _wf_reason}
+
             current_pair_thresholds = await self.sdb.get_pair_thresholds()
+
             pair_threshold_lines = []
+            
             for pair, prec in pair_recs.items():
                 suggested = prec["recommended"]
                 current = current_pair_thresholds.get(pair, cfg.CONFLUENCE_MIN_ABS_SCORE)
                 if abs(suggested - current) < 0.5:
                     continue
+                
                 pair_rows = [r for r in real_rows if r["pair"] == pair]
-                if wf["valid"] and wf.get("passed") is False:
-
-                _wf_allowed, _wf_reason = audit.can_run("walk_forward")
-                if _wf_allowed:
-                    wf = engine.validate_threshold_walk_forward(
-                        real_rows, target_winrate=target_wr, min_sample=min_sample,
-                    )
-                else:
-                    wf = {"valid": False, "error": "audit_gate", "audit_reason": _wf_reason}
+                
                 if wf["valid"] and wf.get("passed") is False:
                     pair_threshold_lines.append(
                         f"  • {pair}: suggested {suggested:.1f} (was {current:.1f}) — "
                         f"NOT applied, failed walk-forward ({wf['holdout_wr']:.0%} holdout WR)"
                     )
                     continue
+                
                 history = await self.sdb.load_threshold_history(key_suffix=pair)
                 gate_ok, gate_reason = self.stability_gate.approve(suggested, history)
                 if not gate_ok:
@@ -1615,6 +1621,7 @@ class BrainEngine:
                         f"NOT applied, stability gate: {gate_reason}"
                     )
                     continue
+                
                 await self.sdb.save_threshold_value(suggested, key_suffix=pair)
                 applied = await self.sdb.set_pair_threshold(pair, suggested)
                 if applied:
@@ -1622,6 +1629,7 @@ class BrainEngine:
                         f"  • {pair}: {current:.1f} -> {suggested:.1f} "
                         f"({prec['rec_wr']:.0%} WR, n={prec['rec_n']}) [applied]"
                     )
+            
             if pair_threshold_lines:
                 recommendations.append({
                     "type": "pair_thresholds", "severity": "medium",
