@@ -19,6 +19,10 @@ from bot_config import cfg, format_ist_time
 Row = Dict[str, Any]
 CapRow = Tuple[float, int, float, float]  # (cap, n, wr, wilson_lower_bound)
 
+# ── Per-report-cycle memo for ev_first_objective ──
+
+_EV_FIRST_CACHE: Dict[Tuple[int, int, int, float, float], Dict[str, Any]] = {}
+
 def wilson_ci(wins: int, n: int, z: float = 1.96) -> Tuple[float, float, float]:
     """Wilson score interval — reliable even for small n. Returns
     (lower_bound, upper_bound, raw_p)."""
@@ -1274,18 +1278,27 @@ def recommend_threshold(
     # ── EV-first target floor selection ──
     target_floor = None
     best_ev_at_cap = None
+
+    _cheap_positive_cap: Optional[float] = None
     for cap, _n_pass, _wr, _wr_lo in caps_data:
         subset = [r for r in rows if r["score"] >= cap]
         if len(subset) < min_sample:
             continue
-        ev_obj = ev_first_objective(subset, min_sample=min_sample)
-        if not ev_obj.get("valid"):
-            continue
-        # Select the LOWEST cap where P(EV>0) >= 0.85 AND ev_p5 > -0.10
-        if ev_obj["p_ev_positive"] >= 0.85 and ev_obj["ev_p5"] > -0.10:
-            if target_floor is None or cap < target_floor:
-                target_floor = cap
-                best_ev_at_cap = ev_obj
+        _ev_point, _hk, _wr_point = ev_and_kelly_for(subset, fee_pct, slippage_pct)
+        if _ev_point > 0:
+            if _cheap_positive_cap is None or cap < _cheap_positive_cap:
+                _cheap_positive_cap = cap
+
+    if _cheap_positive_cap is not None:
+        _final_subset = [r for r in rows if r["score"] >= _cheap_positive_cap]
+        _full_ev_obj = ev_first_objective(_final_subset, min_sample=min_sample)
+        if (
+            _full_ev_obj.get("valid")
+            and _full_ev_obj["p_ev_positive"] >= 0.85
+            and _full_ev_obj["ev_p5"] > -0.10
+        ):
+            target_floor = _cheap_positive_cap
+            best_ev_at_cap = _full_ev_obj
 
     ev_gate_passed = target_floor is not None
 
@@ -1685,7 +1698,7 @@ def is_vote_count_ood(
 
 # ═══════════════════════════════════════════════════════════════════════
 #  NEW: Block-Bootstrap EV Confidence Intervals  (Recommended.txt §6)
-# ═══════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════��═════
 
 def bootstrap_ev_ci(
     rows: List[Row],
@@ -2854,7 +2867,7 @@ def optimize_vote_weights(
         "coeff_stability": coeff_stability,
     }
 
-# ═════════════════════════════════════════════════════���═���══���════════════
+# ════════════════════════════════════════════════════���═���══���════════════
 #  PERMUTATION VOTE IMPORTANCE (AI/ML)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -3158,9 +3171,17 @@ def ev_first_objective(
     - profit_factor, max_drawdown_pct
     - wr (demoted to informational)
     - n, confidence label
+
+    Memoised per report cycle — see _EV_FIRST_CACHE. Returns a fresh
+    dict on every call so callers cannot mutate the cached value.
     """
     if len(rows) < min_sample:
         return {"valid": False, "error": "insufficient_data", "n": len(rows)}
+
+    _cache_key = (id(rows), len(rows), min_sample, fee_pct, slippage_pct)
+    _cached = _EV_FIRST_CACHE.get(_cache_key)
+    if _cached is not None:
+        return dict(_cached)
 
     net_ev, half_kelly, wr = ev_and_kelly_for(rows, fee_pct, slippage_pct)
 
@@ -3213,6 +3234,8 @@ def ev_first_objective(
         "max_drawdown_pct": round(max_dd, 3),
         "confidence": confidence_label(n, lo, hi),
     }
+    _EV_FIRST_CACHE[_cache_key] = _result
+    return dict(_result)
 
 # ═══════════════════════════════════════════════════════════════════════
 #  ML DIAGNOSTICS — Root Cause, Drift, Change-Point, Repair Learning
@@ -4008,7 +4031,7 @@ def portfolio_heat_check(
         return {"blocked": False, "reason": f"gate error (fail-open): {e}", **stats}
 
 
-# ═════════════════════════════════════════════════════════════════════
+# ════════���════════════════════════════════════════════════════════════
 #  KILL SWITCH — fast-failure halt (streak / rolling drawdown)
 # ══════════════════════════════════════════════════════════════════════
 
@@ -4291,7 +4314,7 @@ def trade_quality_score(
         + 0.10 * (cal_wr if cal_wr is not None else 0.5)
     )
 
-    # ─�� Verdict ──
+    # ─Verdict ──
     if quality >= 0.70 and p_profit_effective >= 0.85 and ev_p5 > -0.10:
         verdict = "HIGH"
     elif quality >= 0.50 and p_profit_effective >= 0.65:

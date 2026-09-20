@@ -583,8 +583,17 @@ class BrainEngineV2(BaseBrainEngine):
         real_rows: List[Dict[str, Any]],
         min_sample: int = 20,
         recommendations: Optional[List[Dict[str, Any]]] = None,
+        active_drift_keys: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Six-layer confirmation gate. Returns which patches are actionable."""
+        """Six-layer confirmation gate. Returns which patches are actionable.
+
+        `active_drift_keys` is the persisted CUSUM alarm set (s_neg > h),
+        supplied by the caller. When present, it is authoritative for the
+        stability layer: a detector whose alarm persists in Redis keeps
+        the gate closed even if no new cusum_drift recommendation fires
+        this cycle. Without it, the check falls back to this report's rec
+        list — the old behaviour, which flickers run-to-run.
+        """
         gate: Dict[str, Any] = {
             "data_quality": len(real_rows) >= 100,
             "oos_prediction": False,
@@ -606,10 +615,12 @@ class BrainEngineV2(BaseBrainEngine):
                 ev_obj["p_ev_positive"] >= getattr(cfg, "BRAIN_EV_GATE_P_THRESHOLD", 0.85)
                 and ev_obj["ev_p5"] > getattr(cfg, "BRAIN_EV_GATE_P5_FLOOR", -0.10)
             )
-        # ── Stability: no active CUSUM edge-decay alarm this cycle. Was
-        # hardcoded True, so a drifting alert's own recommendation could
-        # be auto-applied in the same report that flagged the drift. ──
-        if recommendations is not None:
+    
+        # ── Stability: no active CUSUM edge-decay alarm. Prefer the
+
+        if active_drift_keys:
+            gate["stability"] = False
+        elif recommendations is not None:
             gate["stability"] = not any(
                 r.get("type") == "cusum_drift" for r in recommendations
             )
@@ -818,7 +829,7 @@ class BrainEngineV2(BaseBrainEngine):
             self._repair_success_rates = {}
             self._ledger_stats = {}
 
-        # ── ML: contextual repair-effectiveness model ────────────────────
+        # ── ML: contextual repair-effectiveness model ───────────────────
         # Learns P(repair helps | system state) from resolved ledger entries,
         # then annotates each new repair with that probability below.
         try:
@@ -1532,9 +1543,32 @@ class BrainEngineV2(BaseBrainEngine):
             )
 
         # ── Action gate: suppress config patches unless evidence is strong ──
+        _active_drift_keys: List[str] = []
+        if getattr(cfg, "BRAIN_ACTION_GATE_ENABLED", True):
+            try:
+                _seen_aks = {r["alert_key"] for r in real_rows}
+                for _ak in _seen_aks:
+                    _cusum_state = await self.sdb.load_cusum_state(_ak)
+                    if (
+                        _cusum_state
+                        and _cusum_state.get("s_neg", 0.0)
+                            > _cusum_state.get("h", 2.0)
+                    ):
+                        _active_drift_keys.append(_ak)
+                if _active_drift_keys:
+                    logger.info(
+                        f"Action gate: {len(_active_drift_keys)} persisted CUSUM "
+                        f"alarm(s) active — stability layer forced False "
+                        f"({_active_drift_keys[:5]}{'…' if len(_active_drift_keys) > 5 else ''})"
+                    )
+            except Exception as e:
+                logger.debug(f"Persisted CUSUM-state read failed (non-fatal): {e}")
+
         if getattr(cfg, "BRAIN_ACTION_GATE_ENABLED", True):
             action_gate = self._action_gate_check(
-                real_rows, min_sample=min_sample, recommendations=recommendations,
+                real_rows, min_sample=min_sample,
+                recommendations=recommendations,
+                active_drift_keys=_active_drift_keys or None,
             )
         else:
             action_gate = {"actionable": True, "disabled": True}

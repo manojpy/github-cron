@@ -295,6 +295,11 @@ class BrainAuditLayer:
         self._n_rows = 0
         self._n_shadow_rows = 0
         self._archive_stats = None
+        # Drop the per-cycle EV bootstrap cache — see threshold_engine.
+        # _EV_FIRST_CACHE. Stale entries from the previous report would
+        # otherwise be keyed by a recycled id() and return the wrong result.
+        from threshold_engine import _EV_FIRST_CACHE
+        _EV_FIRST_CACHE.clear()
 
     # ── Data Population ───────────────────────────────────────────────
 
@@ -512,7 +517,7 @@ class BrainAuditLayer:
             return RecommendationTier.CANDIDATE
         return RecommendationTier.DESCRIPTIVE
 
-    # ── Analysis Health Recording ─────────────────────────────────────
+    # ── Analysis Health Recording ────────────────────────────────────��
 
     def record_analysis(
         self,

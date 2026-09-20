@@ -755,7 +755,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                         btc_gr = await _eval_gate(
                             ref_pair, btc_15m, btc_5m, btc_daily, state_db, correlation_id, reference_time, btc_oi,
                         )
-
                     if btc_gr is not None and not isinstance(btc_gr, tuple):
                         btc_context = BtcMacroContext(
                             confirmation_buy=btc_gr.confirmation_buy,
@@ -766,8 +765,19 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                             closes=btc_15m.close,
                         )
                     else:
+                        _cached_kind = (
+                            "miss" if _cached_btc is _CLUSTER_CACHE_MISS
+                            else "tuple" if isinstance(_cached_btc, tuple)
+                            else type(_cached_btc).__name__
+                        )
+                        _fresh_kind = (
+                            "tuple" if isinstance(btc_gr, tuple)
+                            else type(btc_gr).__name__
+                        )
                         logger_main.info(
-                            f"Macro context: {ref_pair} gate returned no result this run — macro shadow gate skipped"
+                            f"Macro context: {ref_pair} gate returned no result this run "
+                            f"(cache={_cached_kind}, fresh={_fresh_kind}) — "
+                            f"macro shadow gate skipped"
                         )
             except Exception as e:
                 logger_main.warning(f"Macro context ({ref_pair}) eval failed, disabling macro gate this run: {e}")
