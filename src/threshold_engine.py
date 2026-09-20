@@ -1284,7 +1284,7 @@ def recommend_threshold(
         subset = [r for r in rows if r["score"] >= cap]
         if len(subset) < min_sample:
             continue
-        _ev_point, _hk, _wr_point = ev_and_kelly_for(subset, fee_pct, slippage_pct)
+        _ev_point, _hk, _wr_point = ev_and_kelly_for(subset)
         if _ev_point > 0:
             if _cheap_positive_cap is None or cap < _cheap_positive_cap:
                 _cheap_positive_cap = cap
@@ -1696,7 +1696,7 @@ def is_vote_count_ood(
         "relaxed_mode": relaxed_mode,
     }
 
-# ═══════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════��═════════════════
 #  NEW: Block-Bootstrap EV Confidence Intervals  (Recommended.txt §6)
 # ═════════════════════════════════════════════════════════════════��═════
 
@@ -3219,7 +3219,7 @@ def ev_first_objective(
     win_count = sum(1 for r in rows if r["win"])
     lo, hi, _ = wilson_ci(win_count, n)
 
-    return {
+    _result = {
         "valid": True,
         "n": n,
         "wr": wr,
