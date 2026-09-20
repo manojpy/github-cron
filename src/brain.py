@@ -809,6 +809,7 @@ class BrainEngine:
         threshold suggestion, shadow-mode insight, and a machine-readable
         config patch."""
         real_rows, shadow_rows = await self._get_rows()
+        audit = get_audit() 
         recommendations: List[Dict[str, Any]] = []
         config_patch: List[Dict[str, Any]] = []
         ai_metrics: Dict[str, Any] = {}
@@ -1237,8 +1238,7 @@ class BrainEngine:
         # ── Layered recent/medium/long-history comparison ──
         if getattr(cfg, "ENABLE_LAYERED_WINDOW_ANALYSIS", True):
             recent_days = getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30)
-            long_days = getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180)
-            audit = get_audit()
+            long_days = getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180)      
             can_run_lw, lw_reason = audit.can_run("layered_window")
             if can_run_lw:
                 _t0_lw = time.time()
@@ -1593,9 +1593,9 @@ class BrainEngine:
                 )
             else:
                 wf = {"valid": False, "error": "audit_gate", "audit_reason": _wf_reason}
-             if wf["valid"] and wf.get("passed") is False:
 
             current_pair_thresholds = await self.sdb.get_pair_thresholds()
+
             pair_threshold_lines = []
             
             for pair, prec in pair_recs.items():
