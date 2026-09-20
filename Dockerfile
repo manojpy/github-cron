@@ -96,6 +96,7 @@ COPY --chown=appuser:appuser src/alerts.py ./
 COPY --chown=appuser:appuser src/threshold_engine.py ./
 COPY --chown=appuser:appuser src/brain.py ./
 COPY --chown=appuser:appuser src/brain_enhanced.py ./
+COPY --chown=appuser:appuser src/brain_audit.py ./
 COPY --chown=appuser:appuser src/repair_ledger.py ./
 COPY --chown=appuser:appuser src/apply_config_override.py ./
 COPY --chown=appuser:appuser src/outcome_storage.py ./
