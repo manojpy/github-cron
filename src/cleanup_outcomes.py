@@ -81,19 +81,7 @@ def compress_large_files(data_dir: Path, max_size_mb: int, dry_run: bool = False
     for label in ["outcomes", "shadow"]:
         label_dir = data_dir / label
         if not label_dir.exists():
-            continue
-        for month_file in label_dir.glob("*.jsonl"):
-            if no_compress_within_days > 0:
-                # Use the same filename-date-aware age check as
-                # cleanup_by_age(). st_mtime is unreliable on fresh
-                # git clones (every file's mtime = clone time).
-                age_ref = file_age_reference(month_file)
-                if age_ref >= cutoff:
-                    continue  # still inside the live analysis window 
-
-        label_dir = data_dir / label
-        if not label_dir.exists():
-            continue
+            continue     
         
         for month_file in label_dir.glob("*.jsonl"):     
             if no_compress_within_days > 0:

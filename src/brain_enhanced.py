@@ -202,7 +202,14 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
 
     # ── BLOCKED BY WIN-RATE FILTER (shadow, not dispatched) ─────────────
     try:
-        shadow_rows = recs.get("_shadow_rows", []) or []
+
+        # Shadow rows also come from the confluence, OOD, calibration,
+        # portfolio-heat and brain-disabled paths (tagged rejection_reason);
+        # only the win-rate filter's own rejections belong in this section.
+        shadow_rows = [
+            r for r in (recs.get("_shadow_rows", []) or [])
+            if r.get("rejection_reason") in (None, "win_rate_filter")
+        ]
         if not shadow_rows:
             sections.append(
                 "🚫 BLOCKED BY WIN-RATE FILTER\n"
@@ -1451,7 +1458,6 @@ class BrainEngineV2(BaseBrainEngine):
             action_gate = {"actionable": True, "disabled": True}
 
         ai_metrics["action_gate"] = action_gate
-
         if not action_gate.get("actionable", False):
             # Downgrade all config patches to informational
             for patch in config_patch:
@@ -1460,43 +1466,49 @@ class BrainEngineV2(BaseBrainEngine):
                     f"[GATE BLOCKED] {patch.get('reason', '')} "
                     f"— OOS EV evidence insufficient"
                 )
-            # FIX (Priority 3): Also suppress pending auto-actions
+            # Only RISK-INCREASING auto-actions (re-enable) need this gate.
+            # A disable is protective and stands on its own per-alert evidence
+            # (upper CI bound below the disable threshold, net EV negative,
+            # minimum sample). Gating it on portfolio-wide EV/drawdown/drift
+            # would stop the Brain from switching off a losing alert exactly
+            # when the system as a whole is doing worst.
             for rec in recommendations:
-                if rec.get("pending_auto_action"):
+                if rec.get("pending_auto_action") and rec.get("pending_action") != "disable":
                     rec["pending_auto_action"] = False
                     rec["message"] += " [BLOCKED by action gate]"
             logger.info(
-                f"🚫 Action gate BLOCKED config patches and auto-actions: {action_gate}"
+                f"🚫 Action gate BLOCKED config patches and re-enables "
+                f"(protective disables still proceed): {action_gate}"
             )
-        else:
-            # ── FIX (Priority 3): Execute deferred auto-actions NOW,
-            # after the gate has passed. ──
-            for rec in recommendations:
-                if not rec.get("pending_auto_action"):
-                    continue
-                ak = rec.get("alert")
-                action = rec.get("pending_action")
-                if not ak or not action:
-                    continue
-                try:
-                    if action == "disable":
-                        ok = await self.sdb.set_alert_key_disabled(ak, True)
-                        if ok:
-                            rec["message"] = rec["message"].replace(
-                                "[Pending action gate]", "[APPLIED]"
-                            )
-                            logger.info(f"🔒 Post-gate auto-disabled: {ak}")
-                    elif action == "enable":
-                        ok = await self.sdb.set_alert_key_disabled(ak, False)
-                        if ok:
-                            rec["message"] = rec["message"].replace(
-                                "[Pending action gate]", "[APPLIED]"
-                            )
-                            logger.info(f"🔓 Post-gate auto-re-enabled: {ak}")
-                except Exception as e:
-                    logger.warning(f"Post-gate auto-action failed for {ak}: {e}")
-                # Mark as consumed regardless of success
-                rec["pending_auto_action"] = False
+
+        # ── Execute deferred auto-actions. 'disable' always gets here; 'enable'
+        # only survives the block above when the gate passed. ──
+        for rec in recommendations:
+            if not rec.get("pending_auto_action"):
+                continue
+            ak = rec.get("alert")
+            action = rec.get("pending_action")
+            if not ak or not action:
+                continue
+            try:
+                if action == "disable":
+                    ok = await self.sdb.set_alert_key_disabled(ak, True)
+                    if ok:
+                        rec["message"] = rec["message"].replace(
+                            "[Pending action gate]", "[APPLIED]"
+                        )
+                        logger.info(f"🔒 Post-gate auto-disabled: {ak}")
+                elif action == "enable":
+                    ok = await self.sdb.set_alert_key_disabled(ak, False)
+                    if ok:
+                        rec["message"] = rec["message"].replace(
+                            "[Pending action gate]", "[APPLIED]"
+                        )
+                        logger.info(f"🔓 Post-gate auto-re-enabled: {ak}")
+            except Exception as e:
+                logger.warning(f"Post-gate auto-action failed for {ak}: {e}")
+            # Mark as consumed regardless of success
+            rec["pending_auto_action"] = False
 
         # ─ Re-assemble ─────────────────────────────────────────────────
         result = dict(base_recs)

@@ -719,6 +719,65 @@ class BrainEngine:
             await self.sdb.save_cusum_watermark(alert_key, rows_sorted[-1]["entry_ts"])
         return drift_alerts
 
+    @staticmethod
+    def _reenable_evidence(
+        alert_key: str,
+        shadow_rows: List[Dict[str, Any]],
+        disabled_at: Optional[float],
+        now_ts: float,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Decide whether a brain-disabled alert key has earned re-enabling.
+
+        Evidence must be FRESH: shadow outcomes tagged "brain_disabled",
+        recorded after the disable. A disabled key produces no real outcomes,
+        and its pre-disable rows only lose weight under recency decay (which
+        widens the confidence interval and would otherwise let it drift back
+        to "viable" with no new information).
+
+        Rules (all must hold): cool-down elapsed; at least
+        BRAIN_REENABLE_MIN_NEW_SAMPLES de-clustered outcomes; Wilson lower
+        bound of the win rate >= BRAIN_REENABLE_MIN_WR_LO; and net EV > 0.
+        Returns (ok, detail); detail always carries the reason and counts."""
+        cooldown_h = float(getattr(cfg, "BRAIN_REENABLE_COOLDOWN_HOURS", 72))
+        min_new = int(getattr(cfg, "BRAIN_REENABLE_MIN_NEW_SAMPLES", 30))
+        min_lo = float(getattr(cfg, "BRAIN_REENABLE_MIN_WR_LO", 0.40))
+        detail: Dict[str, Any] = {"n": 0, "needed": min_new}
+        if disabled_at is not None and (now_ts - disabled_at) < cooldown_h * 3600.0:
+            detail["reason"] = f"cool-down: {(now_ts - disabled_at) / 3600.0:.0f}h of {cooldown_h:.0f}h"
+            return False, detail
+        rows = [
+            r for r in shadow_rows
+            if r.get("alert_key") == alert_key
+            and r.get("rejection_reason") == "brain_disabled"
+            and (disabled_at is None or r["entry_ts"] > disabled_at)
+        ]
+        # De-cluster: outcomes overlapping within one horizon are not independent
+        # evidence, so keep at most one per pair per OUTCOME_LOOKAHEAD_CANDLES.
+        gap = int(getattr(cfg, "OUTCOME_LOOKAHEAD_CANDLES", 12)) * 900
+        kept: List[Dict[str, Any]] = []
+        last_kept: Dict[str, float] = {}
+        for r in sorted(rows, key=lambda x: x["entry_ts"]):
+            if r["entry_ts"] - last_kept.get(r["pair"], float("-inf")) >= gap:
+                kept.append(r)
+                last_kept[r["pair"]] = r["entry_ts"]
+        n = len(kept)
+        detail["n"] = n
+        if n < min_new:
+            detail["reason"] = f"waiting for evidence: {n}/{min_new} independent outcomes"
+            return False, detail
+        wins = sum(1 for r in kept if r["win"])
+        lo, hi, _ = engine.wilson_ci(wins, n)
+        ev = engine.ev_and_kelly_for(kept)[0]
+        detail.update(wr=wins / n, lo=lo, hi=hi, ev=ev)
+        if lo < min_lo:
+            detail["reason"] = f"win-rate lower bound {lo:.0%} below {min_lo:.0%}"
+            return False, detail
+        if ev <= 0:
+            detail["reason"] = f"net EV {ev:+.3f}%/trade is not positive"
+            return False, detail
+        detail["reason"] = "evidence sufficient"
+        return True, detail
+
     def _is_alert_frozen(self, alert_key: str, drift_alerts: List[Dict]) -> bool:
         return any(
             d.get("alert") == alert_key and d["type"] == "cusum_drift"
@@ -756,13 +815,23 @@ class BrainEngine:
         auto_disable_on = getattr(cfg, "BRAIN_AUTO_DISABLE_ENABLED", False)
         recency_on = getattr(cfg, "ENABLE_RECENCY_WEIGHTING", False)
         recency_decay_days = getattr(cfg, "RECENCY_DECAY_DAYS", 7.0)
+
         alert_verdicts: Dict[str, str] = {}  # alert_key -> "disable" | "star" | "monitor"
+        key_history = await self.sdb.get_alert_key_history()
+        now_ts = time.time()
+        probation_s = float(getattr(cfg, "BRAIN_REENABLE_PROBATION_DAYS", 30)) * 86400.0
 
         for alert_key, s in alert_stats.items():
+            # Probation after a re-enable: judge only outcomes recorded since,
+            # so the losses that got it disabled cannot re-disable it at once.
+            _reen_ts = key_history["reenabled_at"].get(alert_key)
+            if _reen_ts is not None and probation_s > 0 and (now_ts - _reen_ts) < probation_s:
+                s = {"rows": [r for r in s["rows"] if r["entry_ts"] > _reen_ts], "pairs": s["pairs"]}
             total = len(s["rows"])
             if total < min_sample:
                 continue
             wins = sum(1 for r in s["rows"] if r["win"])
+
             if recency_on:
                 wr, n_eff, lo, hi = engine.weighted_win_rate_with_bonus(
                     s["rows"], decay_days=recency_decay_days
@@ -849,19 +918,6 @@ class BrainEngine:
                         f"(95% CI lower bound {lo:.0%} ≥ target {cfg.MIN_WIN_RATE:.0%})."
                     ),
                 })
-                if auto_eligible and alert_key in current_disabled_keys:
-                    # FIX (Priority 3): Do NOT mutate here. Tag for
-                    # post-gate execution.
-                    recommendations.append({
-                        "type": "auto_reenabled", "severity": "medium", "alert": alert_key,
-                        "pending_auto_action": True,
-                        "pending_action": "enable",
-                        "message": (
-                            f"🔓 Re-enable CANDIDATE {alert_key}: recovered to "
-                            f"{wr:.0%} WR over {sample_label}. "
-                            f"[Pending action gate]"
-                        ),
-                    })
             else:
                 alert_verdicts[alert_key] = "monitor"
                 recommendations.append({
@@ -869,17 +925,31 @@ class BrainEngine:
                     "win_rate": round(wr, 3), "sample_size": total,
                     "message": f"{alert_key} viable ({wr:.0%} WR, {sample_label}).",
                 })
-                if auto_eligible and alert_key in current_disabled_keys:
-                    # FIX (Priority 3): do NOT mutate here. Tag for post-gate
-                    # execution — the action gate must be the sole authorizer.
+            
+        # ── Re-enable pass (hysteresis) ──────────────────────────────────
+        # Independent of the pre-disable win rate above: a key only comes back
+        # on fresh post-disable evidence (see _reenable_evidence).
+        if auto_disable_on:
+            for dk in sorted(current_disabled_keys):
+                ok, ev_detail = self._reenable_evidence(
+                    dk, shadow_rows, key_history["disabled_at"].get(dk), now_ts,
+                )
+                if ok:
                     recommendations.append({
-                        "type": "auto_reenabled", "severity": "medium", "alert": alert_key,
+                        "type": "auto_reenabled", "severity": "medium", "alert": dk,
                         "pending_auto_action": True,
                         "pending_action": "enable",
                         "message": (
-                            f"🔓 Re-enable CANDIDATE {alert_key}: viable at "
-                            f"{wr:.0%} WR over {sample_label}. [Pending action gate]"
+                            f"🔓 Re-enable CANDIDATE {dk}: {ev_detail['wr']:.0%} WR over "
+                            f"{ev_detail['n']} independent post-disable outcomes "
+                            f"(lower bound {ev_detail['lo']:.0%}), net EV "
+                            f"{ev_detail['ev']:+.3f}%/trade. [Pending action gate]"
                         ),
+                    })
+                else:
+                    recommendations.append({
+                        "type": "reenable_waiting", "severity": "low", "alert": dk,
+                        "message": f"{dk} stays disabled — {ev_detail['reason']}.",
                     })
         path_to_keys: Dict[str, List[str]] = defaultdict(list)
         for alert_key in alert_stats:

@@ -575,8 +575,32 @@ class RedisStateStore:
             return set()
         return set(keys) if isinstance(keys, list) else set()
 
+    async def get_alert_key_history(self) -> Dict[str, Dict[str, float]]:
+        """{'disabled_at': {alert_key: ts}, 'reenabled_at': {alert_key: ts}}.
+        Missing or malformed data returns empty maps."""
+        empty: Dict[str, Dict[str, float]] = {"disabled_at": {}, "reenabled_at": {}}
+        raw = await self.get_metadata(BRAIN_KEY_HISTORY_METADATA_KEY)
+        if not raw:
+            return empty
+        try:
+            data = json_loads(raw)
+        except (JSONDecodeError, TypeError, ValueError) as e:
+            logger.warning(f"Ignoring malformed {BRAIN_KEY_HISTORY_METADATA_KEY} in Redis: {e}")
+            return empty
+        if not isinstance(data, dict):
+            return empty
+        out: Dict[str, Dict[str, float]] = {}
+        for bucket in ("disabled_at", "reenabled_at"):
+            src = data.get(bucket)
+            out[bucket] = (
+                {k: float(v) for k, v in src.items() if isinstance(v, (int, float))}
+                if isinstance(src, dict) else {}
+            )
+        return out
+
     async def set_alert_key_disabled(self, alert_key: str, disabled: bool) -> bool:
         current = await self.get_disabled_alert_keys()
+        was_disabled = alert_key in current
         if disabled:
             current.add(alert_key)
         else:
@@ -586,6 +610,21 @@ class RedisStateStore:
         except Exception as e:
             logger.warning(f"Failed to update disabled-key set for '{alert_key}': {e}")
             return False
+        # Best-effort: record the transition time. A failure here must not
+        # undo or fail the disable/enable itself.
+        try:
+            if disabled != was_disabled:
+                hist = await self.get_alert_key_history()
+                now_ts = time.time()
+                if disabled:
+                    hist["disabled_at"][alert_key] = now_ts
+                    hist["reenabled_at"].pop(alert_key, None)
+                else:
+                    hist["reenabled_at"][alert_key] = now_ts
+                    hist["disabled_at"].pop(alert_key, None)
+                await self.set_metadata(BRAIN_KEY_HISTORY_METADATA_KEY, json_dumps(hist))
+        except Exception as e:
+            logger.debug(f"Could not record disable/enable time for '{alert_key}': {e}")
         return True
 
     async def get_pair_thresholds(self) -> Dict[str, float]:

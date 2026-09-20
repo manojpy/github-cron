@@ -206,6 +206,28 @@ def _fmt_score(score: Optional[float], total: Optional[float] = None) -> str:
 
 DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
+def _disabled_hits_passing_confluence(
+    hits: List[Tuple[str, str, str]],
+    confluence_for: Callable[[str], Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]],
+    abs_floor: float,
+) -> List[Tuple[str, str, str]]:
+    """Keep only brain-disabled alert hits that would have cleared the base
+    confluence gate (same pct/abs-floor rule as live dispatch, without the
+    macro/cluster adjustments). Real alerts are judged after that gate, so the
+    shadow sample for a disabled key must be too, or its win rate is biased
+    low against the data it was disabled on."""
+    if not cfg.ENABLE_CONFLUENCE_GATE:
+        return list(hits)
+    kept: List[Tuple[str, str, str]] = []
+    for hit in hits:
+        score, total, _ = confluence_for(hit[2])
+        if score is None or total is None:
+            kept.append(hit)  # gate is not applied without a score, same as live
+            continue
+        if score >= max(total * (cfg.CONFLUENCE_MIN_PCT / 100.0), abs_floor):
+            kept.append(hit)
+    return kept
+
 async def _record_counterfactual_block(
     sdb: "RedisStateStore",
     pair_name: str,
@@ -1320,7 +1342,16 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
 
         all_redis_alert_keys = list(ALERT_KEYS.values())
         previous_states = await sdb.batch_get_all_alert_states(pair_name, all_redis_alert_keys)
+        
         disabled_alert_keys = await sdb.get_disabled_alert_keys()
+        # Brain-disabled keys are still evaluated (never dispatched) so the
+        # Brain gets fresh post-disable evidence for its re-enable decision.
+        _track_disabled = bool(
+            disabled_alert_keys
+            and getattr(cfg, "ENABLE_BRAIN", False)
+            and getattr(cfg, "BRAIN_SHADOW_MODE", True)
+            and not cfg.DRY_RUN_MODE
+        )
         raw_alerts: List[Tuple[str, str, str]] = []
 
         # ── Registry for cross-based alerts (same pattern as _build_resets) ──
@@ -1363,7 +1394,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             if not def_:
                 continue
 
-            if alert_key in disabled_alert_keys: 
+        _brain_disabled = alert_key in disabled_alert_keys
+            if _brain_disabled and not _track_disabled:
                 if cfg.DEBUG_MODE:
                     logger_pair.debug(f"Skipping {alert_key}: brain-disabled (underperforming, per-key)")
                 continue
@@ -1467,8 +1499,16 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 except Exception as e:
                     logger_pair.debug(f"Alert extra_fn failed for {alert_key}: {e}", exc_info=cfg.DEBUG_MODE)
                     extra = f"(Error: {str(e)[:100]})"
+
+                if _brain_disabled:
+                    # Never dispatched: handed to the dispatch stage, which
+                    # shadow-tracks it as "brain_disabled".
+                    context.setdefault("brain_disabled_hits", []).append(
+                        (def_.title, extra, def_.key)
+                    )
+                    continue
                 raw_alerts.append((def_.title, extra, def_.key))
-            
+                
                 if cfg.DEBUG_MODE:
                     logger_pair.debug(
                         f"✅ Alert FIRED: {alert_key} | "
@@ -1543,7 +1583,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
     pair_name = gr.pair_name
     _, ts_curr, reference_time = gr.i15, gr.ts_curr, gr.reference_time
-
+    _disabled_hits = context.pop("brain_disabled_hits", None) or []
 
     if cfg.ENABLE_KILL_SWITCH and sdb and not sdb.degraded and sdb._redis:
         try:
@@ -1662,7 +1702,21 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             capped_alerts = raw_alerts
 
         alerts_to_send = capped_alerts[:cfg.MAX_ALERTS_PER_PAIR]
-
+        if _disabled_hits:
+            _dis_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
+            if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
+                _pair_floor = await sdb.get_pair_threshold(pair_name)
+                if _pair_floor is not None:
+                    _dis_floor = _pair_floor
+            _dis_pass = _disabled_hits_passing_confluence(_disabled_hits, _confluence_for, _dis_floor)
+            if _dis_pass:
+                await _record_counterfactual_block(
+                    sdb, pair_name, _dis_pass, ts_curr, close_curr,
+                    block_reason="brain_disabled",
+                    confluence_scores={ak: _confluence_for(ak) for _, _, ak in _dis_pass},
+                    gr=gr, context=context,
+                    logger_pair=logger_pair,
+                )
         cached_snapshot: Optional[CandleSnapshot] = None
         if alerts_to_send:
             has_reversal_alert = any(

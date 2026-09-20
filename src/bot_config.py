@@ -119,6 +119,8 @@ CONFIG_OVERRIDE_ALLOWED_FIELDS: Set[str] = {
 BRAIN_DISABLED_KEYS_METADATA_KEY = "brain_disabled_alert_keys"
 CONFIG_OVERRIDE_METADATA_KEY = "config_override"
 PAIR_THRESHOLDS_METADATA_KEY = "pair_confluence_thresholds"
+BRAIN_KEY_HISTORY_METADATA_KEY = "brain_alert_key_history"
+
 
 class Constants:
     MIN_WICK_RATIO = 0.2
@@ -369,6 +371,10 @@ class BotConfig(BaseModel):
     ENABLE_PNL_WEIGHTED_TRAINING: bool = Field(default=True, description="Weight each training row in train_market_state_model()/oos_permutation_importance() by |net_pnl_pct| instead of counting every row equally, so the fit is pulled toward correctly classifying economically significant trades rather than just maximizing hit-rate. Set False to fall back to uniform weighting for comparison.")
     BRAIN_AUTO_DISABLE_ENABLED: bool = Field(default=True, description="If True, the brain writes disable_alert/reinstate verdicts directly to the live config_override in Redis instead of only reporting them")
     BRAIN_AUTO_DISABLE_MIN_SAMPLE: int = Field(default=200, ge=50, description="Min samples per individual alert_key (not pooled) before the brain will auto-disable or auto-reinstate its shared config path")
+    BRAIN_REENABLE_COOLDOWN_HOURS: int = Field(default=72, ge=0, le=720, description="Minimum hours an alert key stays brain-disabled before it can be auto re-enabled")
+    BRAIN_REENABLE_MIN_NEW_SAMPLES: int = Field(default=30, ge=10, le=500, description="Min post-disable shadow outcomes (de-clustered to one per pair per outcome horizon) before a disabled alert key can be auto re-enabled")
+    BRAIN_REENABLE_MIN_WR_LO: float = Field(default=0.40, ge=0.30, le=0.90, description="Wilson lower bound of the post-disable shadow win rate required to re-enable. Disable fires when the upper bound is below BRAIN_ALERT_DISABLE_THRESHOLD_WR; re-enable needs the lower bound above this, so there is a dead band between the two")
+    BRAIN_REENABLE_PROBATION_DAYS: int = Field(default=30, ge=0, le=180, description="After a re-enable, the disable verdict only counts outcomes recorded after the re-enable for this many days (0 = off). The re-enable was justified by fresher evidence, so the pre-disable losses are superseded; 30 matches how long they stay in the analysis window. Auto-disable still needs BRAIN_AUTO_DISABLE_MIN_SAMPLE post-re-enable outcomes")
     BRAIN_MC_SIMULATIONS: int = Field(default=50, ge=0, le=500, description="Block-bootstrap Monte Carlo simulations for the robustness check in the periodic brain report. 0 disables it (offline-only, never affects live gating).")
     BRAIN_WEIGHT_OPTIMIZER_MAX_DELTA: float = Field(default=2.0, ge=0.5, le=5.0)
     BRAIN_WEIGHT_OPTIMIZER_WALK_FORWARD: bool = Field(default=True) 
@@ -611,6 +617,16 @@ class BotConfig(BaseModel):
                     f'before the divergence lookback can be satisfied, so ENABLE_OI_PRICE_DIVERGENCE will '
                     f'silently never fire. Raise OI_FUNDING_MAX_SAMPLE_AGE_SEC or lower OI_DIVERGENCE_LOOKBACK_SAMPLES.'
                 )
+        return self
+
+    @model_validator(mode='after')
+    def validate_reenable_deadband(self) -> 'BotConfig':
+        if self.BRAIN_REENABLE_MIN_WR_LO < self.BRAIN_ALERT_DISABLE_THRESHOLD_WR:
+            raise ValueError(
+                f'BRAIN_REENABLE_MIN_WR_LO ({self.BRAIN_REENABLE_MIN_WR_LO}) must be >= '
+                f'BRAIN_ALERT_DISABLE_THRESHOLD_WR ({self.BRAIN_ALERT_DISABLE_THRESHOLD_WR}); '
+                f'otherwise an alert key can be disabled and re-enabled on the same evidence.'
+            )
         return self
 
     @model_validator(mode='after')
