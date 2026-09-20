@@ -1593,6 +1593,7 @@ class BrainEngine:
                 )
             else:
                 wf = {"valid": False, "error": "audit_gate", "audit_reason": _wf_reason}
+            if wf["valid"] and wf.get("passed") is False:
 
             current_pair_thresholds = await self.sdb.get_pair_thresholds()
             pair_threshold_lines = []
@@ -1605,7 +1606,6 @@ class BrainEngine:
                 
                 pair_rows = [r for r in real_rows if r["pair"] == pair]
                 
-                # Ensure this if-block has the indented body below it
                 if wf["valid"] and wf.get("passed") is False:
                     pair_threshold_lines.append(
                         f"  • {pair}: suggested {suggested:.1f} (was {current:.1f}) — "
