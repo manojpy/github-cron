@@ -272,7 +272,7 @@ class BrainAuditLayer:
         header = audit.build_data_quality_header()
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._cycle_start: float = 0.0
         self._history: Optional[HistoryCoverage] = None
         self._reconciliation: Optional[OutcomeReconciliation] = None
