@@ -57,7 +57,6 @@ jobs:
              src/bot_config.py src/state.py src/fetcher.py src/indicators.py \
              src/gates.py src/alerts.py src/threshold_engine.py src/brain.py src/brain_enhanced.py src/brain_audit.py src/outcome_storage.py \
              src/apply_config_override.py src/archive_reader.py src/repair_ledger.py \
-
             --ignore-missing-imports 2>&1 | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "ℹ️ Non-blocking for now -- see PR description before flipping to blocking." >> $GITHUB_STEP_SUMMARY
@@ -228,8 +227,7 @@ jobs:
   brain-only:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: []  # Independent of the build job
-    if: github.event.schedule == '0 3 * * *'  # Only run on the daily 3 AM UTC cron
+    if: github.event.schedule == '0 3 * * *'
     permissions:
       contents: read
     steps:
