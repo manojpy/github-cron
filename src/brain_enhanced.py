@@ -21,6 +21,7 @@ from bot_config import cfg, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS, 
 from state import RedisKeyPrefix, RedisStateStore
 from brain import BrainEngine as BaseBrainEngine, _extract_p_value_for_fdr
 import threshold_engine as engine
+from outcome_storage import OUTCOME_SCHEMA_VERSION
 
 from threshold_engine import (
     optimize_vote_weights, conditional_performance,
@@ -74,8 +75,11 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     archive_stats = recs.get("_archive_stats", {})
     if archive_stats:
         advisory = audit.schema_migration_advisory(
-            current_version=4,
-            stale_count=archive_stats.get("dropped_stale_schema", 0),
+            current_version=OUTCOME_SCHEMA_VERSION,
+            stale_count=(
+                archive_stats.get("dropped_unmigratable", 0)
+                + archive_stats.get("migrated_forward", 0)
+            ),
             migrated_count=archive_stats.get("migrated_forward", 0),
             unmigratable_count=archive_stats.get("dropped_unmigratable", 0),
             total_archive_rows=archive_stats.get("lines_total", 0),
@@ -136,11 +140,19 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                 dir_note = f"Your BUY alerts win only {buy_wr:.0%} vs SELL {sell_wr:.0%} — the buy side is dragging you down."
         
         ev_note = f"Net per trade: {net_ev:+.2f}% after fees" + (" — negative ❌." if net_ev < 0 else " — positive ✅.")
+        
         wr_note = ""
-        if rec_thr_available:
+        if (
+            rec_thr_available
+            and audit.max_recommendation_tier("threshold_recommendation")
+            == RecommendationTier.ACTIONABLE
+        ):
             rec_wr_val = rec_thr.get("rec_wr", 0)
-            wr_note = f"\nCurrent WR {wr:.0%} → ~{rec_wr_val:.0%} projected if you raise the entry bar (see 🚪 below)."
-        low_data = f"\nℹ️ Only {n} trades so far — treat these as strong hints, not certainties." if n < 100 else ""
+            wr_note = (
+                f"\nHistorical filtered WR at the higher bar: {rec_wr_val:.0%} "
+                f"(in-sample estimate, not a forecast; see 🚪 below)."
+            )
+        low_data = ""  # verdict text already carries the confidence caveat
         sections.append(
             f"🧠 PROFIT ACTION PLAN\n📊 Based on {n} trades\n\n🎯 BOTTOM LINE\n{verdict}"
             + (f"\n{dir_note}" if dir_note else "")
@@ -378,6 +390,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                     f"   Do not apply until sample ≥100 and walk-forward passes."
                 )
             elif tier == RecommendationTier.ACTIONABLE:
+                gate_rec = rec_thr
                 if rec_wr_val > wr:
                     outcome_line = f"lifts expected WR to ~{rec_wr_val:.0%} (from {wr:.0%})"
                 else:
@@ -711,7 +724,8 @@ class BrainEngineV2(BaseBrainEngine):
                     f"🗄️ Brain using file archive: {len(real_rows)} real, "
                     f"{len(shadow_rows)} shadow rows | "
                     f"Archive stats: kept={real_stats['kept']}, "
-                    f"stale_schema={real_stats['dropped_stale_schema']}, "
+                    f"migrated={real_stats['migrated_forward']}, "
+                    f"unmigratable={real_stats['dropped_unmigratable']}, "
                     f"signal_only={real_stats['dropped_missing_win']}, "
                     f"malformed={real_stats['lines_malformed']}"
                 )
@@ -768,13 +782,12 @@ class BrainEngineV2(BaseBrainEngine):
         # ══════════════════════════════════════════════════════════════════
         audit = reset_audit()
 
-        # History coverage
+        # History coverage was already set in _generate_baseline_recommendations
         long_days = getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180)
-        history = audit.set_history_coverage(real_rows, requested_days=long_days)
-        audit.set_shadow_count(len(shadow_rows))
+        history = audit._history
 
         # Log coverage warning (structured, replaces the old ad-hoc warning)
-        if history.coverage in (DataCoverage.SEVERELY_LIMITED, DataCoverage.CRITICAL):
+        if history and history.coverage in (DataCoverage.SEVERELY_LIMITED, DataCoverage.CRITICAL):
             logger.warning(
                 f"⚠️ Brain audit: DATA COVERAGE = {history.coverage.value}. "
                 f"Requested {long_days}d, have {history.actual_days:.1f}d. "
@@ -1592,11 +1605,30 @@ class BrainEngineV2(BaseBrainEngine):
         result["_archive_stats"] = audit._archive_stats or {}
         return result
 
-    # ── Baseline wrapper that also exposes raw rows ─────────────────���────
+    # ── Baseline wrapper that also exposes raw rows ─────────────────────
+
     async def _generate_baseline_recommendations(self) -> Dict[str, Any]:
+        # Fresh audit BEFORE any row loading, so reconciliation data and
+        # analysis-health records made during the baseline survive to the report.
+        audit = reset_audit()
         # Load rows ONCE, attach them, and hand them to the baseline via the
         # subclass hook so the parent doesn't read the archive a second time.
         real_rows, shadow_rows = await self._get_rows()
+        # Coverage is measured on the LONG window (not the 30-day analysis
+        # window) and must be set BEFORE the baseline runs, so audit.can_run()
+        # sees real row counts.
+        long_days = getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180)
+        try:
+            _recent, _medium, long_rows = await self._get_layered_window_rows()
+        except Exception as e:
+            audit.record_analysis_exception("history_coverage", e)
+            long_rows = real_rows
+        audit.set_history_coverage(
+            long_rows or real_rows,
+            requested_days=long_days,
+            analysis_rows=real_rows,
+        )
+        audit.set_shadow_count(len(shadow_rows))
         base = await super().generate_recommendations()
         base["_real_rows"] = real_rows
         base["_shadow_rows"] = shadow_rows

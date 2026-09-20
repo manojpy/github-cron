@@ -148,10 +148,10 @@ _ANALYSIS_MIN_HISTORY_DAYS: Dict[str, int] = {
 @dataclass
 class OutcomeReconciliation:
     """Tracks the full lifecycle of outcomes from alert to Brain input."""
-    pending_count: int = 0
-    resolved_this_run: int = 0
-    archived_this_run: int = 0
-    total_archived: int = 0
+    pending_count: Optional[int] = None
+    resolved_this_run: Optional[int] = None
+    archived_this_run: Optional[int] = None
+    total_archived: Optional[int] = None
     loaded_by_brain: int = 0
     archive_rejects_stale_schema: int = 0
     archive_rejects_signal_only: int = 0
@@ -167,11 +167,14 @@ class OutcomeReconciliation:
         return self.status in (HealthStatus.OK, HealthStatus.DEGRADED)
 
     def to_report_lines(self) -> List[str]:
+        def _n(v: Optional[int]) -> str:
+            return "n/a" if v is None else str(v)
+
         lines = [
-            f"   Pending outcomes: {self.pending_count}",
-            f"   Resolved this run: {self.resolved_this_run}",
-            f"   Archived this run: {self.archived_this_run}",
-            f"   Total in archive: {self.total_archived}",
+            f"   Pending outcomes: {_n(self.pending_count)}",
+            f"   Resolved this run: {_n(self.resolved_this_run)}",
+            f"   Archived this run: {_n(self.archived_this_run)}",
+            f"   Archive lines read: {_n(self.total_archived)}",
             f"   Loaded by Brain: {self.loaded_by_brain}",
             f"   Shadow loaded: {self.shadow_loaded}",
         ]
@@ -299,11 +302,16 @@ class BrainAuditLayer:
         self,
         rows: List[Dict[str, Any]],
         requested_days: Optional[int] = None,
+        analysis_rows: Optional[List[Dict[str, Any]]] = None,
     ) -> HistoryCoverage:
-        """Compute and store history coverage from loaded rows."""
+        """Compute and store history coverage from loaded rows.
+
+        `rows` = long-window rows (used for the history SPAN).
+        `analysis_rows` = rows the analyses actually run on (used for the
+        sample-size count). Falls back to `rows` when not given."""
         if requested_days is None:
             requested_days = getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180)
-        n = len(rows)
+        n = len(analysis_rows) if analysis_rows is not None else len(rows)
         self._n_rows = n
 
         if not rows:
@@ -376,10 +384,10 @@ class BrainAuditLayer:
 
     def set_reconciliation(
         self,
-        pending_count: int = 0,
-        resolved_this_run: int = 0,
-        archived_this_run: int = 0,
-        total_archived: int = 0,
+        pending_count: Optional[int] = None,
+        resolved_this_run: Optional[int] = None,
+        archived_this_run: Optional[int] = None,
+        total_archived: Optional[int] = None,
         loaded_by_brain: int = 0,
         shadow_loaded: int = 0,
         archive_stats: Optional[Dict[str, int]] = None,
@@ -398,8 +406,10 @@ class BrainAuditLayer:
         )
 
         if archive_stats:
+            if recon.total_archived is None:
+                recon.total_archived = archive_stats.get("lines_total")
             recon.archive_rejects_stale_schema = archive_stats.get(
-                "dropped_stale_schema", 0
+                "dropped_unmigratable", 0
             )
             recon.archive_rejects_signal_only = archive_stats.get(
                 "dropped_missing_win", 0
@@ -485,9 +495,7 @@ class BrainAuditLayer:
         recommendation (Tier 4) vs being capped at CANDIDATE (Tier 3)."""
         if self._history is None:
             return False
-        if self._history.coverage in (
-            DataCoverage.SEVERELY_LIMITED, DataCoverage.CRITICAL
-        ):
+        if self._history.actual_days < 21:
             return False
         if self._n_rows < 100:
             return False
@@ -579,7 +587,7 @@ class BrainAuditLayer:
     def build_data_quality_header(self) -> List[str]:
         """Build the 📊 BRAIN DATA QUALITY section for the report."""
         lines: List[str] = []
-        lines.append("*📊 BRAIN DATA QUALITY*")
+        lines.append("📊 BRAIN DATA QUALITY")
 
         # History coverage
         if self._history:
