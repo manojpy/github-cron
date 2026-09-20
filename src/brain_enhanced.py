@@ -1295,7 +1295,7 @@ class BrainEngineV2(BaseBrainEngine):
                         "p_value": inter.get("p_value"),
                     })
 
-       _phase_mark("vote_interaction_miner")
+        _phase_mark("vote_interaction_miner")
 
         # ─ Phase 5: Counterfactual Simulator (shadow-validated) ──────
         baseline_ev = ai_metrics.get("net_ev") or 0.0
