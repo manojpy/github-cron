@@ -783,9 +783,20 @@ class BrainEngineV2(BaseBrainEngine):
         return result
 
     async def _generate_recommendations_full(self) -> Dict[str, Any]:
+        # ── Phase timer — one INFO line per phase so a slow report can be
+        # diagnosed from the workflow log without a profiler. Overhead is
+        # one time.time() call per mark; negligible against the phases. ──
+        _phase_t0 = time.time()
+        def _phase_mark(_label: str) -> None:
+            nonlocal _phase_t0
+            _now = time.time()
+            logger.info(f"⏱️ Brain phase '{_label}': {_now - _phase_t0:.2f}s")
+            _phase_t0 = _now
+
         # ── 0. Baseline (original brain logic) ───────────────────────────
         base_recs = await self._generate_baseline_recommendations()
         logger = logging.getLogger("macd_bot")
+        _phase_mark("baseline")
         real_rows = base_recs.get("_real_rows", [])
         shadow_rows = base_recs.get("_shadow_rows", [])
         # ══════════════════════════════════════════════════════════════════
@@ -828,6 +839,7 @@ class BrainEngineV2(BaseBrainEngine):
             logging.getLogger("macd_bot").debug(f"Repair ledger eval failed (non-fatal): {e}")
             self._repair_success_rates = {}
             self._ledger_stats = {}
+        _phase_mark("repair_ledger")
 
         # ── ML: contextual repair-effectiveness model ───────────────────
         # Learns P(repair helps | system state) from resolved ledger entries,
@@ -916,6 +928,8 @@ class BrainEngineV2(BaseBrainEngine):
 
             recommendations.append(wrapped)
 
+        _phase_mark("repair_shop")
+
         # ── Wiring #3: change-point regression → concrete revert patch ──
         for repair in repairs:
             if repair.get("category") != "config_regression_pinpoint":
@@ -946,6 +960,9 @@ class BrainEngineV2(BaseBrainEngine):
                     ),
                     "_source_category": "config_regression_pinpoint",
                 })
+
+        _phase_mark("wiring_and_config_regression")
+
         # ── Phase 1.5: Vote Weight Optimizer (FIXED) ─────────────────────
         if len(real_rows) >= self._phase_samples["weight_optimizer"]:
             wopt = optimize_vote_weights(
@@ -1122,6 +1139,7 @@ class BrainEngineV2(BaseBrainEngine):
                         f"Current weights are better. No changes applied."
                     ),
                 })
+       _phase_mark("weight_optimizer")
 
         # ─ Per-alert breakdown ──────────────────────────────────────────
         alert_stats = engine.per_alert_breakdown(real_rows, min_sample=min_sample)
@@ -1138,6 +1156,8 @@ class BrainEngineV2(BaseBrainEngine):
                 "data": alert_stats,
                 "message": "Per-alert breakdown:\n" + "\n".join(msg_parts),
             })
+
+        _phase_mark("per_alert_breakdown")
 
         # ── Phase 2: Parameter Autopsy ─────────────────────────────────
         if real_rows and any("context" in r for r in real_rows):
@@ -1200,6 +1220,8 @@ class BrainEngineV2(BaseBrainEngine):
                             "reason": f"Parameter autopsy: WR drops above {autopsy['optimal_cutoff']:.2f}",
                         })
 
+        _phase_mark("parameter_autopsy")
+
         # ── Phase 3: Conditional Alert Gating ────────────────────────────
         if real_rows and len(real_rows) >= self._phase_samples["conditional_gating"]:
             ak_counts: Dict[str, int] = defaultdict(int)
@@ -1230,6 +1252,8 @@ class BrainEngineV2(BaseBrainEngine):
                             "below_n": cp["below"]["n"],
                             "below_wr": cp["below"]["wr"],
                         })
+
+        _phase_mark("conditional_gating")
 
         # ── Phase 4: Vote Interaction Miner ──────────────────────────────
         if len(real_rows) >= self._phase_samples["vote_interactions"]:
@@ -1270,6 +1294,8 @@ class BrainEngineV2(BaseBrainEngine):
                         # ── FDR: p_value stamped by the miner directly ──
                         "p_value": inter.get("p_value"),
                     })
+
+       _phase_mark("vote_interaction_miner")
 
         # ─ Phase 5: Counterfactual Simulator (shadow-validated) ──────
         baseline_ev = ai_metrics.get("net_ev") or 0.0
@@ -1360,6 +1386,8 @@ class BrainEngineV2(BaseBrainEngine):
                 })
                 ai_metrics["counterfactual_scenarios"] = scenarios
 
+        _phase_mark("counterfactual")
+
         # ── Phase 6: Regime Profiles (shadow-validated) ───────────────
         if len(real_rows) >= self._phase_samples["regime_profiles"]:
             rpo = regime_profile_optimizer(
@@ -1395,6 +1423,8 @@ class BrainEngineV2(BaseBrainEngine):
                     "type": "dynamic_regime_profile", "severity": "low",
                     "message": "📊 Regime thresholds:\n" + "\n".join(lines),
                 })
+
+        _phase_mark("regime_profiles")
 
         # ── Config Version Regression ────────────────────────────────────
         version_comparisons = compare_config_versions(
@@ -1433,6 +1463,8 @@ class BrainEngineV2(BaseBrainEngine):
 
         ai_metrics["config_comparisons"] = version_comparisons
 
+        _phase_mark("config_version_regression")
+
         # ── AI/ML: OOS Permutation Importance (EV-based, walk-forward) ────
         # FIX: honor cfg.BRAIN_PERMUTATION_IMPORTANCE — previously this
         # ran whenever sample size was sufficient, regardless of the flag.
@@ -1466,6 +1498,8 @@ class BrainEngineV2(BaseBrainEngine):
                     _rec["top_std"] = _top_rec.get("std", 0.0)
                     _rec["n_permutations"] = _perm_n
                 recommendations.append(_rec)
+
+        _phase_mark("permutation_importance")
 
         # ── Benjamini-Hochberg FDR correction ─────────────────��──���───────
         p_val_indices: List[int] = []
@@ -1544,22 +1578,36 @@ class BrainEngineV2(BaseBrainEngine):
 
         # ── Action gate: suppress config patches unless evidence is strong ──
         _active_drift_keys: List[str] = []
+        _below_floor_drift: List[str] = []
         if getattr(cfg, "BRAIN_ACTION_GATE_ENABLED", True):
+            _cusum_min_n = int(getattr(cfg, "BRAIN_CUSUM_MIN_SAMPLE", 30))
             try:
                 _seen_aks = {r["alert_key"] for r in real_rows}
                 for _ak in _seen_aks:
                     _cusum_state = await self.sdb.load_cusum_state(_ak)
-                    if (
-                        _cusum_state
-                        and _cusum_state.get("s_neg", 0.0)
-                            > _cusum_state.get("h", 2.0)
-                    ):
+                    if not _cusum_state:
+                        continue
+                    if _cusum_state.get("s_neg", 0.0) <= _cusum_state.get("h", 2.0):
+                        continue
+                    _n_seen = int(_cusum_state.get("n", 0))
+                    if _n_seen >= _cusum_min_n:
                         _active_drift_keys.append(_ak)
+                    else:
+                        _below_floor_drift.append((_ak, _n_seen))
                 if _active_drift_keys:
                     logger.info(
                         f"Action gate: {len(_active_drift_keys)} persisted CUSUM "
-                        f"alarm(s) active — stability layer forced False "
+                        f"alarm(s) active with n>={_cusum_min_n} — stability layer "
+                        f"forced False "
                         f"({_active_drift_keys[:5]}{'…' if len(_active_drift_keys) > 5 else ''})"
+                    )
+                if _below_floor_drift:
+                    logger.info(
+                        f"Action gate: {len(_below_floor_drift)} CUSUM alarm(s) "
+                        f"seen but below BRAIN_CUSUM_MIN_SAMPLE={_cusum_min_n} — "
+                        f"not vetoing tuning "
+                        f"({[f'{ak}(n={n})' for ak, n in _below_floor_drift[:5]]}"
+                        f"{'…' if len(_below_floor_drift) > 5 else ''})"
                     )
             except Exception as e:
                 logger.debug(f"Persisted CUSUM-state read failed (non-fatal): {e}")
@@ -1626,6 +1674,8 @@ class BrainEngineV2(BaseBrainEngine):
             # Mark as consumed regardless of success
             rec["pending_auto_action"] = False
 
+        _phase_mark("fdr_and_actionability")
+
         # ── Attach audit to ai_metrics for persistence ──
         ai_metrics["brain_audit"] = audit.to_dict()
         ai_metrics["data_quality_header"] = audit.build_data_quality_header()
@@ -1637,6 +1687,7 @@ class BrainEngineV2(BaseBrainEngine):
         result["config_patch"] = config_patch
         result["ai_metrics"] = ai_metrics
         result["_archive_stats"] = audit._archive_stats or {}
+        _phase_mark("audit_attach")
         return result
 
     # ── Baseline wrapper that also exposes raw rows ─────────────────────

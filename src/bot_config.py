@@ -474,6 +474,7 @@ class BotConfig(BaseModel):
     BRAIN_STABILITY_MAX_JUMP: float = Field(default=2.0, ge=0.1, le=10.0, description="StabilityGate: max allowed deviation (in score points) from median history")
     BRAIN_CUSUM_DRIFT_DELTA: float = Field(default=0.10, ge=0.01, le=0.50, description="CUSUM: sensitivity to WR shift (delta parameter)")
     BRAIN_CUSUM_THRESHOLD: float = Field(default=2.0, ge=0.5, le=10.0, description="CUSUM: alarm threshold (h parameter)")
+    BRAIN_CUSUM_MIN_SAMPLE: int = 30
     BRAIN_FEE_PCT: float = Field(default=0.0006, ge=0.0, le=0.01, description="Taker fee per side (0.06%) used in EV/Kelly calculations")
     BRAIN_SLIPPAGE_PCT: float = Field(default=0.0003, ge=0.0, le=0.01, description="Estimated slippage per side used in EV/Kelly calculations")
     BRAIN_OOD_ENABLED: bool = Field(default=True, description="Vote-count OOD gate on/off")
