@@ -1605,6 +1605,7 @@ class BrainEngine:
                 
                 pair_rows = [r for r in real_rows if r["pair"] == pair]
                 
+                # Ensure this if-block has the indented body below it
                 if wf["valid"] and wf.get("passed") is False:
                     pair_threshold_lines.append(
                         f"  • {pair}: suggested {suggested:.1f} (was {current:.1f}) — "
