@@ -12,6 +12,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import os
 from pathlib import Path
 
+from brain_audit import (
+    BrainAuditLayer, HealthStatus, DataCoverage, RecommendationTier,
+    get_audit, reset_audit,
+)
 from archive_reader import load_archived_outcomes
 from bot_config import cfg, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS, json_dumps, json_loads
 from state import RedisKeyPrefix, RedisStateStore
@@ -52,6 +56,31 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     cfg_patch = recs.get("config_patch", []) or []
     ai = recs.get("ai_metrics", {}) or {}
     sections: List[str] = []
+
+    # ══════════════════════════════════════════════════════════════════
+    #  DATA QUALITY HEADER (always first, before any analysis)
+    # ══════════════════════════════════════════════════════════════════
+    audit = get_audit()
+    header_lines = audit.build_data_quality_header()
+
+    # Action gate summary
+    action_gate = ai.get("action_gate", {}) or {}
+    if action_gate:
+        header_lines.append("")
+        header_lines.extend(audit.build_action_gate_summary(action_gate))
+
+    # Schema migration advisory
+    archive_stats = recs.get("_archive_stats", {})
+    if archive_stats:
+        advisory = audit.schema_migration_advisory(
+            current_version=4,
+            stale_count=archive_stats.get("dropped_stale_schema", 0),
+            total_archive_rows=archive_stats.get("lines_total", 0),
+        )
+        if advisory:
+            header_lines.append(f"   {advisory}")
+
+    sections.append("\n".join(header_lines))
 
     _GATE_CHECK_LABELS = {
         "data_quality": "fewer than 100 trades logged",
@@ -96,23 +125,10 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
             ev_obj.get("p_ev_positive", 0) >= 0.85
             if ev_obj and ev_obj.get("valid") else False
         )
-        if net_ev > 0 and ev_positive and ev_obj is not None:
-            verdict = (
-                f"✅ PROFITABLE: Net EV {net_ev:+.2f}%/trade, "
-                f"P(EV>0)={ev_obj['p_ev_positive']:.0%}, WR={wr:.0%}."
-            )
-        elif net_ev > 0:
-            _p_ev = ev_obj.get("p_ev_positive", 0) if ev_obj is not None else 0
-            verdict = (
-                f"⚠️ MARGINALLY POSITIVE: Net EV {net_ev:+.2f}%/trade "
-                f"but P(EV>0) only {_p_ev:.0%}. "
-                f"WR={wr:.0%}. Evidence is thin."
-            )
-        else:
-            verdict = (
-                f"🔴 UNPROFITABLE: Net EV {net_ev:+.2f}%/trade, "
-                f"WR={wr:.0%}. Costs exceed gains."
-            )
+        verdict = audit.qualify_verdict(
+            net_ev=net_ev, wr=wr, n=n,
+            p_ev_positive=ev_obj.get("p_ev_positive", 0) if ev_obj else 0.0,
+        )
         dir_note = ""
         if buy_wr is not None and sell_wr is not None and buy_n >= 5 and sell_n >= 5:
             if sell_wr < buy_wr - 0.15:
@@ -350,22 +366,41 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     gate_rec = None
     try:
         if rec_thr_available:
-            gate_rec = rec_thr
+            tier = audit.max_recommendation_tier("threshold_recommendation")
             rec_wr_val = rec_thr.get("rec_wr", 0)
-            if rec_wr_val > wr:
-                outcome_line = f"lifts expected WR to ~{rec_wr_val:.0%} (from {wr:.0%})"
-            else:
-                outcome_line = (
-                    f"expected WR is ~{rec_wr_val:.0%} — *below* your current {wr:.0%}. "
-                    f"This trades hit-rate for a better EV/R:R profile, not a higher win rate — "
-                    f"only apply it if that trade-off is what you want"
+
+            if tier == RecommendationTier.CANDIDATE:
+                sections.append(
+                    f"🧪 ENTRY BAR — SIMULATION ONLY (NOT VALIDATED)\n"
+                    f"CONFLUENCE_MIN_ABS_SCORE: {cfg.CONFLUENCE_MIN_ABS_SCORE:.1f} → "
+                    f"{rec_thr['recommended']:.1f}\n"
+                    f"   ⚠️ Historical simulation on {n} trades, NOT a validated forecast.\n"
+                    f"   Historical filtered WR: {rec_wr_val:.0%} (in-sample estimate)\n"
+                    f"   Do not apply until sample ≥100 and walk-forward passes."
                 )
-            sections.append(
-                f"🚪 ENTRY BAR — RAISE IT\n"
-                f"CONFLUENCE_MIN_ABS_SCORE: {cfg.CONFLUENCE_MIN_ABS_SCORE:.1f} → {rec_thr['recommended']:.1f}\n"
-                f"   This alone filters out {rec_thr.get('dropped', 0)} weak trades "
-                f" ({rec_thr.get('dropped_pct', 0):.0%}) and {outcome_line}."
-            )
+            elif tier == RecommendationTier.ACTIONABLE:
+                if rec_wr_val > wr:
+                    outcome_line = f"lifts expected WR to ~{rec_wr_val:.0%} (from {wr:.0%})"
+                else:
+                    outcome_line = (
+                        f"expected WR is ~{rec_wr_val:.0%} — *below* your current {wr:.0%}. "
+                        f"This trades hit-rate for a better EV/R:R profile"
+                    )
+                sections.append(
+                    f"🚪 ENTRY BAR — RAISE IT\n"
+                    f"CONFLUENCE_MIN_ABS_SCORE: {cfg.CONFLUENCE_MIN_ABS_SCORE:.1f} → "
+                    f"{rec_thr['recommended']:.1f}\n"
+                    f"   This alone filters out {rec_thr.get('dropped', 0)} weak trades "
+                    f"({rec_thr.get('dropped_pct', 0):.0%}) and {outcome_line}."
+                )
+            else:
+                # DESCRIPTIVE or STATISTICAL tier — just mention it
+                sections.append(
+                    f"📊 ENTRY BAR (observation only)\n"
+                    f"Current: {cfg.CONFLUENCE_MIN_ABS_SCORE:.1f} | "
+                    f"Historical simulation suggests: {rec_thr['recommended']:.1f}\n"
+                    f"   Insufficient data for a recommendation. Accumulate more outcomes."
+                )
     except Exception as e:
         logging.getLogger("macd_bot").debug(f"Brain report: ENTRY GATE THRESHOLD section failed: {e}")
 
@@ -661,17 +696,35 @@ class BrainEngineV2(BaseBrainEngine):
         window_days = getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30)
         
         data_dir = getattr(cfg, "OUTCOME_DATA_DIR", None) or os.environ.get("OUTCOME_DATA_DIR")
+        
         if data_dir and Path(data_dir).exists():
-            real_rows = load_archived_outcomes(data_dir, window_days=window_days, shadow=False)
-            shadow_rows = load_archived_outcomes(data_dir, window_days=window_days, shadow=True)
+            real_rows, real_stats = load_archived_outcomes(
+                data_dir, window_days=window_days, shadow=False,
+                return_stats=True,
+            )
+            shadow_rows, shadow_stats = load_archived_outcomes(
+                data_dir, window_days=window_days, shadow=True,
+                return_stats=True,
+            )
             if real_rows or shadow_rows:
                 logger = logging.getLogger("macd_bot")
                 logger.info(
                     f"🗄️ Brain using file archive: {len(real_rows)} real, "
-                    f"{len(shadow_rows)} shadow rows from {data_dir}"
+                    f"{len(shadow_rows)} shadow rows | "
+                    f"Archive stats: kept={real_stats['kept']}, "
+                    f"stale_schema={real_stats['dropped_stale_schema']}, "
+                    f"signal_only={real_stats['dropped_missing_win']}, "
+                    f"malformed={real_stats['lines_malformed']}"
+                )
+                # Feed reconciliation data to audit layer
+                audit = get_audit()
+                audit.set_reconciliation(
+                    loaded_by_brain=len(real_rows),
+                    shadow_loaded=len(shadow_rows),
+                    archive_stats=real_stats,
                 )
                 self._rows_cache = (real_rows, shadow_rows)
-                self._recent_rows_cache = real_rows  # ← add this
+                self._recent_rows_cache = real_rows
                 return real_rows, shadow_rows
 
         sample_size = getattr(cfg, "BRAIN_REPORT_STREAM_SAMPLE", 5000)
@@ -711,6 +764,23 @@ class BrainEngineV2(BaseBrainEngine):
         logger = logging.getLogger("macd_bot")
         real_rows = base_recs.get("_real_rows", [])
         shadow_rows = base_recs.get("_shadow_rows", [])
+        # ══════════════════════════════════════════════════════════════════
+        #  BRAIN AUDIT LAYER — initialize and validate data population
+        # ══════════════════════════════════════════════════════════════════
+        audit = reset_audit()
+
+        # History coverage
+        long_days = getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180)
+        history = audit.set_history_coverage(real_rows, requested_days=long_days)
+        audit.set_shadow_count(len(shadow_rows))
+
+        # Log coverage warning (structured, replaces the old ad-hoc warning)
+        if history.coverage in (DataCoverage.SEVERELY_LIMITED, DataCoverage.CRITICAL):
+            logger.warning(
+                f"⚠️ Brain audit: DATA COVERAGE = {history.coverage.value}. "
+                f"Requested {long_days}d, have {history.actual_days:.1f}d. "
+                f"Multi-window analyses will be suppressed or degraded."
+            )
         recommendations: List[Dict[str, Any]] = list(base_recs.get("recommendations", []))
         config_patch: List[Dict[str, Any]] = list(base_recs.get("config_patch", []))
         ai_metrics: Dict[str, Any] = dict(base_recs.get("ai_metrics", {}))
@@ -1510,15 +1580,20 @@ class BrainEngineV2(BaseBrainEngine):
             # Mark as consumed regardless of success
             rec["pending_auto_action"] = False
 
-        # ─ Re-assemble ─────────────────────────────────────────────────
+        # ── Attach audit to ai_metrics for persistence ──
+        ai_metrics["brain_audit"] = audit.to_dict()
+        ai_metrics["data_quality_header"] = audit.build_data_quality_header()
+
+        # ── Attach archive stats for the profit action plan ──
         result = dict(base_recs)
         result["recommendations"] = recommendations
         result["recommendation_count"] = len(recommendations)
         result["config_patch"] = config_patch
         result["ai_metrics"] = ai_metrics
+        result["_archive_stats"] = audit._archive_stats or {}
         return result
 
-    # ── Baseline wrapper that also exposes raw rows ──────────────────────
+    # ── Baseline wrapper that also exposes raw rows ─────────────────���────
     async def _generate_baseline_recommendations(self) -> Dict[str, Any]:
         # Load rows ONCE, attach them, and hand them to the baseline via the
         # subclass hook so the parent doesn't read the archive a second time.

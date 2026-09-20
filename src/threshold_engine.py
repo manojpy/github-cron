@@ -258,7 +258,55 @@ def weighted_win_rate_with_bonus(
     hi_idx = min(len(boots) - 1, int(0.975 * (len(boots) - 1)))
     return point_wr, point_n_eff, boots[lo_idx], boots[hi_idx]
 
+# ── Bracket trade model ─────────────────────────────────────────────
+# Outcomes are labelled by which level is touched first: the stop
+# (OUTCOME_MAE_LOSS_PCT) or the target (stop * OUTCOME_RR_TARGET). P&L must
+# describe that SAME trade. pct_move / the stored net_pnl_pct are measured
+# at the 12-candle close, which is a different (hold-to-horizon) trade.
+_TARGET_REASONS = frozenset({"target_hit", "target_hit_ever"})
+_STOP_REASONS = frozenset({"stop_hit", "stop_hit_ever", "ambiguous_same_candle"})
+_UNTAGGED_REASONS = frozenset({None, "", "legacy", "unknown"})
+
+def bracket_exit_pct(row: Row) -> Optional[float]:
+    """Gross signed exit, in percent, if the trade was closed by its stop or
+    target (+target / -stop); None when neither decided it (timeout at the
+    horizon, or no usable tag). Same-candle TP+SL ties count as the stop,
+    matching how state.py labels them. Rows written before outcome_reason
+    existed fall back to their tp_first flag."""
+    reason = row.get("outcome_reason")
+    tp_first = row.get("tp_first")
+    stop_pct = float(cfg.OUTCOME_MAE_LOSS_PCT)
+    if reason in _TARGET_REASONS or (reason in _UNTAGGED_REASONS and tp_first is True):
+        return stop_pct * float(cfg.OUTCOME_RR_TARGET)
+    if reason in _STOP_REASONS or (reason in _UNTAGGED_REASONS and tp_first is False):
+        return -stop_pct
+    return None
+
+def row_net_pnl_pct(row: Row, total_cost_pct: float) -> float:
+    """Signed, cost-adjusted P&L of one resolved trade in percent, under the
+    bracket model. Stop/target exits use the bracket distance minus the row's
+    own realized_cost_pct (flat total_cost_pct if absent). Trades that hit
+    neither level exit at the horizon close, so they keep the stored
+    close-based net_pnl_pct, else the legacy magnitude-by-label estimate.
+    Single source of truth for EV, Kelly, profit factor, drawdown, training
+    weights and the kill switch."""
+    exit_pct = bracket_exit_pct(row)
+    if exit_pct is not None:
+        cost = row.get("realized_cost_pct")
+        cost = float(cost) if cost is not None else total_cost_pct
+        return exit_pct - cost
+    net = row.get("net_pnl_pct")
+    if net is not None:
+        return float(net)
+    mag = abs(float(row.get("pct_move", 0.0)))
+    return (mag - total_cost_pct) if row["win"] else -(mag + total_cost_pct)
+
 def favourable_move(row: Row) -> float:
+    """Gross move magnitude in percent: the bracket distance when the stop or
+    target decided the trade, else the horizon-close move."""
+    exit_pct = bracket_exit_pct(row)
+    if exit_pct is not None:
+        return abs(exit_pct)
     return abs(float(row.get("pct_move", 0.0)))
 
 def expected_value(wins: int, losses: int, avg_win_pct: float, avg_loss_pct: float) -> float:
@@ -1320,28 +1368,18 @@ def ev_and_kelly_for(
     """Net EV after round-trip fees + slippage, plus Half-Kelly fraction.
     Returns (net_ev_pct, half_kelly_fraction, win_rate).
 
-    Prefers each row's own `net_pnl_pct` — the real cost-adjusted P&L
-    computed in state.py from actual fees/slippage and, when available,
-    measured signal-vs-fill slippage — over the flat estimate below.
-    Rows without net_pnl_pct (legacy data predating that field) fall
-    back to the flat fee/slippage estimate."""
+    P&L per row comes from row_net_pnl_pct(): the bracket exit (+target /
+    -stop) net of the row's own realized cost (actual fees plus measured
+    entry slippage when available), so it describes the same trade the
+    win/loss label does. Timeouts keep their close-based net_pnl_pct."""
     if not rows:
         return 0.0, 0.0, 0.0
     # entry + exit for both fee and slippage; fee_pct/slippage_pct are
     # fractions (e.g. 0.0006 = 0.06%) so this must be *100 to land in the
     # same percentage-point units as pct_move (price_diff/price * 100).
     total_cost = ((fee_pct * 2) + (slippage_pct * 2)) * 100
-    net_moves: List[float] = []
-    for r in rows:
-        net_pnl = r.get("net_pnl_pct")
-        if net_pnl is not None:
-            net_moves.append(float(net_pnl))
-            continue
-        mag = abs(float(r.get("pct_move", 0.0)))
-        if r["win"]:
-            net_moves.append(mag - total_cost)
-        else:
-            net_moves.append(-(mag + total_cost))
+
+    net_moves: List[float] = [row_net_pnl_pct(r, total_cost) for r in rows]
 
     wins = [m for m in net_moves if m > 0]
     losses = [abs(m) for m in net_moves if m <= 0]
@@ -1353,7 +1391,6 @@ def ev_and_kelly_for(
     full_kelly = (wr * b - (1 - wr)) / b if b > 0 else 0.0
     half_kelly = max(0.0, min(full_kelly * 0.5, 0.25))  # cap 25 %
     return ev, half_kelly, wr
-
 
 # ════════════════════════════════════════════════════════════════════���══
 #  FIXED: Brier Score & Calibration Curve  (Recommended.txt §2)
@@ -2255,6 +2292,9 @@ def hash_config_state(
         "ENABLE_MARKET_STATE_LIVE_SCORE",
         "ENABLE_PNL_WEIGHTED_TRAINING",
         "ENABLE_FILL_RECONCILIATION",
+        "BRAIN_AUDIT_ENABLED",
+        "BRAIN_AUDIT_MIN_ROWS_FOR_RECOMMENDATION",
+        "BRAIN_AUDIT_MIN_HISTORY_RATIO",
     })
     try:
         for field_name in type(cfg).model_fields:
@@ -2814,7 +2854,7 @@ def optimize_vote_weights(
         "coeff_stability": coeff_stability,
     }
 
-# ═════════════════════════════════════════════════════���═���═══════════════
+# ═════════════════════════════════════════════════════���═���══���════════════
 #  PERMUTATION VOTE IMPORTANCE (AI/ML)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -2886,12 +2926,11 @@ def _pnl_sample_weights(
     still contributes rather than vanishing from the fit entirely."""
     total_cost = (fee_pct * 2 + slippage_pct * 2) * 100
     raw: List[float] = []
+
     for r in rows:
-        net_pnl = r.get("net_pnl_pct")
-        if net_pnl is None:
-            mag = abs(float(r.get("pct_move", 0.0)))
-            net_pnl = mag - total_cost if r.get("win") else -(mag + total_cost)
+        net_pnl = row_net_pnl_pct(r, total_cost)
         raw.append(max(min_weight, abs(float(net_pnl))))
+
     mean_w = statistics.fmean(raw) if raw else 1.0
     if mean_w <= 0:
         return [1.0] * len(rows)
@@ -3132,18 +3171,11 @@ def ev_first_objective(
 
     p_ev_positive = _prob_ev_positive(net_ev, ev_std)
 
-    # ── Net per-row P&L: prefer real net_pnl_pct, else flat cost estimate ──
-    # (mirrors ev_and_kelly_for, so profit_factor/max_drawdown are net of
-    # costs and consistent with net_ev above, not gross moves)
+    # ── Net per-row P&L (bracket model, via row_net_pnl_pct — identical to
+    # ev_and_kelly_for, so profit_factor/max_drawdown are net of costs and
+    # consistent with net_ev above) ──
     total_cost = (fee_pct * 2 + slippage_pct * 2) * 100
-    net_pnls: List[float] = []
-    for r in rows:
-        net_pnl = r.get("net_pnl_pct")
-        if net_pnl is not None:
-            net_pnls.append(float(net_pnl))
-            continue
-        mag = abs(float(r.get("pct_move", 0.0)))
-        net_pnls.append(mag - total_cost if r["win"] else -(mag + total_cost))
+    net_pnls: List[float] = [row_net_pnl_pct(r, total_cost) for r in rows]
 
     # Profit factor (net of costs)
     wins = [p for p in net_pnls if p > 0]
@@ -4037,12 +4069,12 @@ class KillSwitch:
         result["consecutive_losses"] = streak
 
         # Rolling cost-adjusted PnL (same convention as ev_and_kelly_for).
-        total_cost = (self.fee_pct * 2) + (self.slippage_pct * 2)
+        total_cost = ((self.fee_pct * 2) + (self.slippage_pct * 2)) * 100
         window = [r for r in ordered if r["entry_ts"] >= cutoff]
         pnl = 0.0
         for r in window:
-            mag = abs(float(r.get("pct_move", 0.0)))
-            pnl += (mag - total_cost) if r["win"] else -(mag + total_cost)
+            pnl += row_net_pnl_pct(r, total_cost)
+
 
         result.update(
             pnl_pct=round(pnl, 4),
@@ -4259,7 +4291,7 @@ def trade_quality_score(
         + 0.10 * (cal_wr if cal_wr is not None else 0.5)
     )
 
-    # ── Verdict ──
+    # ─�� Verdict ──
     if quality >= 0.70 and p_profit_effective >= 0.85 and ev_p5 > -0.10:
         verdict = "HIGH"
     elif quality >= 0.50 and p_profit_effective >= 0.65:

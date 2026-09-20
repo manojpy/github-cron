@@ -18,6 +18,7 @@ from state import RedisKeyPrefix, RedisStateStore, _rc
 import threshold_engine as engine
 
 from threshold_engine import CUSUMDetector, StabilityGate
+from brain_audit import get_audit, HealthStatus
 
 _ALERT_CONFIG_MAP = {
     "strong_reversal_buy":  "ENABLE_STRONG_REVERSAL_ALERT",
@@ -692,8 +693,26 @@ class BrainEngine:
             )
             if not rows_sorted:
                 continue
+        # ── AUDIT: validate watermark monotonicity ──
+            audit = get_audit()
+            new_watermark = rows_sorted[-1]["entry_ts"]
+            wm_warning = audit.validate_cusum_watermark(
+                alert_key=alert_key,
+                old_watermark=watermark,
+                new_watermark=new_watermark,
+                rows_consumed=len(rows_sorted),
+            )
+            if wm_warning:
+                drift_alerts.append({
+                    "type": "cusum_watermark_anomaly",
+                    "severity": "medium",
+                    "alert": alert_key,
+                    "message": f"⚠️ {wm_warning}",
+                })
+
             det = await self._load_or_create_cusum(alert_key)
             for r in rows_sorted:
+
                 # Deliberately binary: CUSUM detects edge DECAY. s_neg only
                 # accumulates on losses (x < mu), so bonus-weighting wins
                 # cannot change decay detection — keep raw win/loss here.
@@ -1208,14 +1227,38 @@ class BrainEngine:
         if getattr(cfg, "ENABLE_LAYERED_WINDOW_ANALYSIS", True):
             recent_days = getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30)
             long_days = getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180)
-            try:
-                recent_lw, medium_lw, long_lw = await self._get_layered_window_rows()
-                lwa = engine.layered_window_analysis(
-                    recent_lw, medium_lw, long_lw, min_sample=min_sample,
+            audit = get_audit()
+            can_run_lw, lw_reason = audit.can_run("layered_window")
+            if can_run_lw:
+                _t0_lw = time.time()
+                try:
+                    recent_lw, medium_lw, long_lw = await self._get_layered_window_rows()
+                    lwa = engine.layered_window_analysis(
+                        recent_lw, medium_lw, long_lw, min_sample=min_sample,
+                    )
+                    _elapsed_lw = (time.time() - _t0_lw) * 1000
+                    if lwa.get("valid"):
+                        audit.record_analysis(
+                            "layered_window", HealthStatus.OK,
+                            detail=f"{len(lwa.get('per_alert', {}))} alerts analyzed",
+                            duration_ms=_elapsed_lw,
+                        )
+                    else:
+                        audit.record_analysis(
+                            "layered_window", HealthStatus.DEGRADED,
+                            detail="Analysis returned valid=False",
+                            duration_ms=_elapsed_lw,
+                        )
+                except Exception as e:
+                    audit.record_analysis_exception("layered_window", e)
+                    lwa = {"valid": False}
+                    logging.getLogger("macd_bot").debug(f"Brain: layered window analysis failed: {e}")
+            else:
+                audit.record_analysis(
+                    "layered_window", HealthStatus.INSUFFICIENT_DATA,
+                    detail=lw_reason,
                 )
-            except Exception as e:
                 lwa = {"valid": False}
-                logging.getLogger("macd_bot").debug(f"Brain: layered window analysis failed: {e}")
             if lwa.get("valid"):
                 ai_metrics["layered_window_analysis"] = lwa["per_alert"]
                 weak_now = [
@@ -1259,15 +1302,37 @@ class BrainEngine:
 
         # ── Hierarchical pair+direction+alert+regime analysis ──
         if getattr(cfg, "ENABLE_HIERARCHICAL_COMBINATION_ANALYSIS", True):
-            try:
-                hca = engine.hierarchical_combination_analysis(
-                    real_rows,
-                    min_leaf_sample=getattr(cfg, "HIERARCHICAL_MIN_LEAF_SAMPLE", 15),
-                    shrinkage_k=getattr(cfg, "HIERARCHICAL_SHRINKAGE_K", 20.0),
+            can_run_hca, hca_reason = audit.can_run("hierarchical")
+            if can_run_hca:
+                _t0_hca = time.time()
+                try:
+                    hca = engine.hierarchical_combination_analysis(
+                        real_rows,
+                        min_leaf_sample=getattr(cfg, "HIERARCHICAL_MIN_LEAF_SAMPLE", 15),
+                        shrinkage_k=getattr(cfg, "HIERARCHICAL_SHRINKAGE_K", 20.0),
+                    )
+                    _elapsed_hca = (time.time() - _t0_hca) * 1000
+                    if hca.get("valid"):
+                        audit.record_analysis(
+                            "hierarchical", HealthStatus.OK,
+                            detail=f"{len(hca.get('leaves', {}))} leaves",
+                            duration_ms=_elapsed_hca,
+                        )
+                    else:
+                        audit.record_analysis(
+                            "hierarchical", HealthStatus.DEGRADED,
+                            detail="No valid leaves",
+                            duration_ms=_elapsed_hca,
+                        )
+                except Exception as e:
+                    audit.record_analysis_exception("hierarchical", e)
+                    hca = {"valid": False}
+            else:
+                audit.record_analysis(
+                    "hierarchical", HealthStatus.INSUFFICIENT_DATA,
+                    detail=hca_reason,
                 )
-            except Exception as e:
                 hca = {"valid": False}
-                logging.getLogger("macd_bot").debug(f"Brain: hierarchical combination analysis failed: {e}")
             if hca.get("valid"):
                 ai_metrics["hierarchical_combination_analysis"] = hca["leaves"]
                 leaves = list(hca["leaves"].values())
@@ -1383,7 +1448,7 @@ class BrainEngine:
                 "bonus_rate": round(mm_summary.get("bonus_rate", 0.0), 4),
                 "avg_rr_achieved": round(mm_summary.get("avg_rr_achieved", 0.0), 2),
                 "weighted_wr": round(mm_summary.get("weighted_wr", 0.0), 4),
-                # ── FDR: exact McNemar on the discordant 2×2 cells ──
+                # ��─ FDR: exact McNemar on the discordant 2×2 cells ──
                 # Not a two-proportion test — see mcnemar_exact_p docstring.
                 "n": mm_summary["n"],
                 "mfe_only": mm_summary.get("mfe_only", 0),
@@ -1789,7 +1854,7 @@ class BrainEngine:
                     engine.ev_first_objective(real_rows, min_sample=min_sample)
                     if real_rows else None
                 ),
-                # ── NEW: rolling walk-forward ──
+                # ── NEW: rolling walk-forward ─
                 "rolling_wf": (
                     engine.rolling_walk_forward(real_rows, n_folds=5)
                     if len(real_rows) >= min_sample * 6 else None
