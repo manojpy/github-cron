@@ -262,7 +262,8 @@ class RedisStateStore:
         self.metadata_expiry_seconds = 7 * 86400
         self._pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None
         self._shadow_pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None
-
+        self._run_resolved_total: int = 0
+        self._run_archived_total: int = 0
         self.degraded = False
         self.degraded_alerted = False
         self._connection_attempts = 0
@@ -1431,14 +1432,14 @@ class RedisStateStore:
         except Exception as e:
             logger_pair.debug(f"Failed to persist resolved outcomes for {pair}: {e}")
             return
-
+        self._run_resolved_total += resolved_count
         if resolved_for_file and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
             try:
                 from outcome_storage import append_outcome_batch
                 append_outcome_batch(resolved_for_file, shadow=False)
+                self._run_archived_total += len(resolved_for_file)
             except Exception as e:
                 logger_pair.warning(f"[{pair}] File archive write failed: {e}")
-
         logger_pair.debug(
             f"[{pair}] Outcome resolution | "
             f"pending={len(keys)} | "

@@ -118,6 +118,7 @@ _ANALYSIS_MIN_SAMPLES: Dict[str, int] = {
     "layered_window": 60,
     "hierarchical": 50,
     "weight_optimizer": 100,
+    "permutation_importance": 60,
     "calibration": 30,
     "cusum": 20,
     "threshold_recommendation": 20,
@@ -137,10 +138,9 @@ _ANALYSIS_MIN_HISTORY_DAYS: Dict[str, int] = {
     "layered_window": 30,
     "hierarchical": 14,
     "weight_optimizer": 21,
+    "permutation_importance": 14,
     "config_regression": 14,
 }
-
-
 # ══════════════════════════════════════════════════════════════════════
 #  DATA CLASSES
 # ══════════════════════════════════════════════════════════════════════
@@ -171,7 +171,7 @@ class OutcomeReconciliation:
             return "n/a" if v is None else str(v)
 
         lines = [
-            f"   Pending outcomes: {_n(self.pending_count)}",
+            f"   Pending outcomes (at run start): {_n(self.pending_count)}", 
             f"   Resolved this run: {_n(self.resolved_this_run)}",
             f"   Archived this run: {_n(self.archived_this_run)}",
             f"   Archive lines read: {_n(self.total_archived)}",
@@ -226,7 +226,6 @@ class HistoryCoverage:
             for w in self.warnings:
                 lines.append(f"   ⚠️ {w}")
         return lines
-
 
 @dataclass
 class AnalysisHealthEntry:
@@ -451,6 +450,22 @@ class BrainAuditLayer:
         else:
             recon.status = HealthStatus.OK
 
+        # Lifecycle check: every outcome resolved this run should have been
+        # archived. A shortfall means outcomes left Redis but never reached
+        # the file archive (lost to the Brain permanently).
+        if (
+            resolved_this_run is not None
+            and archived_this_run is not None
+            and archived_this_run < resolved_this_run
+        ):
+            recon.notes.append(
+                f"{resolved_this_run - archived_this_run} resolved outcome(s) "
+                f"this run were not archived (resolved={resolved_this_run}, "
+                f"archived={archived_this_run})."
+            )
+            if recon.status == HealthStatus.OK:
+                recon.status = HealthStatus.DEGRADED
+
         self._reconciliation = recon
         return recon
 
@@ -483,9 +498,7 @@ class BrainAuditLayer:
 
         # Coverage-level gate for specific analysis classes
         if self._history is not None:
-            if analysis_name in (
-                "layered_window", "temporal_drift", "config_regression"
-            ) and self._history.coverage in (
+            if analysis_name in ("layered_window",) and self._history.coverage in (
                 DataCoverage.SEVERELY_LIMITED, DataCoverage.CRITICAL
             ):
                 return False, (
@@ -494,6 +507,14 @@ class BrainAuditLayer:
                 )
 
         return True, "ok"
+
+    def gate(self, analysis_name: str) -> bool:
+        ok, why = self.can_run(analysis_name)
+        if not ok:
+            self.record_analysis(
+                analysis_name, HealthStatus.INSUFFICIENT_DATA, detail=why,
+            )
+        return ok
 
     def can_recommend(self, analysis_name: str) -> bool:
         """Whether the analysis result can produce an ACTIONABLE

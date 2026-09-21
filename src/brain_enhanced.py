@@ -46,6 +46,20 @@ _PHASE_MIN_SAMPLES = {
     "config_regression": 20,
 }
 
+}
+
+def _report_section_failed(failed: List[str], name: str, exc: Exception) -> None:
+    """A report section raised. Never let that vanish: record it in the audit
+    layer (logs at WARNING with the exception type) and queue the section
+    name so the report itself says it is unavailable."""
+    try:
+        get_audit().record_analysis_exception(f"report:{name}", exc)
+    except Exception:
+        logging.getLogger("macd_bot").warning(
+            f"Brain report: {name} section failed: {type(exc).__name__}: {exc}"
+        )
+    failed.append(name)
+
 # ══════════════════════════════════════════════════════════════════════
 #  PLAIN-ENGLISH PROFIT ACTION PLAN (layman-friendly report layer)
 # ══════════════════════════════════════════════════════════════════════
@@ -57,6 +71,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     cfg_patch = recs.get("config_patch", []) or []
     ai = recs.get("ai_metrics", {}) or {}
     sections: List[str] = []
+    failed_sections: List[str] = []
 
     # ══════════════════════════════════════════════════════════════════
     #  DATA QUALITY HEADER (always first, before any analysis)
@@ -69,7 +84,6 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
     if action_gate:
         header_lines.append("")
         header_lines.extend(audit.build_action_gate_summary(action_gate))
-
 
     # Schema migration advisory
     archive_stats = recs.get("_archive_stats", {})
@@ -118,7 +132,9 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
         rec_thr = engine.recommend_threshold(
             rows, target_winrate=target, min_sample=getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
         )
-    except Exception:
+    
+    except Exception as e:
+        _report_section_failed(failed_sections, "ENTRY BAR RECOMMENDATION", e)
         rec_thr = {"valid": False}
     rec_thr_available = (
         rec_thr.get("valid") and rec_thr.get("recommended")
@@ -159,8 +175,8 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
             + f"\n{ev_note}{wr_note}{low_data}"
         )
     except Exception as e:
-        logging.getLogger("macd_bot").debug(f"Brain report: BOTTOM LINE section failed: {e}")
-
+        _report_section_failed(failed_sections, "BOTTOM LINE", e)
+        
     # ── PER-ALERT HEALTH ───────────────────────────────────────────────
     try:
         stats = engine.per_alert_breakdown(rows, min_sample=1)  # (ak, wr, n, avg_score)
@@ -225,8 +241,8 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
             block += f"\n\n{nd_block}"
         sections.append(block)
     except Exception as e:
-        logging.getLogger("macd_bot").debug(f"Brain report: PER-ALERT HEALTH section failed: {e}")
-
+        _report_section_failed(failed_sections, "PER-ALERT HEALTH", e)
+        
     # ── BLOCKED BY WIN-RATE FILTER (shadow, not dispatched) ─────────────
     try:
 
@@ -275,8 +291,8 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                     )          
                 sections.append(header + "\n" + "\n".join(dropped_lines[:10]))
     except Exception as e:
-        logging.getLogger("macd_bot").debug(f"Brain report: BLOCKED BY WIN-RATE FILTER section failed: {e}")
-    
+        _report_section_failed(failed_sections, "BLOCKED BY WIN-RATE FILTER", e)
+        
     # ── GATE IMPACT (shadow, per-gate counterfactual EV) ────────────────
     try:
         shadow_rows = recs.get("_shadow_rows", []) or []
@@ -318,8 +334,8 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                 + "\n".join(gate_lines)
             )
     except Exception as e:
-        logging.getLogger("macd_bot").debug(f"Brain report: GATE IMPACT section failed: {e}")
-
+        _report_section_failed(failed_sections, "GATE IMPACT", e)
+        
     # ── CONFLUENCE WEIGHT CHANGES ──────────────────────────────────────
     blocked_lines: List[str] = []
     try:
@@ -348,8 +364,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
         else:
             sections.append("⚖️ CONFLUENCE WEIGHTS\nNo safe weight changes yet — need more trade history before the Brain will move them.")
     except Exception as e:
-        logging.getLogger("macd_bot").debug(f"Brain report: CONFLUENCE WEIGHT CHANGES section failed: {e}")
-
+        _report_section_failed(failed_sections, "CONFLUENCE WEIGHT CHANGES", e)
 
     # ── INDICATOR SETTING CHANGES ──────────────────────────────────────
     try:
@@ -371,7 +386,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
         if blocked_lines:    
             sections.append("🔬 UNDER REVIEW — not confident enough to apply yet\n" + "\n".join(blocked_lines))
     except Exception as e:
-        logging.getLogger("macd_bot").debug(f"Brain report: INDICATOR SETTING CHANGES section failed: {e}")
+        _report_section_failed(failed_sections, "INDICATOR SETTING CHANGES", e)
 
     # ── ENTRY GATE THRESHOLD ───────────────────────────────────────────
     gate_rec = None
@@ -414,7 +429,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                     f"   Insufficient data for a recommendation. Accumulate more outcomes."
                 )
     except Exception as e:
-        logging.getLogger("macd_bot").debug(f"Brain report: ENTRY GATE THRESHOLD section failed: {e}")
+        _report_section_failed(failed_sections, "ENTRY GATE THRESHOLD", e)
 
     # ── COPY-PASTE CONFIG BLOCK ────────────────────────────────────────
     # Kept OUT of `sections` so it can be emitted as a real Telegram code
@@ -440,7 +455,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
             
             json_block = "```json\n" + code_safe + "\n```"
     except Exception as e:
-        logging.getLogger("macd_bot").debug(f"Brain report: COPY-PASTE CONFIG BLOCK section failed: {e}")
+        _report_section_failed(failed_sections, "COPY-PASTE CONFIG BLOCK", e)
 
     # ── BEST / WORST CONDITIONS ────────────────────────────────────
     try:
@@ -474,7 +489,13 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
             
             sections.append(line)
     except Exception as e:
-        logging.getLogger("macd_bot").debug(f"Brain report: BEST/WORST CONDITIONS section failed: {e}")
+        _report_section_failed(failed_sections, "BEST/WORST CONDITIONS", e)
+
+    if failed_sections:
+        sections.append(
+            "⚠️ REPORT SECTIONS UNAVAILABLE (analysis error — see logs):\n   "
+            + ", ".join(failed_sections)
+        )
 
     if not sections and json_block is None:
         return []
@@ -604,10 +625,6 @@ class BrainEngineV2(BaseBrainEngine):
         }
 
         # OOS prediction: rolling walk-forward must pass
-        # Audit-gated: rolling_walk_forward's own guard is only a row count
-        # (n >= 120), so a 2-day archive can still pass it. The audit adds
-        # the history-days requirement, matching the walk-forward metric
-        # already reported in ai_metrics.
         _rwc_allowed = True
         try:
             _rwc_allowed, _ = get_audit().can_run("walk_forward")
@@ -631,7 +648,6 @@ class BrainEngineV2(BaseBrainEngine):
             )
     
         # ── Stability: no active CUSUM edge-decay alarm. Prefer the
-
         if active_drift_keys:
             gate["stability"] = False
         elif recommendations is not None:
@@ -739,9 +755,26 @@ class BrainEngineV2(BaseBrainEngine):
                     f"signal_only={real_stats['dropped_missing_win']}, "
                     f"malformed={real_stats['lines_malformed']}"
                 )
-                # Feed reconciliation data to audit layer
                 audit = get_audit()
+                # Lifecycle counters exist only when this process ran the
+                # pending-outcome pre-scan + resolution (not --brain-only).
+                _pend_map = getattr(self.sdb, "_pending_outcome_keys_by_pair", None)
+                _ran_resolution = _pend_map is not None
                 audit.set_reconciliation(
+                    pending_count=(
+                        sum(len(v) for v in _pend_map.values())
+                        if _ran_resolution else None
+                    ),
+                    resolved_this_run=(
+                        getattr(self.sdb, "_run_resolved_total", None)
+                        if _ran_resolution else None
+                    ),
+                    archived_this_run=(
+                        getattr(self.sdb, "_run_archived_total", None)
+                        if _ran_resolution
+                        and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False)
+                        else None
+                    ),
                     loaded_by_brain=len(real_rows),
                     shadow_loaded=len(shadow_rows),
                     archive_stats=real_stats,
@@ -835,7 +868,7 @@ class BrainEngineV2(BaseBrainEngine):
             self._ledger_stats = await ledger_stats(self.sdb)
             ai_metrics["repair_ledger"] = dict(self._ledger_stats)
         except Exception as e:
-            logging.getLogger("macd_bot").debug(f"Repair ledger eval failed (non-fatal): {e}")
+            audit.record_analysis_exception("repair_ledger", e)
             self._repair_success_rates = {}
             self._ledger_stats = {}
         _phase_mark("repair_ledger")
@@ -860,9 +893,7 @@ class BrainEngineV2(BaseBrainEngine):
                 self._repair_help_preds = rem["p_help_by_category"]
                 ai_metrics["repair_effectiveness_model"] = rem
         except Exception as e:
-            logging.getLogger("macd_bot").debug(
-                f"Repair effectiveness model failed (non-fatal): {e}"
-            )
+            audit.record_analysis_exception("repair_effectiveness_model", e)
             self._repair_help_preds = {}
 
         # ── REPAIR SHOP (runs first — highest priority) ──────────────────
@@ -923,8 +954,7 @@ class BrainEngineV2(BaseBrainEngine):
                 if rid:
                     wrapped["_repair_id"] = rid
             except Exception as e:
-                logger.debug(f"Repair ledger write failed (non-fatal): {e}")
-
+                audit.record_analysis_exception("repair_ledger_write", e)          
             recommendations.append(wrapped)
 
         _phase_mark("repair_shop")
@@ -1473,7 +1503,17 @@ class BrainEngineV2(BaseBrainEngine):
         # ── AI/ML: OOS Permutation Importance (EV-based, walk-forward) ────
         # FIX: honor cfg.BRAIN_PERMUTATION_IMPORTANCE — previously this
         # ran whenever sample size was sufficient, regardless of the flag.
-        if getattr(cfg, "BRAIN_PERMUTATION_IMPORTANCE", True) and len(real_rows) >= min_sample * 3:
+        _perm_enabled = (
+            getattr(cfg, "BRAIN_PERMUTATION_IMPORTANCE", True)
+            and len(real_rows) >= min_sample * 3
+        )
+        _perm_ok, _perm_why = audit.can_run("permutation_importance")
+        if _perm_enabled and not _perm_ok:
+            audit.record_analysis(
+                "permutation_importance", HealthStatus.INSUFFICIENT_DATA,
+                detail=_perm_why,
+            )
+        if _perm_enabled and _perm_ok:
             _perm_n = 15
             perm_imp = engine.oos_permutation_importance(
                 real_rows, min_sample=min_sample, n_permutations=_perm_n
@@ -1571,7 +1611,7 @@ class BrainEngineV2(BaseBrainEngine):
         await self._remember_config_version(ai_metrics["config_version"])
         logger.info(f"⏱️   └ hash_and_remember: {time.time() - _hash_t0:.2f}s")
 
-        # ── Bonus-aware metrics ──────────────────────────────────────────
+        # ── Bonus-aware metrics ───────────────────────────────�����──────────
         if real_rows:
             bonus_count = sum(1 for r in real_rows if r.get("bonus_win"))
             total_wins = sum(1 for r in real_rows if r["win"])
@@ -1588,6 +1628,7 @@ class BrainEngineV2(BaseBrainEngine):
             )
 
         # ─ Action gate: suppress config patches unless evidence is strong ──      
+        _cusum_read_failed = False
         _active_drift_keys: List[str] = []
         _below_floor_drift: List[Tuple[str, int]] = []
 
@@ -1630,8 +1671,10 @@ class BrainEngineV2(BaseBrainEngine):
                         f"({[f'{ak}(n={n})' for ak, n in _below_floor_drift[:5]]}"
                         f"{'…' if len(_below_floor_drift) > 5 else ''})"
                     )
+
             except Exception as e:
-                logger.debug(f"Persisted CUSUM-state read failed (non-fatal): {e}")
+                _cusum_read_failed = True
+                audit.record_analysis_exception("cusum_gate_read", e)
 
         if getattr(cfg, "BRAIN_ACTION_GATE_ENABLED", True):
             action_gate = self._action_gate_check(
@@ -1641,7 +1684,9 @@ class BrainEngineV2(BaseBrainEngine):
             )
         else:
             action_gate = {"actionable": True, "disabled": True}
-
+        if _cusum_read_failed and not action_gate.get("disabled"):
+            action_gate["stability"] = False
+            action_gate["actionable"] = False
         ai_metrics["action_gate"] = action_gate
         if not action_gate.get("actionable", False):
             # Downgrade all config patches to informational
