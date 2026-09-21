@@ -791,9 +791,10 @@ def _profit_status(net_ev: float, n: int) -> str:
         return "⚪ NO DATA"
     return "🔴 POOR" if net_ev <= -0.05 else "🟡 FLAT" if net_ev < 0.05 else "🟢 POSITIVE"
 
-
-def _data_status(F: Dict[str, Any]) -> str:
-    cov = F["coverage"].coverage if F["coverage"] else None
+def _data_status(F: Dict[str, Any]) -> str:   
+    cov: Optional[DataCoverage] = getattr(cov_obj, "coverage", None) if cov_obj else None
+    if cov is None:
+        return "⚪ UNKNOWN"
     return {
         DataCoverage.FULL: "🟢 GOOD",
         DataCoverage.PARTIAL: "🟡 PARTIAL HISTORY",
@@ -872,7 +873,7 @@ def _sec_summary(F: Dict[str, Any], cfg) -> List[str]:
     prof = _profit_status(net_ev, n)
     out = [_hdr(1, 'EXECUTIVE SUMMARY — "WHAT DO I NEED TO KNOW?"')]
     out.append(_p(
-        f"🩺 OVERALL SYSTEM STATUS\n{_overall(F)}\n\n"
+        f"OVERALL SYSTEM STATUS\n{_overall(F)}\n\n"
         f"Observed profitability:   {prof}\n"
         f"Data quality:             {_data_status(F)}\n"
         f"Outcome recording:        {_recording_status(F)}\n"
@@ -964,7 +965,6 @@ def _sec_verdict(F: Dict[str, Any], cfg) -> List[str]:
         f"Confidence: {F['conf']}\nAction Gate: APPROVED"
     ))
     return out
-
 
 def _sec_do_now(F: Dict[str, Any], cfg) -> List[str]:
     n, wr = F["n"], F["wr"]
@@ -1108,7 +1108,6 @@ def _sec_positive(F: Dict[str, Any], cfg) -> List[str]:
     ))
     return out
 
-
 def _sec_scorecard(F: Dict[str, Any], cfg) -> List[str]:
     out = [_hdr(6, '🚦 ALERT SCORECARD — "WHAT SHOULD I TRUST?"')]
     validated = [a for a in F["good"] if a["rank"] == 4]
@@ -1128,7 +1127,6 @@ def _sec_scorecard(F: Dict[str, Any], cfg) -> List[str]:
     if zero > 0:
         out.append(_p(f"➖ {zero} alert(s) with exactly zero net EV are not listed above."))
     return out
-
 
 def _sec_coins(F: Dict[str, Any], cfg) -> List[str]:
     out = [_hdr(7, '🪙 COIN ANALYSIS — "WHERE ARE WE WINNING/LOSING?"')]
@@ -1466,7 +1464,6 @@ _REPORT_SECTIONS = (
     ("ACTION GATE", _sec_gate), ("DATA QUALITY", _sec_quality),
     ("EVIDENCE", _sec_evidence), ("TECHNICAL APPENDIX", _sec_appendix),
 )
-
 
 def build_brain_report(recs: Dict[str, Any], cfg) -> List[str]:
     """Layered 16-section Brain report. Returns Telegram-ready MarkdownV2
