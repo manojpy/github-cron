@@ -1667,6 +1667,7 @@ class RedisStateStore:
         if resolved_count:
             logger_pair.debug(
                 f"[{pair}] Shadow outcome resolution | resolved={resolved_count}"
+            )
 
     async def get_alert_win_rate(self, pair: str, alert_key: str) -> Tuple[Optional[float], int]:
         """Returns (win_rate, sample_size). win_rate is None until MIN_WIN_RATE_SAMPLE is reached."""
