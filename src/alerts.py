@@ -747,6 +747,27 @@ SELL_ALERT_KEYS: Set[str] = {
 }
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
 
+async def _run_post_send_hooks(p: AlertPayload, sdb: RedisStateStore,
+                               logger_run: logging.Logger) -> None:
+    """Post-delivery bookkeeping for one payload. Each step is isolated so a
+    Redis/outcome error on one pair cannot skip the candle-processed marker
+    (which would allow a duplicate Telegram alert next run) or abort the
+    remaining pairs in the batch."""
+    for label, hook in (("record_win_rate", p.record_win_rate),
+                        ("record_win_rate_after_send", p.record_win_rate_after_send)):
+        if hook:
+            try:
+                await hook()
+            except Exception as e:
+                logger_run.error(
+                    f"[{p.pair_name}] Post-send {label} failed AFTER Telegram delivery: {e}"
+                )
+    if p.mark_candle_processed:
+        try:
+            await sdb.set_last_processed_candle_ts(p.pair_name, p.ts)
+        except Exception as e:
+            logger_run.error(f"[{p.pair_name}] Failed to mark candle processed: {e}")
+
 async def dispatch_combined_alerts(
     payloads: List[AlertPayload],
     telegram_queue: TelegramQueue,
@@ -863,16 +884,10 @@ async def dispatch_combined_alerts(
         async with alerts_sent_lock:
             alerts_sent_ref[0] += sum(p.budget_count for p in sent_payloads)
         for p in sent_payloads:
-            if p.record_win_rate:
-                await p.record_win_rate()
-            if p.record_win_rate_after_send:
-                await p.record_win_rate_after_send()
-            if p.mark_candle_processed:
-                await sdb.set_last_processed_candle_ts(p.pair_name, p.ts)
+            await _run_post_send_hooks(p, sdb, logger_run)
         logger_run.info(
             f"🔔 Combined dispatch sent {len(sent_payloads)} pair(s) in {len(messages)} message(s)"
         )
-
     already_sent = sum(p.budget_count for p in sent_payloads)
 
     if combined_success:
@@ -904,12 +919,7 @@ async def dispatch_combined_alerts(
                 await sdb.atomic_batch_update(p.state_changes)
             async with alerts_sent_lock:
                 alerts_sent_ref[0] += p.budget_count
-            if p.record_win_rate:
-                await p.record_win_rate()
-            if p.record_win_rate_after_send:
-                await p.record_win_rate_after_send()
-            if p.mark_candle_processed:
-                await sdb.set_last_processed_candle_ts(p.pair_name, p.ts)
+            await _run_post_send_hooks(p, sdb, logger_run)
             fallback_sent += p.budget_count
         else:
             # Send failed. Keep the dedup claims so the alert cannot
@@ -918,7 +928,6 @@ async def dispatch_combined_alerts(
                 f"Individual send failed for {p.pair_name} — keeping dedup claims "
                 f"({p.dedup_keys}) so it won't re-fire until window expires"
             )
-    
     # Report the full delivered total — the caller logs this as "N alerts
     # delivered", and silently returning only the fallback portion made
     # partial-success batches look like complete failures.
@@ -1559,6 +1568,35 @@ def rolling_correlation(alt_returns: np.ndarray, btc_returns: np.ndarray, window
     if np.std(a) == 0 or np.std(b) == 0:
         return float("nan")
     return float(np.corrcoef(a, b)[0, 1])
+
+async def _confirm_alert_candle(
+    fetcher: DataFetcher, symbol: str, pair_name: str, ts_curr: int,
+    cached_snapshot: CandleSnapshot, is_green: bool, is_red: bool,
+    reference_time: int, logger_pair: logging.Logger,
+) -> Tuple[Optional[bool], Optional[bool]]:
+    """Run the candle re-confirmation and the mark-price check concurrently.
+
+    Returns (reconfirmed, mark_agrees) with the same meaning the two sequential
+    calls had: mark_agrees is only meaningful when reconfirmed is True and is
+    reported as None otherwise, so callers' branch order is unchanged. Costs at
+    most one wasted mark request on the (rare) repaint path, and saves one full
+    HTTP round-trip on every alert that goes out."""
+    reconfirmed, mark_agrees = await asyncio.gather(
+        confirm_candle_unchanged(
+            fetcher, symbol, pair_name, ts_curr, cached_snapshot, reference_time, logger_pair
+        ),
+        verify_mark_price_agrees(
+            fetcher, pair_name, ts_curr, is_green, is_red, reference_time, logger_pair
+        ),
+        return_exceptions=True,
+    )
+    if isinstance(reconfirmed, BaseException):
+        raise reconfirmed                      # same as the old sequential await
+    if reconfirmed is not True:
+        return reconfirmed, None               # old code never evaluated mark here
+    if isinstance(mark_agrees, BaseException):
+        raise mark_agrees                      # old code raised when reconfirmed was True
+    return reconfirmed, mark_agrees
 
 async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], conditional_states: Dict[str, bool],
     raw_alerts: List[Tuple[str, str, str]], sdb: RedisStateStore, telegram_queue: TelegramQueue,
@@ -2268,14 +2306,17 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
             # Strip the datetime line so the run-level dispatcher can add one shared footer
             msg_body, _, _ = msg.rpartition("\n")
+            # Outcome recording and ACTIVE-state activation are DEFERRED to the
+            # dispatcher, which runs them only after Telegram confirms delivery.
+            # A failed or truncated send therefore never creates a phantom trade.
+            deferred_activations: List[Tuple[str, str, None]] = []
+            deferred_record: Optional[Callable[[], Awaitable[None]]] = None
             if not cfg.DRY_RUN_MODE:
                 assert cached_snapshot is not None
-                reconfirmed = await confirm_candle_unchanged(
-                    fetcher, symbol, pair_name, ts_curr, cached_snapshot, reference_time, logger_pair
+                reconfirmed, mark_agrees = await _confirm_alert_candle(
+                    fetcher, symbol, pair_name, ts_curr, cached_snapshot,
+                    is_green, is_red, reference_time, logger_pair,
                 )
-                mark_agrees = await verify_mark_price_agrees(
-                    fetcher, pair_name, ts_curr, is_green, is_red, reference_time, logger_pair
-                ) if reconfirmed is True else None
                 if reconfirmed is None:
                     logger_pair.warning(
                         f"[{pair_name}] Confirmation inconclusive — alert suppressed this run, "
@@ -2342,15 +2383,13 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     }, None
 
                 # ── Reached only when reconfirm is True AND mark_agrees is True ──
-                # 1. Record the outcome first (survives send failures)
+                # 1. Hand outcome recording + ACTIVE activations to the dispatcher;
+                #    it runs them only after the Telegram send succeeds.
                 if cfg.ENABLE_WIN_RATE_FILTER:
-                    await _record_win_rates()
+                    deferred_record = _record_win_rates
+                deferred_activations = list(new_alert_activations)
 
-                # 2. Merge new alert activations into the main state list NOW.
-                if new_alert_activations:
-                    all_state_changes.extend(new_alert_activations)
-
-                # 3. Commit ALL state changes (including new activations) in one batch
+                # 2. Commit the remaining (non-activation) state changes now.
                 if all_state_changes:
                     persist_ok = await sdb.atomic_batch_update(all_state_changes)
                     if not persist_ok:
@@ -2381,16 +2420,15 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 total=confluence_total,
                 msg_body=msg_body,
                 dedup_keys=dedup_keys,
-                state_changes=[],              # already committed above
+                state_changes=deferred_activations,   # committed by the dispatcher after delivery
                 budget_count=len(alerts_to_send),
                 ts=ts_curr,
                 macro_shadow=macro_shadow,
                 alert_keys=[ak for _, _, ak in alerts_to_send],
-                record_win_rate=None,          # already recorded above
-                record_win_rate_after_send=None,  # not needed yet — reserved for future
+                record_win_rate=deferred_record,      # runs only after Telegram confirms delivery
+                record_win_rate_after_send=None,
                 mark_candle_processed=True,    # dispatcher marks candle after delivery
             )
-
             return pair_name, {
                 "state": "BATCHED",
                 "ts": int(time.time()),
@@ -2402,7 +2440,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 }
             }, payload
 
-        # ════════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════��════════════════════
         # IMMEDIATE MODE  →  legacy per-pair Telegram send (unchanged logic)
         # ════════════════════════════════════════════════════════════════════
         async def _refund_alert_budget(n: int) -> None:
@@ -2461,12 +2499,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
                 if not cfg.DRY_RUN_MODE:
                     assert cached_snapshot is not None
-                    reconfirmed = await confirm_candle_unchanged(
-                        fetcher, symbol, pair_name, ts_curr, cached_snapshot, reference_time, logger_pair
+                    reconfirmed, mark_agrees = await _confirm_alert_candle(
+                        fetcher, symbol, pair_name, ts_curr, cached_snapshot,
+                        is_green, is_red, reference_time, logger_pair,
                     )
-                    mark_agrees = await verify_mark_price_agrees(
-                        fetcher, pair_name, ts_curr, is_green, is_red, reference_time, logger_pair
-                    ) if reconfirmed is True else None
 
                     if reconfirmed is None:
                         logger_pair.warning(
@@ -2507,15 +2543,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         confirmation_blocked = True   # NEW
                         send_success = False
                     else:
-                        # ── FIX: record outcome before the send attempt ──
-                        if cfg.ENABLE_WIN_RATE_FILTER:
-                            await _record_win_rates()
-
-                        # Merge new alert activations into the main state list NOW.
-                        if new_alert_activations:
-                            all_state_changes.extend(new_alert_activations)
-
-                        # Commit ALL state changes BEFORE the network I/O
+                        # Commit the non-activation state changes BEFORE the network I/O.
                         if all_state_changes:
                             persist_ok = await sdb.atomic_batch_update(all_state_changes)
                             if not persist_ok:
@@ -2526,8 +2554,16 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
                         send_success = await telegram_queue.send(msg)
 
+                        # Outcome + ACTIVE state only once Telegram confirmed delivery,
+                        # so a failed send never leaves a phantom trade behind.
+                        if send_success:
+                            if cfg.ENABLE_WIN_RATE_FILTER:
+                                await _record_win_rates()
+                            if new_alert_activations:
+                                await sdb.atomic_batch_update(new_alert_activations)
+
                     if send_success:
-                        # State and outcome are already committed. Mark the candle
+                        # State and outcome were committed just above. Mark the candle
                         # as processed so this exact candle is not re-evaluated.
                         await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
                         logger_pair.info(
@@ -2544,7 +2580,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
                         logger_pair.error(
                             f"Alert send failed | {pair_name} | "
-                            f"Outcome already recorded, state ACTIVE, budget consumed | "
+                            f"Outcome NOT recorded, state NOT activated, budget consumed | "
                             f"Dedup claim retained to prevent duplicate Telegram delivery"
                         )
                 else:

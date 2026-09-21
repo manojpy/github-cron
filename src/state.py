@@ -1384,6 +1384,11 @@ class RedisStateStore:
                                 )
                             else:
                                 resolved_for_file.append({
+                                    # Stable per-outcome ID: archive_reader dedups on
+                                    # `_stream_id`, so a retry after a partial failure
+                                    # (archive written, Redis delete failed) cannot
+                                    # double-count the trade.
+                                    "_stream_id": f"{pair}:{alert_key}:{entry_ts}",
                                     "pair": str(pair),
                                     "alert_key": str(alert_key),
                                     "direction": str(direction),
@@ -1422,9 +1427,25 @@ class RedisStateStore:
                     except Exception as e:
                         logger_pair.debug(f"Failed to resolve pending outcome {key}: {e}")
                         bad_payload_count += 1
+                        
                         continue
 
                 if pending_writes:
+                    # Archive FIRST, then delete pending + update stats. If the file
+                    # write fails we bail out before the Redis pipeline executes, so
+                    # the pending outcomes stay in Redis and are retried next run
+                    # instead of being lost from the Brain archive.
+                    if resolved_for_file and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                        try:
+                            from outcome_storage import append_outcome_batch
+                            append_outcome_batch(resolved_for_file, shadow=False)
+                            self._run_archived_total += len(resolved_for_file)
+                        except Exception as e:
+                            logger_pair.error(
+                                f"[{pair}] File archive write failed — {resolved_count} "
+                                f"resolved outcome(s) left PENDING in Redis for retry: {e}"
+                            )
+                            return
                     await asyncio.wait_for(
                         _execute_pipeline(write_pipe),
                         timeout=2.0,
@@ -1433,13 +1454,6 @@ class RedisStateStore:
             logger_pair.debug(f"Failed to persist resolved outcomes for {pair}: {e}")
             return
         self._run_resolved_total += resolved_count
-        if resolved_for_file and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
-            try:
-                from outcome_storage import append_outcome_batch
-                append_outcome_batch(resolved_for_file, shadow=False)
-                self._run_archived_total += len(resolved_for_file)
-            except Exception as e:
-                logger_pair.warning(f"[{pair}] File archive write failed: {e}")
         logger_pair.debug(
             f"[{pair}] Outcome resolution | "
             f"pending={len(keys)} | "
@@ -1650,17 +1664,9 @@ class RedisStateStore:
             )
             return
 
-        if resolved_for_file and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
-            try:
-                from outcome_storage import append_outcome_batch
-                append_outcome_batch(resolved_for_file, shadow=True)
-            except Exception as e:
-                logger_pair.warning(f"[{pair}] Shadow file archive write failed: {e}")
-
         if resolved_count:
             logger_pair.debug(
                 f"[{pair}] Shadow outcome resolution | resolved={resolved_count}"
-            )
 
     async def get_alert_win_rate(self, pair: str, alert_key: str) -> Tuple[Optional[float], int]:
         """Returns (win_rate, sample_size). win_rate is None until MIN_WIN_RATE_SAMPLE is reached."""

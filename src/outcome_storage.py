@@ -158,6 +158,7 @@ def load_recent_outcomes(days: int = 30, shadow: bool = False,
         cutoff = time.time() - (days * 86400)
     pattern = os.path.join(_OUTCOME_DIR, subdir, "*.jsonl")
     files = sorted(glob.glob(pattern), reverse=True)
+    seen_ids: set = set()   # `_stream_id` dedup, mirrors archive_reader
     for path in files:
         try:
             ftime = os.path.getmtime(path)
@@ -175,15 +176,21 @@ def load_recent_outcomes(days: int = 30, shadow: bool = False,
                         row = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+
                     # Drop signal-only rows (no resolution yet).
                     if "win" not in row:
                         continue
+                    sid = row.get("_stream_id")
+                    if sid:
+                        if sid in seen_ids:
+                            continue
+                        seen_ids.add(sid)
                     if row.get("entry_ts", 0) >= cutoff:
                         rows.append(row)
         except Exception:
             continue
     return rows
- 
+
 def save_brain_state(state: Dict[str, Any]) -> None:
     path = os.path.join(_OUTCOME_DIR, "brain_state.json")
     with open(path, "w", encoding="utf-8") as f:

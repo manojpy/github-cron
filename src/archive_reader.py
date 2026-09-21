@@ -241,13 +241,15 @@ def load_archived_outcomes(
         "lines_total": 0,
         "lines_malformed": 0,
         "dropped_missing_win": 0,
-        "dropped_stale_schema": 0,
+        "dropped_stale_schema": 0,   # retained for log/audit compatibility; no code path drops on age alone
         "dropped_unmigratable": 0,
+        "dropped_unparseable": 0,
         "migrated_forward": 0,
         "dropped_before_window": 0,
         "dropped_duplicate_sid": 0,
         "kept": 0,
     }
+
     if not root.exists():
         return ([], stats) if return_stats else []
 
@@ -299,11 +301,10 @@ def load_archived_outcomes(
                     if ts < cutoff:
                         stats["dropped_before_window"] += 1
                         continue
-
-             
                     if "win" not in raw:
                         stats["dropped_missing_win"] += 1
                         continue
+                    migrated = False
                     if drop_stale_schema:
                         row_schema = int(raw.get("schema_version", 1))
                         if row_schema != CURRENT_SCHEMA_VERSION:
@@ -313,12 +314,19 @@ def load_archived_outcomes(
                                 stats["dropped_unmigratable"] += 1
                                 continue
                             # Migratable — let _parse_jsonl_row handle it
-                            stats["migrated_forward"] += 1
+                            migrated = True
 
                     parsed = _parse_jsonl_row(raw, drop_stale_schema=drop_stale_schema)
                     if parsed:
                         rows.append(parsed)
                         stats["kept"] += 1
+                        if migrated:
+                            stats["migrated_forward"] += 1
+                    else:
+                        # Passed every filter above but still rejected by the row
+                        # parser (bad entry_ts, total<=0, ...). Previously uncounted,
+                        # so lines_total did not reconcile with kept + dropped_*.
+                        stats["dropped_unparseable"] += 1
         except OSError:
             continue
 
@@ -326,6 +334,7 @@ def load_archived_outcomes(
         stats["dropped_missing_win"]
         + stats["dropped_stale_schema"]
         + stats["dropped_unmigratable"]
+        + stats["dropped_unparseable"]
         + stats["dropped_before_window"]
         + stats["dropped_duplicate_sid"]
         + stats["lines_malformed"]
@@ -336,6 +345,7 @@ def load_archived_outcomes(
             f"migrated_forward={stats['migrated_forward']}, "
             f"dropped signal-only={stats['dropped_missing_win']}, "
             f"unmigratable={stats['dropped_unmigratable']}, "
+            f"unparseable={stats['dropped_unparseable']}, "
             f"out-of-window={stats['dropped_before_window']}, "
             f"dup-sid={stats['dropped_duplicate_sid']}, "
             f"malformed={stats['lines_malformed']}"
