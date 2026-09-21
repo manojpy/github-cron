@@ -722,7 +722,6 @@ def _collect_facts(recs: Dict[str, Any], cfg) -> Dict[str, Any]:
     F["shadow_on"] = bool(getattr(cfg, "BRAIN_SHADOW_MODE", False))
     return F
 
-
 def _outcome_anatomy(rows: List[Dict[str, Any]], cfg) -> Tuple[Optional[str], Dict[str, Any]]:
     """Plain-English 'how a win is judged' text plus how trades really ended.
     Uses only fields already on every outcome row (outcome_reason, mfe, mae;
@@ -738,7 +737,8 @@ def _outcome_anatomy(rows: List[Dict[str, Any]], cfg) -> Tuple[Optional[str], Di
                "both_hit": "both", "ambiguous_same_candle": "both", "no_hit": "neither"}
     counts = {"target": 0, "stop": 0, "both": 0, "neither": 0}
     for r in rows:
-        b = buckets.get(r.get("outcome_reason"))
+        reason = r.get("outcome_reason")
+        b = buckets.get(reason) if isinstance(reason, str) else None
         if b:
             counts[b] += 1
     known = sum(counts.values())
@@ -769,7 +769,7 @@ def _outcome_anatomy(rows: List[Dict[str, Any]], cfg) -> Tuple[Optional[str], Di
     if med_mae is not None:
         lines.append(f"Typical worst move against you: {med_mae:.1f}% (stop {risk:.1f}%)")
     strict = med_mfe is not None and 0 < med_mfe < 0.5 * target
-    if strict:
+    if strict and med_mfe is not None:
         lines.append(
             f"⚠️ The target is {target / med_mfe:.0f}x your typical best move, so this rule "
             f"is hard for ANY 15-minute signal to meet. It lowers every alert's win rate. "
@@ -2059,7 +2059,7 @@ class BrainEngineV2(BaseBrainEngine):
                             f"({len(holdout_rows_wf)} rows after split)"
                         )
 
-                # ── Shadow out-of-sample veto ─────────�����────────────
+                # ── Shadow out-of-sample veto ─────────�������────────────
                 shadow_weight_ok, shadow_weight_note = True, ""
                 if (wopt.get("walk_forward_passed") and conf_score >= min_conf
                 and len(shadow_rows) >= 15 and oos_weight_ok):
