@@ -694,18 +694,60 @@ class BrainAuditLayer:
 
         return lines
 
-    # ── Statistical Language Helpers ──────────────────────────────────
+    # ── Read-only accessors used by the layered Brain report ─────────
+
+    def history_span(self) -> Optional[Tuple[float, int]]:
+        """(days of history actually loaded, days requested), or None if the
+        history coverage has not been computed yet."""
+        h = self._history
+        if h is None:
+            return None
+        return float(h.actual_days), int(h.requested_days)
+
+    def history_coverage(self) -> Optional[HistoryCoverage]:
+        return self._history
+
+    def reconciliation_snapshot(self) -> Optional[OutcomeReconciliation]:
+        return self._reconciliation
+
+    def suppressed_analysis_names(self) -> List[str]:
+        return list(self._suppressed_analyses)
+
+    def analysis_health_entries(self) -> List[AnalysisHealthEntry]:
+        return list(self._analysis_health.values())
 
     def statistical_confidence_label(self) -> str:
-        """Plain-language confidence qualifier for the current sample."""
+        """Plain-language confidence qualifier for the current sample.
+
+        Trade COUNT alone is not enough: hundreds of trades taken over a few
+        days all share the same market conditions and are not independent.
+        The label is therefore capped by how many days the history spans
+        (thresholds mirror the minimum-history rules of the analyses:
+        14 / 21 / 30 days)."""
         n = self._n_rows
         if n >= 300:
-            return "HIGH"
-        if n >= 100:
-            return "MODERATE"
-        if n >= 30:
-            return "LOW"
-        return "VERY LOW"
+            label = "HIGH"
+        elif n >= 100:
+            label = "MODERATE"
+        elif n >= 30:
+            label = "LOW"
+        else:
+            label = "VERY LOW"
+
+        span = self.history_span()
+        if span is not None:
+            days = span[0]
+            if days < 7:
+                cap = "VERY LOW"
+            elif days < 14:
+                cap = "LOW"
+            elif days < 30:
+                cap = "MODERATE"
+            else:
+                cap = "HIGH"
+            order = ["VERY LOW", "LOW", "MODERATE", "HIGH"]
+            label = order[min(order.index(label), order.index(cap))]
+        return label
 
     def qualify_projection(self, metric_name: str, value_str: str) -> str:
         """Replace 'projected' language with statistically honest phrasing."""
