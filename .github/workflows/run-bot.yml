@@ -438,7 +438,27 @@ jobs:
             ls -la outcomes/ 2>/dev/null || echo "(no outcomes dir)"
             ls -la shadow/   2>/dev/null || echo "(no shadow dir)"
             exit 0
+          
           fi
 
           git commit -m "chore: persist outcomes $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          git push "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" HEAD:main
+
+          # The cleanup workflow also pushes to this repo. If it landed between
+          # our clone and now, a plain push is rejected as non-fast-forward and
+          # this run's outcomes would be lost. Rebase onto the new tip and retry.
+          PUSH_URL="https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git"
+          for attempt in 1 2 3 4 5; do
+            if git push "$PUSH_URL" HEAD:main; then
+              echo "✅ Outcomes pushed (attempt ${attempt})"
+              exit 0
+            fi
+            echo "::warning::Push rejected (attempt ${attempt}/5) — rebasing onto latest main"
+            sleep $(( attempt * 2 + RANDOM % 3 ))
+            if ! git pull --rebase --no-tags "$PUSH_URL" main; then
+              echo "::error::Rebase conflict — aborting; outcomes NOT persisted"
+              git rebase --abort 2>/dev/null || true
+              exit 1
+            fi
+          done
+          echo "::error::Could not push outcomes after 5 attempts"
+          exit 1

@@ -59,4 +59,21 @@ jobs:
             exit 0
           fi
           git commit -m "chore: cleanup old outcomes $(date -u +%Y-%m-%d)"
-          git push origin main
+
+          # The alert workflow pushes to this repo every 15 minutes. If it landed
+          # after our clone, a plain push is rejected — rebase and retry.
+          for attempt in 1 2 3 4 5; do
+            if git push origin main; then
+              echo "✅ Cleanup pushed (attempt ${attempt})"
+              exit 0
+            fi
+            echo "::warning::Push rejected (attempt ${attempt}/5) — rebasing onto latest main"
+            sleep $(( attempt * 2 + RANDOM % 3 ))
+            if ! git pull --rebase --no-tags origin main; then
+              echo "::error::Rebase conflict — aborting; cleanup NOT pushed"
+              git rebase --abort 2>/dev/null || true
+              exit 1
+            fi
+          done
+          echo "::error::Could not push cleanup after 5 attempts"
+          exit 1
