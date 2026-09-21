@@ -110,10 +110,11 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONOPTIMIZE=2 \
     NUMBA_CACHE_DIR=/tmp/numba_cache \
     NUMBA_WARNINGS=0 \
+    
     NUMBA_THREADING_LAYER=tbb \
     NUMBA_NUM_THREADS=2 \
     OMP_NUM_THREADS=2 \
-    MEMORY_LIMIT_BYTES=850000000 \ 
+    MEMORY_LIMIT_BYTES=850000000 \
     TZ=Asia/Kolkata
 
 LABEL org.opencontainers.image.title="MACD Unified Bot (AOT)" \
