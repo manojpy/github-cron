@@ -46,8 +46,6 @@ _PHASE_MIN_SAMPLES = {
     "config_regression": 20,
 }
 
-}
-
 def _report_section_failed(failed: List[str], name: str, exc: Exception) -> None:
     """A report section raised. Never let that vanish: record it in the audit
     layer (logs at WARNING with the exception type) and queue the section
