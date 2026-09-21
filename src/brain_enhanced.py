@@ -791,9 +791,10 @@ def _profit_status(net_ev: float, n: int) -> str:
         return "⚪ NO DATA"
     return "🔴 POOR" if net_ev <= -0.05 else "🟡 FLAT" if net_ev < 0.05 else "🟢 POSITIVE"
 
-def _data_status(F: Dict[str, Any]) -> str:   
-    cov: Optional[DataCoverage] = getattr(cov_obj, "coverage", None) if cov_obj else None
-    if cov is None:
+def _data_status(F: Dict[str, Any]) -> str:
+    cov_obj = F.get("coverage")
+    cov = getattr(cov_obj, "coverage", None) if cov_obj else None
+    if not isinstance(cov, DataCoverage):
         return "⚪ UNKNOWN"
     return {
         DataCoverage.FULL: "🟢 GOOD",
@@ -801,7 +802,6 @@ def _data_status(F: Dict[str, Any]) -> str:
         DataCoverage.SEVERELY_LIMITED: "🟠 LIMITED HISTORY",
         DataCoverage.CRITICAL: "🔴 INSUFFICIENT HISTORY",
     }.get(cov, "⚪ UNKNOWN")
-
 
 def _recording_status(F: Dict[str, Any]) -> str:
     r = F["recon"]
@@ -833,7 +833,6 @@ def _overall(F: Dict[str, Any]) -> str:
 def _fmt_days(d: Optional[float]) -> str:
     return "n/a" if d is None else f"{d:.1f} days"
 
-
 def _fmt_span(d: Optional[float]) -> str:
     """Adjective form: '2.5-day' (for 'the current 2.5-day sample')."""
     return "very short" if d is None else f"{d:.1f}-day"
@@ -841,7 +840,6 @@ def _fmt_span(d: Optional[float]) -> str:
 
 def _row(label: str, result: str, verdict: str = "", w1: int = 14, w2: int = 10) -> str:
     return f"{label:<{w1}}{result:>{w2}}  {verdict}".rstrip()
-
 
 def _active_blockers(F: Dict[str, Any]) -> List[str]:
     g = F["gate"]
