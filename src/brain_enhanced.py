@@ -603,14 +603,18 @@ class BrainEngineV2(BaseBrainEngine):
             "execution": True,
         }
 
-        # OOS prediction: rolling walk-forward must pass.
-        # Audit-gated: on thin archives the audit's sample/history check
-        # is equivalent to rolling_walk_forward's internal guards, and free.
+        # OOS prediction: rolling walk-forward must pass
+        # Audit-gated: rolling_walk_forward's own guard is only a row count
+        # (n >= 120), so a 2-day archive can still pass it. The audit adds
+        # the history-days requirement, matching the walk-forward metric
+        # already reported in ai_metrics.
         _rwc_allowed = True
         try:
             _rwc_allowed, _ = get_audit().can_run("walk_forward")
-        except Exception:
-            pass  # fail-open: run the real check if audit is unavailable
+        except Exception as _e:
+            logging.getLogger("macd_bot").debug(
+                f"Audit unavailable for walk_forward gate, running check: {_e}"
+            )  # fail-open: run the real check if the audit is unavailable
 
         if _rwc_allowed:
             rwc = engine.rolling_walk_forward(real_rows, n_folds=5)
