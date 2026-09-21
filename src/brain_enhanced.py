@@ -215,7 +215,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                 _lo, _hi, _ = engine.wilson_ci(int(awr * cnt), cnt)
                 _conf = engine.confidence_label(cnt, _lo, _hi)
                 groups["🔴"].append(
-                    f"�� {ak}: EV {ak_net_ev:+.2f}%, WR {awr:.0%} (n={cnt}, "
+                    f"💀 {ak}: EV {ak_net_ev:+.2f}%, WR {awr:.0%} (n={cnt}, "
                     f"confidence: {_conf}) — negative EV, consider disabling"
                 )
         titles = {
@@ -830,7 +830,7 @@ class BrainEngineV2(BaseBrainEngine):
         shadow_rows = base_recs.get("_shadow_rows", [])
         # ══════════════════════════════════════════════════════════════════
         #  BRAIN AUDIT LAYER — initialize and validate data population
-        # ══════════════════════════════════════════════════════════════════  
+        # ═══════════════════════════════════════���══════════════════════════  
         audit = get_audit()  # keep coverage/reconciliation set during baseline
 
         # History coverage was already set in _generate_baseline_recommendations
