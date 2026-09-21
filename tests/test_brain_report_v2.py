@@ -162,13 +162,3 @@ def test_generate_report_falls_back_to_classic_plan(monkeypatch):
     import logging
     ok = asyncio.run(eng.generate_report([], Q(), logging.getLogger("t")))
     assert ok is True and sent == ["classic"]
-````
-
-
----
-
-## Tuning knobs (all optional, inside the new block)
-- `_RULE = "━" * 30` — width of the section rules (30 fits a phone; the mock used 58).
-- `_MSG_LIMIT = 3800` — max characters per Telegram message.
-- Evidence ladder: `_evidence_rank` (⚪ <15 trades, 🟡 <30, 🟠 <60, 🔵 60+; capped 🟡 under 14 days, 🟠 under 30 days; 🟢 only when the Action Gate passes, EV>0, P(EV>0)≥85%, ≥60 trades and ≥30 days).
-- Names: `_TOKEN_NAMES` maps alert-key words to display words (e.g. `choch` → `CHoCH`); the word `cross` is dropped so `dynamic_flow_cross_buy` shows as `Dynamic Flow BUY` (the appendix keeps the raw key).
