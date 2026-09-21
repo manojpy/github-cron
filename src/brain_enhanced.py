@@ -215,7 +215,7 @@ def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
                 _lo, _hi, _ = engine.wilson_ci(int(awr * cnt), cnt)
                 _conf = engine.confidence_label(cnt, _lo, _hi)
                 groups["🔴"].append(
-                    f"🔴 {ak}: EV {ak_net_ev:+.2f}%, WR {awr:.0%} (n={cnt}, "
+                    f"�� {ak}: EV {ak_net_ev:+.2f}%, WR {awr:.0%} (n={cnt}, "
                     f"confidence: {_conf}) — negative EV, consider disabling"
                 )
         titles = {
@@ -613,7 +613,7 @@ class BrainEngineV2(BaseBrainEngine):
         this cycle. Without it, the check falls back to this report's rec
         list — the old behaviour, which flickers run-to-run.
         """
-        gate: Dict[str, Any] = {
+        gate: Dict[str, bool] = {
             "data_quality": len(real_rows) >= 100,
             "oos_prediction": False,
             "profitability": False,
@@ -621,7 +621,6 @@ class BrainEngineV2(BaseBrainEngine):
             "risk": True,
             "execution": True,
         }
-
         # OOS prediction: rolling walk-forward must pass
         _rwc_allowed = True
         try:
@@ -758,11 +757,11 @@ class BrainEngineV2(BaseBrainEngine):
                 # pending-outcome pre-scan + resolution (not --brain-only).
                 _pend_map = getattr(self.sdb, "_pending_outcome_keys_by_pair", None)
                 _ran_resolution = _pend_map is not None
+                # Extract to a variable so mypy can properly narrow _pend_map to non-None 
+                # and correctly infer the generator's item type (int) for sum().
+                pending_count = sum(len(v) for v in _pend_map.values()) if _pend_map is not None else None
                 audit.set_reconciliation(
-                    pending_count=(
-                        sum(len(v) for v in _pend_map.values())
-                        if _ran_resolution else None
-                    ),
+                    pending_count=pending_count,
                     resolved_this_run=(
                         getattr(self.sdb, "_run_resolved_total", None)
                         if _ran_resolution else None
