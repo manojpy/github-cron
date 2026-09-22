@@ -9,7 +9,7 @@ import random
 import time
 import unicodedata
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import os
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -412,7 +412,7 @@ def _ljust(s: str, width: int) -> str:
 def _rjust(s: str, width: int) -> str:
     return " " * max(0, width - _vwidth(s)) + s
 
-def _table(rows: List[Tuple[str, ...]], aligns: str, gap: int = 2) -> List[str]:
+def _table(rows: Sequence[Tuple[str, ...]], aligns: str, gap: int = 2) -> List[str]:
     """Render `rows` (equal-length tuples of cell text, header included if
     any) as monospace lines whose columns are all aligned to the widest
     VISUAL width in that column across every row — so a dot/emoji in row 3
@@ -432,7 +432,7 @@ def _table(rows: List[Tuple[str, ...]], aligns: str, gap: int = 2) -> List[str]:
         out.append((" " * gap).join(cells))
     return out
 
-def _kv_table(pairs: List[Tuple[str, str]]) -> List[str]:
+def _kv_table(pairs: Sequence[Tuple[str, str]]) -> List[str]:
     """Convenience for the common 'Label: Value' block, e.g.
     'Observed profitability:  🟢 POSITIVE'. Colon is part of the label
     text passed in so it stays glued to the label instead of the padding."""
