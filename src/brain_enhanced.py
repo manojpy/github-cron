@@ -121,7 +121,7 @@ def _c(text: str) -> "_Piece":
 
 def _c_split(lines: List[str], limit: int = 3000) -> List[_Piece]:
     """Fenced blocks of at most `limit` chars, split on line boundaries."""
-    out: List[str] = []
+    out: List[_Piece] = []          # was: List[str]
     cur: List[str] = []
     size = 0
     for ln in lines:
@@ -600,13 +600,11 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
 
 _EVIDENCE_LEGEND = "Ev = evidence: ⚪ observation · 🟡 early · 🟠 meaningful · 🔵 strong · 🟢 validated"
 
-
-def _alert_table(items: List[Dict[str, Any]], limit: int) -> List[str]:
+def _alert_table(items: List[Dict[str, Any]], limit: int) -> List[_Piece]:
     rows = [f"{'Alert':<22}{'EV%':>6}{'WR':>5}{'N':>4}  Ev"]
     for a in items[:limit]:
         rows.append(f"{a['name'][:21]:<22}{a['ev']:>+6.2f}{a['wr']:>5.0%}{a['n']:>4}  {_LADDER[a['rank']]}")
     return _c_split(rows) + [_p(_EVIDENCE_LEGEND)]
-
 
 def _sec_loss(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(4, '🔎 LOSS DIAGNOSIS — "WHERE ARE WE FALTERING?"')]
@@ -1001,7 +999,6 @@ _REPORT_SECTIONS = (
 )
 
 def build_brain_report_sections(recs: Dict[str, Any], cfg) -> Tuple[List[List["_Piece"]], str]:
-    sections: List[List["_Piece"]] = []
     """Compute the 16 report sections once. Returns (sections, stamp); each
     section is a list of rendered pieces. An individual failing section is
     replaced by a notice; the call raises only if the shared facts cannot
