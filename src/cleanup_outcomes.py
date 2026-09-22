@@ -10,21 +10,25 @@ import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-_DATE_IN_NAME = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+_DATE_IN_NAME = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:_(\d{2})-(\d{2}))?")
 
 def file_age_reference(path: Path) -> datetime:
     """UTC timestamp used to judge a file's age.
 
-    Uses the YYYY-MM-DD in the file name (outcomes/2026-03-04.jsonl,
-    reports/2026-03-04_12-30.md). st_mtime is only a fallback: on a fresh
+    Uses the date in the file name (outcomes/2026-03-04.jsonl -> end of that
+    day; reports/2026-03-04_12-30.md -> exactly 12:30 UTC). st_mtime is only a fallback: on a fresh
     `git clone` every file's mtime is the clone time, so mtime-based age
     checks never fire in CI.
     """
     m = _DATE_IN_NAME.search(path.name)
     if m:
         try:
+            if m.group(4) is not None:
+                hh, mm, ss = int(m.group(4)), int(m.group(5)), 0
+            else:
+                hh, mm, ss = 23, 59, 59
             return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
-                            23, 59, 59, tzinfo=timezone.utc)
+                            hh, mm, ss, tzinfo=timezone.utc)
         except ValueError:
             pass
     return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
@@ -48,15 +52,18 @@ def format_size(bytes: int) -> str:
         bytes /= 1024.0
     return f"{bytes:.2f} TB"
 
-def cleanup_by_age(data_dir: Path, max_age_days: int, dry_run: bool = False) -> int:
-    """Remove files older than max_age_days."""
+def cleanup_by_age(data_dir: Path, max_age_days: int, dry_run: bool = False,
+                   reports_max_age_days: int = 7) -> int:
+    """Remove files older than max_age_days (reports/*.md use their own,
+    shorter reports_max_age_days)."""
     removed = 0
-    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    now = datetime.now(timezone.utc)
 
     for label, pattern in (("outcomes", "*.jsonl*"), ("shadow", "*.jsonl*"), ("reports", "*.md")):
         label_dir = data_dir / label
         if not label_dir.exists():
             continue
+        cutoff = now - timedelta(days=reports_max_age_days if label == "reports" else max_age_days)
         
         for file_path in label_dir.glob(pattern):
             try:         
@@ -153,6 +160,8 @@ def main():
                     help="Root directory for archived JSONL files")
     ap.add_argument("--max-age-days", type=int, default=90,
                     help="Remove files older than this many days (default: 90)")
+    ap.add_argument("--reports-max-age-days", type=int, default=7,
+                    help="Remove Brain reports (reports/*.md) older than this many days (default: 7)")
     ap.add_argument("--max-size-mb", type=int, default=100,
                     help="Compress files larger than this size in MB (default: 100)")
     ap.add_argument("--max-total-mb", type=int, default=400,
@@ -190,8 +199,10 @@ def main():
     print(f"Current size: {format_size(current_size)}")
     print(f"Max total size: {args.max_total_mb} MB")
     
-    print(f"\n📋 Checking for files older than {args.max_age_days} days...")
-    removed = cleanup_by_age(data_dir, args.max_age_days, dry_run=args.dry_run)
+    print(f"\n📋 Checking for files older than {args.max_age_days} days "
+          f"(reports: {args.reports_max_age_days} days)...")
+    removed = cleanup_by_age(data_dir, args.max_age_days, dry_run=args.dry_run,
+                             reports_max_age_days=args.reports_max_age_days)
     if removed:
         print(f"✅ {'Would remove' if args.dry_run else 'Removed'} {removed} old file(s)")
     else:

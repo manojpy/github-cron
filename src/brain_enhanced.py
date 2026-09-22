@@ -19,10 +19,10 @@ from brain_audit import (
 
 from archive_reader import load_archived_outcomes
 from bot_config import cfg, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS, json_dumps, json_loads
+
 from state import RedisKeyPrefix, RedisStateStore
 from brain import BrainEngine as BaseBrainEngine, _extract_p_value_for_fdr
 import threshold_engine as engine
-from outcome_storage import OUTCOME_SCHEMA_VERSION
 
 from threshold_engine import (
     optimize_vote_weights, conditional_performance,
@@ -60,471 +60,6 @@ def _report_section_failed(failed: List[str], name: str, exc: Exception) -> None
     failed.append(name)
 
 # ══════════════════════════════════════════════════════════════════════
-#  PLAIN-ENGLISH PROFIT ACTION PLAN (layman-friendly report layer)
-# ══════════════════════════════════════════════════════════════════════
-
-def build_profit_action_plan(recs: Dict[str, Any], cfg) -> List[str]:
-    """Translate Brain findings into a plain-English, copy-paste action plan.
-    Returns a list of Telegram-ready messages (each within the 4096-char limit)."""
-    rows = recs.get("_real_rows", []) or []
-    cfg_patch = recs.get("config_patch", []) or []
-    ai = recs.get("ai_metrics", {}) or {}
-    sections: List[str] = []
-    failed_sections: List[str] = []
-
-    # ══════════════════════════════════════════════════════════════════
-    #  DATA QUALITY HEADER (always first, before any analysis)
-    # ══════════════════════════════════════════════════════════════════
-    audit = get_audit()
-    header_lines = audit.build_data_quality_header()
-
-    # Action gate summary
-    action_gate = ai.get("action_gate", {}) or {}
-    if action_gate:
-        header_lines.append("")
-        header_lines.extend(audit.build_action_gate_summary(action_gate))
-
-    # Schema migration advisory
-    archive_stats = recs.get("_archive_stats", {})
-    if archive_stats:
-        advisory = audit.schema_migration_advisory(
-            current_version=OUTCOME_SCHEMA_VERSION,
-            stale_count=(
-                archive_stats.get("dropped_unmigratable", 0)
-                + archive_stats.get("migrated_forward", 0)
-            ),
-            migrated_count=archive_stats.get("migrated_forward", 0),
-            unmigratable_count=archive_stats.get("dropped_unmigratable", 0),
-            total_archive_rows=archive_stats.get("lines_total", 0),
-        )
-        if advisory:
-            header_lines.append(f"   {advisory}")
-
-    sections.append("\n".join(header_lines))
-
-    _GATE_CHECK_LABELS = {
-        "data_quality": "fewer than 100 trades logged",
-        "oos_prediction": "didn't hold up in out-of-sample testing",
-        "profitability": "not confident enough of net profit (P>0 or EV floor)",
-        "stability": "a drift alarm is currently active on one of your alerts",
-        "risk": "recent drawdown exceeds the kill-switch budget",
-        "execution": "fee/slippage assumptions aren't configured",
-    }
-    action_gate = ai.get("action_gate", {}) or {}
-    _failing_checks = [
-        label for key, label in _GATE_CHECK_LABELS.items()
-        if action_gate.get(key) is False
-    ]
-    gate_block_reason = "; ".join(_failing_checks) if _failing_checks else "insufficient evidence"
-
-    n = len(rows)
-    wins = sum(1 for r in rows if r["win"])
-    wr = wins / n if n else 0.0
-    target = getattr(cfg, "MIN_WIN_RATE", 0.55)
-    kill_thr = getattr(cfg, "BRAIN_ALERT_DISABLE_THRESHOLD_WR", 0.40)
-    net_ev = ai.get("net_ev", 0.0) or 0.0
-
-    # Computed once here (was previously computed a second time, later,
-    # in the ENTRY GATE THRESHOLD section) so BOTTOM LINE can show
-    # current-vs-expected WR without a duplicate call.
-    try:
-        rec_thr = engine.recommend_threshold(
-            rows, target_winrate=target, min_sample=getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
-        )
-    
-    except Exception as e:
-        _report_section_failed(failed_sections, "ENTRY BAR RECOMMENDATION", e)
-        rec_thr = {"valid": False}
-    rec_thr_available = (
-        rec_thr.get("valid") and rec_thr.get("recommended")
-        and rec_thr["recommended"] > cfg.CONFLUENCE_MIN_ABS_SCORE
-    )
-    # ── BOTTOM LINE ────────────────────────────────────────────────────
-    try:
-        buy_wr, buy_n, sell_wr, sell_n = engine.direction_split(rows)    
-        ev_obj = engine.ev_first_objective(rows, min_sample=10) if rows else None    
-        verdict = audit.qualify_verdict(
-            net_ev=net_ev, wr=wr, n=n,
-            p_ev_positive=ev_obj.get("p_ev_positive", 0) if ev_obj else 0.0,
-        )
-        dir_note = ""
-        if buy_wr is not None and sell_wr is not None and buy_n >= 5 and sell_n >= 5:
-            if sell_wr < buy_wr - 0.15:
-                dir_note = f"Your SELL alerts win only {sell_wr:.0%} vs BUY {buy_wr:.0%} — the sell side is dragging you down."
-            elif buy_wr < sell_wr - 0.15:
-                dir_note = f"Your BUY alerts win only {buy_wr:.0%} vs SELL {sell_wr:.0%} — the buy side is dragging you down."
-        
-        ev_note = f"Net per trade: {net_ev:+.2f}% after fees" + (" — negative ❌." if net_ev < 0 else " — positive ✅.")
-        
-        wr_note = ""
-        if (
-            rec_thr_available
-            and audit.max_recommendation_tier("threshold_recommendation")
-            == RecommendationTier.ACTIONABLE
-        ):
-            rec_wr_val = rec_thr.get("rec_wr", 0)
-            wr_note = (
-                f"\nHistorical filtered WR at the higher bar: {rec_wr_val:.0%} "
-                f"(in-sample estimate, not a forecast; see 🚪 below)."
-            )
-        low_data = ""  # verdict text already carries the confidence caveat
-        sections.append(
-            f"🧠 PROFIT ACTION PLAN\n📊 Based on {n} trades\n\n🎯 BOTTOM LINE\n{verdict}"
-            + (f"\n{dir_note}" if dir_note else "")
-            + f"\n{ev_note}{wr_note}{low_data}"
-        )
-    except Exception as e:
-        _report_section_failed(failed_sections, "BOTTOM LINE", e)
-        
-    # ── PER-ALERT HEALTH ───────────────────────────────────────────────
-    try:
-        stats = engine.per_alert_breakdown(rows, min_sample=1)  # (ak, wr, n, avg_score)
-        groups: Dict[str, List[str]] = {"🔴": [], "🟡": [], "🟢": [], "⚪": []}
-
-        # Group rows by alert_key for EV computation
-        rows_by_alert: Dict[str, list] = defaultdict(list)
-        for r in rows:
-            rows_by_alert[r["alert_key"]].append(r)
-
-        needs_data: List[Tuple[str, float, int]] = []
-        for ak, awr, cnt, _avg in stats:
-            if cnt < 10:
-                needs_data.append((ak, awr, cnt))
-                continue
-
-            ak_rows = rows_by_alert.get(ak, [])
-            ak_ev = engine.ev_first_objective(ak_rows, min_sample=10) if ak_rows else None
-            ak_net_ev = ak_ev.get("net_ev", 0) if ak_ev and ak_ev.get("valid") else 0
-            ak_p_ev = ak_ev.get("p_ev_positive", 0) if ak_ev and ak_ev.get("valid") else 0
-
-            if ak_net_ev > 0 and ak_p_ev >= 0.85:
-                groups["🟢"].append(
-                    f"🟢 {ak}: EV {ak_net_ev:+.2f}% (P>0: {ak_p_ev:.0%}), "
-                    f"WR {awr:.0%} (n={cnt}) — profitable, keep it"
-                )
-            elif ak_net_ev > 0:
-                groups["🟡"].append(
-                    f"🟡 {ak}: EV {ak_net_ev:+.2f}% but P(EV>0)={ak_p_ev:.0%}, "
-                    f"WR {awr:.0%} (n={cnt}) — thin evidence, monitor"
-                )
-            elif awr >= kill_thr:
-                groups["🟡"].append(
-                    f"🟡 {ak}: EV {ak_net_ev:+.2f}%, WR {awr:.0%} (n={cnt}) "
-                    f"— below target; tighten its filter"
-                )
-            else:
-                _lo, _hi, _ = engine.wilson_ci(int(awr * cnt), cnt)
-                _conf = engine.confidence_label(cnt, _lo, _hi)
-                groups["🔴"].append(
-                    f"�� {ak}: EV {ak_net_ev:+.2f}%, WR {awr:.0%} (n={cnt}, "
-                    f"confidence: {_conf}) — negative EV, consider disabling"
-                )
-        titles = {
-            "🔴": "NEGATIVE EV — REVIEW FOR DISABLE",
-            "🟡": "MIXED / MONITOR",
-            "🟢": "POSITIVE EV — KEEP",
-        }
-        block = "🚦 YOUR ALERTS — EVIDENCE BY BUCKET"
-        for bucket in ("🔴", "🟡", "🟢"):
-            if groups[bucket]:
-                block += f"\n\n{titles[bucket]}:\n" + "\n".join(groups[bucket])
-
-        if needs_data:
-            needs_data.sort(key=lambda t: t[2], reverse=True)
-            shown = needs_data[:5]
-            nd_lines = [f"⚪ {ak}: {awr:.0%} WR (n={cnt})" for ak, awr, cnt in shown]
-            remainder = len(needs_data) - len(shown)
-            nd_block = f"NEED MORE DATA ({len(needs_data)} alerts; closest to a verdict shown):\n" + "\n".join(nd_lines)
-            if remainder > 0:
-                nd_block += f"\n…and {remainder} more with too few trades to list."
-            block += f"\n\n{nd_block}"
-        sections.append(block)
-    except Exception as e:
-        _report_section_failed(failed_sections, "PER-ALERT HEALTH", e)
-        
-    # ── BLOCKED BY WIN-RATE FILTER (shadow, not dispatched) ─────────────
-    try:
-
-        # Shadow rows also come from the confluence, OOD, calibration,
-        # portfolio-heat and brain-disabled paths (tagged rejection_reason);
-        # only the win-rate filter's own rejections belong in this section.
-        shadow_rows = [
-            r for r in (recs.get("_shadow_rows", []) or [])
-            if r.get("rejection_reason") in (None, "win_rate_filter")
-        ]
-        if not shadow_rows:
-            sections.append(
-                "🚫 BLOCKED BY WIN-RATE FILTER\n"
-                "   Shadow mode is off — no data on what the filter is rejecting.\n"
-                "   Set BRAIN_SHADOW_MODE=true to see whether rejections would have won."
-            )
-        else:
-            target = getattr(cfg, "MIN_WIN_RATE", 0.55)
-            shadow_stats = engine.per_alert_breakdown(shadow_rows, min_sample=1)
-            dropped_lines = []
-            over_blocking = 0
-            for ak, awr, cnt, _avg in shadow_stats:
-                if cnt < 5:
-                    continue
-                if awr >= target:
-                    over_blocking += 1
-                    dropped_lines.append(
-                        f"  ⚠️ {ak}: {cnt} blocked, shadow WR {awr:.0%} "
-                        f"(ABOVE {target:.0%} target — filter may be over-blocking)"
-                    )
-                elif awr < target * 0.75:
-                    dropped_lines.append(
-                        f"  ✅ {ak}: {cnt} blocked, shadow WR {awr:.0%} "
-                        f"(filter correctly rejected)"
-                    )
-                else:
-                    dropped_lines.append(
-                        f"  👻 {ak}: {cnt} blocked, shadow WR {awr:.0%}"
-                    )
-            if dropped_lines:
-                header = "🚫 BLOCKED BY WIN-RATE FILTER (sent to shadow, not dispatched)"
-                if over_blocking:
-                    header += (
-                        f"\n   ⚠️ {over_blocking} alert(s) blocked at or above target — "
-                        f"review MIN_WIN_RATE / MIN_WIN_RATE_SAMPLE for those keys."
-                    )          
-                sections.append(header + "\n" + "\n".join(dropped_lines[:10]))
-    except Exception as e:
-        _report_section_failed(failed_sections, "BLOCKED BY WIN-RATE FILTER", e)
-        
-    # ── GATE IMPACT (shadow, per-gate counterfactual EV) ────────────────
-    try:
-        shadow_rows = recs.get("_shadow_rows", []) or []
-        gate_groups: Dict[str, list] = defaultdict(list)
-        for r in shadow_rows:
-            reason = r.get("rejection_reason")
-            if reason:
-                gate_groups[reason].append(r)
-
-        min_sample = getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
-        gate_lines = []
-
-        for reason, grows in sorted(gate_groups.items()):
-            ev = engine.ev_first_objective(grows, min_sample=min_sample)
-
-            if not ev.get("valid"):
-                gate_lines.append(
-                    f"⚪ {reason}: n={len(grows)} — below min sample ({min_sample}), no verdict yet"
-                )
-                continue
-
-            net_ev = ev.get("net_ev", 0.0)
-            p_ev = ev.get("p_ev_positive", 0.0)
-
-            verdict = (
-                "would likely have HELPED"
-                if net_ev > 0 and p_ev >= 0.65
-                else "correctly filtering losers"
-            )
-
-            gate_lines.append(
-                f"{'🟡' if net_ev > 0 else '🟢'} {reason}: rejected {len(grows)} signals, "
-                f"their hypothetical net EV was {net_ev:+.2f}% (P>0: {p_ev:.0%}) — {verdict}"
-            )
-
-        if gate_lines:
-            sections.append(
-                "🚧 GATE IMPACT — WHAT EACH FILTER IS COSTING/SAVING YOU\n"
-                + "\n".join(gate_lines)
-            )
-    except Exception as e:
-        _report_section_failed(failed_sections, "GATE IMPACT", e)
-        
-    # ── CONFLUENCE WEIGHT CHANGES ──────────────────────────────────────
-    blocked_lines: List[str] = []
-    try:
-        weight_lines: List[str] = []
-        for p in cfg_patch:
-            if p.get("path") != "CONFLUENCE_WEIGHTS":
-                continue
-            if p.get("_blocked_by_action_gate"):
-                blocked_lines.append(f"🔬 CONFLUENCE_WEIGHTS: candidate changes — blocked: {gate_block_reason}")
-                continue
-            cur = p.get("current", {}) or {}
-            sug = p.get("suggested", {}) or {}
-            for vote, new_w in sug.items():
-                old_w = cur.get(vote, CONFLUENCE_WEIGHTS.get(vote, 0.0))
-                if abs(new_w - old_w) < 0.05:
-                    continue
-                if new_w > old_w:
-                    weight_lines.append(f"⬆️ {vote}: {old_w:.1f} → {new_w:.1f}  (this vote predicts wins — give it more power)")
-                else:
-                    weight_lines.append(f"⬇️ {vote}: {old_w:.1f} → {new_w:.1f}  (this vote hurts accuracy — reduce its power)")
-        if weight_lines:
-            sections.append(
-                "⚖️ CONFLUENCE WEIGHTS — CHANGE THESE\n"
-                "(How much each signal counts toward the entry gate)\n\n" + "\n".join(weight_lines)
-            )
-        else:
-            sections.append("⚖️ CONFLUENCE WEIGHTS\nNo safe weight changes yet — need more trade history before the Brain will move them.")
-    except Exception as e:
-        _report_section_failed(failed_sections, "CONFLUENCE WEIGHT CHANGES", e)
-
-    # ── INDICATOR SETTING CHANGES ──────────────────────────────────────
-    try:
-        setting_lines: List[str] = []
-        for p in cfg_patch:
-            if p.get("path") == "CONFLUENCE_WEIGHTS":
-                continue
-            cur, sug = p.get("current"), p.get("suggested")
-            if cur is None or sug is None:
-                continue
-            if p.get("_blocked_by_action_gate"):
-                # Not vetted by the action gate — don't present it as a
-                # ready change or let it into the copy-paste block below.
-                blocked_lines.append(f"🔬 {p['path']}: candidate {sug} — blocked: {gate_block_reason}")
-                continue
-            setting_lines.append(f"🔧 {p['path']}: {cur} → {sug}\n   Why: {p.get('reason', 'data-driven optimum')}")
-        if setting_lines:
-            sections.append("🎚️ INDICATOR SETTINGS — CHANGE THESE\n\n" + "\n".join(setting_lines))
-        if blocked_lines:    
-            sections.append("🔬 UNDER REVIEW — not confident enough to apply yet\n" + "\n".join(blocked_lines))
-    except Exception as e:
-        _report_section_failed(failed_sections, "INDICATOR SETTING CHANGES", e)
-
-    # ── ENTRY GATE THRESHOLD ───────────────────────────────────────────
-    gate_rec = None
-    try:
-        if rec_thr_available:
-            tier = audit.max_recommendation_tier("threshold_recommendation")
-            rec_wr_val = rec_thr.get("rec_wr", 0)
-
-            if tier == RecommendationTier.CANDIDATE:
-                sections.append(
-                    f"🧪 ENTRY BAR — SIMULATION ONLY (NOT VALIDATED)\n"
-                    f"CONFLUENCE_MIN_ABS_SCORE: {cfg.CONFLUENCE_MIN_ABS_SCORE:.1f} → "
-                    f"{rec_thr['recommended']:.1f}\n"
-                    f"   ⚠️ Historical simulation on {n} trades, NOT a validated forecast.\n"
-                    f"   Historical filtered WR: {rec_wr_val:.0%} (in-sample estimate)\n"
-                    f"   Do not apply until sample ≥100 and walk-forward passes."
-                )
-            elif tier == RecommendationTier.ACTIONABLE:
-                gate_rec = rec_thr
-                if rec_wr_val > wr:
-                    outcome_line = f"lifts expected WR to ~{rec_wr_val:.0%} (from {wr:.0%})"
-                else:
-                    outcome_line = (
-                        f"expected WR is ~{rec_wr_val:.0%} — *below* your current {wr:.0%}. "
-                        f"This trades hit-rate for a better EV/R:R profile"
-                    )
-                sections.append(
-                    f"🚪 ENTRY BAR — RAISE IT\n"
-                    f"CONFLUENCE_MIN_ABS_SCORE: {cfg.CONFLUENCE_MIN_ABS_SCORE:.1f} → "
-                    f"{rec_thr['recommended']:.1f}\n"
-                    f"   This alone filters out {rec_thr.get('dropped', 0)} weak trades "
-                    f"({rec_thr.get('dropped_pct', 0):.0%}) and {outcome_line}."
-                )
-            else:
-                # DESCRIPTIVE or STATISTICAL tier — just mention it
-                sections.append(
-                    f"📊 ENTRY BAR (observation only)\n"
-                    f"Current: {cfg.CONFLUENCE_MIN_ABS_SCORE:.1f} | "
-                    f"Historical simulation suggests: {rec_thr['recommended']:.1f}\n"
-                    f"   Insufficient data for a recommendation. Accumulate more outcomes."
-                )
-    except Exception as e:
-        _report_section_failed(failed_sections, "ENTRY GATE THRESHOLD", e)
-
-    # ── COPY-PASTE CONFIG BLOCK ────────────────────────────────────────
-    # Kept OUT of `sections` so it can be emitted as a real Telegram code
-    # block. If we ran it through escape_markdown_v2 like every other
-    # section, `CONFLUENCE_WEIGHTS` becomes `CONFLUENCE\_WEIGHTS`, every
-    # `{` becomes `\{` etc., and the user cannot paste the result into a
-    # JSON file. Inside a MarkdownV2 code block, only ` and \ need escaping.
-    json_block: Optional[str] = None
-    try:   
-        json_changes: Dict[str, Any] = {}
-        for p in cfg_patch:
-            if p.get("_blocked_by_action_gate"):
-                continue  # not vetted — never let it into the paste-ready block
-            if p.get("path") == "CONFLUENCE_WEIGHTS":
-                json_changes["CONFLUENCE_WEIGHTS"] = p.get("suggested", {})
-            elif p.get("current") is not None and p.get("suggested") is not None:
-                json_changes[p["path"]] = p["suggested"]
-        if gate_rec is not None:
-            json_changes["CONFLUENCE_MIN_ABS_SCORE"] = round(gate_rec["recommended"], 1)
-        if json_changes:
-            raw_json = json.dumps(json_changes, indent=1)
-            code_safe = raw_json.replace("\\", "\\\\").replace("`", "\\`")
-            
-            json_block = "```json\n" + code_safe + "\n```"
-    except Exception as e:
-        _report_section_failed(failed_sections, "COPY-PASTE CONFIG BLOCK", e)
-
-    # ── BEST / WORST CONDITIONS ────────────────────────────────────
-    try:
-        pair_stats = engine.per_pair_breakdown(rows, min_sample=5)  # worst-first
-        if len(pair_stats) >= 2:
-            worst, best = pair_stats[0], pair_stats[-1]
-            # FIX (Priority 8): Qualify with confidence label instead of
-            # raw WR ranking. A 70% WR on n=5 is NOT stronger evidence
-            # than 60% WR on n=150.
-            best_lo, best_hi, _ = engine.wilson_ci(
-                int(best[1] * best[2]), best[2]
-            )
-            worst_lo, worst_hi, _ = engine.wilson_ci(
-                int(worst[1] * worst[2]), worst[2]
-            )
-            best_conf = engine.confidence_label(best[2], best_lo, best_hi)
-            worst_conf = engine.confidence_label(worst[2], worst_lo, worst_hi)
-            line = (f"🌍 WHERE YOU WIN & LOSE\n"
-                    f"🏆 Best: {best[0]} at {best[1]:.0%} WR "
-                    f"(n={best[2]}, confidence: {best_conf})\n"
-                    f"💀 Worst: {worst[0]} at {worst[1]:.0%} WR "
-                    f"(n={worst[2]}, confidence: {worst_conf})")
-            if worst_conf in ("LOW", "MEDIUM"):
-                line += " — insufficient evidence to remove; monitor"
-            else:
-                line += " — consider removing this pair"
-            sess = engine.session_breakdown(rows, min_sample=5)
-            if len(sess) >= 2:
-                line += (f"\n⏰ Best session: {sess[-1][0]} ({sess[-1][1]:.0%}, n={sess[-1][2]}) "
-                         f"| Worst: {sess[0][0]} ({sess[0][1]:.0%}, n={sess[0][2]})")
-            
-            sections.append(line)
-    except Exception as e:
-        _report_section_failed(failed_sections, "BEST/WORST CONDITIONS", e)
-
-    if failed_sections:
-        sections.append(
-            "⚠️ REPORT SECTIONS UNAVAILABLE (analysis error — see logs):\n   "
-            + ", ".join(failed_sections)
-        )
-
-    if not sections and json_block is None:
-        return []
-
-    # ── Pack sections into <4096-char messages ─────────────────────────
-    msgs: List[str] = []
-    cur = ""
-    for s in sections:
-        if len(cur) + len(s) + 2 > 3500:
-            if cur:
-                msgs.append(cur)
-            cur = s
-        else:
-            cur = (cur + "\n\n" + s) if cur else s
-    if cur:
-        msgs.append(cur)
-
-    escaped_msgs = [escape_markdown_v2(m) for m in msgs]
-
-    if json_block is not None:
-        header = escape_markdown_v2("📋 COPY-PASTE INTO config_macd.json")
-        candidate = header + "\n" + json_block
-        if escaped_msgs and len(escaped_msgs[-1]) + len(candidate) + 2 <= 3900:
-            escaped_msgs[-1] = escaped_msgs[-1] + "\n\n" + candidate
-        else:
-            escaped_msgs.append(candidate)
-
-    return escaped_msgs
-
-# ══════════════════════════════════════════════════════════════════════
 #  BRAIN REPORT v2 — layered 16-section layout
 #  Sections 01-05 = the "human Brain" (read these first).
 #  Sections 06-16 = the evidence behind it.
@@ -554,8 +89,7 @@ _DIRECTION_TOKENS = {"buy", "sell", "up", "down", "cross", "s1", "s2", "s3", "r1
 def _pretty_alert(key: str) -> str:
     """strong_reversal_buy -> 'Strong Reversal BUY'."""
     toks = [t for t in str(key).split("_") if t and t.lower() != "cross"]
-    return " ".join(_TOKEN_NAMES.get(t.lower(), t.capitalize()) for t in toks) or str(key)
-
+    return " ".join(_TOKEN_NAMES.get(t.lower(), t.capitalize()) for t in toks) or _pretty_alert(key)
 
 def _alert_family(key: str) -> str:
     """pivot_down_S1 -> 'Pivot'; dynamic_flow_cross_sell -> 'Dynamic Flow'."""
@@ -563,15 +97,28 @@ def _alert_family(key: str) -> str:
     return " ".join(_TOKEN_NAMES.get(t.lower(), t.capitalize()) for t in toks) or _pretty_alert(key)
 
 
-def _p(text: str) -> str:
+class _Piece(str):
+    """A rendered Telegram fragment that remembers its plain source text and
+    kind ('p' prose, 'c' code, 'h' section header), so the same report can
+    also be written out as Markdown."""
+    kind: str
+    raw: str
+
+    def __new__(cls, rendered: str, kind: str, raw: str) -> "_Piece":
+        obj = super().__new__(cls, rendered)
+        obj.kind = kind
+        obj.raw = raw
+        return obj
+
+
+def _p(text: str) -> "_Piece":
     """Prose piece, MarkdownV2-escaped."""
-    return escape_markdown_v2(text)
+    return _Piece(escape_markdown_v2(text), "p", text)
 
 
-def _c(text: str) -> str:
+def _c(text: str) -> "_Piece":
     """Code-block piece. Inside ``` only ` and \\ need escaping."""
-    return "```\n" + text.replace("\\", "\\\\").replace("`", "\\`") + "\n```"
-
+    return _Piece("```\n" + text.replace("\\", "\\\\").replace("`", "\\`") + "\n```", "c", text)
 
 def _c_split(lines: List[str], limit: int = 3000) -> List[str]:
     """Fenced blocks of at most `limit` chars, split on line boundaries."""
@@ -588,10 +135,8 @@ def _c_split(lines: List[str], limit: int = 3000) -> List[str]:
         out.append(_c("\n".join(cur)))
     return out
 
-
-def _hdr(num: int, title: str) -> str:
-    return _p(f"{_RULE}\n{num:02d} │ {title}\n{_RULE}")
-
+def _hdr(num: int, title: str) -> "_Piece":
+    return _Piece(escape_markdown_v2(f"{_RULE}\n{num:02d} │ {title}\n{_RULE}"), "h", f"{num:02d} │ {title}")
 
 def _evidence_rank(n: int, days: Optional[float], validated: bool = False) -> int:
     """0 ⚪ Observation … 4 🟢 Validated. Capped by history span so a short
@@ -602,7 +147,6 @@ def _evidence_rank(n: int, days: Optional[float], validated: bool = False) -> in
     if days is not None:
         r = min(r, 1 if days < 14 else 2 if days < 30 else 3)
     return r
-
 
 def _wrap_names(names: List[str], width: int = 34, indent: str = "   ") -> List[str]:
     """Bullet-free wrapped list: 'A · B · C' broken into short lines."""
@@ -1015,7 +559,6 @@ def _sec_do_now(F: Dict[str, Any], cfg) -> List[str]:
         out.append(_p("🚫 DO NOT CHANGE YET\n\n" + "\n".join(f"• {x}" for x in dont)))
     return out
 
-
 def _sec_profit(F: Dict[str, Any], cfg) -> List[str]:
     n, wr, net_ev, days = F["n"], F["wr"], F["net_ev"], F["days"]
     an = F["anatomy"] or {}
@@ -1087,7 +630,6 @@ def _sec_loss(F: Dict[str, Any], cfg) -> List[str]:
                 "➡️ They are \"investigate\" candidates.\n➡️ They are NOT yet \"disable\" candidates.")
     out.append(_p("🧠 INTERPRETATION\n\n" + text))
     return out
-
 
 def _sec_positive(F: Dict[str, Any], cfg) -> List[str]:
     out = [_hdr(5, '🟢 POSITIVE SIGNS — "WHERE ARE WE DOING BETTER?"')]
@@ -1205,7 +747,6 @@ def _sec_filters(F: Dict[str, Any], cfg) -> List[str]:
     ))
     return out
 
-
 def _sec_investigation(F: Dict[str, Any], cfg) -> List[str]:
     out = [_hdr(10, '🔬 BRAIN INVESTIGATION — "WHAT ARE WE TESTING?"')]
     topics = ["Entry quality", "BUY vs SELL performance", "Alert-family performance",
@@ -1223,7 +764,6 @@ def _sec_investigation(F: Dict[str, Any], cfg) -> List[str]:
                                             else "🟢 None")))
     return out
 
-
 def _config_json_block(F: Dict[str, Any], cfg) -> Optional[str]:
     changes: Dict[str, Any] = {}
     for p in F["cfg_patch"]:
@@ -1237,20 +777,19 @@ def _config_json_block(F: Dict[str, Any], cfg) -> Optional[str]:
         changes["CONFLUENCE_MIN_ABS_SCORE"] = round(F["rec_thr"]["recommended"], 1)
     return json.dumps(changes, indent=1) if changes else None
 
-
 def _sec_sims(F: Dict[str, Any], cfg) -> List[str]:
     out = [_hdr(11, "🧪 SIMULATIONS / WHAT-IF ANALYSIS")]
     gate = F["gate"]
     if F["rec_thr_ok"]:
         rt = F["rec_thr"]
         validated = F["thr_tier"] == RecommendationTier.ACTIONABLE
-        out.append(_p(
+        out.append(_p((
             f"CONFLUENCE MIN SCORE\n\nCurrent:       {cfg.CONFLUENCE_MIN_ABS_SCORE:.0f}\n"
             f"Simulation:    {rt['recommended']:.0f}\n\n"
             f"Historical simulated WR: {rt.get('rec_wr', 0):.0%}\n\n"
             f"Status:\n{'✅ VALIDATED' if validated else '🚫 NOT VALIDATED'}\n\n"
             + ("" if validated else "Reason:\nIn-sample simulation only.")
-        ).rstrip())
+        ).rstrip()))
         checks = [
             ("Minimum sample reached", gate.get("data_quality")),
             ("Walk-forward validation passes", gate.get("oos_prediction")),
@@ -1463,10 +1002,11 @@ _REPORT_SECTIONS = (
     ("EVIDENCE", _sec_evidence), ("TECHNICAL APPENDIX", _sec_appendix),
 )
 
-def build_brain_report(recs: Dict[str, Any], cfg) -> List[str]:
-    """Layered 16-section Brain report. Returns Telegram-ready MarkdownV2
-    messages (each under 4096 chars). Raises only if the shared facts cannot
-    be computed; an individual failing section is replaced by a notice."""
+def build_brain_report_sections(recs: Dict[str, Any], cfg) -> Tuple[List[List[str]], str]:
+    """Compute the 16 report sections once. Returns (sections, stamp); each
+    section is a list of rendered pieces. An individual failing section is
+    replaced by a notice; the call raises only if the shared facts cannot
+    be computed."""
     F = _collect_facts(recs, cfg)
     stamp = datetime.now(_IST).strftime("%d %b %Y | %H:%M IST").upper()
     sections: List[List[str]] = []
@@ -1477,7 +1017,11 @@ def build_brain_report(recs: Dict[str, Any], cfg) -> List[str]:
         except Exception as e:
             _report_section_failed(failed, name, e)
             sections.append([_hdr(i, name), _p("⚠️ This section is unavailable (analysis error — see logs).")])
+    return sections, stamp
 
+def render_report_messages(sections: List[List[str]], stamp: str) -> List[str]:
+    """Pack the sections into Telegram-ready MarkdownV2 messages (each under
+    4096 chars)."""
     msgs: List[str] = []
     cur = _p(f"{'═' * 30}\n🧠 BRAIN REPORT\n{stamp}\n{'═' * 30}")
 
@@ -1510,6 +1054,41 @@ def build_brain_report(recs: Dict[str, Any], cfg) -> List[str]:
         cur = tail
     _flush()
     return msgs
+
+
+def _md_prose(raw: str) -> str:
+    """Plain prose -> Markdown: keep line breaks, neutralise * _ ` and \\."""
+    text = raw.replace("\\", "\\\\")
+    for ch in ("*", "_", "`"):
+        text = text.replace(ch, "\\" + ch)
+    paragraphs = [p.replace("\n", "  \n") for p in text.split("\n\n")]
+    return "\n\n".join(paragraphs)
+
+
+def render_report_markdown(sections: List[List[str]], stamp: str) -> str:
+    """The same report as a Markdown document (for the reports/ archive):
+    no Telegram escaping, real headings, tables kept as code blocks."""
+    out: List[str] = [f"# 🧠 Brain Report — {stamp}"]
+    for idx, pieces in enumerate(sections, 1):
+        for piece in pieces:
+            kind = getattr(piece, "kind", "p")
+            raw = getattr(piece, "raw", str(piece))
+            if kind == "h":
+                out.append("## " + raw)
+            elif kind == "c":
+                out.append("```\n" + raw + "\n```")
+            else:
+                out.append(_md_prose(raw))
+        if idx == _HUMAN_SECTIONS:
+            out.append("---\n\n*Sections 06–16: the evidence behind the above.*")
+    out.append("---\n\n*End of Brain report.*")
+    return "\n\n".join(out) + "\n"
+
+
+def build_brain_report(recs: Dict[str, Any], cfg) -> List[str]:
+    """Convenience wrapper: sections -> Telegram messages."""
+    sections, stamp = build_brain_report_sections(recs, cfg)
+    return render_report_messages(sections, stamp)
 
 class BrainEngineV2(BaseBrainEngine):
     """Drop-in replacement for BrainEngine. Inherits the original and adds
@@ -2588,7 +2167,7 @@ class BrainEngineV2(BaseBrainEngine):
     
         logger.info(f"⏱️   └ actionability_block: {time.time() - _act_t0:.2f}s")
 
-        # ── Config version hash ──────────────────────────────────────────
+        # ── Config version hash ──────────────��───────────────────────────
         _hash_t0 = time.time()
         ai_metrics["config_version"] = hash_config_state(
             CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
@@ -2654,7 +2233,7 @@ class BrainEngineV2(BaseBrainEngine):
                         f"seen but below BRAIN_CUSUM_MIN_SAMPLE={_cusum_min_n} — "
                         f"not vetoing tuning "
                         f"({[f'{ak}(n={n})' for ak, n in _below_floor_drift[:5]]}"
-                        f"{'…' if len(_below_floor_drift) > 5 else ''})"
+                        f"{'' if len(_below_floor_drift) > 5 else ''})"
                     )
 
             except Exception as e:
@@ -3159,17 +2738,29 @@ class BrainEngineV2(BaseBrainEngine):
             ))
             return False
 
+    @staticmethod
+    def _archive_report(sections: List[List[str]], stamp: str, logger_run: logging.Logger) -> None:
+        """Save this report as Markdown in <OUTCOME_DATA_DIR>/reports/
+        (YYYY-MM-DD_HH-MM.md, UTC). Never fatal: a failed archive must not
+        stop the Telegram report or trigger the fallback report."""
+        try:
+            from outcome_storage import save_report
+            path = save_report(render_report_markdown(sections, stamp))
+            logger_run.info(f"Brain report archived: {path}")
+        except Exception as e:
+            logger_run.warning(f"Brain report archive failed (non-fatal): {e}")
+
     async def generate_report(self, pairs, telegram_queue, logger_run) -> bool:
         """Override: send ONLY the plain-English action plan (no jargon), then store for application."""
         try:
             recs = await self.generate_recommendations()
 
             # Build and send the plain-English action plan
-            try:
-                plan_messages = build_brain_report(recs, cfg)  # layered 16-section report, MarkdownV2-escaped
-            except Exception as report_err:
-                logger_run.warning(f"Layered Brain report failed ({report_err}); using classic plan")
-                plan_messages = build_profit_action_plan(recs, cfg)  # already MarkdownV2-escaped
+            # Layered 16-section report. If building it raises, the outer
+            # handler below falls back to the base technical report.
+            sections, stamp = build_brain_report_sections(recs, cfg)
+            plan_messages = render_report_messages(sections, stamp)   # already MarkdownV2-escaped
+            self._archive_report(sections, stamp, logger_run)
             sent_ok = True
             for msg in plan_messages:
                 if not await telegram_queue.send(msg):
