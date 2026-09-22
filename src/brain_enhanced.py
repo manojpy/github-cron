@@ -96,7 +96,6 @@ def _alert_family(key: str) -> str:
     toks = [t for t in str(key).split("_") if t and t.lower() not in _DIRECTION_TOKENS]
     return " ".join(_TOKEN_NAMES.get(t.lower(), t.capitalize()) for t in toks) or _pretty_alert(key)
 
-
 class _Piece(str):
     """A rendered Telegram fragment that remembers its plain source text and
     kind ('p' prose, 'c' code, 'h' section header), so the same report can
@@ -120,7 +119,7 @@ def _c(text: str) -> "_Piece":
     """Code-block piece. Inside ``` only ` and \\ need escaping."""
     return _Piece("```\n" + text.replace("\\", "\\\\").replace("`", "\\`") + "\n```", "c", text)
 
-def _c_split(lines: List[str], limit: int = 3000) -> List[str]:
+def _c_split(lines: List[str], limit: int = 3000) -> List[_Piece]:
     """Fenced blocks of at most `limit` chars, split on line boundaries."""
     out: List[str] = []
     cur: List[str] = []
@@ -162,7 +161,6 @@ def _wrap_names(names: List[str], width: int = 34, indent: str = "   ") -> List[
     if cur:
         lines.append(indent + cur)
     return lines
-
 
 def _collect_facts(recs: Dict[str, Any], cfg) -> Dict[str, Any]:
     """Everything the sections need, computed once."""
@@ -407,7 +405,7 @@ def _active_blockers(F: Dict[str, Any]) -> List[str]:
 
 # ── the sections ──────────────────────────────────────────────────────
 
-def _sec_summary(F: Dict[str, Any], cfg) -> List[str]:
+def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
     n, wr, net_ev, days = F["n"], F["wr"], F["net_ev"], F["days"]
     validated_mode = F["gate_ok"] and net_ev > 0 and F["conf"] in ("MODERATE", "HIGH")
     if validated_mode:
@@ -460,7 +458,7 @@ def _sec_summary(F: Dict[str, Any], cfg) -> List[str]:
     return out
 
 
-def _sec_verdict(F: Dict[str, Any], cfg) -> List[str]:
+def _sec_verdict(F: Dict[str, Any], cfg) -> List[_Piece]:
     """End-state Section 1, shown only when the action gate passes."""
     g = F["gate"]
     out = [_hdr(1, "🧠 BRAIN VERDICT")]
@@ -508,7 +506,7 @@ def _sec_verdict(F: Dict[str, Any], cfg) -> List[str]:
     ))
     return out
 
-def _sec_do_now(F: Dict[str, Any], cfg) -> List[str]:
+def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
     n, wr = F["n"], F["wr"]
     out = [_hdr(2, "🚦 WHAT SHOULD I DO NOW?")]
     do_now: List[str] = []
@@ -559,7 +557,7 @@ def _sec_do_now(F: Dict[str, Any], cfg) -> List[str]:
         out.append(_p("🚫 DO NOT CHANGE YET\n\n" + "\n".join(f"• {x}" for x in dont)))
     return out
 
-def _sec_profit(F: Dict[str, Any], cfg) -> List[str]:
+def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
     n, wr, net_ev, days = F["n"], F["wr"], F["net_ev"], F["days"]
     an = F["anatomy"] or {}
     be = 1.0 / (1.0 + an["rr"]) if an.get("rr") else None
@@ -610,7 +608,7 @@ def _alert_table(items: List[Dict[str, Any]], limit: int) -> List[str]:
     return _c_split(rows) + [_p(_EVIDENCE_LEGEND)]
 
 
-def _sec_loss(F: Dict[str, Any], cfg) -> List[str]:
+def _sec_loss(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(4, '🔎 LOSS DIAGNOSIS — "WHERE ARE WE FALTERING?"')]
     weak = F["weak"]
     if not weak:
@@ -631,7 +629,7 @@ def _sec_loss(F: Dict[str, Any], cfg) -> List[str]:
     out.append(_p("🧠 INTERPRETATION\n\n" + text))
     return out
 
-def _sec_positive(F: Dict[str, Any], cfg) -> List[str]:
+def _sec_positive(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(5, '🟢 POSITIVE SIGNS — "WHERE ARE WE DOING BETTER?"')]
     good = F["good"]
     if not good:
@@ -648,7 +646,7 @@ def _sec_positive(F: Dict[str, Any], cfg) -> List[str]:
     ))
     return out
 
-def _sec_scorecard(F: Dict[str, Any], cfg) -> List[str]:
+def _sec_scorecard(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(6, '🚦 ALERT SCORECARD — "WHAT SHOULD I TRUST?"')]
     validated = [a for a in F["good"] if a["rank"] == 4]
     promising = [a for a in F["good"] if a["rank"] < 4]
@@ -668,7 +666,7 @@ def _sec_scorecard(F: Dict[str, Any], cfg) -> List[str]:
         out.append(_p(f"➖ {zero} alert(s) with exactly zero net EV are not listed above."))
     return out
 
-def _sec_coins(F: Dict[str, Any], cfg) -> List[str]:
+def _sec_coins(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(7, '🪙 COIN ANALYSIS — "WHERE ARE WE WINNING/LOSING?"')]
     pairs = F["pairs"]
     if len(pairs) < 2:
@@ -690,7 +688,7 @@ def _sec_coins(F: Dict[str, Any], cfg) -> List[str]:
     return out
 
 
-def _sec_sessions(F: Dict[str, Any], cfg) -> List[str]:
+def _sec_sessions(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(8, "⏰ SESSION / TIME ANALYSIS")]
     sess = F["sessions"]                                     # worst-first
     if not sess:
@@ -712,7 +710,7 @@ def _sec_sessions(F: Dict[str, Any], cfg) -> List[str]:
     return out
 
 
-def _sec_filters(F: Dict[str, Any], cfg) -> List[str]:
+def _sec_filters(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(9, "🧩 FILTER / CONFLUENCE ANALYSIS")]
     groups: Dict[str, list] = defaultdict(list)
     for r in F["shadow_rows"]:
@@ -747,7 +745,7 @@ def _sec_filters(F: Dict[str, Any], cfg) -> List[str]:
     ))
     return out
 
-def _sec_investigation(F: Dict[str, Any], cfg) -> List[str]:
+def _sec_investigation(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(10, '🔬 BRAIN INVESTIGATION — "WHAT ARE WE TESTING?"')]
     topics = ["Entry quality", "BUY vs SELL performance", "Alert-family performance",
               "Coin performance", "Session performance", "Confluence score", "Volatility regime",
@@ -777,7 +775,7 @@ def _config_json_block(F: Dict[str, Any], cfg) -> Optional[str]:
         changes["CONFLUENCE_MIN_ABS_SCORE"] = round(F["rec_thr"]["recommended"], 1)
     return json.dumps(changes, indent=1) if changes else None
 
-def _sec_sims(F: Dict[str, Any], cfg) -> List[str]:
+def _sec_sims(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(11, "🧪 SIMULATIONS / WHAT-IF ANALYSIS")]
     gate = F["gate"]
     if F["rec_thr_ok"]:
@@ -821,7 +819,7 @@ def _sec_sims(F: Dict[str, Any], cfg) -> List[str]:
     return out
 
 
-def _sec_recs(F: Dict[str, Any], cfg) -> List[str]:
+def _sec_recs(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(12, "🤖 BRAIN RECOMMENDATIONS")]
     act: List[str] = []
     recon_ok = F["recon"] is not None and F["recon"].status == HealthStatus.OK
@@ -859,7 +857,7 @@ def _sec_recs(F: Dict[str, Any], cfg) -> List[str]:
     return out
 
 
-def _sec_gate(F: Dict[str, Any], cfg) -> List[str]:
+def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     g = F["gate"]
     out = [_hdr(13, '🛡️ ACTION GATE — "CAN THE BRAIN SAFELY CHANGE ANYTHING?"')]
     labels = [("data_quality", "Minimum trades"), ("oos_prediction", "OOS EV"),
@@ -879,7 +877,7 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[str]:
     return out
 
 
-def _sec_quality(F: Dict[str, Any], cfg) -> List[str]:
+def _sec_quality(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(14, "📊 DATA QUALITY & RECONCILIATION")]
     cov, rec, st = F["coverage"], F["recon"], F["archive_stats"]
 
@@ -926,7 +924,7 @@ def _sec_quality(F: Dict[str, Any], cfg) -> List[str]:
     return out
 
 
-def _sec_evidence(F: Dict[str, Any], cfg) -> List[str]:
+def _sec_evidence(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(15, "📈 EVIDENCE / CONFIDENCE")]
     days, n, g = F["days"], F["n"], F["gate"]
     recon_ok = F["recon"] is not None and F["recon"].status == HealthStatus.OK
@@ -950,7 +948,7 @@ def _sec_evidence(F: Dict[str, Any], cfg) -> List[str]:
     return out
 
 
-def _sec_appendix(F: Dict[str, Any], cfg) -> List[str]:
+def _sec_appendix(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(16, "📚 TECHNICAL APPENDIX")]
     out.append(_p("Detailed data for advanced users."))
     rows = [f"{'Alert':<20}{'N':>4}{'WR':>5}{'EV':>7}{'P>0':>5}"]
@@ -1002,14 +1000,14 @@ _REPORT_SECTIONS = (
     ("EVIDENCE", _sec_evidence), ("TECHNICAL APPENDIX", _sec_appendix),
 )
 
-def build_brain_report_sections(recs: Dict[str, Any], cfg) -> Tuple[List[List[str]], str]:
+def build_brain_report_sections(recs: Dict[str, Any], cfg) -> Tuple[List[_Piece]], str]:
     """Compute the 16 report sections once. Returns (sections, stamp); each
     section is a list of rendered pieces. An individual failing section is
     replaced by a notice; the call raises only if the shared facts cannot
     be computed."""
     F = _collect_facts(recs, cfg)
     stamp = datetime.now(_IST).strftime("%d %b %Y | %H:%M IST").upper()
-    sections: List[List[str]] = []
+    sections: List[List[_Piece]] = []
     failed: List[str] = []
     for i, (name, fn) in enumerate(_REPORT_SECTIONS, 1):
         try:
@@ -1019,34 +1017,47 @@ def build_brain_report_sections(recs: Dict[str, Any], cfg) -> Tuple[List[List[st
             sections.append([_hdr(i, name), _p("⚠️ This section is unavailable (analysis error — see logs).")])
     return sections, stamp
 
-def render_report_messages(sections: List[List[str]], stamp: str) -> List[str]:
-    """Pack the sections into Telegram-ready MarkdownV2 messages (each under
-    4096 chars)."""
+def render_report_messages(sections: List[List[_Piece]], stamp: str) -> List[str]:
+    """Pack the sections into Telegram-ready MarkdownV2 messages..."""
     msgs: List[str] = []
-    cur = _p(f"{'═' * 30}\n🧠 BRAIN REPORT\n{stamp}\n{'═' * 30}")
-
+    
+    # Explicitly type as str to allow f-string reassignments later
+    cur: str = _p(f"{'═' * 30}\n🧠 BRAIN REPORT\n{stamp}\n{'═' * 30}")
+    
     def _flush() -> None:
         nonlocal cur
         if cur:
             msgs.append(cur)
-        cur = ""
-
+            cur = ""
+            
     for idx, pieces in enumerate(sections, 1):
         if len(pieces) > 1:                            # never strand a header from its body
-            pieces = [f"{pieces[0]}\n\n{pieces[1]}"] + pieces[2:]
+            # Combine header and first body piece.
+            # FIX 1: Use \n\n for proper Telegram paragraph spacing.
+            # FIX 2: Set kind="p" so render_report_markdown() doesn't 
+            # accidentally format the body text as a Markdown heading (##).
+            combined_rendered = f"{pieces[0]}\n\n{pieces[1]}"
+            combined_raw = f"{pieces[0].raw}\n\n{pieces[1].raw}"
+            combined = _Piece(combined_rendered, "p", combined_raw)
+            pieces = [combined] + pieces[2:]
+            
+        # RESTORED: Original optimization to keep small sections intact
         whole = "\n\n".join(pieces)
         if cur and len(cur) + len(whole) + 2 > _MSG_LIMIT and len(whole) <= _MSG_LIMIT:
             _flush()                                   # small section: start a fresh message
+            
         for piece in pieces:
             if cur and len(cur) + len(piece) + 2 > _MSG_LIMIT:
                 _flush()
             cur = f"{cur}\n\n{piece}" if cur else piece
+            
         if idx == _HUMAN_SECTIONS:
             divider = _p("▼ SECTIONS 06–16: THE EVIDENCE BEHIND THE ABOVE ▼")
             if cur and len(cur) + len(divider) + 2 > _MSG_LIMIT:
                 _flush()
             cur = f"{cur}\n\n{divider}" if cur else divider
-    tail = _p(f"{'═' * 30}\n END OF BRAIN REPORT\n{'═' * 30}")
+            
+    tail = _p(f"{'═' * 30}\nEND OF BRAIN REPORT\n{'═' * 30}")
     if cur and len(cur) + len(tail) + 2 <= _MSG_LIMIT:
         cur = f"{cur}\n\n{tail}"
     else:
@@ -1054,7 +1065,6 @@ def render_report_messages(sections: List[List[str]], stamp: str) -> List[str]:
         cur = tail
     _flush()
     return msgs
-
 
 def _md_prose(raw: str) -> str:
     """Plain prose -> Markdown: keep line breaks, neutralise * _ ` and \\."""
@@ -1065,7 +1075,7 @@ def _md_prose(raw: str) -> str:
     return "\n\n".join(paragraphs)
 
 
-def render_report_markdown(sections: List[List[str]], stamp: str) -> str:
+def render_report_markdown(sections: List[List[_Piece]], stamp: str) -> str:
     """The same report as a Markdown document (for the reports/ archive):
     no Telegram escaping, real headings, tables kept as code blocks."""
     out: List[str] = [f"# 🧠 Brain Report — {stamp}"]
@@ -2739,7 +2749,7 @@ class BrainEngineV2(BaseBrainEngine):
             return False
 
     @staticmethod
-    def _archive_report(sections: List[List[str]], stamp: str, logger_run: logging.Logger) -> None:
+    def _archive_report(sections: List[List[_Piece]], stamp: str, logger_run: logging.Logger) -> None:
         """Save this report as Markdown in <OUTCOME_DATA_DIR>/reports/
         (YYYY-MM-DD_HH-MM.md, UTC). Never fatal: a failed archive must not
         stop the Telegram report or trigger the fallback report."""
