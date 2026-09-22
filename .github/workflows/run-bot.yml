@@ -42,7 +42,7 @@ env:
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
   BOT_TIMEOUT: 660
   # BRAIN_REPORT_ON_DEMAND is set per-run inside the bot_run step
-  # via .bot_env (BRAIN_FULL), not here — the workflow's 4-hour
+  # via .bot_env (BRAIN_FULL), not here — the workflow's 6-hour
   # archive-depth decision is the real cadence control.
   CLEAR_REDIS: ${{ inputs.clear_redis }}
   CLEAR_KILL_SWITCH: ${{ inputs.clear_kill_switch }}
@@ -152,7 +152,8 @@ jobs:
         id: brain_depth
         run: |
           NOW=$(date -u +%s)
-          if [ "${{ inputs.brain_report }}" = "true" ] || [ $(( (NOW / 900) % 16 )) -eq 0 ]; then
+          # 900 s = one 15-minute slot; 24 slots = 6 hours (00:00/06:00/12:00/18:00 UTC).
+          if [ "${{ inputs.brain_report }}" = "true" ] || [ $(( (NOW / 900) % 24 )) -eq 0 ]; then
             echo "brain_full=true"  >> "$GITHUB_OUTPUT"
             echo "archive_days=185" >> "$GITHUB_OUTPUT"
             echo "🧠 Brain-report run: full 185-day archive"
@@ -419,6 +420,12 @@ jobs:
 
           # Safety net: if anything else new appeared under these dirs, grab it.
           git add -f outcomes shadow 2>/dev/null || true
+
+          # Brain reports (Markdown) written by the bot this run. Kept 7 days;
+          # the daily cleanup workflow deletes older ones.
+          # --sparse is REQUIRED: report file names are not in the sparse-checkout
+          # list, and a plain `git add` silently refuses paths outside it.
+          git add --sparse -f reports 2>/dev/null || true
 
           if [ -f brain_state.json ]; then
             git add -f brain_state.json

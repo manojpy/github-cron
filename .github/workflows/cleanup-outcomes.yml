@@ -41,6 +41,7 @@ jobs:
             python3 src/cleanup_outcomes.py \
               --data-dir /tmp/data-repo \
               --max-age-days 185 \
+              --reports-max-age-days 7 \
               --max-size-mb 100 \
               --max-total-mb 400 \
               --no-compress-within-days 30
