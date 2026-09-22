@@ -420,13 +420,13 @@ def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
         f"{'Brain action gate':<25} : {'🟢 PASSED' if F['gate_ok'] else '🔴 BLOCKED'}",
     ]
     out.extend(_c_split(status_rows))
-
+    req_days_str = f"{F['req_days']} days"
     stats_rows = [
         f"{'Resolved Trades':<22} : {n:>6}",
         f"{'Win Rate':<22} : {wr:>6.0%}",
         f"{'Net EV/trade':<22} : {net_ev:>+6.2f}%",
         f"{'History available':<22} : {_fmt_days(days):>10}",
-        f"{'History requested':<22} : {f'{F[\"req_days\"]} days':>10}",
+        f"{'History requested':<22} : {req_days_str:>10}",
     ]
     out.extend(_c_split(stats_rows))
     losing = net_ev <= -0.05
