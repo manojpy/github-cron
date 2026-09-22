@@ -79,11 +79,13 @@ def test_confidence_is_capped_by_history_span():
     a._history.actual_days = 45
     assert a.statistical_confidence_label() == "HIGH"
 
-
 def test_all_sixteen_sections_in_order_and_fit_telegram():
     msgs = _report(_rows(_SPEC))
     text = _plain(msgs)
-    positions = [text.index(f"{i:02d} │") for i in range(1, 17)]
+    positions = [
+        re.search(rf"^{i:02d} │", text, re.MULTILINE).start() 
+        for i in range(1, 17)
+    ]
     assert positions == sorted(positions)
     assert "BRAIN REPORT" in msgs[0] and "END OF BRAIN REPORT" in _plain(msgs[-1:])
     assert all(len(m) <= 4096 for m in msgs)
