@@ -69,47 +69,10 @@ def _report_section_failed(failed: List[str], name: str, exc: Exception) -> None
 
 _RULE = "━" * 30
 _IST = timezone(timedelta(hours=5, minutes=30))
-
 _LADDER = ["⚪", "🟡", "🟠", "🔵", "🟢"]          # Observation → Validated
 _LADDER_NAMES = ["Observation", "Early evidence", "Meaningful evidence",
                  "Strong evidence", "Validated evidence"]
 _MSG_LIMIT = 3800                                   # rendered chars per Telegram message
-
-# ── Monospace-aware padding ─────────────────────────────────────────
-# Telegram renders ```code``` in a monospace font, but an emoji takes
-# TWO columns while len() counts it as ONE. Every padded table row that
-# contains an emoji therefore shifts everything after it by 1 column.
-# These helpers pad by DISPLAY WIDTH instead of character count.
-import unicodedata
-
-_EMOJI_RANGES = (
-    (0x1F300, 0x1FAFF),   # symbols, pictographs, emoji
-    (0x2600, 0x27BF),     # misc symbols / dingbats (⚪ 🟡 ⚠ ✅ ❌)
-    (0x1F000, 0x1F2FF),   # mahjong / dominoes
-    (0x1F900, 0x1F9FF),   # supplemental symbols
-)
-
-def _dwidth(s: str) -> int:
-    """Display width in monospace columns: emoji = 2, combining = 0."""
-    w = 0
-    for ch in s:
-        if unicodedata.combining(ch):
-            continue
-        cp = ord(ch)
-        if any(lo <= cp <= hi for lo, hi in _EMOJI_RANGES):
-            w += 2
-        else:
-            w += 1
-    return w
-
-def _pad_r(s: str, width: int) -> str:
-    """Left-align: pad with spaces on the RIGHT to `width` display cols."""
-    return s + " " * max(0, width - _dwidth(s))
-
-def _pad_l(s: str, width: int) -> str:
-    """Right-align: pad with spaces on the LEFT to `width` display cols."""
-    return " " * max(0, width - _dwidth(s)) + s
-
 _HUMAN_SECTIONS = 5                                 # sections 1-5 are packed on their own
 
 _TOKEN_NAMES = {
@@ -151,6 +114,7 @@ def _p(text: str) -> "_Piece":
     """Prose piece, MarkdownV2-escaped."""
     return _Piece(escape_markdown_v2(text), "p", text)
 
+
 def _c(text: str) -> "_Piece":
     """Code-block piece. Inside ``` only ` and \\ need escaping."""
     return _Piece("```\n" + text.replace("\\", "\\\\").replace("`", "\\`") + "\n```", "c", text)
@@ -184,13 +148,12 @@ def _evidence_rank(n: int, days: Optional[float], validated: bool = False) -> in
     return r
 
 def _wrap_names(names: List[str], width: int = 34, indent: str = "   ") -> List[str]:
-    """Bullet-free wrapped list: 'A · B · C' broken into short lines.
-    Uses display width so emojis count as 2 columns, not 1."""
+    """Bullet-free wrapped list: 'A · B · C' broken into short lines."""
     lines: List[str] = []
     cur = ""
     for nm in names:
         add = nm if not cur else f" · {nm}"
-        if cur and _dwidth(cur) + _dwidth(add) > width:
+        if cur and len(cur) + len(add) > width:
             lines.append(indent + cur)
             cur = nm
         else:
@@ -416,9 +379,9 @@ def _fmt_span(d: Optional[float]) -> str:
     """Adjective form: '2.5-day' (for 'the current 2.5-day sample')."""
     return "very short" if d is None else f"{d:.1f}-day"
 
+
 def _row(label: str, result: str, verdict: str = "", w1: int = 14, w2: int = 10) -> str:
-    # Display-width-aware: emojis take 2 monospace columns, not 1.
-    return f"{_pad_r(label, w1)}{_pad_l(result, w2)}  {verdict}".rstrip()
+    return f"{label:<{w1}}{result:>{w2}}  {verdict}".rstrip()
 
 def _active_blockers(F: Dict[str, Any]) -> List[str]:
     g = F["gate"]
@@ -603,20 +566,18 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
                   else "🟢 At/above break-even" if be else "⚪")
     dd, bud = F["dd"], F["dd_budget"]
     rows = [
-        # Two extra spaces so the HEADER sits above the TEXT of each verdict,
-        # not above the 2-column-wide emoji prefix.
-        _row("", "RESULT", "  VERDICT"),
+        _row("", "RESULT", "VERDICT"),
         _row("Trades", str(n), "🟢 Good sample" if n >= 100 else "🟡 Small sample" if n >= 30 else "🔴 Tiny sample"),
         _row("Win Rate", f"{wr:.0%}", wr_verdict),
         _row("Net EV", f"{net_ev:+.2f}%", "🟢 Positive" if net_ev > 0.05 else "🟡 Flat" if net_ev > -0.05 else "🔴 Negative"),
         _row("History", "n/a" if days is None else f"{days:.1f}d",
              "🟢 Long enough" if (days or 0) >= 30 else "🟡 Short" if (days or 0) >= 14 else "🔴 Too short"),
         _row("After costs?", "YES" if F["gate"].get("execution", True) else "NO",
-             "  🟢" if F["gate"].get("execution", True) else "  🔴"),
+             "🟢" if F["gate"].get("execution", True) else "🔴"),
         _row("Drawdown", "n/a" if dd is None else f"{dd:.1f}%",
-             "  ⚪ unknown" if dd is None else f"{'🟢 Within' if dd <= bud else '🔴 Over'} {bud:.1f}% budget"),
+             "⚪ unknown" if dd is None else f"{'🟢 Within' if dd <= bud else '🔴 Over'} {bud:.1f}% budget"),
         _row("CUSUM drift", "ACTIVE" if F["gate"].get("stability") is False else "NONE",
-             "  🔴" if F["gate"].get("stability") is False else "  🟢"),
+             "🔴" if F["gate"].get("stability") is False else "🟢"),
     ]
     out.extend(_c_split(rows))
     if net_ev < 0:
@@ -639,23 +600,10 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
 
 _EVIDENCE_LEGEND = "Ev = evidence: ⚪ observation · 🟡 early · 🟠 meaningful · 🔵 strong · 🟢 validated"
 
-
 def _alert_table(items: List[Dict[str, Any]], limit: int) -> List[_Piece]:
-    rows = [
-        f"{_pad_r('Alert', 22)}{_pad_l('EV%', 6)}{_pad_l('WR', 5)}{_pad_l('N', 4)}  Ev"
-    ]
+    rows = [f"{'Alert':<22}{'EV%':>6}{'WR':>5}{'N':>4}  Ev"]
     for a in items[:limit]:
-        # Extract nested f-string pieces to plain variables — keeps the
-        # outer f-string expressions quote-free, which compiles on every
-        # Python >= 3.6 (pre-3.12 forbids same-quote nesting).
-        ev_str = f"{a['ev']:+.2f}"
-        wr_str = f"{a['wr']:.0%}"
-        rows.append(
-            f"{_pad_r(a['name'][:21], 22)}"
-            f"{_pad_l(ev_str, 6)}"
-            f"{_pad_l(wr_str, 5)}"
-            f"{_pad_l(str(a['n']), 4)}  {_LADDER[a['rank']]}"
-        )
+        rows.append(f"{a['name'][:21]:<22}{a['ev']:>+6.2f}{a['wr']:>5.0%}{a['n']:>4}  {_LADDER[a['rank']]}")
     return _c_split(rows) + [_p(_EVIDENCE_LEGEND)]
 
 def _sec_loss(F: Dict[str, Any], cfg) -> List[_Piece]:
@@ -745,17 +693,11 @@ def _sec_sessions(F: Dict[str, Any], cfg) -> List[_Piece]:
         out.append(_p("No session data yet."))
         return out
     best, worst = sess[-1][0], sess[0][0]
-    rows = [f"{_pad_r('SESSION', 10)}{_pad_l('WR', 5)}{_pad_l('TRADES', 8)}  STATUS"]
+    rows = [f"{'SESSION':<10}{'WR':>5}{'TRADES':>8}  STATUS"]
     for name, swr, sn in sorted(sess, key=lambda t: -t[1]):
         tag = ("🟡 Best observed" if name == best and len(sess) > 1
-               else "🔴 Weakest observed" if name == worst and len(sess) > 1
-               else "  ⚪")
-        wr_str = f"{swr:.0%}"   # hoisted out of the f-string expression
-        rows.append(
-            f"{_pad_r(name.upper(), 10)}"
-            f"{_pad_l(wr_str, 5)}"
-            f"{_pad_l(str(sn), 8)}  {tag}"
-        )
+               else "🔴 Weakest observed" if name == worst and len(sess) > 1 else "⚪")
+        rows.append(f"{name.upper():<10}{swr:>5.0%}{sn:>8}  {tag}")
     out.extend(_c_split(rows))
     if len(sess) > 1:
         out.append(_p(f"🧠 Interpretation:\n\n{best.upper()} has performed better in this sample.\n\n"
@@ -774,30 +716,19 @@ def _sec_filters(F: Dict[str, Any], cfg) -> List[_Piece]:
     for must in ("calibration_gate", "confluence_gate", "win_rate_filter"):
         groups.setdefault(must, [])
     min_s = getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
-    rows = [f"{_pad_r('FILTER', 20)}{_pad_l('TRADES', 7)}{_pad_l('EV', 8)}  VERDICT"]
+    rows = [f"{'FILTER':<20}{'TRADES':>7}{'EV':>8}  VERDICT"]
     for reason in sorted(groups):
         g = groups[reason]
         label = reason.replace("_gate", "").replace("_", " ").capitalize()
         if not g:
-            rows.append(f"{_pad_r(label[:19], 20)}{_pad_l('0', 7)}{_pad_l('n/a', 8)}  ⚪")
+            rows.append(f"{label[:19]:<20}{0:>7}{'n/a':>8}  ⚪")
             continue
         try:
             ev = engine.ev_first_objective(g, min_sample=min_s)
         except Exception:
             ev = {"valid": False}
         if not ev.get("valid"):
-            rows.append(
-                f"{_pad_r(label[:19], 20)}{_pad_l(str(len(g)), 7)}"
-                f"{_pad_l('n/a', 8)}  ⚪ need {min_s}"
-            )
-        else:
-            ne, pe = ev.get("net_ev", 0.0), ev.get("p_ev_positive", 0.0)
-            v = "🟡 may over-block" if ne > 0 and pe >= 0.65 else "🟢 filters losers"
-            ev_str = f"{ne:+.2f}%"   # hoisted out of the f-string expression
-            rows.append(
-                f"{_pad_r(label[:19], 20)}{_pad_l(str(len(g)), 7)}"
-                f"{_pad_l(ev_str, 8)}  {v}"
-            )
+            rows.append(f"{label[:19]:<20}{len(g):>7}{'n/a':>8}  ⚪ need {min_s}")
         else:
             ne, pe = ev.get("net_ev", 0.0), ev.get("p_ev_positive", 0.0)
             v = "🟡 may over-block" if ne > 0 and pe >= 0.65 else "🟢 filters losers"
@@ -923,14 +854,15 @@ def _sec_recs(F: Dict[str, Any], cfg) -> List[_Piece]:
                       "• Confluence score change\n• Automatic Brain plan"))
     return out
 
+
 def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     g = F["gate"]
     out = [_hdr(13, '🛡️ ACTION GATE — "CAN THE BRAIN SAFELY CHANGE ANYTHING?"')]
     labels = [("data_quality", "Minimum trades"), ("oos_prediction", "OOS EV"),
               ("profitability", "Net EV confidence"), ("stability", "CUSUM drift"),
               ("risk", "Drawdown budget"), ("execution", "Cost assumptions")]
-    rows = [f"{_pad_r('', 20)}  STATUS"] + [
-        f"{_pad_r(lab, 20)}{'🟢 PASS' if g.get(k) else '🔴 FAIL'}" for k, lab in labels]
+    rows = [f"{'':<20}STATUS"] + [
+        f"{lab:<20}{'🟢 PASS' if g.get(k) else '🔴 FAIL'}" for k, lab in labels]
     out.extend(_c_split(rows))
     out.append(_p(
         "OVERALL:\n\n"
@@ -941,6 +873,7 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
            "to investigate, but it is not sufficiently confident to modify the live strategy.\"")
     ))
     return out
+
 
 def _sec_quality(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(14, "📊 DATA QUALITY & RECONCILIATION")]
@@ -994,14 +927,14 @@ def _sec_evidence(F: Dict[str, Any], cfg) -> List[_Piece]:
     days, n, g = F["days"], F["n"], F["gate"]
     recon_ok = F["recon"] is not None and F["recon"].status == HealthStatus.OK
     rows = [
-        f"{_pad_r('', 27)}  CURRENT STATUS",
-        f"{_pad_r('Data integrity', 27)}{'🟢 GOOD' if recon_ok else '🟡 CHECK'}",
-        f"{_pad_r('Trade count', 27)}{'🟢 GOOD' if n >= 100 else '🟡 OK' if n >= 30 else '🔴 POOR'}",
-        f"{_pad_r('History depth', 27)}{'🟢 GOOD' if (days or 0) >= 30 else '🟡 FAIR' if (days or 0) >= 14 else '🔴 POOR'}",
-        f"{_pad_r('Market regime coverage', 27)}{'🟢 GOOD' if (days or 0) >= 30 else '🟡 FAIR' if (days or 0) >= 14 else '🔴 POOR'}",
-        f"{_pad_r('OOS validation', 27)}{'🟢 PASSED' if g.get('oos_prediction') else '🔴 BLOCKED'}",
-        f"{_pad_r('Statistical confidence', 27)}{_conf_status(F['conf'])}",
-        f"{_pad_r('Strategy-change confidence', 27)}{'🟢 HIGH' if F['gate_ok'] else '🔴 LOW'}",
+        f"{'':<27}CURRENT STATUS",
+        f"{'Data integrity':<27}{'🟢 GOOD' if recon_ok else '🟡 CHECK'}",
+        f"{'Trade count':<27}{'🟢 GOOD' if n >= 100 else '🟡 OK' if n >= 30 else '🔴 POOR'}",
+        f"{'History depth':<27}{'🟢 GOOD' if (days or 0) >= 30 else '🟡 FAIR' if (days or 0) >= 14 else '🔴 POOR'}",
+        f"{'Market regime coverage':<27}{'🟢 GOOD' if (days or 0) >= 30 else '🟡 FAIR' if (days or 0) >= 14 else '🔴 POOR'}",
+        f"{'OOS validation':<27}{'🟢 PASSED' if g.get('oos_prediction') else '🔴 BLOCKED'}",
+        f"{'Statistical confidence':<27}{_conf_status(F['conf'])}",
+        f"{'Strategy-change confidence':<27}{'🟢 HIGH' if F['gate_ok'] else '🔴 LOW'}",
     ]
     out.extend(_c_split(rows))
     used = sorted({a["rank"] for a in F["alerts"]})
@@ -1012,25 +945,15 @@ def _sec_evidence(F: Dict[str, Any], cfg) -> List[_Piece]:
                      else "Therefore:\nValidated findings may be acted on, one change at a time.")))
     return out
 
+
 def _sec_appendix(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(16, "📚 TECHNICAL APPENDIX")]
     out.append(_p("Detailed data for advanced users."))
-    rows = [
-        f"{_pad_r('Alert', 20)}{_pad_l('N', 4)}{_pad_l('WR', 5)}"
-        f"{_pad_l('EV', 7)}{_pad_l('P>0', 5)}"
-    ]
+    rows = [f"{'Alert':<20}{'N':>4}{'WR':>5}{'EV':>7}{'P>0':>5}"]
     for a in sorted(F["alerts"], key=lambda a: -a["n"]):
-        ev_str = f"{a['ev']:+.2f}" if a["ev"] is not None else "n/a"
-        pv_str = f"{a['p']:.0%}"  if a["p"]  is not None else "n/a"
-        wr_str = f"{a['wr']:.0%}"
-        n_str  = str(a["n"])
-        rows.append(
-            f"{_pad_r(a['key'][:19], 20)}"
-            f"{_pad_l(n_str, 4)}"
-            f"{_pad_l(wr_str, 5)}"
-            f"{_pad_l(ev_str, 7)}"
-            f"{_pad_l(pv_str, 5)}"
-        )
+        ev = f"{a['ev']:+.2f}" if a["ev"] is not None else "  n/a"
+        pv = f"{a['p']:.0%}" if a["p"] is not None else " n/a"
+        rows.append(f"{a['key'][:19]:<20}{a['n']:>4}{a['wr']:>5.0%}{ev:>7}{pv:>5}")
     out.append(_p("• Full alert-by-alert statistics (EV = net % per trade, P>0 = P(EV>0))"))
     out.extend(_c_split(rows))
     ev_obj = F["ev_obj"] or {}
