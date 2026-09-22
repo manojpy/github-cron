@@ -1000,7 +1000,8 @@ _REPORT_SECTIONS = (
     ("EVIDENCE", _sec_evidence), ("TECHNICAL APPENDIX", _sec_appendix),
 )
 
-def build_brain_report_sections(recs: Dict[str, Any], cfg) -> Tuple[List[_Piece]], str]:
+def build_brain_report_sections(recs: Dict[str, Any], cfg) -> Tuple[List[List["_Piece"]], str]:
+    sections: List[List["_Piece"]] = []
     """Compute the 16 report sections once. Returns (sections, stamp); each
     section is a list of rendered pieces. An individual failing section is
     replaced by a notice; the call raises only if the shared facts cannot
