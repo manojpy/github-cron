@@ -427,6 +427,7 @@ def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
     _prof_icon = prof.split(" ")[0]
     out.append(_p("OVERALL SYSTEM STATUS"))
     out.append(_c("\n".join([
+        f"{_cell('Overall status', 24)} {_overall(F)}",
         f"{_cell('Observed profitability', 24)} {_prof_icon} {prof.split(' ', 1)[1] if ' ' in prof else prof}",
         f"{_cell('Data quality', 24)} {_data_status(F)}",
         f"{_cell('Outcome recording', 24)} {_recording_status(F)}",
