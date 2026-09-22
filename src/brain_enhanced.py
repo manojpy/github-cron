@@ -134,39 +134,6 @@ def _c_split(lines: List[str], limit: int = 3000) -> List[_Piece]:
         out.append(_c("\n".join(cur)))
     return out
 
-# ── Display-width helpers ─────────────────────────────────────────────
-# Telegram's fenced code blocks are rendered in a monospace font, but
-# Python's f-string width spec (`:<20`, `:>6`) counts each emoji as ONE
-# character while the terminal draws it as TWO cells. Any column to the
-# right of an emoji therefore drifts by one cell per emoji. These helpers
-# pad by *display width*, not character count, so emoji-bearing columns
-# stay aligned.
-import unicodedata as _ud
-
-def _dw(s: str) -> int:
-    """Terminal display width: emoji/CJK count as 2, combining marks 0."""
-    w = 0
-    for ch in s:
-        cp = ord(ch)
-        if 0xFE00 <= cp <= 0xFE0F or cp == 0x200D:   # variation sel / ZWJ
-            continue
-        if _ud.combining(ch):
-            continue
-        w += 2 if _ud.east_asian_width(ch) in ("W", "F") else 1
-    return w
-
-def _pad(s: str, width: int, align: str = "left") -> str:
-    """Pad s to `width` display columns (not Python len)."""
-    gap = width - _dw(s)
-    if gap <= 0:
-        return s
-    if align == "right":
-        return " " * gap + s
-    if align == "center":
-        left = gap // 2
-        return " " * left + s + " " * (gap - left)
-    return s + " " * gap
-
 def _hdr(num: int, title: str) -> "_Piece":
     return _Piece(escape_markdown_v2(f"{_RULE}\n{num:02d} │ {title}\n{_RULE}"), "h", f"{num:02d} │ {title}")
 
@@ -354,6 +321,7 @@ def _outcome_anatomy(rows: List[Dict[str, Any]], cfg) -> Tuple[Optional[str], Di
                               "med_mfe": med_mfe, "med_mae": med_mae, "strict": strict,
                               "counts": counts, "known": known}
 
+
 def _goal_wr(cfg) -> float:
     return float(getattr(cfg, "MIN_WIN_RATE", 0.55))
 
@@ -411,14 +379,9 @@ def _fmt_span(d: Optional[float]) -> str:
     """Adjective form: '2.5-day' (for 'the current 2.5-day sample')."""
     return "very short" if d is None else f"{d:.1f}-day"
 
-def _row(label: str, result: str, verdict: str = "", w1: int = 20, w2: int = 10) -> str:
-    """Column-aligned row for section 03 / 15 tables.
-    Uses display-width padding so an emoji in the verdict column does not
-    shift the whole row to the right."""
-    line = _pad(label, w1) + _pad(result, w2, "right")
-    if verdict:
-        line += "  " + verdict
-    return line
+
+def _row(label: str, result: str, verdict: str = "", w1: int = 14, w2: int = 10) -> str:
+    return f"{label:<{w1}}{result:>{w2}}  {verdict}".rstrip()
 
 def _active_blockers(F: Dict[str, Any]) -> List[str]:
     g = F["gate"]
@@ -441,34 +404,29 @@ def _active_blockers(F: Dict[str, Any]) -> List[str]:
 
 
 # ── the sections ──────────────────────────────────────────────────────
+
 def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
     n, wr, net_ev, days = F["n"], F["wr"], F["net_ev"], F["days"]
     validated_mode = F["gate_ok"] and net_ev > 0 and F["conf"] in ("MODERATE", "HIGH")
     if validated_mode:
         return _sec_verdict(F, cfg)
-
     prof = _profit_status(net_ev, n)
     out = [_hdr(1, 'EXECUTIVE SUMMARY — "WHAT DO I NEED TO KNOW?"')]
-    out.append(_p(f"OVERALL SYSTEM STATUS\n{_overall(F)}"))
-
-    # Status block — inside a code block so the two columns stay lined up
-    status_rows = [
-        _pad("Observed profitability:", 26) + prof,
-        _pad("Data quality:", 26)           + _data_status(F),
-        _pad("Outcome recording:", 26)      + _recording_status(F),
-        _pad("Statistical confidence:", 26) + _conf_status(F["conf"]),
-        _pad("Brain action gate:", 26)      + ("🟢 PASSED" if F["gate_ok"] else "🔴 BLOCKED"),
-    ]
-    out.extend(_c_split(status_rows))
-
-    sample_rows = [
-        f"📊 {n} resolved trades",
-        _pad("📈 Win Rate:", 26, "left")       + f"{wr:.0%}",
-        _pad("💰 Net EV/trade:", 26, "left")   + f"{net_ev:+.2f}%",
-        _pad("📅 History available:", 26, "left") + _fmt_days(days),
-        _pad("📅 History requested:", 26, "left") + f"{F['req_days']} days",
-    ]
-    out.extend(_c_split(sample_rows))
+    out.append(_p(
+        f"OVERALL SYSTEM STATUS\n{_overall(F)}\n\n"
+        f"Observed profitability:   {prof}\n"
+        f"Data quality:             {_data_status(F)}\n"
+        f"Outcome recording:        {_recording_status(F)}\n"
+        f"Statistical confidence:   {_conf_status(F['conf'])}\n"
+        f"Brain action gate:        {'🟢 PASSED' if F['gate_ok'] else '🔴 BLOCKED'}"
+    ))
+    out.append(_p(
+        f"📊 {n} resolved trades\n"
+        f"📈 Win Rate:          {wr:.0%}\n"
+        f"💰 Net EV/trade:      {net_ev:+.2f}%\n"
+        f"📅 History available: {_fmt_days(days)}\n"
+        f"📅 History requested: {F['req_days']} days"
+    ))
     losing = net_ev <= -0.05
     if losing and F["low_trust"]:
         text = (
@@ -607,29 +565,21 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
     wr_verdict = ("🔴 Very poor" if be and wr < be * 0.5 else "🔴 Below break-even" if be and wr < be
                   else "🟢 At/above break-even" if be else "⚪")
     dd, bud = F["dd"], F["dd_budget"]
-    # Header + data share the same column widths. The result column is
-    # left-aligned (not right) so short values like "7%" don't detach
-    # from their label; the verdict column then starts at a fixed offset.
-    W_LABEL, W_RESULT = 16, 10
-    header = _pad("", W_LABEL) + _pad("RESULT", W_RESULT) + "  VERDICT"
     rows = [
-        header,
-        _pad("Trades", W_LABEL) + _pad(str(n), W_RESULT) + "  " +
-            ("🟢 Good sample" if n >= 100 else "🟡 Small sample" if n >= 30 else "🔴 Tiny sample"),
-        _pad("Win Rate", W_LABEL) + _pad(f"{wr:.0%}", W_RESULT) + "  " + wr_verdict,
-        _pad("Net EV", W_LABEL) + _pad(f"{net_ev:+.2f}%", W_RESULT) + "  " +
-            ("🟢 Positive" if net_ev > 0.05 else "🟡 Flat" if net_ev > -0.05 else "🔴 Negative"),
-        _pad("History", W_LABEL) + _pad("n/a" if days is None else f"{days:.1f}d", W_RESULT) + "  " +
-            ("🟢 Long enough" if (days or 0) >= 30 else "🟡 Short" if (days or 0) >= 14 else "🔴 Too short"),
-        _pad("After costs?", W_LABEL) + _pad("YES" if F["gate"].get("execution", True) else "NO", W_RESULT) + "  " +
-            ("🟢" if F["gate"].get("execution", True) else "🔴"),
-        _pad("Drawdown", W_LABEL) + _pad("n/a" if dd is None else f"{dd:.1f}%", W_RESULT) + "  " +
-            ("⚪ unknown" if dd is None else f"{'🟢 Within' if dd <= bud else '🔴 Over'} {bud:.1f}% budget"),
-        _pad("CUSUM drift", W_LABEL) + _pad("ACTIVE" if F["gate"].get("stability") is False else "NONE", W_RESULT) + "  " +
-            ("🔴" if F["gate"].get("stability") is False else "🟢"),
+        _row("", "RESULT", "VERDICT"),
+        _row("Trades", str(n), "🟢 Good sample" if n >= 100 else "🟡 Small sample" if n >= 30 else "🔴 Tiny sample"),
+        _row("Win Rate", f"{wr:.0%}", wr_verdict),
+        _row("Net EV", f"{net_ev:+.2f}%", "🟢 Positive" if net_ev > 0.05 else "🟡 Flat" if net_ev > -0.05 else "🔴 Negative"),
+        _row("History", "n/a" if days is None else f"{days:.1f}d",
+             "🟢 Long enough" if (days or 0) >= 30 else "🟡 Short" if (days or 0) >= 14 else "🔴 Too short"),
+        _row("After costs?", "YES" if F["gate"].get("execution", True) else "NO",
+             "🟢" if F["gate"].get("execution", True) else "🔴"),
+        _row("Drawdown", "n/a" if dd is None else f"{dd:.1f}%",
+             "⚪ unknown" if dd is None else f"{'🟢 Within' if dd <= bud else '🔴 Over'} {bud:.1f}% budget"),
+        _row("CUSUM drift", "ACTIVE" if F["gate"].get("stability") is False else "NONE",
+             "🔴" if F["gate"].get("stability") is False else "🟢"),
     ]
     out.extend(_c_split(rows))
-
     if net_ev < 0:
         meaning = ("The observed trades are losing money after costs.\n\n"
                    + ("BUT the Brain does not yet know whether this will persist across different "
@@ -647,29 +597,13 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
         out.append(_p("🎲 WHY THE WIN RATE LOOKS LOW\n\n" + F["anatomy_text"]))
     return out
 
+
 _EVIDENCE_LEGEND = "Ev = evidence: ⚪ observation · 🟡 early · 🟠 meaningful · 🔵 strong · 🟢 validated"
 
 def _alert_table(items: List[Dict[str, Any]], limit: int) -> List[_Piece]:
-    # Column widths in *display* columns. The final "Ev" column is one
-    # emoji wide, but emoji count as two cells in Telegram's monospace,
-    # so it is padded via _pad which measures real terminal width.
-    W_NAME, W_EV, W_WR, W_N = 22, 7, 5, 4
-    header = (
-        _pad("Alert", W_NAME)
-        + _pad("EV%", W_EV, "right")
-        + _pad("WR", W_WR, "right")
-        + _pad("N", W_N, "right")
-        + "  Ev"
-    )
-    rows = [header]
+    rows = [f"{'Alert':<22}{'EV%':>6}{'WR':>5}{'N':>4}  Ev"]
     for a in items[:limit]:
-        rows.append(
-            _pad(a["name"][:21], W_NAME)
-            + _pad(f"{a['ev']:+.2f}", W_EV, "right")
-            + _pad(f"{a['wr']:.0%}", W_WR, "right")
-            + _pad(str(a["n"]), W_N, "right")
-            + "  " + _LADDER[a["rank"]]
-        )
+        rows.append(f"{a['name'][:21]:<22}{a['ev']:>+6.2f}{a['wr']:>5.0%}{a['n']:>4}  {_LADDER[a['rank']]}")
     return _c_split(rows) + [_p(_EVIDENCE_LEGEND)]
 
 def _sec_loss(F: Dict[str, Any], cfg) -> List[_Piece]:
@@ -759,23 +693,11 @@ def _sec_sessions(F: Dict[str, Any], cfg) -> List[_Piece]:
         out.append(_p("No session data yet."))
         return out
     best, worst = sess[-1][0], sess[0][0]
-    W_S, W_WR, W_N = 10, 5, 8
-    header = (
-        _pad("SESSION", W_S)
-        + _pad("WR", W_WR, "right")
-        + _pad("TRADES", W_N, "right")
-        + "  STATUS"
-    )
-    rows = [header]
+    rows = [f"{'SESSION':<10}{'WR':>5}{'TRADES':>8}  STATUS"]
     for name, swr, sn in sorted(sess, key=lambda t: -t[1]):
         tag = ("🟡 Best observed" if name == best and len(sess) > 1
                else "🔴 Weakest observed" if name == worst and len(sess) > 1 else "⚪")
-        rows.append(
-            _pad(name.upper(), W_S)
-            + _pad(f"{swr:.0%}", W_WR, "right")
-            + _pad(str(sn), W_N, "right")
-            + "  " + tag
-        )
+        rows.append(f"{name.upper():<10}{swr:>5.0%}{sn:>8}  {tag}")
     out.extend(_c_split(rows))
     if len(sess) > 1:
         out.append(_p(f"🧠 Interpretation:\n\n{best.upper()} has performed better in this sample.\n\n"
@@ -794,35 +716,24 @@ def _sec_filters(F: Dict[str, Any], cfg) -> List[_Piece]:
     for must in ("calibration_gate", "confluence_gate", "win_rate_filter"):
         groups.setdefault(must, [])
     min_s = getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
-    W_F, W_TR, W_EV = 20, 7, 8
-    header = (
-        _pad("FILTER", W_F)
-        + _pad("TRADES", W_TR, "right")
-        + _pad("EV", W_EV, "right")
-        + "  VERDICT"
-    )
-    rows = [header]
+    rows = [f"{'FILTER':<20}{'TRADES':>7}{'EV':>8}  VERDICT"]
     for reason in sorted(groups):
         g = groups[reason]
         label = reason.replace("_gate", "").replace("_", " ").capitalize()
         if not g:
-            rows.append(_pad(label[:19], W_F) + _pad("0", W_TR, "right")
-                        + _pad("n/a", W_EV, "right") + "  ⚪")
+            rows.append(f"{label[:19]:<20}{0:>7}{'n/a':>8}  ⚪")
             continue
         try:
             ev = engine.ev_first_objective(g, min_sample=min_s)
         except Exception:
             ev = {"valid": False}
         if not ev.get("valid"):
-            rows.append(_pad(label[:19], W_F) + _pad(str(len(g)), W_TR, "right")
-                        + _pad("n/a", W_EV, "right") + f"  ⚪ need {min_s}")
+            rows.append(f"{label[:19]:<20}{len(g):>7}{'n/a':>8}  ⚪ need {min_s}")
         else:
             ne, pe = ev.get("net_ev", 0.0), ev.get("p_ev_positive", 0.0)
             v = "🟡 may over-block" if ne > 0 and pe >= 0.65 else "🟢 filters losers"
-            rows.append(_pad(label[:19], W_F) + _pad(str(len(g)), W_TR, "right")
-                        + _pad(f"{ne:+.2f}%", W_EV, "right") + "  " + v)
+            rows.append(f"{label[:19]:<20}{len(g):>7}{ne:>+7.2f}%  {v}")
     out.extend(_c_split(rows))
-
     out.append(_p(
         "🧠 QUESTION THE BRAIN IS TRYING TO ANSWER:\n\n"
         "\"Are my filters removing bad trades or accidentally removing profitable trades?\"\n\n"
@@ -950,10 +861,8 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     labels = [("data_quality", "Minimum trades"), ("oos_prediction", "OOS EV"),
               ("profitability", "Net EV confidence"), ("stability", "CUSUM drift"),
               ("risk", "Drawdown budget"), ("execution", "Cost assumptions")]
-    W_LAB = 20
-    rows = [_pad("", W_LAB) + "STATUS"]
-    for k, lab in labels:
-        rows.append(_pad(lab, W_LAB) + ("🟢 PASS" if g.get(k) else "🔴 FAIL"))
+    rows = [f"{'':<20}STATUS"] + [
+        f"{lab:<20}{'🟢 PASS' if g.get(k) else '🔴 FAIL'}" for k, lab in labels]
     out.extend(_c_split(rows))
     out.append(_p(
         "OVERALL:\n\n"
@@ -973,20 +882,19 @@ def _sec_quality(F: Dict[str, Any], cfg) -> List[_Piece]:
     def _n(v: Any) -> str:
         return "n/a" if v is None else str(v)
 
-    W_K, W_V = 22, 12
     rows = []
     if cov:
-        rows += [_pad("Requested history", W_K) + _pad(f"{cov.requested_days} days", W_V, "right"),
-                 _pad("Available", W_K)         + _pad(f"{cov.actual_days:.1f} days", W_V, "right"),
-                 _pad("Coverage", W_K)          + _pad(f"{cov.coverage_ratio:.0%}", W_V, "right"),
-                 _pad("Resolved trades", W_K)   + _pad(str(cov.n_rows), W_V, "right")]
+        rows += [f"{'Requested history':<22}{cov.requested_days:>7} days",
+                 f"{'Available':<22}{cov.actual_days:>7.1f} days",
+                 f"{'Coverage':<22}{cov.coverage_ratio:>7.0%}",
+                 f"{'Resolved trades':<22}{cov.n_rows:>12}"]
     if rec:
-        rows += [_pad("Pending at start", W_K)   + _pad(_n(rec.pending_count), W_V, "right"),
-                 _pad("Resolved this run", W_K)  + _pad(_n(rec.resolved_this_run), W_V, "right"),
-                 _pad("Archived this run", W_K)  + _pad(_n(rec.archived_this_run), W_V, "right"),
-                 _pad("Archive lines read", W_K) + _pad(_n(rec.total_archived), W_V, "right"),
-                 _pad("Loaded by Brain", W_K)    + _pad(str(rec.loaded_by_brain), W_V, "right"),
-                 _pad("Shadow loaded", W_K)      + _pad(str(rec.shadow_loaded), W_V, "right")]
+        rows += [f"{'Pending at start':<22}{_n(rec.pending_count):>12}",
+                 f"{'Resolved this run':<22}{_n(rec.resolved_this_run):>12}",
+                 f"{'Archived this run':<22}{_n(rec.archived_this_run):>12}",
+                 f"{'Archive lines read':<22}{_n(rec.total_archived):>12}",
+                 f"{'Loaded by Brain':<22}{rec.loaded_by_brain:>12}",
+                 f"{'Shadow loaded':<22}{rec.shadow_loaded:>12}"]
     if rows:
         out.extend(_c_split(rows))
     lines: List[str] = []
@@ -1018,17 +926,15 @@ def _sec_evidence(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(15, "📈 EVIDENCE / CONFIDENCE")]
     days, n, g = F["days"], F["n"], F["gate"]
     recon_ok = F["recon"] is not None and F["recon"].status == HealthStatus.OK
-
-    W_K = 27
     rows = [
-        _pad("", W_K) + "CURRENT STATUS",
-        _pad("Data integrity", W_K)             + ("🟢 GOOD" if recon_ok else "🟡 CHECK"),
-        _pad("Trade count", W_K)                + ("🟢 GOOD" if n >= 100 else "🟡 OK" if n >= 30 else "🔴 POOR"),
-        _pad("History depth", W_K)              + ("🟢 GOOD" if (days or 0) >= 30 else "🟡 FAIR" if (days or 0) >= 14 else "🔴 POOR"),
-        _pad("Market regime coverage", W_K)     + ("🟢 GOOD" if (days or 0) >= 30 else "🟡 FAIR" if (days or 0) >= 14 else "🔴 POOR"),
-        _pad("OOS validation", W_K)             + ("🟢 PASSED" if g.get("oos_prediction") else "🔴 BLOCKED"),
-        _pad("Statistical confidence", W_K)     + _conf_status(F["conf"]),
-        _pad("Strategy-change confidence", W_K) + ("🟢 HIGH" if F["gate_ok"] else "🔴 LOW"),
+        f"{'':<27}CURRENT STATUS",
+        f"{'Data integrity':<27}{'🟢 GOOD' if recon_ok else '🟡 CHECK'}",
+        f"{'Trade count':<27}{'🟢 GOOD' if n >= 100 else '🟡 OK' if n >= 30 else '🔴 POOR'}",
+        f"{'History depth':<27}{'🟢 GOOD' if (days or 0) >= 30 else '🟡 FAIR' if (days or 0) >= 14 else '🔴 POOR'}",
+        f"{'Market regime coverage':<27}{'🟢 GOOD' if (days or 0) >= 30 else '🟡 FAIR' if (days or 0) >= 14 else '🔴 POOR'}",
+        f"{'OOS validation':<27}{'🟢 PASSED' if g.get('oos_prediction') else '🔴 BLOCKED'}",
+        f"{'Statistical confidence':<27}{_conf_status(F['conf'])}",
+        f"{'Strategy-change confidence':<27}{'🟢 HIGH' if F['gate_ok'] else '🔴 LOW'}",
     ]
     out.extend(_c_split(rows))
     used = sorted({a["rank"] for a in F["alerts"]})
@@ -1039,22 +945,15 @@ def _sec_evidence(F: Dict[str, Any], cfg) -> List[_Piece]:
                      else "Therefore:\nValidated findings may be acted on, one change at a time.")))
     return out
 
+
 def _sec_appendix(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(16, "📚 TECHNICAL APPENDIX")]
     out.append(_p("Detailed data for advanced users."))
-    W_K, W_N, W_WR, W_EV, W_P = 20, 4, 5, 7, 5
-    rows = [_pad("Alert", W_K) + _pad("N", W_N, "right") + _pad("WR", W_WR, "right")
-            + _pad("EV", W_EV, "right") + _pad("P>0", W_P, "right")]
+    rows = [f"{'Alert':<20}{'N':>4}{'WR':>5}{'EV':>7}{'P>0':>5}"]
     for a in sorted(F["alerts"], key=lambda a: -a["n"]):
-        ev = f"{a['ev']:+.2f}" if a["ev"] is not None else "n/a"
-        pv = f"{a['p']:.0%}" if a["p"] is not None else "n/a"
-        rows.append(
-            _pad(a["key"][:19], W_K)
-            + _pad(str(a["n"]), W_N, "right")
-            + _pad(f"{a['wr']:.0%}", W_WR, "right")
-            + _pad(ev, W_EV, "right")
-            + _pad(pv, W_P, "right")
-        )
+        ev = f"{a['ev']:+.2f}" if a["ev"] is not None else "  n/a"
+        pv = f"{a['p']:.0%}" if a["p"] is not None else " n/a"
+        rows.append(f"{a['key'][:19]:<20}{a['n']:>4}{a['wr']:>5.0%}{ev:>7}{pv:>5}")
     out.append(_p("• Full alert-by-alert statistics (EV = net % per trade, P>0 = P(EV>0))"))
     out.extend(_c_split(rows))
     ev_obj = F["ev_obj"] or {}
@@ -1505,7 +1404,7 @@ class BrainEngineV2(BaseBrainEngine):
         _phase_mark("baseline")
         real_rows = base_recs.get("_real_rows", [])
         shadow_rows = base_recs.get("_shadow_rows", [])
-        # ═══════════��══════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════
         #  BRAIN AUDIT LAYER — initialize and validate data population
         # ═══════════════════════════════════════════════════════════════  
         audit = get_audit()  # keep coverage/reconciliation set during baseline
