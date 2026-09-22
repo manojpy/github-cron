@@ -139,26 +139,75 @@ def test_empty_data_does_not_crash():
     assert msgs and "01 │" in _plain(msgs)
 
 
-def test_generate_report_falls_back_to_classic_plan(monkeypatch):
-    sent = []
-
+def _engine(monkeypatch, sent):
     class Q:
         async def send(self, m):
             sent.append(m)
             return True
 
     eng = object.__new__(be.BrainEngineV2)
+    rows = _rows(_SPEC)
+    a = get_audit()
+    a.begin_cycle()
+    a.set_history_coverage(rows, requested_days=180)
 
     async def fake_recs():
-        return {"_real_rows": [], "ai_metrics": {}}
+        return {"_real_rows": rows, "_shadow_rows": [], "config_patch": [], "_archive_stats": {},
+                "ai_metrics": {"net_ev": -0.38, "action_gate": _BLOCKED}}
 
     async def fake_store(recs):
         return None
 
     monkeypatch.setattr(eng, "generate_recommendations", fake_recs)
     monkeypatch.setattr(eng, "_store_pending_plan", fake_store)
-    monkeypatch.setattr(be, "build_brain_report", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
-    monkeypatch.setattr(be, "build_profit_action_plan", lambda *a, **k: ["classic"])
+    return eng, Q()
+
+
+def test_report_is_archived_as_markdown_and_still_sent(monkeypatch):
     import logging
-    ok = asyncio.run(eng.generate_report([], Q(), logging.getLogger("t")))
-    assert ok is True and sent == ["classic"]
+    import outcome_storage
+    saved, sent = [], []
+    monkeypatch.setattr(outcome_storage, "save_report", lambda md: saved.append(md) or "reports/x.md")
+    eng, q = _engine(monkeypatch, sent)
+    assert asyncio.run(eng.generate_report([], q, logging.getLogger("t"))) is True
+    assert len(saved) == 1 and len(sent) >= 3
+    md = saved[0]
+    assert md.startswith("# 🧠 Brain Report")
+    assert len(re.findall(r"^## \d\d │", md, re.M)) == 16
+    assert md.count("```") % 2 == 0
+    assert not re.search(r"\\[.\-()!+=|]", md)           # no Telegram MarkdownV2 escaping in the file
+
+
+def test_archive_failure_is_not_fatal_and_sends_once(monkeypatch):
+    import logging
+    import outcome_storage
+    sent = []
+
+    def boom(md):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(outcome_storage, "save_report", boom)
+    eng, q = _engine(monkeypatch, sent)
+    assert asyncio.run(eng.generate_report([], q, logging.getLogger("t"))) is True
+    assert "END OF BRAIN REPORT" in _plain(sent[-1:])
+    assert not any("classic" in m for m in sent)               # no fallback report was sent
+
+
+def test_generate_report_falls_back_to_base_report(monkeypatch):
+    import logging
+    sent, called = [], []
+    eng, q = _engine(monkeypatch, sent)
+    monkeypatch.setattr(be, "build_brain_report_sections",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    async def base_report(pairs, telegram_queue, logger_run):
+        called.append(True)
+        return True
+
+    monkeypatch.setattr(eng, "_generate_and_send", base_report)
+    assert asyncio.run(eng.generate_report([], q, logging.getLogger("t"))) is True
+    assert called == [True] and sent == []
+
+
+def test_build_profit_action_plan_is_gone():
+    assert not hasattr(be, "build_profit_action_plan")
