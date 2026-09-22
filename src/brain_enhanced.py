@@ -412,21 +412,21 @@ def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
         return _sec_verdict(F, cfg)
     prof = _profit_status(net_ev, n)
     out = [_hdr(1, 'EXECUTIVE SUMMARY — "WHAT DO I NEED TO KNOW?"')]
-    out.append(_p(
-        f"OVERALL SYSTEM STATUS\n{_overall(F)}\n\n"
-        f"Observed profitability:   {prof}\n"
-        f"Data quality:             {_data_status(F)}\n"
-        f"Outcome recording:        {_recording_status(F)}\n"
-        f"Statistical confidence:   {_conf_status(F['conf'])}\n"
-        f"Brain action gate:        {'🟢 PASSED' if F['gate_ok'] else '🔴 BLOCKED'}"
-    ))
-    out.append(_p(
-        f"📊 {n} resolved trades\n"
-        f"📈 Win Rate:          {wr:.0%}\n"
-        f"💰 Net EV/trade:      {net_ev:+.2f}%\n"
-        f"📅 History available: {_fmt_days(days)}\n"
-        f"📅 History requested: {F['req_days']} days"
-    ))
+    out.append(_p(f"OVERALL SYSTEM STATUS\n{_overall(F)}"))
+    out.append(_c("\n".join([
+        f"{'Observed profitability:':<25}{prof}",
+        f"{'Data quality:':<25}{_data_status(F)}",
+        f"{'Outcome recording:':<25}{_recording_status(F)}",
+        f"{'Statistical confidence:':<25}{_conf_status(F['conf'])}",
+        f"{'Brain action gate:':<25}{'🟢 PASSED' if F['gate_ok'] else '🔴 BLOCKED'}",
+    ])))
+    out.append(_c("\n".join([
+        f"📊 {n} resolved trades",
+        f"{'📈 Win Rate:':<22}{wr:.0%}",
+        f"{'💰 Net EV/trade:':<22}{net_ev:+.2f}%",
+        f"{'📅 History available:':<22}{_fmt_days(days)}",
+        f"{'📅 History requested:':<22}{F['req_days']} days",
+    ])))
     losing = net_ev <= -0.05
     if losing and F["low_trust"]:
         text = (
@@ -462,14 +462,14 @@ def _sec_verdict(F: Dict[str, Any], cfg) -> List[_Piece]:
     """End-state Section 1, shown only when the action gate passes."""
     g = F["gate"]
     out = [_hdr(1, "🧠 BRAIN VERDICT")]
-    out.append(_p(
-        f"System health:      {_recording_status(F).split(' ')[0]}\n"
-        f"Profitability:      {_profit_status(F['net_ev'], F['n']).split(' ')[0]}\n"
-        f"Evidence quality:   {_conf_status(F['conf']).split(' ')[0]}\n"
-        f"OOS validation:     {_icon(g.get('oos_prediction'))}\n"
-        f"Drift:              {_icon(g.get('stability'))}\n"
-        f"Drawdown:           {_icon(g.get('risk'))}"
-    ))
+    out.append(_c("\n".join([
+        f"{'System health:':<20}{_recording_status(F).split(' ')[0]}",
+        f"{'Profitability:':<20}{_profit_status(F['net_ev'], F['n']).split(' ')[0]}",
+        f"{'Evidence quality:':<20}{_conf_status(F['conf']).split(' ')[0]}",
+        f"{'OOS validation:':<20}{_icon(g.get('oos_prediction'))}",
+        f"{'Drift:':<20}{_icon(g.get('stability'))}",
+        f"{'Drawdown:':<20}{_icon(g.get('risk'))}",
+    ])))
     validated = [a for a in F["alerts"] if a["rank"] == 4]
     validated.sort(key=lambda a: -(a["ev"] or 0))
     edge = [f"• {a['name']}  (EV {a['ev']:+.2f}%, WR {a['wr']:.0%}, n={a['n']})" for a in validated[:3]]
@@ -588,11 +588,11 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
     else:
         meaning = "The observed trades are not losing money after costs in this sample."
     recon_ok = F["recon"] is not None and F["recon"].status == HealthStatus.OK
-    out.append(_p(
-        f"🧠 What this means:\n\n{meaning}\n\n"
-        f"Confidence in the RESULT:        {_conf_status(F['conf'])}\n"
-        f"Confidence in the DATA PIPELINE: {'🟢 GOOD' if recon_ok else '🟡 CHECK SECTION 14'}"
-    ))
+    out.append(_p(f"🧠 What this means:\n\n{meaning}"))
+    out.append(_c("\n".join([
+        f"{'Confidence in the RESULT:':<34}{_conf_status(F['conf'])}",
+        f"{'Confidence in the DATA PIPELINE:':<34}{'🟢 GOOD' if recon_ok else '🟡 CHECK SECTION 14'}",
+    ])))
     if F["anatomy_text"]:
         out.append(_p("🎲 WHY THE WIN RATE LOOKS LOW\n\n" + F["anatomy_text"]))
     return out
@@ -779,9 +779,12 @@ def _sec_sims(F: Dict[str, Any], cfg) -> List[_Piece]:
     if F["rec_thr_ok"]:
         rt = F["rec_thr"]
         validated = F["thr_tier"] == RecommendationTier.ACTIONABLE
+        out.append(_p("CONFLUENCE MIN SCORE"))
+        out.append(_c("\n".join([
+            f"{'Current:':<15}{cfg.CONFLUENCE_MIN_ABS_SCORE:.0f}",
+            f"{'Simulation:':<15}{rt['recommended']:.0f}",
+        ])))
         out.append(_p((
-            f"CONFLUENCE MIN SCORE\n\nCurrent:       {cfg.CONFLUENCE_MIN_ABS_SCORE:.0f}\n"
-            f"Simulation:    {rt['recommended']:.0f}\n\n"
             f"Historical simulated WR: {rt.get('rec_wr', 0):.0%}\n\n"
             f"Status:\n{'✅ VALIDATED' if validated else '🚫 NOT VALIDATED'}\n\n"
             + ("" if validated else "Reason:\nIn-sample simulation only.")
@@ -976,11 +979,10 @@ def _sec_appendix(F: Dict[str, Any], cfg) -> List[_Piece]:
     ledger = (F["ai"] or {}).get("repair_ledger")
     if ledger:
         out.append(_p("• Repair ledger\n" + "\n".join(f"{k}: {v}" for k, v in list(ledger.items())[:10])))
-
     if F["cfg_patch"]:
         out.append(_p("• Full Brain candidate table\n" + "\n".join(
             f"{p.get('path')}: {p.get('current')} → {p.get('suggested')}"
-            f"{' [🚫 Change Rejected — CV retained]' if p.get('_blocked_by_action_gate') else ''}"
+            f"{' [blocked]' if p.get('_blocked_by_action_gate') else ''}"
             for p in F["cfg_patch"][:20])))
     out.append(_p("Also computed but not shown here: Monte Carlo, CUSUM, walk-forward, calibration, "
                   "permutation importance, hierarchical analysis and weight optimisation "
@@ -1406,7 +1408,7 @@ class BrainEngineV2(BaseBrainEngine):
         shadow_rows = base_recs.get("_shadow_rows", [])
         # ══════════════════════════════════════════════════════════════════
         #  BRAIN AUDIT LAYER — initialize and validate data population
-        # ═══════════════════════════════════════════════════════════════  
+        # ══════════════════════���════════════════���══════════════════════════  
         audit = get_audit()  # keep coverage/reconciliation set during baseline
 
         # History coverage was already set in _generate_baseline_recommendations
