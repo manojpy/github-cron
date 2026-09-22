@@ -7,6 +7,7 @@ import json
 import logging
 import random
 import time
+import unicodedata
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 import os
@@ -380,8 +381,62 @@ def _fmt_span(d: Optional[float]) -> str:
     return "very short" if d is None else f"{d:.1f}-day"
 
 
-def _row(label: str, result: str, verdict: str = "", w1: int = 14, w2: int = 10) -> str:
-    return f"{label:<{w1}}{result:>{w2}}  {verdict}".rstrip()
+_WIDE_EMOJI_RANGES = (
+    (0x1F300, 0x1FAFF), (0x2600, 0x27BF), (0x2B00, 0x2BFF), (0x1F000, 0x1F02F),
+)
+
+def _vwidth(s: str) -> int:
+    """Visual width of `s` in monospace columns. Plain str length
+    undercounts emoji and other wide glyphs — they render ~2 columns
+    wide in virtually every renderer that shows this report (Telegram,
+    Gemini, a terminal, Notepad's default monospace font) — so padding
+    computed from len() alone silently drifts by one column per emoji.
+    This is the actual reason earlier alignment attempts looked fine in
+    the source but scattered on screen."""
+    w = 0
+    for ch in s:
+        cp = ord(ch)
+        if unicodedata.east_asian_width(ch) in ("W", "F"):
+            w += 2
+        elif any(lo <= cp <= hi for lo, hi in _WIDE_EMOJI_RANGES):
+            w += 2
+        elif unicodedata.combining(ch):
+            pass
+        else:
+            w += 1
+    return w
+
+def _ljust(s: str, width: int) -> str:
+    return s + " " * max(0, width - _vwidth(s))
+
+def _rjust(s: str, width: int) -> str:
+    return " " * max(0, width - _vwidth(s)) + s
+
+def _table(rows: List[Tuple[str, ...]], aligns: str, gap: int = 2) -> List[str]:
+    """Render `rows` (equal-length tuples of cell text, header included if
+    any) as monospace lines whose columns are all aligned to the widest
+    VISUAL width in that column across every row — so a dot/emoji in row 3
+    can't push row 3's own values out of line with rows 1, 2, 4... `aligns`
+    is one 'l' or 'r' per column. The last column is never padded (no
+    point padding text nothing follows)."""
+    ncol = len(aligns)
+    widths = [max((_vwidth(r[i]) for r in rows), default=0) for i in range(ncol)]
+    out = []
+    for r in rows:
+        cells = []
+        for i, cell in enumerate(r):
+            if i == ncol - 1:
+                cells.append(cell)
+            else:
+                cells.append((_ljust if aligns[i] == "l" else _rjust)(cell, widths[i]))
+        out.append((" " * gap).join(cells))
+    return out
+
+def _kv_table(pairs: List[Tuple[str, str]]) -> List[str]:
+    """Convenience for the common 'Label: Value' block, e.g.
+    'Observed profitability:  🟢 POSITIVE'. Colon is part of the label
+    text passed in so it stays glued to the label instead of the padding."""
+    return _table([(f"{label}:", value) for label, value in pairs], "ll")
 
 def _active_blockers(F: Dict[str, Any]) -> List[str]:
     g = F["gate"]
@@ -412,21 +467,22 @@ def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
         return _sec_verdict(F, cfg)
     prof = _profit_status(net_ev, n)
     out = [_hdr(1, 'EXECUTIVE SUMMARY — "WHAT DO I NEED TO KNOW?"')]
-    out.append(_p(
-        f"OVERALL SYSTEM STATUS\n{_overall(F)}\n\n"
-        f"Observed profitability:   {prof}\n"
-        f"Data quality:             {_data_status(F)}\n"
-        f"Outcome recording:        {_recording_status(F)}\n"
-        f"Statistical confidence:   {_conf_status(F['conf'])}\n"
-        f"Brain action gate:        {'🟢 PASSED' if F['gate_ok'] else '🔴 BLOCKED'}"
-    ))
-    out.append(_p(
-        f"📊 {n} resolved trades\n"
-        f"📈 Win Rate:          {wr:.0%}\n"
-        f"💰 Net EV/trade:      {net_ev:+.2f}%\n"
-        f"📅 History available: {_fmt_days(days)}\n"
-        f"📅 History requested: {F['req_days']} days"
-    ))
+    out.append(_p(f"OVERALL SYSTEM STATUS\n{_overall(F)}"))
+    out.append(_c("\n".join(_kv_table([
+        ("Observed profitability", prof),
+        ("Data quality", _data_status(F)),
+        ("Outcome recording", _recording_status(F)),
+        ("Statistical confidence", _conf_status(F['conf'])),
+        ("Brain action gate", '🟢 PASSED' if F['gate_ok'] else '🔴 BLOCKED'),
+    ]))))
+    out.append(_c("\n".join(
+        [f"📊 {n} resolved trades"] + _table([
+            ("📈 Win Rate:", f"{wr:.0%}"),
+            ("💰 Net EV/trade:", f"{net_ev:+.2f}%"),
+            ("📅 History available:", _fmt_days(days)),
+            ("📅 History requested:", f"{F['req_days']} days"),
+        ], "lr")
+    )))
     losing = net_ev <= -0.05
     if losing and F["low_trust"]:
         text = (
@@ -462,14 +518,14 @@ def _sec_verdict(F: Dict[str, Any], cfg) -> List[_Piece]:
     """End-state Section 1, shown only when the action gate passes."""
     g = F["gate"]
     out = [_hdr(1, "🧠 BRAIN VERDICT")]
-    out.append(_p(
-        f"System health:      {_recording_status(F).split(' ')[0]}\n"
-        f"Profitability:      {_profit_status(F['net_ev'], F['n']).split(' ')[0]}\n"
-        f"Evidence quality:   {_conf_status(F['conf']).split(' ')[0]}\n"
-        f"OOS validation:     {_icon(g.get('oos_prediction'))}\n"
-        f"Drift:              {_icon(g.get('stability'))}\n"
-        f"Drawdown:           {_icon(g.get('risk'))}"
-    ))
+    out.append(_c("\n".join(_kv_table([
+        ("System health", _recording_status(F).split(' ')[0]),
+        ("Profitability", _profit_status(F['net_ev'], F['n']).split(' ')[0]),
+        ("Evidence quality", _conf_status(F['conf']).split(' ')[0]),
+        ("OOS validation", _icon(g.get('oos_prediction'))),
+        ("Drift", _icon(g.get('stability'))),
+        ("Drawdown", _icon(g.get('risk'))),
+    ]))))
     validated = [a for a in F["alerts"] if a["rank"] == 4]
     validated.sort(key=lambda a: -(a["ev"] or 0))
     edge = [f"• {a['name']}  (EV {a['ev']:+.2f}%, WR {a['wr']:.0%}, n={a['n']})" for a in validated[:3]]
@@ -566,20 +622,20 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
                   else "🟢 At/above break-even" if be else "⚪")
     dd, bud = F["dd"], F["dd_budget"]
     rows = [
-        _row("", "RESULT", "VERDICT"),
-        _row("Trades", str(n), "🟢 Good sample" if n >= 100 else "🟡 Small sample" if n >= 30 else "🔴 Tiny sample"),
-        _row("Win Rate", f"{wr:.0%}", wr_verdict),
-        _row("Net EV", f"{net_ev:+.2f}%", "🟢 Positive" if net_ev > 0.05 else "🟡 Flat" if net_ev > -0.05 else "🔴 Negative"),
-        _row("History", "n/a" if days is None else f"{days:.1f}d",
-             "🟢 Long enough" if (days or 0) >= 30 else "🟡 Short" if (days or 0) >= 14 else "🔴 Too short"),
-        _row("After costs?", "YES" if F["gate"].get("execution", True) else "NO",
-             "🟢" if F["gate"].get("execution", True) else "🔴"),
-        _row("Drawdown", "n/a" if dd is None else f"{dd:.1f}%",
-             "⚪ unknown" if dd is None else f"{'🟢 Within' if dd <= bud else '🔴 Over'} {bud:.1f}% budget"),
-        _row("CUSUM drift", "ACTIVE" if F["gate"].get("stability") is False else "NONE",
-             "🔴" if F["gate"].get("stability") is False else "🟢"),
+        ("METRIC", "RESULT", "VERDICT"),
+        ("Trades", str(n), "🟢 Good sample" if n >= 100 else "🟡 Small sample" if n >= 30 else "🔴 Tiny sample"),
+        ("Win Rate", f"{wr:.0%}", wr_verdict),
+        ("Net EV", f"{net_ev:+.2f}%", "🟢 Positive" if net_ev > 0.05 else "🟡 Flat" if net_ev > -0.05 else "🔴 Negative"),
+        ("History", "n/a" if days is None else f"{days:.1f}d",
+         "🟢 Long enough" if (days or 0) >= 30 else "🟡 Short" if (days or 0) >= 14 else "🔴 Too short"),
+        ("After costs?", "YES" if F["gate"].get("execution", True) else "NO",
+         "🟢" if F["gate"].get("execution", True) else "🔴"),
+        ("Drawdown", "n/a" if dd is None else f"{dd:.1f}%",
+         "⚪ unknown" if dd is None else f"{'🟢 Within' if dd <= bud else '🔴 Over'} {bud:.1f}% budget"),
+        ("CUSUM drift", "ACTIVE" if F["gate"].get("stability") is False else "NONE",
+         "🔴" if F["gate"].get("stability") is False else "🟢"),
     ]
-    out.extend(_c_split(rows))
+    out.extend(_c_split(_table(rows, "lrl")))
     if net_ev < 0:
         meaning = ("The observed trades are losing money after costs.\n\n"
                    + ("BUT the Brain does not yet know whether this will persist across different "
@@ -588,11 +644,11 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
     else:
         meaning = "The observed trades are not losing money after costs in this sample."
     recon_ok = F["recon"] is not None and F["recon"].status == HealthStatus.OK
-    out.append(_p(
-        f"🧠 What this means:\n\n{meaning}\n\n"
-        f"Confidence in the RESULT:        {_conf_status(F['conf'])}\n"
-        f"Confidence in the DATA PIPELINE: {'🟢 GOOD' if recon_ok else '🟡 CHECK SECTION 14'}"
-    ))
+    out.append(_p(f"🧠 What this means:\n\n{meaning}"))
+    out.append(_c("\n".join(_kv_table([
+        ("Confidence in the RESULT", _conf_status(F['conf'])),
+        ("Confidence in the DATA PIPELINE", '🟢 GOOD' if recon_ok else '🟡 CHECK SECTION 14'),
+    ]))))
     if F["anatomy_text"]:
         out.append(_p("🎲 WHY THE WIN RATE LOOKS LOW\n\n" + F["anatomy_text"]))
     return out
@@ -601,10 +657,10 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
 _EVIDENCE_LEGEND = "Ev = evidence: ⚪ observation · 🟡 early · 🟠 meaningful · 🔵 strong · 🟢 validated"
 
 def _alert_table(items: List[Dict[str, Any]], limit: int) -> List[_Piece]:
-    rows = [f"{'Alert':<22}{'EV%':>6}{'WR':>5}{'N':>4}  Ev"]
+    rows = [("Alert", "EV%", "WR", "N", "Ev")]
     for a in items[:limit]:
-        rows.append(f"{a['name'][:21]:<22}{a['ev']:>+6.2f}{a['wr']:>5.0%}{a['n']:>4}  {_LADDER[a['rank']]}")
-    return _c_split(rows) + [_p(_EVIDENCE_LEGEND)]
+        rows.append((a['name'], f"{a['ev']:+.2f}", f"{a['wr']:.0%}", str(a['n']), _LADDER[a['rank']]))
+    return _c_split(_table(rows, "lrrrl")) + [_p(_EVIDENCE_LEGEND)]
 
 def _sec_loss(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(4, '🔎 LOSS DIAGNOSIS — "WHERE ARE WE FALTERING?"')]
@@ -693,12 +749,12 @@ def _sec_sessions(F: Dict[str, Any], cfg) -> List[_Piece]:
         out.append(_p("No session data yet."))
         return out
     best, worst = sess[-1][0], sess[0][0]
-    rows = [f"{'SESSION':<10}{'WR':>5}{'TRADES':>8}  STATUS"]
+    rows = [("SESSION", "WR", "TRADES", "STATUS")]
     for name, swr, sn in sorted(sess, key=lambda t: -t[1]):
         tag = ("🟡 Best observed" if name == best and len(sess) > 1
                else "🔴 Weakest observed" if name == worst and len(sess) > 1 else "⚪")
-        rows.append(f"{name.upper():<10}{swr:>5.0%}{sn:>8}  {tag}")
-    out.extend(_c_split(rows))
+        rows.append((name.upper(), f"{swr:.0%}", str(sn), tag))
+    out.extend(_c_split(_table(rows, "lrrl")))
     if len(sess) > 1:
         out.append(_p(f"🧠 Interpretation:\n\n{best.upper()} has performed better in this sample.\n\n"
                       f"{worst.upper()} has performed worse."))
@@ -716,24 +772,24 @@ def _sec_filters(F: Dict[str, Any], cfg) -> List[_Piece]:
     for must in ("calibration_gate", "confluence_gate", "win_rate_filter"):
         groups.setdefault(must, [])
     min_s = getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
-    rows = [f"{'FILTER':<20}{'TRADES':>7}{'EV':>8}  VERDICT"]
+    rows = [("FILTER", "TRADES", "EV", "VERDICT")]
     for reason in sorted(groups):
         g = groups[reason]
         label = reason.replace("_gate", "").replace("_", " ").capitalize()
         if not g:
-            rows.append(f"{label[:19]:<20}{0:>7}{'n/a':>8}  ⚪")
+            rows.append((label, "0", "n/a", "⚪"))
             continue
         try:
             ev = engine.ev_first_objective(g, min_sample=min_s)
         except Exception:
             ev = {"valid": False}
         if not ev.get("valid"):
-            rows.append(f"{label[:19]:<20}{len(g):>7}{'n/a':>8}  ⚪ need {min_s}")
+            rows.append((label, str(len(g)), "n/a", f"⚪ need {min_s}"))
         else:
             ne, pe = ev.get("net_ev", 0.0), ev.get("p_ev_positive", 0.0)
             v = "🟡 may over-block" if ne > 0 and pe >= 0.65 else "🟢 filters losers"
-            rows.append(f"{label[:19]:<20}{len(g):>7}{ne:>+7.2f}%  {v}")
-    out.extend(_c_split(rows))
+            rows.append((label, str(len(g)), f"{ne:+.2f}%", v))
+    out.extend(_c_split(_table(rows, "lrrl")))
     out.append(_p(
         "🧠 QUESTION THE BRAIN IS TRYING TO ANSWER:\n\n"
         "\"Are my filters removing bad trades or accidentally removing profitable trades?\"\n\n"
@@ -779,9 +835,12 @@ def _sec_sims(F: Dict[str, Any], cfg) -> List[_Piece]:
     if F["rec_thr_ok"]:
         rt = F["rec_thr"]
         validated = F["thr_tier"] == RecommendationTier.ACTIONABLE
+        out.append(_p("CONFLUENCE MIN SCORE"))
+        out.append(_c("\n".join(_kv_table([
+            ("Current", f"{cfg.CONFLUENCE_MIN_ABS_SCORE:.0f}"),
+            ("Simulation", f"{rt['recommended']:.0f}"),
+        ]))))
         out.append(_p((
-            f"CONFLUENCE MIN SCORE\n\nCurrent:       {cfg.CONFLUENCE_MIN_ABS_SCORE:.0f}\n"
-            f"Simulation:    {rt['recommended']:.0f}\n\n"
             f"Historical simulated WR: {rt.get('rec_wr', 0):.0%}\n\n"
             f"Status:\n{'✅ VALIDATED' if validated else '🚫 NOT VALIDATED'}\n\n"
             + ("" if validated else "Reason:\nIn-sample simulation only.")
@@ -861,9 +920,8 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     labels = [("data_quality", "Minimum trades"), ("oos_prediction", "OOS EV"),
               ("profitability", "Net EV confidence"), ("stability", "CUSUM drift"),
               ("risk", "Drawdown budget"), ("execution", "Cost assumptions")]
-    rows = [f"{'':<20}STATUS"] + [
-        f"{lab:<20}{'🟢 PASS' if g.get(k) else '🔴 FAIL'}" for k, lab in labels]
-    out.extend(_c_split(rows))
+    rows = [("", "STATUS")] + [(lab, '🟢 PASS' if g.get(k) else '🔴 FAIL') for k, lab in labels]
+    out.extend(_c_split(_table(rows, "ll")))
     out.append(_p(
         "OVERALL:\n\n"
         + ("🟢 BRAIN ACTION GATE = PASSED\n\nMeaning:\n\n\"The Brain's evidence is strong enough to "
@@ -884,37 +942,41 @@ def _sec_quality(F: Dict[str, Any], cfg) -> List[_Piece]:
 
     rows = []
     if cov:
-        rows += [f"{'Requested history':<22}{cov.requested_days:>7} days",
-                 f"{'Available':<22}{cov.actual_days:>7.1f} days",
-                 f"{'Coverage':<22}{cov.coverage_ratio:>7.0%}",
-                 f"{'Resolved trades':<22}{cov.n_rows:>12}"]
+        rows += [("Requested history", f"{cov.requested_days} days"),
+                 ("Available", f"{cov.actual_days:.1f} days"),
+                 ("Coverage", f"{cov.coverage_ratio:.0%}"),
+                 ("Resolved trades", str(cov.n_rows))]
     if rec:
-        rows += [f"{'Pending at start':<22}{_n(rec.pending_count):>12}",
-                 f"{'Resolved this run':<22}{_n(rec.resolved_this_run):>12}",
-                 f"{'Archived this run':<22}{_n(rec.archived_this_run):>12}",
-                 f"{'Archive lines read':<22}{_n(rec.total_archived):>12}",
-                 f"{'Loaded by Brain':<22}{rec.loaded_by_brain:>12}",
-                 f"{'Shadow loaded':<22}{rec.shadow_loaded:>12}"]
+        rows += [("Pending at start", _n(rec.pending_count)),
+                 ("Resolved this run", _n(rec.resolved_this_run)),
+                 ("Archived this run", _n(rec.archived_this_run)),
+                 ("Archive lines read", _n(rec.total_archived)),
+                 ("Loaded by Brain", str(rec.loaded_by_brain)),
+                 ("Shadow loaded", str(rec.shadow_loaded))]
     if rows:
-        out.extend(_c_split(rows))
+        out.extend(_c_split(_table(rows, "lr")))
+    status_rows = []
+    if rec:
+        status_rows.append(("Outcome reconciliation", f"{rec.status.icon} {rec.status.value}"))
+    else:
+        status_rows.append(("Outcome reconciliation", "⚪ no data"))
+    migrated, dropped = st.get("migrated_forward", 0), st.get("dropped_unmigratable", 0)
+    status_rows.append(("Schema migration", (
+        "🟠 " + f"{dropped} rows could not be migrated" if dropped
+        else f"🟡 {migrated} old rows upgraded (some fields empty)" if migrated else "🟢 OK")))
+    out.append(_c("\n".join(_kv_table(status_rows))))
     lines: List[str] = []
     if rec:
-        lines.append(f"Outcome reconciliation:  {rec.status.icon} {rec.status.value}")
         lines += [f"⚠️ {note}" for note in rec.notes]
         for label, val in (("Stale-schema rows excluded", rec.archive_rejects_stale_schema),
                            ("Signal-only rows excluded", rec.archive_rejects_signal_only),
                            ("Malformed rows excluded", rec.archive_rejects_malformed)):
             if val:
                 lines.append(f"{label}: {val}")
-    else:
-        lines.append("Outcome reconciliation:  ⚪ no data")
-    migrated, dropped = st.get("migrated_forward", 0), st.get("dropped_unmigratable", 0)
-    lines.append("Schema migration:        " + (
-        "🟠 " + f"{dropped} rows could not be migrated" if dropped
-        else f"🟡 {migrated} old rows upgraded (some fields empty)" if migrated else "🟢 OK"))
     if cov and cov.warnings:
         lines += [f"⚠️ {w}" for w in cov.warnings]
-    out.append(_p("\n".join(lines)))
+    if lines:
+        out.append(_p("\n".join(lines)))
     supp = F["audit"].suppressed_analysis_names()
     if supp:
         out.append(_p("Advanced analyses blocked (not enough history yet):\n\n"
@@ -927,16 +989,16 @@ def _sec_evidence(F: Dict[str, Any], cfg) -> List[_Piece]:
     days, n, g = F["days"], F["n"], F["gate"]
     recon_ok = F["recon"] is not None and F["recon"].status == HealthStatus.OK
     rows = [
-        f"{'':<27}CURRENT STATUS",
-        f"{'Data integrity':<27}{'🟢 GOOD' if recon_ok else '🟡 CHECK'}",
-        f"{'Trade count':<27}{'🟢 GOOD' if n >= 100 else '🟡 OK' if n >= 30 else '🔴 POOR'}",
-        f"{'History depth':<27}{'🟢 GOOD' if (days or 0) >= 30 else '🟡 FAIR' if (days or 0) >= 14 else '🔴 POOR'}",
-        f"{'Market regime coverage':<27}{'🟢 GOOD' if (days or 0) >= 30 else '🟡 FAIR' if (days or 0) >= 14 else '🔴 POOR'}",
-        f"{'OOS validation':<27}{'🟢 PASSED' if g.get('oos_prediction') else '🔴 BLOCKED'}",
-        f"{'Statistical confidence':<27}{_conf_status(F['conf'])}",
-        f"{'Strategy-change confidence':<27}{'🟢 HIGH' if F['gate_ok'] else '🔴 LOW'}",
+        ("", "CURRENT STATUS"),
+        ("Data integrity", '🟢 GOOD' if recon_ok else '🟡 CHECK'),
+        ("Trade count", '🟢 GOOD' if n >= 100 else '🟡 OK' if n >= 30 else '🔴 POOR'),
+        ("History depth", '🟢 GOOD' if (days or 0) >= 30 else '🟡 FAIR' if (days or 0) >= 14 else '🔴 POOR'),
+        ("Market regime coverage", '🟢 GOOD' if (days or 0) >= 30 else '🟡 FAIR' if (days or 0) >= 14 else '🔴 POOR'),
+        ("OOS validation", '🟢 PASSED' if g.get('oos_prediction') else '🔴 BLOCKED'),
+        ("Statistical confidence", _conf_status(F['conf'])),
+        ("Strategy-change confidence", '🟢 HIGH' if F['gate_ok'] else '🔴 LOW'),
     ]
-    out.extend(_c_split(rows))
+    out.extend(_c_split(_table(rows, "ll")))
     used = sorted({a["rank"] for a in F["alerts"]})
     ladder = "\n".join(f"{_LADDER[i]} {_LADDER_NAMES[i]}" for i in range(5))
     now = " / ".join(_LADDER[i] for i in used) if used else "⚪"
@@ -949,13 +1011,13 @@ def _sec_evidence(F: Dict[str, Any], cfg) -> List[_Piece]:
 def _sec_appendix(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(16, "📚 TECHNICAL APPENDIX")]
     out.append(_p("Detailed data for advanced users."))
-    rows = [f"{'Alert':<20}{'N':>4}{'WR':>5}{'EV':>7}{'P>0':>5}"]
+    rows = [("Alert", "N", "WR", "EV", "P>0")]
     for a in sorted(F["alerts"], key=lambda a: -a["n"]):
-        ev = f"{a['ev']:+.2f}" if a["ev"] is not None else "  n/a"
-        pv = f"{a['p']:.0%}" if a["p"] is not None else " n/a"
-        rows.append(f"{a['key'][:19]:<20}{a['n']:>4}{a['wr']:>5.0%}{ev:>7}{pv:>5}")
+        ev = f"{a['ev']:+.2f}" if a["ev"] is not None else "n/a"
+        pv = f"{a['p']:.0%}" if a["p"] is not None else "n/a"
+        rows.append((a['key'], str(a['n']), f"{a['wr']:.0%}", ev, pv))
     out.append(_p("• Full alert-by-alert statistics (EV = net % per trade, P>0 = P(EV>0))"))
-    out.extend(_c_split(rows))
+    out.extend(_c_split(_table(rows, "lrrrr")))
     ev_obj = F["ev_obj"] or {}
     if ev_obj:
         out.append(_p("• Portfolio EV: net " + f"{ev_obj.get('net_ev', 0):+.2f}%"
@@ -976,11 +1038,10 @@ def _sec_appendix(F: Dict[str, Any], cfg) -> List[_Piece]:
     ledger = (F["ai"] or {}).get("repair_ledger")
     if ledger:
         out.append(_p("• Repair ledger\n" + "\n".join(f"{k}: {v}" for k, v in list(ledger.items())[:10])))
-
     if F["cfg_patch"]:
         out.append(_p("• Full Brain candidate table\n" + "\n".join(
             f"{p.get('path')}: {p.get('current')} → {p.get('suggested')}"
-            f"{' [🚫 Change Rejected — CV retained]' if p.get('_blocked_by_action_gate') else ''}"
+            f"{' [blocked]' if p.get('_blocked_by_action_gate') else ''}"
             for p in F["cfg_patch"][:20])))
     out.append(_p("Also computed but not shown here: Monte Carlo, CUSUM, walk-forward, calibration, "
                   "permutation importance, hierarchical analysis and weight optimisation "
@@ -1406,7 +1467,7 @@ class BrainEngineV2(BaseBrainEngine):
         shadow_rows = base_recs.get("_shadow_rows", [])
         # ══════════════════════════════════════════════════════════════════
         #  BRAIN AUDIT LAYER — initialize and validate data population
-        # ═══════════════════════════════════════════════════════════════  
+        # ══════════════════════���════════════════���══════════════════════════  
         audit = get_audit()  # keep coverage/reconciliation set during baseline
 
         # History coverage was already set in _generate_baseline_recommendations
