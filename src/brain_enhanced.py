@@ -976,10 +976,11 @@ def _sec_appendix(F: Dict[str, Any], cfg) -> List[_Piece]:
     ledger = (F["ai"] or {}).get("repair_ledger")
     if ledger:
         out.append(_p("• Repair ledger\n" + "\n".join(f"{k}: {v}" for k, v in list(ledger.items())[:10])))
+
     if F["cfg_patch"]:
         out.append(_p("• Full Brain candidate table\n" + "\n".join(
             f"{p.get('path')}: {p.get('current')} → {p.get('suggested')}"
-            f"{' [blocked]' if p.get('_blocked_by_action_gate') else ''}"
+            f"{' [🚫 Change Rejected — CV retained]' if p.get('_blocked_by_action_gate') else ''}"
             for p in F["cfg_patch"][:20])))
     out.append(_p("Also computed but not shown here: Monte Carlo, CUSUM, walk-forward, calibration, "
                   "permutation importance, hierarchical analysis and weight optimisation "
@@ -1405,7 +1406,7 @@ class BrainEngineV2(BaseBrainEngine):
         shadow_rows = base_recs.get("_shadow_rows", [])
         # ══════════════════════════════════════════════════════════════════
         #  BRAIN AUDIT LAYER — initialize and validate data population
-        # ══════════════════════���════════════════���══════════════════════════  
+        # ═══════════════════════════════════════════════════════════════  
         audit = get_audit()  # keep coverage/reconciliation set during baseline
 
         # History coverage was already set in _generate_baseline_recommendations
