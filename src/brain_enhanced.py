@@ -592,7 +592,9 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
     h_icon, h_verdict = (("⚪", "n/a") if days is None else
                          ("🟢", "Long enough") if days >= 30 else
                          ("🟡", "Short") if days >= 14 else ("🔴", "Too short"))
+
     exec_ok = F["gate"].get("execution", True)
+    dd, bud = F["dd"], F["dd_budget"]
     dd_icon, dd_verdict = (("⚪", "unknown") if dd is None else
                            ("🟢", f"Within {bud:.1f}%") if dd <= bud else ("🔴", f"Over {bud:.1f}%"))
     drift = F["gate"].get("stability") is False
@@ -920,9 +922,6 @@ def _sec_quality(F: Dict[str, Any], cfg) -> List[_Piece]:
 
     def _n(v: Any) -> str:
         return "n/a" if v is None else str(v)
-
-
-
     rows = []
     if cov:
         rows += [f"{_cell('Requested history', 18)}{cov.requested_days:>7} days",
