@@ -422,10 +422,11 @@ def _table(rows: Sequence[Tuple[str, ...]], aligns: str, gap: int = 2) -> List[s
     ncol = len(aligns)
     widths = [max((_vwidth(r[i]) for r in rows), default=0) for i in range(ncol)]
     out = []
+
     for r in rows:
         cells = []
         for i, cell in enumerate(r):
-            if i == ncol - 1:
+            if i == ncol - 1 and aligns[i] != "r":
                 cells.append(cell)
             else:
                 cells.append((_ljust if aligns[i] == "l" else _rjust)(cell, widths[i]))
@@ -956,8 +957,13 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     labels = [("data_quality", "Minimum trades"), ("oos_prediction", "OOS EV"),
               ("profitability", "Net EV confidence"), ("stability", "CUSUM drift"),
               ("risk", "Drawdown budget"), ("execution", "Cost assumptions")]
-    rows = [("", "STATUS")] + [(lab, '🟢 PASS' if g.get(k) else '🔴 FAIL') for k, lab in labels]
-    out.extend(_c_split(_table(rows, "ll")))
+    # Route through _kv_table so the emoji lands at column 0 and the
+    # values right-align against each other.
+    rows = [
+        (lab, f"{'🟢' if g.get(k) else '🔴'} {'PASS' if g.get(k) else 'FAIL'}")
+        for k, lab in labels
+    ]
+    out.extend(_c_split(_kv_table(rows)))
     out.append(_p(
         "OVERALL:\n\n"
         + ("🟢 BRAIN ACTION GATE = PASSED\n\nMeaning:\n\n\"The Brain's evidence is strong enough to "
@@ -1025,7 +1031,6 @@ def _sec_evidence(F: Dict[str, Any], cfg) -> List[_Piece]:
     days, n, g = F["days"], F["n"], F["gate"]
     recon_ok = F["recon"] is not None and F["recon"].status == HealthStatus.OK
     rows = [
-        ("", "CURRENT STATUS"),
         ("Data integrity", '🟢 GOOD' if recon_ok else '🟡 CHECK'),
         ("Trade count", '🟢 GOOD' if n >= 100 else '🟡 OK' if n >= 30 else '🔴 POOR'),
         ("History depth", '🟢 GOOD' if (days or 0) >= 30 else '🟡 FAIR' if (days or 0) >= 14 else '🔴 POOR'),
@@ -1034,7 +1039,7 @@ def _sec_evidence(F: Dict[str, Any], cfg) -> List[_Piece]:
         ("Statistical confidence", _conf_status(F['conf'])),
         ("Strategy-change confidence", '🟢 HIGH' if F['gate_ok'] else '🔴 LOW'),
     ]
-    out.extend(_c_split(_table(rows, "ll")))
+    out.extend(_c_split(_kv_table(rows)))
     used = sorted({a["rank"] for a in F["alerts"]})
     ladder = "\n".join(f"{_LADDER[i]} {_LADDER_NAMES[i]}" for i in range(5))
     now = " / ".join(_LADDER[i] for i in used) if used else "⚪"
