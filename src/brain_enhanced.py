@@ -1059,7 +1059,6 @@ def _sec_evidence(F: Dict[str, Any], cfg) -> List[_Piece]:
         ("Statistical confidence", _conf_status(F['conf'])),
         ("Strategy-change confidence", '🟢 HIGH' if F['gate_ok'] else '🔴 LOW'),
     ])))
-    out.extend(_c_split(_kv_table(rows)))
     used = sorted({a["rank"] for a in F["alerts"]})
     ladder = "\n".join(f"{_LADDER[i]} {_LADDER_NAMES[i]}" for i in range(5))
     now = " / ".join(_LADDER[i] for i in used) if used else "⚪"
