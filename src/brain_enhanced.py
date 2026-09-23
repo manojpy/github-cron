@@ -475,6 +475,25 @@ def _kv_table(pairs: Sequence[Tuple[str, str]]) -> List[str]:
             rows.append((f"{label}:", value))
     return _table(rows, "ll")
 
+def _active_blockers(F: Dict[str, Any]) -> List[str]:
+    g = F["gate"]
+    out: List[str] = []
+    if F["days"] is not None and F["days"] < 14:
+        out.append(f"Only {F['days']:.1f} days history")
+    if g and g.get("data_quality") is False:
+        out.append("Fewer than 100 trades")
+    if g and g.get("oos_prediction") is False:
+        out.append("OOS validation unavailable")
+    if g and g.get("profitability") is False:
+        out.append("Net EV not confidently positive")
+    if g and g.get("stability") is False:
+        out.append("CUSUM drift active")
+    if g and g.get("risk") is False:
+        out.append("Drawdown outside current budget")
+    if g and g.get("execution") is False:
+        out.append("Fee/slippage assumptions missing")
+    return out
+
 # ── the sections ──────────────────────────────────────────────────────
 
 def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
