@@ -493,11 +493,14 @@ class BrainEngine:
             "context": context,
         }
         market_state_p_win = None
+        ml_calibration_curve = None
         if getattr(cfg, "ENABLE_MARKET_STATE_MODEL", True):
             model = await self._load_market_state_model()
             market_state_p_win = engine.predict_market_state_proba(
                 model, votes=votes, context=context, session=session, direction=direction,
             )
+            if market_state_p_win is not None:
+                ml_calibration_curve = await self._load_ml_calibration_curve()
         try:
             result = engine.trade_quality_score(
                 row, ev_model_result, calibration_curve, bundle.get("regime_info"),
@@ -506,6 +509,7 @@ class BrainEngine:
                 calibration_slack=getattr(cfg, "CALIBRATION_SLACK", 0.05),
                 market_state_p_win=market_state_p_win,
                 use_market_state_live=getattr(cfg, "ENABLE_MARKET_STATE_LIVE_SCORE", False),
+                ml_calibration_curve=ml_calibration_curve,
             )
         except Exception:
             return None

@@ -1919,7 +1919,7 @@ def parameter_autopsy(
         "higher_is_worse": higher_is_worse,
     }
 
-# ═════════════════════════════════════════════════════════���������═════════════
+# ═════════════════════════════════════════════════════════�������������═════════════
 #  PHASE 3 — CONDITIONAL ALERT GATING
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -4491,6 +4491,7 @@ def trade_quality_score(
     calibration_slack: float = 0.05,
     market_state_p_win: Optional[float] = None,
     use_market_state_live: bool = False,
+    ml_calibration_curve: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Unified quality assessment for a single prospective trade."""
     result: Dict[str, Any] = {
@@ -4515,20 +4516,26 @@ def trade_quality_score(
     n_oos = ev_model_result.get("n", 0)
 
     # ── Layer 2b: live per-trade market-state prediction (item #12).
-    # Always recorded for observability so you can watch it accumulate
-    # against real outcomes; only allowed to move quality/verdict once
-    # ENABLE_MARKET_STATE_LIVE_SCORE is explicitly turned on. ──
+    market_state_p_win_cal = market_state_p_win
+    calibration_reason = None
+    if market_state_p_win is not None and ml_calibration_curve:
+        p_cal, calibration_reason = ml_calibration_lookup(
+            ml_calibration_curve, market_state_p_win,
+        )
+        if p_cal is not None:
+            market_state_p_win_cal = p_cal
+
     p_profit_effective = p_profit
-    if market_state_p_win is not None:
+    if market_state_p_win_cal is not None:
         if use_market_state_live:
-            p_profit_effective = 0.5 * p_profit + 0.5 * market_state_p_win
+            p_profit_effective = 0.5 * p_profit + 0.5 * market_state_p_win_cal
 
     per_trade = None
-    if market_state_p_win is not None and use_market_state_live:
-        # Optional: look up calibrated version if ML curve is supplied
-        # For now use raw p_win; Step 1 curve can be passed later
+    if market_state_p_win_cal is not None and use_market_state_live:
         rr = (row.get("context") or {}).get("rr", 2.0)  # or from MAE/MFE profile
-        per_trade = per_trade_ev(market_state_p_win, reward_r=float(rr))
+        per_trade = per_trade_ev(market_state_p_win_cal, reward_r=float(rr))
+        per_trade["p_raw"] = round(market_state_p_win, 4)
+        per_trade["calibration_reason"] = calibration_reason or "no_curve"
         result["per_trade_ev"] = per_trade
 
     # ── Layer 3: Calibration ──
@@ -4578,15 +4585,17 @@ def trade_quality_score(
         verdict = "MEDIUM"
     else:
         verdict = "LOW"
-
     result.update({
         "verdict": verdict,
         "quality_score": round(quality, 3),
         "p_ev_positive": round(p_profit, 3),
         "market_state_p_win": (
+            round(market_state_p_win_cal, 3) if market_state_p_win_cal is not None else None
+        ),
+        "market_state_p_win_raw": (
             round(market_state_p_win, 3) if market_state_p_win is not None else None
         ),
-        "market_state_live": bool(use_market_state_live and market_state_p_win is not None),
+        "market_state_live": bool(use_market_state_live and market_state_p_win_cal is not None),
         "net_ev": round(net_ev, 4),
         "ev_p5": round(ev_p5, 4),
         "n_oos": n_oos,
@@ -4597,7 +4606,6 @@ def trade_quality_score(
         ),
         "regime_compatible": regime_ok,
     })
-
     return result
 
     
