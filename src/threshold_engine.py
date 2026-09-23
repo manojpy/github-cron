@@ -1919,7 +1919,7 @@ def parameter_autopsy(
         "higher_is_worse": higher_is_worse,
     }
 
-# ═════════════════════════════════════════════════════════�������������═════════════
+# ═════════════════════════════════════════════════════════���������������═════════════
 #  PHASE 3 — CONDITIONAL ALERT GATING
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -4529,9 +4529,10 @@ def trade_quality_score(
     if market_state_p_win_cal is not None:
         if use_market_state_live:
             p_profit_effective = 0.5 * p_profit + 0.5 * market_state_p_win_cal
-
     per_trade = None
-    if market_state_p_win_cal is not None and use_market_state_live:
+    if (market_state_p_win is not None
+            and market_state_p_win_cal is not None
+            and use_market_state_live):
         rr = (row.get("context") or {}).get("rr", 2.0)  # or from MAE/MFE profile
         per_trade = per_trade_ev(market_state_p_win_cal, reward_r=float(rr))
         per_trade["p_raw"] = round(market_state_p_win, 4)
