@@ -432,6 +432,52 @@ def _table(rows: Sequence[Tuple[str, ...]], aligns: str, gap: int = 2) -> List[s
         out.append((" " * gap).join(cells))
     return out
 
+def _split_leading_emoji(text: str) -> Tuple[str, str]:
+    """Split off a leading emoji (plus any variation selector / ZWJ
+    continuation) from `text`. Returns (emoji, rest). No leading emoji
+    → ('', text).
+
+    '🟡 FLAT'    → ('🟡', 'FLAT')
+    '⚠️ WARNING'  → ('⚠️', 'WARNING')
+    'FLAT'       → ('',  'FLAT')
+
+    Uses the same ranges _vwidth() uses, so anything _vwidth counts as
+    a wide glyph is treated as an emoji here too — the two stay in sync.
+    """
+    i, n = 0, len(text)
+    while i < n:
+        cp = ord(text[i])
+        if any(lo <= cp <= hi for lo, hi in _WIDE_EMOJI_RANGES) or cp in (0xFE0F, 0x200D):
+            i += 1
+            continue
+        break
+    if i == 0:
+        return "", text
+    return text[:i], text[i:].lstrip()
+
+def _kv_table(pairs: Sequence[Tuple[str, str]]) -> List[str]:
+    """Convenience for the common 'Label: Value' block.
+
+    Emoji in a value is lifted to column 0 so every row reads
+        🟡 Observed profitability:   FLAT
+        🔴 Data quality:             LOW
+    with one aligned value column, instead of the emoji drifting with
+    the value and the labels looking ragged. Rows whose values carry no
+    emoji at all (e.g. 'Current: 18') are left in the plain
+    'Label: Value' form — no phantom emoji column.
+    """
+    rows = []
+    for label, value in pairs:
+        emoji, rest = _split_leading_emoji(value)
+        if emoji:
+            rows.append((f"{emoji} {label}:", rest))
+        else:
+            rows.append((f"{label}:", value))
+    return _table(rows, "ll")
+
+
+
+
 def _kv_table(pairs: Sequence[Tuple[str, str]]) -> List[str]:
     """Convenience for the common 'Label: Value' block, e.g.
     'Observed profitability:  🟢 POSITIVE'. Colon is part of the label
@@ -1465,7 +1511,7 @@ class BrainEngineV2(BaseBrainEngine):
         _phase_mark("baseline")
         real_rows = base_recs.get("_real_rows", [])
         shadow_rows = base_recs.get("_shadow_rows", [])
-        # ══════════════════════════════════════════════════════════════════
+        # ════════════════════════════════════════���═════════════════════════
         #  BRAIN AUDIT LAYER — initialize and validate data population
         # ══════════════════════���════════════════���══════════════════════════  
         audit = get_audit()  # keep coverage/reconciliation set during baseline
