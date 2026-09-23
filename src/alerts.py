@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, Tuple, List, Set, Callable, Union, Awaitable, cast
 import numpy as np
 
+StateChange = Tuple[str, str, Optional[int]]
+
 @dataclass
 class AlertPayload:
     pair_name: str
@@ -19,7 +21,7 @@ class AlertPayload:
     total: Optional[float]
     msg_body: str           # MarkdownV2-escaped body WITHOUT datetime/bias footer
     dedup_keys: List[str]
-    state_changes: List[Tuple[str, str, None]]
+    state_changes: List[StateChange]
     budget_count: int
     ts: int
     macro_shadow: Optional[Dict[str, Any]] = None
@@ -558,11 +560,10 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
 
     return True, None
 
-def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> List[Tuple[str, str, None]]:
+def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> List[StateChange]:
     """Generic cross-reset engine. Emits INACTIVE updates when a cross that was
     previously ACTIVE has now reversed."""
-    resets: List[Tuple[str, str, None]] = []
-
+    resets: List[StateChange] = []
     def _add(up_key: str, down_key: str,
              curr: float, prev: float,
              up_thr_curr: float, up_thr_prev: float,
@@ -867,7 +868,7 @@ async def dispatch_combined_alerts(
     # ── Attempt combined send ──
     combined_success = True
     sent_payloads: List[AlertPayload] = []
-    all_changes: List[Tuple[str, str, None]] = []
+    all_changes: List[StateChange] = []
 
     for msg, msg_payloads in zip(messages, message_payloads):
         if await telegram_queue.send(msg):
@@ -2321,7 +2322,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             # Outcome recording and ACTIVE-state activation are DEFERRED to the
             # dispatcher, which runs them only after Telegram confirms delivery.
             # A failed or truncated send therefore never creates a phantom trade.
-            deferred_activations: List[Tuple[str, str, None]] = []
+            deferred_activations: List[StateChange] = []
             deferred_record: Optional[Callable[[], Awaitable[None]]] = None
             if not cfg.DRY_RUN_MODE:
                 assert cached_snapshot is not None

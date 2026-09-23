@@ -628,20 +628,42 @@ def monte_carlo_walk_forward(
             if oos_ev_list else 0.0
         ),
     }
-
 def rolling_walk_forward(
     rows: List[Row],
     n_folds: int = 5,
     train_frac: float = 0.60,
     min_sample: int = 20,
     target_winrate: float = 0.55,
+    lookahead_sec: Optional[int] = None,
+    embargo_sec: int = 900,
 ) -> Dict[str, Any]:
     """Multi-fold chronological walk-forward.
 
     Splits the timeline into n_folds sequential windows.
     For each fold, trains on the preceding data, tests on the fold.
     Aggregates OOS performance across all folds.
+
+    ── Purge + embargo (roadmap item: purged/embargoed OOS) ──
+    Every fold's cut gets the same discipline walk_forward_split() applies
+    to its single split: purge drops train rows whose outcome window
+    (entry_ts + lookahead_sec) spills past the cut, so a train label isn't
+    partly determined by prices the test fold is about to see; embargo
+    drops the first embargo_sec of the test fold so it isn't still
+    statistically coupled to the train tail. Previously only the
+    single-split helper had this — rolling_walk_forward trained on
+    ordered[:train_end] and tested on ordered[test_start:] with zero gap
+    at every one of its n_folds cuts, which is the same leakage bug in
+    n_folds places instead of one. This function's p_ev_positive feeds a
+    hard ML-eligibility gate in brain_enhanced.py's _action_gate_check(),
+    so a leaky estimate here was a real (not just diagnostic) risk.
     """
+    if lookahead_sec is None:
+        lookahead_sec = (
+            max(0, int(getattr(cfg, "OUTCOME_FILL_DELAY_CANDLES", 1)))
+            + int(cfg.OUTCOME_LOOKAHEAD_CANDLES)
+            + 1
+        ) * 900
+
     ordered = sorted(rows, key=lambda r: r.get("entry_ts", 0))
     n = len(ordered)
     if n < min_sample * (n_folds + 1):
@@ -658,13 +680,25 @@ def rolling_walk_forward(
         train_end = fold_size * (fold_idx + 1)
         test_start = train_end
         test_end = min(test_start + fold_size, n)
+        if test_start >= n:
+            continue
 
-        train_rows = ordered[:train_end]
-        test_rows = ordered[test_start:test_end]
+        cut_ts = ordered[test_start].get("entry_ts", 0)
+
+        # Purge: drop train rows whose outcome window spills past this
+        # fold's cut (same rule as walk_forward_split()).
+        train_rows = [
+            r for r in ordered[:train_end]
+            if r.get("entry_ts", 0) + lookahead_sec < cut_ts - embargo_sec
+        ]
+        # Embargo: skip the first embargo_sec of this fold's test window.
+        test_rows = [
+            r for r in ordered[test_start:test_end]
+            if r.get("entry_ts", 0) >= cut_ts + embargo_sec
+        ]
 
         if len(train_rows) < min_sample * 2 or len(test_rows) < min_sample:
             continue
-
         train_result = recommend_threshold(
             train_rows, target_winrate=target_winrate, min_sample=min_sample
         )
