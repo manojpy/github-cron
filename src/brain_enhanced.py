@@ -658,21 +658,30 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
     wr_verdict = ("🔴 Very poor" if be and wr < be * 0.5 else "🔴 Below break-even" if be and wr < be
                   else "🟢 At/above break-even" if be else "⚪")
     dd, bud = F["dd"], F["dd_budget"]
-    rows = [
-        ("METRIC", "RESULT", "VERDICT"),
-        ("Trades", str(n), "🟢 Good sample" if n >= 100 else "🟡 Small sample" if n >= 30 else "🔴 Tiny sample"),
+
+    # Emoji lifted out of VERDICT and placed at column 0; column order is
+    # now emoji | metric | result (right-aligned) | verdict text.
+    entries = [
+        ("Trades", str(n),
+         "🟢 Good sample" if n >= 100 else "🟡 Small sample" if n >= 30 else "🔴 Tiny sample"),
         ("Win Rate", f"{wr:.0%}", wr_verdict),
-        ("Net EV", f"{net_ev:+.2f}%", "🟢 Positive" if net_ev > 0.05 else "🟡 Flat" if net_ev > -0.05 else "🔴 Negative"),
+        ("Net EV", f"{net_ev:+.2f}%",
+         "🟢 Positive" if net_ev > 0.05 else "🟡 Flat" if net_ev > -0.05 else "🔴 Negative"),
         ("History", "n/a" if days is None else f"{days:.1f}d",
          "🟢 Long enough" if (days or 0) >= 30 else "🟡 Short" if (days or 0) >= 14 else "🔴 Too short"),
         ("After costs?", "YES" if F["gate"].get("execution", True) else "NO",
-         "🟢" if F["gate"].get("execution", True) else "🔴"),
+         "🟢 Costs accounted" if F["gate"].get("execution", True) else "🔴 Missing"),
         ("Drawdown", "n/a" if dd is None else f"{dd:.1f}%",
          "⚪ unknown" if dd is None else f"{'🟢 Within' if dd <= bud else '🔴 Over'} {bud:.1f}% budget"),
         ("CUSUM drift", "ACTIVE" if F["gate"].get("stability") is False else "NONE",
-         "🔴" if F["gate"].get("stability") is False else "🟢"),
+         "🔴 Drifting" if F["gate"].get("stability") is False else "🟢 Stable"),
     ]
-    out.extend(_c_split(_table(rows, "lrl")))
+    rows = [("", "METRIC", "RESULT", "VERDICT")]
+    for metric, value, verdict in entries:
+        emoji, rest = _split_leading_emoji(verdict)
+        rows.append((emoji or "⚪", metric, value, rest))
+    out.extend(_c_split(_table(rows, "llrl")))
+
     if net_ev < 0:
         meaning = ("The observed trades are losing money after costs.\n\n"
                    + ("BUT the Brain does not yet know whether this will persist across different "
@@ -694,10 +703,13 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
 _EVIDENCE_LEGEND = "Ev = evidence: ⚪ observation · 🟡 early · 🟠 meaningful · 🔵 strong · 🟢 validated"
 
 def _alert_table(items: List[Dict[str, Any]], limit: int) -> List[_Piece]:
-    rows = [("Alert", "EV%", "WR", "N", "Ev")]
+    rows = [("Alert", "EV%", "WR", "N")]
     for a in items[:limit]:
-        rows.append((a['name'], f"{a['ev']:+.2f}", f"{a['wr']:.0%}", str(a['n']), _LADDER[a['rank']]))
-    return _c_split(_table(rows, "lrrrl")) + [_p(_EVIDENCE_LEGEND)]
+        rows.append((
+            f"{_LADDER[a['rank']]} {a['name']}",
+            f"{a['ev']:+.2f}", f"{a['wr']:.0%}", str(a['n']),
+        ))
+    return _c_split(_table(rows, "lrrr")) + [_p(_EVIDENCE_LEGEND)]
 
 def _sec_loss(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(4, '🔎 LOSS DIAGNOSIS — "WHERE ARE WE FALTERING?"')]
@@ -785,13 +797,18 @@ def _sec_sessions(F: Dict[str, Any], cfg) -> List[_Piece]:
     if not sess:
         out.append(_p("No session data yet."))
         return out
+
     best, worst = sess[-1][0], sess[0][0]
-    rows = [("SESSION", "WR", "TRADES", "STATUS")]
+    rows = [("", "SESSION", "WR", "TRADES", "STATUS")]
     for name, swr, sn in sorted(sess, key=lambda t: -t[1]):
-        tag = ("🟡 Best observed" if name == best and len(sess) > 1
-               else "🔴 Weakest observed" if name == worst and len(sess) > 1 else "⚪")
-        rows.append((name.upper(), f"{swr:.0%}", str(sn), tag))
-    out.extend(_c_split(_table(rows, "lrrl")))
+        if name == best and len(sess) > 1:
+            emoji, tag = "🟡", "Best observed"
+        elif name == worst and len(sess) > 1:
+            emoji, tag = "🔴", "Weakest observed"
+        else:
+            emoji, tag = "⚪", ""
+        rows.append((emoji, name.upper(), f"{swr:.0%}", str(sn), tag))
+    out.extend(_c_split(_table(rows, "llrrl")))
     if len(sess) > 1:
         out.append(_p(f"🧠 Interpretation:\n\n{best.upper()} has performed better in this sample.\n\n"
                       f"{worst.upper()} has performed worse."))
@@ -809,24 +826,28 @@ def _sec_filters(F: Dict[str, Any], cfg) -> List[_Piece]:
     for must in ("calibration_gate", "confluence_gate", "win_rate_filter"):
         groups.setdefault(must, [])
     min_s = getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
-    rows = [("FILTER", "TRADES", "EV", "VERDICT")]
+
+    rows = [("", "FILTER", "TRADES", "EV", "VERDICT")]
     for reason in sorted(groups):
         g = groups[reason]
         label = reason.replace("_gate", "").replace("_", " ").capitalize()
         if not g:
-            rows.append((label, "0", "n/a", "⚪"))
+            rows.append(("⚪", label, "0", "n/a", ""))
             continue
         try:
             ev = engine.ev_first_objective(g, min_sample=min_s)
         except Exception:
             ev = {"valid": False}
         if not ev.get("valid"):
-            rows.append((label, str(len(g)), "n/a", f"⚪ need {min_s}"))
+            rows.append(("⚪", label, str(len(g)), "n/a", f"need {min_s}"))
         else:
             ne, pe = ev.get("net_ev", 0.0), ev.get("p_ev_positive", 0.0)
-            v = "🟡 may over-block" if ne > 0 and pe >= 0.65 else "🟢 filters losers"
-            rows.append((label, str(len(g)), f"{ne:+.2f}%", v))
-    out.extend(_c_split(_table(rows, "lrrl")))
+            if ne > 0 and pe >= 0.65:
+                emoji, verdict = "🟡", "may over-block"
+            else:
+                emoji, verdict = "🟢", "filters losers"
+            rows.append((emoji, label, str(len(g)), f"{ne:+.2f}%", verdict))
+    out.extend(_c_split(_table(rows, "llrrl")))
     out.append(_p(
         "🧠 QUESTION THE BRAIN IS TRYING TO ANSWER:\n\n"
         "\"Are my filters removing bad trades or accidentally removing profitable trades?\"\n\n"
@@ -954,16 +975,15 @@ def _sec_recs(F: Dict[str, Any], cfg) -> List[_Piece]:
 def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     g = F["gate"]
     out = [_hdr(13, '🛡️ ACTION GATE — "CAN THE BRAIN SAFELY CHANGE ANYTHING?"')]
+
     labels = [("data_quality", "Minimum trades"), ("oos_prediction", "OOS EV"),
               ("profitability", "Net EV confidence"), ("stability", "CUSUM drift"),
               ("risk", "Drawdown budget"), ("execution", "Cost assumptions")]
-    # Route through _kv_table so the emoji lands at column 0 and the
-    # values right-align against each other.
-    rows = [
-        (lab, f"{'🟢' if g.get(k) else '🔴'} {'PASS' if g.get(k) else 'FAIL'}")
-        for k, lab in labels
-    ]
-    out.extend(_c_split(_kv_table(rows)))
+    # Emoji at column 0, label, then PASS/FAIL — same shape as _kv_table
+    # without needing to wrap because the pairs are built inline here.
+    rows = [(f"{'🟢' if g.get(k) else '🔴'} {lab}:", "PASS" if g.get(k) else "FAIL")
+            for k, lab in labels]
+    out.extend(_c_split(_table(rows, "ll")))
     out.append(_p(
         "OVERALL:\n\n"
         + ("🟢 BRAIN ACTION GATE = PASSED\n\nMeaning:\n\n\"The Brain's evidence is strong enough to "
@@ -1030,7 +1050,7 @@ def _sec_evidence(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(15, "📈 EVIDENCE / CONFIDENCE")]
     days, n, g = F["days"], F["n"], F["gate"]
     recon_ok = F["recon"] is not None and F["recon"].status == HealthStatus.OK
-    rows = [
+    out.extend(_c_split(_kv_table([
         ("Data integrity", '🟢 GOOD' if recon_ok else '🟡 CHECK'),
         ("Trade count", '🟢 GOOD' if n >= 100 else '🟡 OK' if n >= 30 else '🔴 POOR'),
         ("History depth", '🟢 GOOD' if (days or 0) >= 30 else '🟡 FAIR' if (days or 0) >= 14 else '🔴 POOR'),
@@ -1038,7 +1058,7 @@ def _sec_evidence(F: Dict[str, Any], cfg) -> List[_Piece]:
         ("OOS validation", '🟢 PASSED' if g.get('oos_prediction') else '🔴 BLOCKED'),
         ("Statistical confidence", _conf_status(F['conf'])),
         ("Strategy-change confidence", '🟢 HIGH' if F['gate_ok'] else '🔴 LOW'),
-    ]
+    ])))
     out.extend(_c_split(_kv_table(rows)))
     used = sorted({a["rank"] for a in F["alerts"]})
     ladder = "\n".join(f"{_LADDER[i]} {_LADDER_NAMES[i]}" for i in range(5))
@@ -1056,7 +1076,8 @@ def _sec_appendix(F: Dict[str, Any], cfg) -> List[_Piece]:
     for a in sorted(F["alerts"], key=lambda a: -a["n"]):
         ev = f"{a['ev']:+.2f}" if a["ev"] is not None else "n/a"
         pv = f"{a['p']:.0%}" if a["p"] is not None else "n/a"
-        rows.append((a['key'], str(a['n']), f"{a['wr']:.0%}", ev, pv))
+        rows.append((f"{_LADDER[a['rank']]} {a['key']}",
+                     str(a['n']), f"{a['wr']:.0%}", ev, pv))
     out.append(_p("• Full alert-by-alert statistics (EV = net % per trade, P>0 = P(EV>0))"))
     out.extend(_c_split(_table(rows, "lrrrr")))
     ev_obj = F["ev_obj"] or {}
