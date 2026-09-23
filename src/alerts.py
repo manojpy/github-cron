@@ -2099,8 +2099,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                         if ml_calibration_curve else (None, "no_curve")
                                     )
                                     p_use = p_cal if p_cal is not None else p_raw
-                                    rr = float((live_context or {}).get("rr") or context.get("rr") or getattr(cfg, "OUTCOME_RR_TARGET", 2.0))
-                                    sl_pct = float((live_context or {}).get("sl_pct") or context.get("sl_pct") or (float(getattr(cfg, "OUTCOME_MAE_LOSS_PCT", 0.5)) / 100.0))
+                                    _rr_raw = (live_context or {}).get("rr") or context.get("rr") or getattr(cfg, "OUTCOME_RR_TARGET", 2.0)
+                                    _sl_raw = (live_context or {}).get("sl_pct") or context.get("sl_pct") or (float(getattr(cfg, "OUTCOME_MAE_LOSS_PCT", 0.5)) / 100.0)
+                                    rr = float(_rr_raw)       # type: ignore[arg-type]
+                                    sl_pct = float(_sl_raw)   # type: ignore[arg-type]
                                     ev = engine.per_trade_ev(p_use, reward_r=rr, risk_r=1.0, fee_pct=getattr(cfg, "BRAIN_FEE_PCT", 0.0006), slippage_pct=getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003), sl_pct=sl_pct)
                                     qualify = (
                                         ev.get("valid")

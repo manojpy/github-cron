@@ -1919,7 +1919,7 @@ def parameter_autopsy(
         "higher_is_worse": higher_is_worse,
     }
 
-# ═════════════════════════════════════════════════════════�������═════════════
+# ═════════════════════════════════════════════════════════���������═════════════
 #  PHASE 3 — CONDITIONAL ALERT GATING
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -4133,12 +4133,12 @@ def build_ml_calibration_curve(
     chunk_size = math.ceil(n / n_bins)
     chunks = [pairs[i:i + chunk_size] for i in range(0, n, chunk_size)]
     chunks = [c for c in chunks if c]
-
     boundaries = [0.0]
     for i in range(len(chunks) - 1):
-        boundaries.append((chunks[i][-1][0] + chunks[i + 1][0]) / 2.0)
+        prev_pred: float = chunks[i][-1][0]
+        next_pred: float = chunks[i + 1][0][0]
+        boundaries.append((prev_pred + next_pred) / 2.0)
     boundaries.append(1.0)
-
     out = []
     for idx, chunk in enumerate(chunks):
         n_c = len(chunk)
