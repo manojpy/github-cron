@@ -1624,6 +1624,75 @@ def _percentile(data: List[float], p: float) -> float:
         return s[f]
     return s[f] * (c - k) + s[c] * (k - f)
 
+def mae_mfe_trade_plan(
+    rows: List[Row],
+    sl_percentile: float = 70.0,
+    tp1_percentile: float = 60.0,
+    tp2_percentile: float = 85.0,
+    sl_min_pct: float = 0.15,
+    sl_max_pct: float = 3.0,
+) -> Optional[Dict[str, Any]]:
+    """... (median MAE would be hit ~half the time; sl_percentile covers
+    most of the historical adverse excursion, clamped to a safety range;
+    TP1/TP2 from MFE percentiles; percentages, not fractions)"""
+    maes = [abs(r["mae"]) * 100.0 for r in rows if r.get("mae") is not None]
+    mfes = [abs(r["mfe"]) * 100.0 for r in rows if r.get("mfe") is not None]
+    if not maes or not mfes:
+        return None
+    tp_first_rows = [r for r in rows if r.get("tp_first") is not None]
+    tp_first_rate = (
+        sum(1 for r in tp_first_rows if r["tp_first"] is True) / len(tp_first_rows)
+        if tp_first_rows else None
+    )
+    sl = max(sl_min_pct, min(sl_max_pct, _percentile(maes, sl_percentile)))
+    tp1 = _percentile(mfes, tp1_percentile)
+    tp2 = max(tp1, _percentile(mfes, tp2_percentile))
+    return {
+        "n": len(rows), "n_mae": len(maes), "n_mfe": len(mfes),
+        "median_mae_pct": round(_percentile(maes, 50.0), 3),
+        "median_mfe_pct": round(_percentile(mfes, 50.0), 3),
+        "sl_suggested_pct": round(sl, 3),
+        "tp1_suggested_pct": round(tp1, 3),
+        "tp2_suggested_pct": round(tp2, 3),
+        "tp_first_rate": round(tp_first_rate, 3) if tp_first_rate is not None else None,
+        "sl_percentile": sl_percentile, "tp1_percentile": tp1_percentile, "tp2_percentile": tp2_percentile,
+    }
+
+def mae_mfe_profiles_by_bucket(rows, min_sample=15, **plan_kwargs):
+    """Builds mae_mfe_trade_plan() at pair+alert+direction ("leaf:"),
+    alert+direction ("alert_dir:"), alert ("alert:"), and "global"."""
+    by_leaf, by_alert_dir, by_alert = defaultdict(list), defaultdict(list), defaultdict(list)
+    for r in rows:
+        ak, d, p = r.get("alert_key", "?"), r.get("direction", "?"), r.get("pair", "?")
+        by_leaf[f"{p}|{ak}|{d}"].append(r)
+        by_alert_dir[f"{ak}|{d}"].append(r)
+        by_alert[ak].append(r)
+    profiles = {}
+    for prefix, buckets in (("leaf", by_leaf), ("alert_dir", by_alert_dir), ("alert", by_alert)):
+        for key, bucket in buckets.items():
+            if len(bucket) < min_sample:
+                continue
+            plan = mae_mfe_trade_plan(bucket, **plan_kwargs)
+            if plan:
+                profiles[f"{prefix}:{key}"] = plan
+    if len(rows) >= min_sample:
+        plan = mae_mfe_trade_plan(rows, **plan_kwargs)
+        if plan:
+            profiles["global"] = plan
+    return profiles
+
+def lookup_mae_mfe_plan(profiles, pair, alert_key, direction):
+    """Most specific bucket with enough history wins, else falls back
+    down to alert, then global. Returns a copy tagged with the bucket used."""
+    for key in (f"leaf:{pair}|{alert_key}|{direction}", f"alert_dir:{alert_key}|{direction}",
+                f"alert:{alert_key}", "global"):
+        plan = profiles.get(key)
+        if plan:
+            plan = dict(plan)
+            plan["bucket"] = key
+            return plan
+    return None
+
 def is_vote_pattern_ood(
     rows: List[Row],
     current_votes: Dict[str, bool],
@@ -1696,7 +1765,7 @@ def is_vote_count_ood(
         "relaxed_mode": relaxed_mode,
     }
 
-# ═════════════════════════════════════════════════════��═════════════════
+# ═════════════════════════════════════════════════════��══════���══════════
 #  NEW: Block-Bootstrap EV Confidence Intervals  (Recommended.txt §6)
 # ═════════════════════════════════════════════════════════════════��═════
 

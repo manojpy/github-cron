@@ -429,6 +429,24 @@ class BrainEngine:
         calibration_curve = await self._load_calibration_curve(alert_key)
         context = dict(live_context or {})
         context.setdefault("adx_val", adx_val)
+
+        # ── Bayesian-shrunk pair/regime edge (roadmap item: hierarchical
+        leaves = bundle.get("hierarchical_leaves") or {}
+        median_adx = bundle.get("hierarchical_median_adx")
+        leaf_adx = context.get("adx_val")
+        if median_adx is not None and leaf_adx is not None:
+            regime = "trending" if leaf_adx >= median_adx else "ranging"
+        else:
+            regime = "unknown"
+        leaf = leaves.get(f"{pair}|{alert_key}|{direction}|{regime}")
+        ev_model_result = dict(ev_model_result)
+        if leaf:
+            ev_model_result["net_ev"] = leaf["shrunk_net_ev"]
+            ev_model_result["net_ev_source"] = "hierarchical_shrunk"
+            ev_model_result["net_ev_leaf_n"] = leaf["n"]
+        else:
+            ev_model_result["net_ev_source"] = "alert_baseline"
+
         row = {
             "pair": pair,
             "alert_key": alert_key,
@@ -443,7 +461,7 @@ class BrainEngine:
                 model, votes=votes, context=context, session=session, direction=direction,
             )
         try:
-            return engine.trade_quality_score(
+            result = engine.trade_quality_score(
                 row, ev_model_result, calibration_curve, bundle.get("regime_info"),
                 target_wr=getattr(cfg, "MIN_WIN_RATE", 0.55),
                 calibration_min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
@@ -453,6 +471,14 @@ class BrainEngine:
             )
         except Exception:
             return None
+
+        if getattr(cfg, "ENABLE_MAE_MFE_TRADE_PLAN", True) and result.get("verdict") != "BLOCKED":
+            plan = engine.lookup_mae_mfe_plan(
+                bundle.get("mae_mfe_profiles") or {}, pair, alert_key, direction,
+            )
+            if plan:
+                result["trade_plan"] = plan
+        return result
 
     # ── Kill switch ──────────────────────────────────────────────────────
     async def is_kill_switch_active(self) -> bool:
@@ -1440,7 +1466,7 @@ class BrainEngine:
             gap = mfe_wr - close_wr
             summary_msg = (
                 f"📐 Three-Metric Evaluation (n={mm_summary['n']}):\n"
-                f"  • Close WR (point-in-time): {close_wr:.0%} "
+                f"  Close WR (point-in-time): {close_wr:.0%} "
                 f"[{mm_summary['close_wilson'][0]:.0%}-{mm_summary['close_wilson'][1]:.0%}]\n"
                 f"  • MFE WR (TP ever hit):    {mfe_wr:.0%} "
                 f"[{mm_summary['mfe_wilson'][0]:.0%}-{mm_summary['mfe_wilson'][1]:.0%}]\n"
@@ -1762,10 +1788,30 @@ class BrainEngine:
             ev_obj = engine.ev_first_objective(s["rows"], min_sample=min_sample)
             if ev_obj.get("valid"):
                 ev_by_alert[alert_key] = ev_obj
+
+        mae_mfe_profiles: Dict[str, Any] = {}
+        if getattr(cfg, "ENABLE_MAE_MFE_TRADE_PLAN", True) and real_rows:
+            try:
+                mae_mfe_profiles = engine.mae_mfe_profiles_by_bucket(
+                    real_rows,
+                    min_sample=getattr(cfg, "MAE_MFE_MIN_SAMPLE", 15),
+                    sl_percentile=getattr(cfg, "MAE_MFE_SL_PERCENTILE", 70.0),
+                    tp1_percentile=getattr(cfg, "MAE_MFE_TP1_PERCENTILE", 60.0),
+                    tp2_percentile=getattr(cfg, "MAE_MFE_TP2_PERCENTILE", 85.0),
+                    sl_min_pct=getattr(cfg, "MAE_MFE_SL_MIN_PCT", 0.15),
+                    sl_max_pct=getattr(cfg, "MAE_MFE_SL_MAX_PCT", 3.0),
+                )
+            except Exception as e:
+                audit.record_analysis_exception("mae_mfe_trade_plan", e)
+                mae_mfe_profiles = {}
+
         if ev_by_alert:
             await self._persist_quality_inputs({
                 "ev_by_alert": ev_by_alert,
                 "regime_info": rb,
+                "hierarchical_leaves": hca.get("leaves", {}) if hca.get("valid") else {},
+                "hierarchical_median_adx": hca.get("median_adx"),
+                "mae_mfe_profiles": mae_mfe_profiles,
                 "ts": int(time.time()),
             })
 

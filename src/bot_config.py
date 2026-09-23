@@ -510,6 +510,13 @@ class BotConfig(BaseModel):
     ENABLE_HIERARCHICAL_COMBINATION_ANALYSIS: bool = Field(default=True, description="Adds a pair+direction+alert_key+regime breakdown to the brain report, using empirical-Bayes shrinkage toward each combo's alert+direction+regime parent so small leaf combinations don't overfit. Purely diagnostic — never changes live gating on its own")
     HIERARCHICAL_MIN_LEAF_SAMPLE: int = Field(default=15, ge=1, le=1000, description="Minimum raw sample size for a pair+direction+alert+regime leaf to be reported at all in hierarchical_combination_analysis — shrinkage still pulls it toward its parent above this floor, this just filters out leaves too thin to report on")
     HIERARCHICAL_SHRINKAGE_K: float = Field(default=20.0, ge=1.0, le=500.0, description="Equivalent-sample-size prior strength for hierarchical_combination_analysis's empirical-Bayes shrinkage — higher pulls leaf estimates harder toward their parent bucket regardless of the leaf's own sample size")
+    ENABLE_MAE_MFE_TRADE_PLAN: bool = Field(default=True, description="Attach a historical-MAE/MFE-derived SL/TP1/TP2 suggestion ... Advisory only — never changes the bracket used to grade an alert's own win/loss.")
+    MAE_MFE_MIN_SAMPLE: int = Field(default=15, ge=1, le=1000, description="Minimum sample per bucket before falling back to the next-broader one, down to global.")
+    MAE_MFE_SL_PERCENTILE: float = Field(default=70.0, ge=50.0, le=95.0, description="...")
+    MAE_MFE_TP1_PERCENTILE: float = Field(default=60.0, ge=40.0, le=90.0, description="...")
+    MAE_MFE_TP2_PERCENTILE: float = Field(default=85.0, ge=60.0, le=99.0, description="...")
+    MAE_MFE_SL_MIN_PCT: float = Field(default=0.15, ge=0.01, le=5.0, description="Safety floor ...")
+    MAE_MFE_SL_MAX_PCT: float = Field(default=3.0, ge=0.1, le=20.0, description="Safety ceiling ...")
 
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:

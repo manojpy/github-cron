@@ -2058,6 +2058,18 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     f"(P(profit)={tq.get('p_ev_positive', 0):.0%}, "
                                     f"netEV={tq.get('net_ev', 0):+.2f}%)"
                                 )
+                                plan = tq.get("trade_plan")
+                                if plan:
+                                    alert_extra = (
+                                        f"{alert_extra} | SL -{plan['sl_suggested_pct']:.2f}% "
+                                        f"TP1 +{plan['tp1_suggested_pct']:.2f}% "
+                                        f"TP2 +{plan['tp2_suggested_pct']:.2f}%"
+                                        + (
+                                            f" (TP1-first {plan['tp_first_rate']:.0%}, n={plan['n']})"
+                                            if plan.get("tp_first_rate") is not None
+                                            else f" (n={plan['n']})"
+                                        )
+                                    )
                     surviving_alerts.append((alert_title, alert_extra, alert_key))
                     continue
 
