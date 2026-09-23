@@ -1919,7 +1919,7 @@ def parameter_autopsy(
         "higher_is_worse": higher_is_worse,
     }
 
-# ═══════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════�������═════════════
 #  PHASE 3 — CONDITIONAL ALERT GATING
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -3129,6 +3129,10 @@ def train_market_state_model(
     accuracy (item #6). Returns a dict with valid=False and a reason if
     the fit doesn't clear the bar — callers should keep serving whatever
     model they already had rather than overwrite it with this one.
+
+    Also builds an ML calibration curve on the full holdout (p_win, label)
+    and returns its ECE so callers can compare against conf_pct ECE
+    before wiring the future EV pipeline.
     """
     if len(rows) < min_sample:
         return {"valid": False, "error": "insufficient_data", "n": len(rows)}
@@ -3174,6 +3178,23 @@ def train_market_state_model(
             "valid": False, "error": "oos_ev_not_convincing",
             "holdout_ev": holdout_ev_obj, "drift_check": drift_check,
         }
+
+    # ── ML calibration curve on full holdout (p_win vs realized label) ──
+    # Same math as build_calibration_curves, different input column.
+    # Used only for ECE comparison and (later) calibrated P lookup;
+    # does not affect the OOS EV acceptance gate above.
+    holdout_preds = [
+        _sigmoid(sum(b * x for b, x in zip(beta, X_hold[i])))
+        for i in range(len(holdout_rows))
+    ]
+    holdout_labels = [bool(r["win"]) for r in holdout_rows]
+    ml_calib = build_ml_calibration_curve(
+        holdout_preds,
+        holdout_labels,
+        n_bins=10,
+        min_sample=max(10, min_sample // 10),
+    )
+
     return {
         "valid": True,
         "beta": beta,
@@ -3182,6 +3203,8 @@ def train_market_state_model(
         "n_holdout": len(holdout_rows),
         "n_kept_at_decision": len(kept),
         "holdout_ev": holdout_ev_obj,
+        "ml_calibration": ml_calib,
+        "ml_ece": ml_calib.get("ece"),
         "trained_at": int(time.time()),
         "drift_check": drift_check,
     }
@@ -3339,6 +3362,51 @@ def ev_first_objective(
     }
     _EV_FIRST_CACHE[_cache_key] = _result
     return dict(_result)
+
+def per_trade_ev(
+    calibrated_p: float,
+    reward_r: float,          # e.g. R:R = 2.0 → reward_r = 2.0
+    risk_r: float = 1.0,      # stop-loss in R units (usually 1.0)
+    fee_pct: float = 0.0006,
+    slippage_pct: float = 0.0003,
+    sl_pct: Optional[float] = None,  # if known, convert costs into R
+) -> Dict[str, Any]:
+    """Per-trade EV from a calibrated probability (future pipeline).
+
+    EV = p * reward_r − (1−p) * risk_r − costs_in_R
+    This is NOT the historical alert-key bucket EV used by
+    trade_quality_score today.
+    """
+    if calibrated_p is None or not (0.0 <= calibrated_p <= 1.0):
+        return {"valid": False, "error": "bad_p"}
+    # Round-trip cost, matching ev_and_kelly_for / ev_first_objective.
+    # fee_pct/slippage_pct are fractions (0.0006 = 0.06%), so *100 puts
+    # the value in percentage points.
+    costs_pct = ((fee_pct * 2) + (slippage_pct * 2)) * 100.0
+    if sl_pct and sl_pct > 0:
+        # sl_pct arrives as a fraction (0.005 = 0.5%). Convert to percent
+        # so the units match costs_pct, then divide to express cost as a
+        # fraction of the stop distance (R units).
+        costs_r = costs_pct / (sl_pct * 100.0)
+    else:
+        # Fallback: default stop from live config. Using OUTCOME_MAE_LOSS_PCT
+        # keeps the fallback consistent with how outcome resolution grades
+        # the trade.
+        _default_stop_pct = float(getattr(cfg, "OUTCOME_MAE_LOSS_PCT", 0.5))
+        costs_r = costs_pct / _default_stop_pct
+    net_ev = (
+        calibrated_p * reward_r
+        - (1.0 - calibrated_p) * risk_r
+        - costs_r
+    )
+    return {
+        "valid": True,
+        "net_ev": round(net_ev, 4),
+        "calibrated_p": round(calibrated_p, 4),
+        "reward_r": reward_r,
+        "risk_r": risk_r,
+        "costs_r": round(costs_r, 4),
+    }
 
 # ═══════════════════════════════════════════════════════════════════════
 #  ML DIAGNOSTICS — Root Cause, Drift, Change-Point, Repair Learning
@@ -4043,6 +4111,59 @@ def build_calibration_curves(
         "built_at": int(time.time()),
     }
 
+def build_ml_calibration_curve(
+    predictions: List[float],
+    labels: List[bool],
+    n_bins: int = 10,
+    min_sample: int = 15,
+) -> Dict[str, Any]:
+    """Calibration curve on model output: bins on raw P(profit), not conf_pct.
+
+    predictions: OOS holdout p_win values in [0, 1]
+    labels: corresponding resolved win/loss (True/False)
+    Returns same shape as one curve from build_calibration_curves so
+    calibration_gate_decision / ECE math can be reused.
+    """
+    if len(predictions) != len(labels) or len(predictions) < min_sample:
+        return {"buckets": [], "ece": None, "n": len(predictions)}
+
+    pairs = sorted(zip(predictions, labels), key=lambda t: t[0])
+    n = len(pairs)
+    n_bins = max(1, min(n_bins, n // min_sample))
+    chunk_size = math.ceil(n / n_bins)
+    chunks = [pairs[i:i + chunk_size] for i in range(0, n, chunk_size)]
+    chunks = [c for c in chunks if c]
+
+    boundaries = [0.0]
+    for i in range(len(chunks) - 1):
+        boundaries.append((chunks[i][-1][0] + chunks[i + 1][0]) / 2.0)
+    boundaries.append(1.0)
+
+    out = []
+    for idx, chunk in enumerate(chunks):
+        n_c = len(chunk)
+        wins = sum(1 for _, y in chunk if y)
+        wr = wins / n_c
+        lo, hi, _ = wilson_ci(wins, n_c)
+        pred = statistics.mean(p for p, _ in chunk)
+        out.append({
+            "lo": round(boundaries[idx], 4),
+            "hi": round(boundaries[idx + 1], 4),
+            "predicted": round(pred, 4),
+            "observed": round(wr, 4),
+            "n": n_c,
+            "trusted": n_c >= min_sample,
+            "wilson_lo": round(lo, 4),
+            "wilson_hi": round(hi, 4),
+        })
+    ece = sum((bk["n"] / n) * abs(bk["observed"] - bk["predicted"]) for bk in out)
+    return {
+        "buckets": out,
+        "ece": round(ece, 4),
+        "n": n,
+        "built_at": int(time.time()),
+    }
+
 def calibration_gate_decision(
     curve: Dict[str, Any],
     conf_pct: float,
@@ -4077,6 +4198,31 @@ def calibration_gate_decision(
             f"{target_wr:.0%} target at conf {conf_pct:.0f}%"
         )
     return True, cal_wr, "ok"
+
+def ml_calibration_lookup(
+    curve: Dict[str, Any],
+    p_win: float,
+    min_sample: int = 15,
+) -> Tuple[Optional[float], str]:
+    """Return (calibrated_P, reason) for a raw model p_win.
+    Returns (None, reason) for thin/untrusted buckets so the caller falls
+    back to the RAW model prediction. A calibration layer must never
+    replace a raw probability with a bucket's noisy empirical WR on a
+    sample too small to trust — same fail-open discipline as
+    calibration_gate_decision."""
+    buckets = curve.get("buckets", [])
+    if not buckets:
+        return None, "no_curve"
+    chosen = None
+    for bk in buckets:
+        if bk["lo"] <= p_win < bk["hi"]:
+            chosen = bk
+            break
+    if chosen is None:
+        chosen = min(buckets, key=lambda bk: min(abs(p_win - bk["lo"]), abs(p_win - bk["hi"])))
+    if not chosen.get("trusted") or chosen["n"] < min_sample:
+        return None, "thin_bucket_fail_open"
+    return chosen["observed"], "ok"
 
 # ══════════════════════════════════════════════════════════════════════
 #  PORTFOLIO HEAT — hard exposure caps, independent of confluence math
@@ -4134,7 +4280,7 @@ def portfolio_heat_check(
         return {"blocked": False, "reason": f"gate error (fail-open): {e}", **stats}
 
 
-# ════════���════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 #  KILL SWITCH — fast-failure halt (streak / rolling drawdown)
 # ══════════════════════════════════════════════════════════════════════
 
@@ -4376,6 +4522,14 @@ def trade_quality_score(
     if market_state_p_win is not None:
         if use_market_state_live:
             p_profit_effective = 0.5 * p_profit + 0.5 * market_state_p_win
+
+    per_trade = None
+    if market_state_p_win is not None and use_market_state_live:
+        # Optional: look up calibrated version if ML curve is supplied
+        # For now use raw p_win; Step 1 curve can be passed later
+        rr = (row.get("context") or {}).get("rr", 2.0)  # or from MAE/MFE profile
+        per_trade = per_trade_ev(market_state_p_win, reward_r=float(rr))
+        result["per_trade_ev"] = per_trade
 
     # ── Layer 3: Calibration ──
     cal_wr = None

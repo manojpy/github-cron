@@ -1612,6 +1612,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     cluster_context: Optional[ClusterContext] = None,
     bias_context: Optional[BiasContext] = None,
     calibration_curves: Optional[Dict[str, Any]] = None,
+    ml_market_state_model: Optional[Dict[str, Any]] = None,
+    ml_calibration_curve: Optional[Dict[str, Any]] = None,
     batch_mode: bool = False,
 ) -> Optional[Tuple[str, Dict[str, Any], Optional[AlertPayload]]]:
 
@@ -1999,6 +2001,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 "buy_wick_ratio": gr.buy_wick_ratio,
                                 "sell_wick_ratio": gr.sell_wick_ratio,
                                 "adx_val": adx_val,
+                                "rr": float(getattr(cfg, "OUTCOME_RR_TARGET", 2.0)),
+                                "sl_pct": float(getattr(cfg, "OUTCOME_MAE_LOSS_PCT", 0.5)) / 100.0,
                                 "config_version": hash_config_state(
                                     CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
                                 ),
@@ -2038,7 +2042,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             )
                         except Exception as e:
                             tq = None
-                            logger_pair.debug(f"Trade quality lookup failed for {alert_key}: {e}")                 
+                            logger_pair.debug(f"Trade quality lookup failed for {alert_key}: {e}")
 
                         if tq and tq.get("verdict"):
                             if tq.get("market_state_p_win") is not None:
@@ -2071,6 +2075,92 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                             else f" (n={plan['n']})"
                                         )
                                     )
+
+                        # ── ML-EV shadow / hard qualification ──
+                        if (
+                            (getattr(cfg, "ENABLE_ML_EV_SHADOW", False)
+                             or getattr(cfg, "ENABLE_ML_EV_GATE", False))
+                            and ml_market_state_model is not None
+                        ):
+                            try:
+                                # Model + curve are pre-loaded once per run in
+                                # macd_unified.process_pairs_with_workers() — no
+                                # per-pair Redis GET or JSON parse here.
+                                p_raw = engine.predict_market_state_proba(
+                                    ml_market_state_model,
+                                    votes=alert_votes,
+                                    context=live_context,
+                                    session=current_session or "unknown",
+                                    direction=direction,
+                                )
+                                if p_raw is not None:
+                                    p_cal, cal_reason = (
+                                        engine.ml_calibration_lookup(ml_calibration_curve, p_raw)
+                                        if ml_calibration_curve else (None, "no_curve")
+                                    )
+                                    p_use = p_cal if p_cal is not None else p_raw
+                                    rr = float((live_context or {}).get("rr") or context.get("rr") or getattr(cfg, "OUTCOME_RR_TARGET", 2.0))
+                                    sl_pct = float((live_context or {}).get("sl_pct") or context.get("sl_pct") or (float(getattr(cfg, "OUTCOME_MAE_LOSS_PCT", 0.5)) / 100.0))
+                                    ev = engine.per_trade_ev(p_use, reward_r=rr, risk_r=1.0, fee_pct=getattr(cfg, "BRAIN_FEE_PCT", 0.0006), slippage_pct=getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003), sl_pct=sl_pct)
+                                    qualify = (
+                                        ev.get("valid")
+                                        and ev["net_ev"]
+                                        >= getattr(cfg, "ML_EV_MIN_THRESHOLD", 0.0)
+                                    )
+                                    logger_pair.info(
+                                        f"[{pair_name}] ML-EV {alert_key}: "
+                                        f"p_raw={p_raw:.3f} p_cal={p_use:.3f} "
+                                        f"({cal_reason}) EV={ev.get('net_ev')} "
+                                        f"qualify={qualify}"
+                                    )
+                                    # Shadow annotation (never blocks)
+                                    if getattr(cfg, "ENABLE_ML_EV_SHADOW", False):
+                                        context.setdefault("ml_ev_shadow_by_alert", {})[
+                                            alert_key
+                                        ] = {
+                                            "p_raw": round(p_raw, 4),
+                                            "p_cal": round(p_use, 4),
+                                            "cal_reason": cal_reason,
+                                            "net_ev_r": ev.get("net_ev"),
+                                            "rr": rr,
+                                            "sl_pct": sl_pct,
+                                            "would_block": not qualify,
+                                        }
+                                        if qualify:
+                                            alert_extra = (
+                                                f"{alert_extra} | 📐 ML-EV shadow: "
+                                                f"EV={ev.get('net_ev'):+.3f}R "
+                                                f"(p={p_use:.0%})"
+                                            )
+                                        else:
+                                            alert_extra = (
+                                                f"{alert_extra} | 📐 ML-EV shadow: "
+                                                f"EV={ev.get('net_ev'):+.3f}R "
+                                                f"(below floor, still dispatched)"
+                                            )
+                                    # Hard gate (only when explicitly enabled)
+                                    if getattr(cfg, "ENABLE_ML_EV_GATE", False) and not qualify:
+                                        logger_pair.info(
+                                            f"[{pair_name}] ML-EV gate dropped {alert_key}: "
+                                            f"EV={ev.get('net_ev')} < {cfg.ML_EV_MIN_THRESHOLD}"
+                                        )
+                                        await _record_counterfactual_block(
+                                            sdb, pair_name,
+                                            [(alert_title, alert_extra, alert_key)],
+                                            ts_curr, close_curr,
+                                            block_reason="ml_ev_gate",
+                                            confluence_scores={
+                                                alert_key: _confluence_for(alert_key)
+                                            },
+                                            gr=gr, context=context,
+                                            logger_pair=logger_pair,
+                                        )
+                                        continue
+                            except Exception as e:
+                                logger_pair.debug(
+                                    f"ML-EV path failed for {alert_key}: {e}"
+                                )
+
                     surviving_alerts.append((alert_title, alert_extra, alert_key))
                     continue
 
@@ -2205,6 +2295,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     "rvol_ok": gr.rvol_ok,
                     "ichimoku_gate_ok_buy": gr.ichimoku_gate_ok_buy,
                     "ichimoku_gate_ok_sell": gr.ichimoku_gate_ok_sell,
+                    "ml_ev_shadow": (
+                        (context.get("ml_ev_shadow_by_alert") or {}).get(alert_key)
+                    ),
                 }
                 # ── NEW: compute effective score after macro/cluster ──
                 eff_score = s

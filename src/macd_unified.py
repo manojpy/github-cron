@@ -101,7 +101,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     cluster_context: Optional[ClusterContext] = None,
     bias_context: Optional[BiasContext] = None,
     gate_cache: Optional[Dict[str, Any]] = None,
-    calibration_curves: Optional[Dict[str, Any]] = None) -> Optional[Tuple[str, Dict[str, Any], Optional[Any]]]:
+    calibration_curves: Optional[Dict[str, Any]] = None,
+    ml_market_state_model: Optional[Dict[str, Any]] = None,
+    ml_calibration_curve: Optional[Dict[str, Any]] = None) -> Optional[Tuple[str, Dict[str, Any], Optional[Any]]]:
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     pair_oi = (oi_gate_data or {}).get(pair_name)
@@ -264,6 +266,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             cluster_context=cluster_context,
             bias_context=bias_context,
             calibration_curves=calibration_curves,
+            ml_market_state_model=ml_market_state_model,
+            ml_calibration_curve=ml_calibration_curve, 
             batch_mode=getattr(cfg, "ENABLE_BATCHED_ALERTS", True),
         )
     finally:
@@ -290,7 +294,9 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
                        bias_context: Optional[BiasContext] = None,
                        gate_cache: Optional[Dict[str, Any]] = None,
                        parsed_cache: Optional[Dict[str, Any]] = None,
-                       calibration_curves: Optional[Dict[str, Any]] = None):
+                       calibration_curves: Optional[Dict[str, Any]] = None, 
+                       ml_market_state_model: Optional[Dict[str, Any]] = None,
+                       ml_calibration_curve: Optional[Dict[str, Any]] = None):
     p_name, symbol, candles = task_data
     try:
         pd_15m, pd_5m, data_daily = (parsed_cache or {}).get(p_name, (None, None, None))
@@ -316,6 +322,8 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
             bias_context=bias_context,
             gate_cache=gate_cache,
             calibration_curves=calibration_curves,
+            ml_market_state_model=ml_market_state_model,
+            ml_calibration_curve=ml_calibration_curve,
         )
         return result
     except asyncio.CancelledError:
@@ -650,10 +658,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         state_db._shadow_pending_outcome_keys_by_pair = None
 
     # ── Calibration curves: loaded ONCE per run ──
-    # The blob is rewritten only when a brain report fires (every
-    # BRAIN_REPORT_INTERVAL_RUNS), so a per-run snapshot is authoritative
-    # for the whole run. Loading it here eliminates the per-alert Redis
-    # GET + JSON parse that _apply_and_dispatch_alerts used to trigger.
     calibration_curves: Dict[str, Any] = {}
     if (cfg.ENABLE_CALIBRATION_GATE and cfg.ENABLE_BRAIN
             and state_db and not state_db.degraded and state_db._redis):
@@ -676,6 +680,45 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         except Exception as e:
             logger_main.warning(f"Calibration curve pre-load failed (fail-open): {e}")
             calibration_curves = {}
+
+    # ── ML-EV: market-state model + ML calibration curve, also loaded
+    # ONCE per run. Both blobs are immutable within a run, so per-pair
+    # re-loads (30 pairs × 2 GETs × JSON parses) are pure waste.
+    ml_market_state_model: Optional[Dict[str, Any]] = None
+    ml_calibration_curve: Optional[Dict[str, Any]] = None
+    if (
+        (getattr(cfg, "ENABLE_ML_EV_SHADOW", False)
+         or getattr(cfg, "ENABLE_ML_EV_GATE", False))
+        and state_db and not state_db.degraded and state_db._redis
+    ):
+        try:
+            from brain import MARKET_STATE_MODEL_KEY, ML_CALIBRATION_KEY
+            raw_model, raw_curve = await asyncio.gather(
+                state_db._safe_redis_op(
+                    lambda: _rc(state_db._redis).get(MARKET_STATE_MODEL_KEY),
+                    2.0, "ml_model_runload",
+                ),
+                state_db._safe_redis_op(
+                    lambda: _rc(state_db._redis).get(ML_CALIBRATION_KEY),
+                    2.0, "ml_calibration_runload",
+                ),
+            )
+            if raw_model:
+                _m = json_loads(raw_model)
+                if _m.get("valid"):
+                    ml_market_state_model = _m
+            if raw_curve:
+                ml_calibration_curve = json_loads(raw_curve)
+            logger_main.info(
+                f"🤖 ML-EV pre-loaded: "
+                f"model={'yes' if ml_market_state_model else 'no'}, "
+                f"calibration={'yes' if ml_calibration_curve else 'no'}"
+            )
+        except Exception as e:
+            logger_main.warning(f"ML-EV pre-load failed (fail-open): {e}")
+            ml_market_state_model = None
+            ml_calibration_curve = None
+
 
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
     prepared_tasks = []
@@ -815,6 +858,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 gate_cache=gate_cache,
                 parsed_cache=parsed_cache,
                 calibration_curves=calibration_curves,
+                ml_market_state_model=ml_market_state_model,
+                ml_calibration_curve=ml_calibration_curve,
             )
     results = await asyncio.gather(
         *[_bounded_eval(t) for t in prepared_tasks],

@@ -68,6 +68,7 @@ CALIBRATION_CURVES_KEY = "brain:calibration_curves"
 QUALITY_INPUTS_KEY = "brain:quality_inputs"
 KILL_SWITCH_KEY = "brain:kill_switch_active"
 MARKET_STATE_MODEL_KEY = "brain:market_state_model"
+ML_CALIBRATION_KEY = "brain:ml_calibration_curve"   # NEW
 
 def _resolve_config_path(alert_key: str) -> Optional[str]:
     path = _ALERT_CONFIG_MAP.get(alert_key)
@@ -225,6 +226,8 @@ class BrainEngine:
         self._market_model_cache: Optional[Dict[str, Any]] = None
         self._market_model_cache_ts = 0.0
         self._cached_real_raw: Optional[List[Dict[str, str]]] = None
+        self._ml_calib_cache: Optional[Dict[str, Any]] = None
+        self._ml_calib_cache_ts = 0.0
 
     async def check_rewardable_override(
         self,
@@ -349,6 +352,41 @@ class BrainEngine:
                 return None
             self._market_model_cache_ts = now
         return self._market_model_cache
+
+    # ── ML calibration curve (bins on model p_win, not conf_pct) ─────
+    async def _persist_ml_calibration_curve(self, curve: Dict[str, Any]) -> None:
+        if self.sdb.degraded or not self.sdb._redis:
+            return
+        try:
+            await self.sdb._safe_redis_op(
+                lambda: _rc(self.sdb._redis).set(
+                    ML_CALIBRATION_KEY,
+                    json_dumps(curve),
+                    ex=int(getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30) * 86400),
+                ),
+                2.0,
+                "ml_calibration_persist",
+            )
+        except Exception:
+            pass
+
+    async def _load_ml_calibration_curve(self) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        if self._ml_calib_cache is None or now - self._ml_calib_cache_ts > 300:
+            if self.sdb.degraded or not self.sdb._redis:
+                return None
+            raw = await self.sdb._safe_redis_op(
+                lambda: _rc(self.sdb._redis).get(ML_CALIBRATION_KEY),
+                2.0, "ml_calibration_load",
+            )
+            if not raw:
+                return None
+            try:
+                self._ml_calib_cache = json.loads(raw)
+            except Exception:
+                return None
+            self._ml_calib_cache_ts = now
+        return self._ml_calib_cache
 
     async def check_calibration_gate(
         self, alert_key: str, conf_pct: float,
@@ -1817,7 +1855,6 @@ class BrainEngine:
 
         # ── Market-state model: report-only refresh each cycle. Discarded
         # (previous persisted model kept as-is) unless it clears OOS EV
-        # validation — see train_market_state_model(). ──
         if getattr(cfg, "ENABLE_MARKET_STATE_MODEL", True):
             ms_model = engine.train_market_state_model(
                 real_rows,
@@ -1829,6 +1866,10 @@ class BrainEngine:
             }
             if ms_model.get("valid"):
                 await self._persist_market_state_model(ms_model)
+                # Persist ML calibration curve for dispatch-time lookup
+                ml_curve = ms_model.get("ml_calibration")
+                if ml_curve and ml_curve.get("buckets"):
+                    await self._persist_ml_calibration_curve(ml_curve)
                 recommendations.append({
                     "type": "market_state_model_refreshed",
                     "severity": "low",
@@ -1837,7 +1878,21 @@ class BrainEngine:
                         f"OOS P(EV>0)={ms_model['holdout_ev']['p_ev_positive']:.0%} "
                         f"on n_holdout={ms_model['n_holdout']}."
                     ),
-                })         
+                })
+                # Surface ECE comparison
+                ml_ece = ms_model.get("ml_ece")
+                conf_ece = ai_metrics.get("calibration_ece_mean")
+                if ml_ece is not None:
+                    _ml_n = ms_model.get("n_holdout", 0)
+                    _conf_n = len(real_rows)
+                    _same_sample = _conf_n > 0 and _ml_n > 0 and abs(_ml_n - _conf_n) / max(_conf_n, 1) < 0.15
+                    _caveat = "" if _same_sample else f" (⚠️ different samples: ML n={_ml_n}, conf_pct n={_conf_n} — compare with caution)"
+                    _verdict = "ML is better calibrated — future pipeline candidate." if (conf_ece is None or ml_ece < conf_ece) else "ML not yet better than conf_pct."
+                    recommendations.append({
+                        "type": "ml_vs_conf_ece",
+                        "severity": "low",
+                        "message": f"📊 ML ECE={ml_ece:.3f} vs conf_pct ECE={conf_ece}{_caveat}. {_verdict}",
+                    })         
             else:
                 recommendations.append({
                     "type": "market_state_model_rejected",

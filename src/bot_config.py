@@ -517,6 +517,9 @@ class BotConfig(BaseModel):
     MAE_MFE_TP2_PERCENTILE: float = Field(default=85.0, ge=60.0, le=99.0, description="...")
     MAE_MFE_SL_MIN_PCT: float = Field(default=0.15, ge=0.01, le=5.0, description="Safety floor ...")
     MAE_MFE_SL_MAX_PCT: float = Field(default=3.0, ge=0.1, le=20.0, description="Safety ceiling ...")
+    ENABLE_ML_EV_SHADOW: bool = Field(default=False, description="If True, compute per-trade calibrated EV + qualification at dispatch and log it; never blocks. Requires a persisted ML calibration curve with acceptable ECE.")
+    ML_EV_MIN_THRESHOLD: float = Field(default=0.0, ge=-1.0, le=2.0, description="Shadow-only EV floor used for the qualification verdict label (not a hard gate yet).")
+    ENABLE_ML_EV_GATE: bool = Field(default=False, description="HARD gate: block dispatch when per-trade calibrated EV < ML_EV_MIN_THRESHOLD. Keep False until shadow mode has been observed for a full analysis window.")
 
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
