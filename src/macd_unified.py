@@ -675,15 +675,25 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                     round((time.time() - built_at) / 3600, 1)
                     if built_at else None
                 )
-
-                if built_age_hr is not None and built_age_hr >= 12.0:
-                    logger_main.warning(
-                        f"⚠️ Calibration curves are stale: "
-                        f"built {built_age_hr}h ago "
-                        f"(expected refresh is approximately every 6h). "
-                        f"Live calibration gate remains active."
-                    )
-
+                _expected_cadence_hr = 6.0
+                if built_age_hr is not None and built_age_hr >= _expected_cadence_hr:
+                    _missed_cycles = int(built_age_hr // _expected_cadence_hr) - 1
+                    if built_age_hr >= (_expected_cadence_hr * 2):
+                        logger_main.error(
+                            f"🚨 Calibration curves are {built_age_hr}h old — "
+                            f"approximately {_missed_cycles} Brain refresh cycle(s) did NOT "
+                            f"persist a new curve. Check brain report logs for persistence "
+                            f"failures, or verify the full-archive Brain run is actually "
+                            f"executing. Live calibration gate is using STALE historical "
+                            f"calibration."
+                        )
+                    else:
+                        logger_main.warning(
+                            f"⚠️ Calibration curves are stale: "
+                            f"built {built_age_hr}h ago "
+                            f"(expected refresh is approximately {_expected_cadence_hr:.0f}h). "
+                            f"Live calibration gate remains active."
+                        )
                 logger_main.info(
                     f"🎯 Calibration curves pre-loaded: "
                     f"{len(calibration_curves)} alert_key(s) "

@@ -1919,7 +1919,7 @@ def parameter_autopsy(
         "higher_is_worse": higher_is_worse,
     }
 
-# ═════════════════════════════════════════════════════════�����������������═════════════
+# ═════════════════════════════════════════════════════════�������������������═════════════
 #  PHASE 3 — CONDITIONAL ALERT GATING
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -4194,10 +4194,11 @@ def calibration_gate_decision(
         if bk["lo"] <= conf_pct < bk["hi"]:
             chosen = bk
             break
-    if chosen is None:  # conf_pct outside covered range → nearest bucket
-        chosen = min(buckets, key=lambda bk: min(abs(conf_pct - bk["lo"]), abs(conf_pct - bk["hi"])))
+    if chosen is None:
+        return True, None, "out_of_range_fail_open"
     if not chosen.get("trusted") or chosen["n"] < min_sample:
         return True, chosen["observed"], "thin_bucket_fail_open"
+
     cal_wr = chosen["observed"]
     if cal_wr < target_wr - slack and chosen["wilson_hi"] < target_wr:
         return False, cal_wr, (
@@ -4226,8 +4227,8 @@ def ml_calibration_lookup(
         if bk["lo"] <= p_win < bk["hi"]:
             chosen = bk
             break
-    if chosen is None:
-        chosen = min(buckets, key=lambda bk: min(abs(p_win - bk["lo"]), abs(p_win - bk["hi"])))
+    if chosen is None:    
+        return None, "out_of_range_fail_open"
     if not chosen.get("trusted") or chosen["n"] < min_sample:
         return None, "thin_bucket_fail_open"
     return chosen["observed"], "ok"

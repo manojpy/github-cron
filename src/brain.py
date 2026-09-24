@@ -341,9 +341,12 @@ class BrainEngine:
     # ── Market-state model (report-only trained fit, item #12) ────────
     async def _persist_market_state_model(self, model: Dict[str, Any]) -> None:
         if self.sdb.degraded or not self.sdb._redis:
+            logging.getLogger("macd_bot").warning(
+                "Market-state model persistence skipped: Redis unavailable or state degraded."
+            )
             return
         try:
-            await self.sdb._safe_redis_op(
+            result = await self.sdb._safe_redis_op(
                 lambda: _rc(self.sdb._redis).set(
                     MARKET_STATE_MODEL_KEY,
                     json_dumps(model),
@@ -352,8 +355,15 @@ class BrainEngine:
                 2.0,
                 "market_state_model_persist",
             )
-        except Exception:
-            pass
+            if result is None:
+                logging.getLogger("macd_bot").warning(
+                    "Market-state model persistence returned None — "
+                    "Redis write may not have completed; previous model (if any) stays live."
+                )
+        except Exception as e:
+            logging.getLogger("macd_bot").error(
+                f"Market-state model persistence FAILED: {e} — previous model stays live."
+            )
 
     async def _load_market_state_model(self) -> Optional[Dict[str, Any]]:
         now = time.time()
@@ -376,9 +386,12 @@ class BrainEngine:
     # ── ML calibration curve (bins on model p_win, not conf_pct) ─────
     async def _persist_ml_calibration_curve(self, curve: Dict[str, Any]) -> None:
         if self.sdb.degraded or not self.sdb._redis:
+            logging.getLogger("macd_bot").warning(
+                "ML calibration curve persistence skipped: Redis unavailable or state degraded."
+            )
             return
         try:
-            await self.sdb._safe_redis_op(
+            result = await self.sdb._safe_redis_op(
                 lambda: _rc(self.sdb._redis).set(
                     ML_CALIBRATION_KEY,
                     json_dumps(curve),
@@ -387,8 +400,15 @@ class BrainEngine:
                 2.0,
                 "ml_calibration_persist",
             )
-        except Exception:
-            pass
+            if result is None:
+                logging.getLogger("macd_bot").warning(
+                    "ML calibration curve persistence returned None — "
+                    "Redis write may not have completed; previous curve (if any) stays live."
+                )
+        except Exception as e:
+            logging.getLogger("macd_bot").error(
+                f"ML calibration curve persistence FAILED: {e} — previous curve stays live."
+            )
 
     async def _load_ml_calibration_curve(self) -> Optional[Dict[str, Any]]:
         now = time.time()
@@ -426,12 +446,15 @@ class BrainEngine:
         )
         return ok, cal_wr
 
-# ── Trade quality score (report-only) ───────────────────────────────
+    # ── Trade quality score (report-only) ───────────────────────────────
     async def _persist_quality_inputs(self, quality_inputs: Dict[str, Any]) -> None:
         if self.sdb.degraded or not self.sdb._redis:
+            logging.getLogger("macd_bot").warning(
+                "Quality-inputs persistence skipped: Redis unavailable or state degraded."
+            )
             return
         try:
-            await self.sdb._safe_redis_op(
+            result = await self.sdb._safe_redis_op(
                 lambda: _rc(self.sdb._redis).set(
                     QUALITY_INPUTS_KEY,
                     json_dumps(quality_inputs),
@@ -440,8 +463,15 @@ class BrainEngine:
                 2.0,
                 "quality_inputs_persist",
             )
-        except Exception:
-            pass
+            if result is None:
+                logging.getLogger("macd_bot").warning(
+                    "Quality-inputs persistence returned None — "
+                    "Redis write may not have completed; previous bundle stays live."
+                )
+        except Exception as e:
+            logging.getLogger("macd_bot").error(
+                f"Quality-inputs persistence FAILED: {e} — previous bundle stays live."
+            )
 
     async def _load_quality_inputs(self) -> Optional[Dict[str, Any]]:
         now = time.time()
@@ -1832,7 +1862,10 @@ class BrainEngine:
                     "severity": "medium" if miscal else "low",
                     "message": (
                         f"🎯 Calibration gate armed: dispatch filters on calibrated WR, "
-                        f"not raw confluence %. Mean ECE {calib.get('ece_mean', 0):.3f}."
+                        f"not raw confluence %. "
+                        f"Mean per-alert ECE {calib.get('ece_mean', 0):.3f} "
+                        f"(historical/in-sample over per-alert-key curves — "
+                        f"not a global OOS ECE)."
                         + (
                             " Most miscalibrated: "
                             + ", ".join(f"{ak} (ECE {ece:.2f}, n={n})" for ak, ece, n in miscal[:5])
@@ -1910,25 +1943,32 @@ class BrainEngine:
                 if ml_ece is not None:
                     _ml_n = ms_model.get("n_holdout", 0)
                     _conf_n = len(real_rows)
-
                     _same_sample = (
                         _conf_n > 0
                         and _ml_n > 0
                         and abs(_ml_n - _conf_n) / max(_conf_n, 1) < 0.15
                     )
-
+                    _populations_note = (
+                        " Underlying populations differ: "
+                        "ML uses holdout-only rows from a purge/embargo split; "
+                        "conf_pct uses all real rows plus eligible shadow rows "
+                        "(calibration_gate-rejected rows excluded), fit in-sample."
+                    )
                     if not _same_sample:
                         _caveat = (
                             f" ⚠️ Different evaluation samples: "
-                            f"ML n={_ml_n}, conf_pct n={_conf_n}. "
-                            f"ECE values are descriptive and not directly comparable."
+                            f"ML n={_ml_n}, conf_pct n={_conf_n}."
+                            f"{_populations_note} "
+                            f"ECE values are descriptive only — not a valid "
+                            f"basis for model-selection between the two."
                         )
                     else:
                         _caveat = (
                             f" Evaluation sample sizes are similar "
                             f"(ML n={_ml_n}, conf_pct n={_conf_n})."
+                            f"{_populations_note} "
+                            f"Treat as descriptive, not a model-selection verdict."
                         )
-
                     recommendations.append({
                         "type": "ml_vs_conf_ece",
                         "severity": "low",
