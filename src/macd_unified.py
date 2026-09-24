@@ -52,7 +52,6 @@ _pair_eval_counter = 0
 _CLUSTER_CACHE_MISS = object()
 _run_once_sdb: Optional["RedisStateStore"] = None
 
-
 def _sync_signal_handler(sig: int, frame: Any) -> None:
     logger.warning(f"Received signal {sig}, initiating async shutdown...")
     try:
@@ -90,7 +89,8 @@ def print_startup_banner_once() -> None:
     _STARTUP_BANNER_PRINTED = True
     logger.info(
         f"📡 Bot v{__version__} | Pairs: {len(cfg.PAIRS)} | Workers: {cfg.MAX_PARALLEL_FETCH} | "
-        f"Timeout: {cfg.RUN_TIMEOUT_SECONDS}s | Redis Lock: {cfg.REDIS_LOCK_EXPIRY}s"
+        f"Timeout: {cfg.RUN_TIMEOUT_SECONDS}s | State Backend: {cfg.STATE_BACKEND} | "
+        f"Lock TTL: {cfg.REDIS_LOCK_EXPIRY}s"
     )
 print_startup_banner_once()
 

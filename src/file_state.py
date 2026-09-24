@@ -87,6 +87,9 @@ class _FileRedisAdapter:
         self.connection_pool = _Pool()
 
     async def connect(self) -> None:
+        import logging
+        _log = logging.getLogger("macd_bot")
+
         os.makedirs(self._dir, exist_ok=True)
         os.makedirs(self._streams_dir, exist_ok=True)
         for name, target in (
@@ -100,8 +103,17 @@ class _FileRedisAdapter:
                         data = json.load(f)
                     if isinstance(data, dict):
                         target.update(data)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Log loudly but DO NOT raise: an alerting bot must not
+                    # refuse to run because a state file is corrupt. We lose
+                    # this run's dedup/pending claims for the affected
+                    # category; the run continues and the next flush
+                    # overwrites the corrupt file with clean data.
+                    _log.error(
+                        f"Failed to load {name}.json state ({exc}) — "
+                        f"starting with empty {name} state this run; "
+                        f"state will be rewritten on flush."
+                    )
         for fname in os.listdir(self._streams_dir):
             if not fname.endswith(".jsonl"):
                 continue
@@ -118,8 +130,15 @@ class _FileRedisAdapter:
                             eid, fields = json.loads(line)
                             entries.append((eid, fields))
                         except Exception:
+                            # Individual malformed line — skip it, keep the
+                            # rest. Expected when the previous run crashed
+                            # mid-write; not worth an ERROR per line.
                             continue
-            except Exception:
+            except Exception as exc:
+                _log.error(
+                    f"Failed to read stream file {fname} ({exc}) — "
+                    f"skipping this stream this run."
+                )
                 continue
             self._streams[key] = entries
 
@@ -210,7 +229,12 @@ class _FileRedisAdapter:
         for k in keys:
             if self._expired(k):
                 continue
-            if k in self._kv or k in self._hashes or k in self._lists:
+            if (
+                k in self._kv
+                or k in self._hashes
+                or k in self._lists
+                or k in self._streams
+            ):
                 n += 1
         return n
 
@@ -229,6 +253,14 @@ class _FileRedisAdapter:
         return new
 
     async def expire(self, key: str, seconds: int) -> bool:
+        self._expired(key)
+        if (
+            key not in self._kv
+            and key not in self._hashes
+            and key not in self._lists
+            and key not in self._streams
+        ):
+            return False
         self._ttls[key] = time.time() + seconds
         return True
 
