@@ -1037,6 +1037,8 @@ async def run_once() -> Optional[bool]:
     TRACE_ID.set(correlation_id)
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
     start_time = time.time()
+    global _run_once_sdb
+    _run_once_sdb = None
     sdb: Optional[RedisStateStore] = None
     lock: Optional[RedisLock] = None
     fetcher: Optional[DataFetcher] = None
@@ -1362,7 +1364,9 @@ async def run_once() -> Optional[bool]:
         final_memory_mb = process.memory_info().rss / 1024 / 1024
         memory_delta = final_memory_mb - container_memory_mb
         run_duration = time.time() - start_time
-        redis_status = "OK" if (sdb and not sdb.degraded) else "DEGRADED"
+
+        state_backend = os.environ.get("STATE_BACKEND", "file").lower()
+        state_status = "OK" if (sdb and not sdb.degraded) else "DEGRADED"
 
         summary = (
             f"🎯🌏 RUN COMPLETE | "
@@ -1371,7 +1375,7 @@ async def run_once() -> Optional[bool]:
             f"Alerts: {alerts_sent_ref[0]} | "
             f"OI/Funding blocks: {fetcher_stats.get('oi_funding_blocks', 0)} | "
             f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
-            f"Redis: {redis_status}"
+            f"State({state_backend}): {state_status}"
         )
         logger_run.info(summary)
 
@@ -1458,12 +1462,14 @@ async def run_once() -> Optional[bool]:
         if sdb:
             try:
                 await asyncio.wait_for(sdb.close(), timeout=3.0)
-                logger_run.debug("✅ Redis connection closed")
+                logger_run.debug("✅ State backend closed")
             except asyncio.TimeoutError:
-                logger_run.error("Timeout closing Redis")
+                logger_run.error("Timeout closing state backend")
             except Exception as e:
-                logger_run.error(f"Error closing Redis: {e}", exc_info=False)
-                
+                logger_run.error(f"Error closing state backend: {e}", exc_info=False)
+
+        _run_once_sdb = None
+
         try:
             await asyncio.wait_for(
                 RedisStateStore.shutdown_global_pool(),

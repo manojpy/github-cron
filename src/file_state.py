@@ -35,6 +35,8 @@ class _FilePipeline:
         self._ops.append(("expire", (key, seconds), {})); return self
     def hset(self, key: str, mapping: Optional[Dict[str, str]] = None, **kw) -> "_FilePipeline":
         self._ops.append(("hset", (key,), {"mapping": mapping, **kw})); return self
+    def hgetall(self, key: str) -> "_FilePipeline":
+        self._ops.append(("hgetall", (key,), {})); return self
     def hdel(self, key: str, *fields: str) -> "_FilePipeline":
         self._ops.append(("hdel", (key, *fields), {})); return self
     def hincrby(self, key: str, field: str, amount: int = 1) -> "_FilePipeline":

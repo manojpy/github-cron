@@ -440,8 +440,15 @@ class RedisStateStore:
         if cfg.FAIL_ON_REDIS_DOWN:
             raise RedisConnectionError("Redis unavailable after all retries – FAIL_ON_REDIS_DOWN=true")
       
+
     async def close(self) -> None:
+        _redis = self._redis
         self._redis = None
+        if _redis is not None:
+            try:
+                await _redis.close()               # type: ignore[attr-defined]
+            except Exception as e:
+                logger.error(f"File state flush failed: {e}")
 
     @classmethod
     async def shutdown_global_pool(cls, redis_url: Optional[str] = None) -> None:
