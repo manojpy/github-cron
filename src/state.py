@@ -2223,8 +2223,15 @@ class FileStateStore(RedisStateStore):
         _env_dir: Optional[str] = os.environ.get("OUTCOME_DATA_DIR")
         _cfg_dir: Any = getattr(cfg, "OUTCOME_DATA_DIR", None)
         data_dir: str = _env_dir or (str(_cfg_dir) if _cfg_dir else "outcome-data")
-        self._redis = _FileRedisAdapter(data_dir)  # type: ignore[assignment]
-        await self._redis.connect()                # type: ignore[attr-defined]
+
+        # Build the adapter into a local first so mypy can see its concrete
+        # type when we call .connect(). Assigning to self._redis (typed as
+        # Optional[redis.Redis] on the base class) then only needs a single
+        # [assignment] ignore, and the .connect() call needs no ignore at all.
+        adapter = _FileRedisAdapter(data_dir)
+        await adapter.connect()
+        self._redis = adapter  # type: ignore[assignment]
+
         self.degraded = False
         self.degraded_alerted = False
         self._pending_outcome_keys_by_pair = None
