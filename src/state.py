@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import time
 import asyncio
 import logging
@@ -252,15 +253,17 @@ class RedisStateStore:
     def __init__(self, redis_url: str):
         self.redis_url = redis_url
         self._redis: Optional[redis.Redis] = None
-
         self.state_prefix = RedisKeyPrefix.PAIR_STATE
         self.meta_prefix = RedisKeyPrefix.METADATA
         self.alert_prefix = RedisKeyPrefix.ALERT
-
         self.expiry_seconds = max(cfg.STATE_EXPIRY_DAYS * 86400 if cfg.STATE_EXPIRY_DAYS > 0 else 0, 7 * 86400)
         self.alert_expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
         self.metadata_expiry_seconds = 7 * 86400
         self._pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None
+        self._run_pair_thresholds_cache: Optional[Dict[str, float]] = None
+        self._run_disabled_keys_cache: Optional[Set[str]] = None
+        self._run_open_positions_cache: Optional[List[Dict[str, Any]]] = None
+        self._run_last_processed_cache: Dict[str, Optional[int]] = {}
         self._shadow_pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None
         self._run_resolved_total: int = 0
         self._run_archived_total: int = 0
@@ -275,12 +278,29 @@ class RedisStateStore:
                 f"Alert TTL: {cfg.STATE_EXPIRY_DAYS}d | "
                 f"Metadata TTL: 7d"
             )
+    # Quota/limit errors are not transient — retrying only burns more of the
+    # already-exhausted quota. Detect them and go straight to degraded.
+    _QUOTA_MARKERS = (
+        "max requests limit exceeded",
+        "max daily request limit",
+        "quota exceeded",
+    )
 
     async def _record_redis_failure(self, operation: str, exc: Exception) -> None:
         logger.error(f"Redis operation '{operation}' failed: {exc}")
         if self.degraded:
             return
         self.degraded = True
+
+        _exc_text = str(exc).lower()
+        if any(m in _exc_text for m in self._QUOTA_MARKERS):
+            logger.critical(
+                f"Redis quota exhausted (matched in '{operation}') — "
+                f"NOT attempting reconnect (each retry consumes quota). "
+                f"Staying degraded for remainder of run."
+            )
+            return
+
         logger.warning(f"Redis marked degraded after failure in '{operation}' — attempting one reconnect")
         try:
             reconnected = await self._attempt_connect(timeout=5.0)
@@ -2176,4 +2196,63 @@ class TokenBucket:
                     return
                 wait_time = (1 - self.tokens) / (self.rate / 60)
             await asyncio.sleep(wait_time)
+
+# ══════════════════════════════════════════════════════════════════════
+#  BACKEND SELECTION
+# ══════════════════════════════════════════════════════════════════════
+
+class FileStateStore(RedisStateStore):
+    """RedisStateStore with a file-backed in-memory adapter in place of a
+    real Redis client. Every higher-level method runs unchanged, because
+    self._redis presents the same async interface Redis-py does.
+
+    State is loaded once on connect() and flushed on close(). run_once()
+    calls close() in its finally block, so a clean shutdown persists state
+    to <OUTCOME_DATA_DIR>/state/.
+    """
+
+    async def connect(self, timeout: float = 5.0) -> None:
+        from file_state import _FileRedisAdapter
+        data_dir = os.environ.get("OUTCOME_DATA_DIR") or getattr(cfg, "OUTCOME_DATA_DIR", "outcome-data")
+        self._redis = _FileRedisAdapter(data_dir)  # type: ignore[assignment]
+        await self._redis.connect()                # type: ignore[attr-defined]
+        self.degraded = False
+        self.degraded_alerted = False
+        self._pending_outcome_keys_by_pair = None
+        self._shadow_pending_outcome_keys_by_pair = None
+        logger.info(f"File state backend ready ({data_dir}/state)")
+
+    async def close(self) -> None:
+        if self._redis is not None:
+            try:
+                await self._redis.close()          # type: ignore[attr-defined]
+            except Exception as e:
+                logger.error(f"File state flush failed: {e}")
+        self._redis = None
+
+    @classmethod
+    async def shutdown_global_pool(cls, redis_url: Optional[str] = None) -> None:
+        return
+
+    async def _attempt_connect(self, timeout: float = 5.0) -> bool:
+        return True
+
+    async def _record_redis_failure(self, operation: str, exc: Exception) -> None:
+        logger.error(f"File state op '{operation}' failed: {exc}")
+        self.degraded = True
+
+    async def _ping_with_retry(self, timeout: float) -> bool:
+        return True
+
+_STATE_BACKEND = os.environ.get("STATE_BACKEND", "file").lower()
+if _STATE_BACKEND == "file":
+    StateStore = FileStateStore
+elif _STATE_BACKEND == "redis":
+    StateStore = RedisStateStore
+else:
+    raise ValueError(f"STATE_BACKEND must be 'file' or 'redis', got {_STATE_BACKEND!r}")
+
+RedisStateStore = StateStore  # type: ignore[misc]
+
+
 
