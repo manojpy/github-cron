@@ -4,8 +4,9 @@ import time
 import asyncio
 import logging
 import uuid
-from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, TYPE_CHECKING, Set, Sequence, Awaitable, Union, cast
+from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, TYPE_CHECKING, Set, Sequence, Awaitable, Type, Union, cast
 import numpy as np
+
 import redis.asyncio as redis  # type: ignore[import-untyped]
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError  # type: ignore[import-untyped]
 
@@ -2210,10 +2211,11 @@ class FileStateStore(RedisStateStore):
     calls close() in its finally block, so a clean shutdown persists state
     to <OUTCOME_DATA_DIR>/state/.
     """
-
     async def connect(self, timeout: float = 5.0) -> None:
         from file_state import _FileRedisAdapter
-        data_dir = os.environ.get("OUTCOME_DATA_DIR") or getattr(cfg, "OUTCOME_DATA_DIR", "outcome-data")
+        _env_dir: Optional[str] = os.environ.get("OUTCOME_DATA_DIR")
+        _cfg_dir: Any = getattr(cfg, "OUTCOME_DATA_DIR", None)
+        data_dir: str = _env_dir or (str(_cfg_dir) if _cfg_dir else "outcome-data")
         self._redis = _FileRedisAdapter(data_dir)  # type: ignore[assignment]
         await self._redis.connect()                # type: ignore[attr-defined]
         self.degraded = False
@@ -2245,6 +2247,7 @@ class FileStateStore(RedisStateStore):
         return True
 
 _STATE_BACKEND = os.environ.get("STATE_BACKEND", "file").lower()
+StateStore: Type[RedisStateStore]
 if _STATE_BACKEND == "file":
     StateStore = FileStateStore
 elif _STATE_BACKEND == "redis":
@@ -2253,6 +2256,3 @@ else:
     raise ValueError(f"STATE_BACKEND must be 'file' or 'redis', got {_STATE_BACKEND!r}")
 
 RedisStateStore = StateStore  # type: ignore[misc]
-
-
-
