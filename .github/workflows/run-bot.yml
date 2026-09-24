@@ -66,20 +66,26 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: 🔑 Verify Secrets
+        env:
+          STATE_BACKEND: file
         run: |
           MISSING=()
           [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
           [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
-          [ -z "${{ secrets.REDIS_URL }}" ] && MISSING+=("REDIS_URL")
           [ -z "${{ secrets.DELTA_API_BASE }}" ] && MISSING+=("DELTA_API_BASE")
+
+          # REDIS_URL is only required when STATE_BACKEND=redis
+          if [ "$STATE_BACKEND" = "redis" ] && [ -z "${{ secrets.REDIS_URL }}" ]; then
+            MISSING+=("REDIS_URL")
+          fi
 
           if [ ${#MISSING[@]} -gt 0 ]; then
             echo "❌ Missing secrets: ${MISSING[*]}"
             exit 1
           fi
 
-          echo "✅ All required secrets configured"
-
+          echo "✅ All required secrets configured (STATE_BACKEND=$STATE_BACKEND)"
+  
       - name: 🔨 Verify Config (repo-only)
         run: |
           if [ ! -f config_macd.json ]; then
@@ -107,6 +113,20 @@ jobs:
           docker pull --quiet --platform linux/amd64 "$IMAGE"
           echo "✅ Image ready in $(( $(date +%s) - START ))s"
 
+      - name: 📦 Checkout outcome-data (for apply-brain)
+        if: inputs.apply_brain_plan == true
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          # apply-brain reads the pending plan from state/, which lives in
+          # the outcome-data repo. Without this checkout the container sees
+          # an empty state dir and reports "no pending plan".
+          git clone --depth=1 \
+            "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" \
+            /tmp/data-repo
+          mkdir -p /tmp/data-repo/state
+          chmod -R 777 /tmp/data-repo
+
       - name: ✅ Apply Brain Plan (on-demand)
         if: inputs.apply_brain_plan == true
         run: |
@@ -114,14 +134,16 @@ jobs:
           cat > "$ENV_FILE" <<EOF
           TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
-          REDIS_URL=${{ secrets.REDIS_URL }}
           DELTA_API_BASE=${{ secrets.DELTA_API_BASE }}
+          STATE_BACKEND=file
+          OUTCOME_DATA_DIR=/tmp/data-repo
           EOF
 
           docker run --rm \
             --platform linux/amd64 \
             --env-file "$ENV_FILE" \
             -e PYTHONPATH=/app/src \
+            -v "/tmp/data-repo:/tmp/data-repo:rw" \
             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" \
             python macd_unified.py --apply-brain
@@ -265,8 +287,8 @@ jobs:
           cat > "$ENV_FILE" <<EOF
           TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
-          REDIS_URL=${{ secrets.REDIS_URL }}
           DELTA_API_BASE=${{ secrets.DELTA_API_BASE }}
+          STATE_BACKEND=file
           DRY_RUN_MODE=$DRY_RUN
           TRIGGER_TIMESTAMP=$START_TIME
           CLEAR_REDIS=$CLEAR_REDIS
@@ -274,7 +296,6 @@ jobs:
           BRAIN_ARCHIVE_SHALLOW=$BRAIN_SHALLOW
           CLEAR_KILL_SWITCH=$CLEAR_KILL_SWITCH
           EOF
-
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run             --rm             --name "macd_bot_${{ github.run_id }}"             --platform linux/amd64             --memory="900m"             --memory-swap="1800m"             --cpus="2.0"             --security-opt=no-new-privileges             --read-only             --tmpfs /tmp:rw,noexec,nosuid,size=64m             --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m             --env-file "$ENV_FILE"             -e TZ=Asia/Kolkata             -e PYTHONPATH=/app/src             -e PYTHONUNBUFFERED=1             -e NUMBA_NUM_THREADS=2             -e OMP_NUM_THREADS=2             -e OUTCOME_DATA_DIR=/tmp/data-repo             -v "/tmp/data-repo:/tmp/data-repo:rw"             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro"             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>&1 | tee logs/bot_output.log
 
           EXIT_CODE=${PIPESTATUS[0]}
