@@ -284,21 +284,41 @@ class BrainEngine:
         return f"{conf_pct:.0f}% confluence, shadow WR {wr:.0%} over {total} tracked rejections"
 
     # ── Calibration live gate ────────────────────────────────────────────
+
     async def _persist_calibration_curves(self, calib: Dict[str, Any]) -> None:
         if self.sdb.degraded or not self.sdb._redis:
+            logging.getLogger("macd_bot").warning(
+                "Calibration curve persistence skipped: Redis unavailable or state degraded."
+            )
             return
+
         try:
-            await self.sdb._safe_redis_op(
+            result = await self.sdb._safe_redis_op(
                 lambda: _rc(self.sdb._redis).set(
                     CALIBRATION_CURVES_KEY,
                     json_dumps(calib),
-                    ex=int(getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30) * 86400),
+                    ex=int(
+                        getattr(
+                            cfg,
+                            "BRAIN_ANALYSIS_WINDOW_DAYS",
+                            30,
+                        ) * 86400
+                    ),
                 ),
                 2.0,
                 "calibration_persist",
             )
-        except Exception:
-            pass
+
+            if result is None:
+                logging.getLogger("macd_bot").warning(
+                    "Calibration curve persistence returned None — "
+                    "Redis write may not have completed."
+                )
+
+        except Exception as e:
+            logging.getLogger("macd_bot").error(
+                f"Calibration curve persistence FAILED: {e}"
+            )
 
     async def _load_calibration_curve(self, alert_key: str) -> Optional[Dict[str, Any]]:
         now = time.time()
@@ -1886,17 +1906,38 @@ class BrainEngine:
                 # Surface ECE comparison
                 ml_ece = ms_model.get("ml_ece")
                 conf_ece = ai_metrics.get("calibration_ece_mean")
+
                 if ml_ece is not None:
                     _ml_n = ms_model.get("n_holdout", 0)
                     _conf_n = len(real_rows)
-                    _same_sample = _conf_n > 0 and _ml_n > 0 and abs(_ml_n - _conf_n) / max(_conf_n, 1) < 0.15
-                    _caveat = "" if _same_sample else f" (⚠️ different samples: ML n={_ml_n}, conf_pct n={_conf_n} — compare with caution)"
-                    _verdict = "ML is better calibrated — future pipeline candidate." if (conf_ece is None or ml_ece < conf_ece) else "ML not yet better than conf_pct."
+
+                    _same_sample = (
+                        _conf_n > 0
+                        and _ml_n > 0
+                        and abs(_ml_n - _conf_n) / max(_conf_n, 1) < 0.15
+                    )
+
+                    if not _same_sample:
+                        _caveat = (
+                            f" ⚠️ Different evaluation samples: "
+                            f"ML n={_ml_n}, conf_pct n={_conf_n}. "
+                            f"ECE values are descriptive and not directly comparable."
+                        )
+                    else:
+                        _caveat = (
+                            f" Evaluation sample sizes are similar "
+                            f"(ML n={_ml_n}, conf_pct n={_conf_n})."
+                        )
+
                     recommendations.append({
                         "type": "ml_vs_conf_ece",
                         "severity": "low",
-                        "message": f"📊 ML ECE={ml_ece:.3f} vs conf_pct ECE={conf_ece}{_caveat}. {_verdict}",
-                    })         
+                        "message": (
+                            f"📊 ML ECE={ml_ece:.3f} vs "
+                            f"conf_pct mean-per-alert ECE={conf_ece}."
+                            f"{_caveat}"
+                        ),
+                    })
             else:
                 recommendations.append({
                     "type": "market_state_model_rejected",

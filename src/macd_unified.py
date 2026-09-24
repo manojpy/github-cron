@@ -675,10 +675,19 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                     round((time.time() - built_at) / 3600, 1)
                     if built_at else None
                 )
+
+                if built_age_hr is not None and built_age_hr >= 12.0:
+                    logger_main.warning(
+                        f"⚠️ Calibration curves are stale: "
+                        f"built {built_age_hr}h ago "
+                        f"(expected refresh is approximately every 6h). "
+                        f"Live calibration gate remains active."
+                    )
+
                 logger_main.info(
                     f"🎯 Calibration curves pre-loaded: "
                     f"{len(calibration_curves)} alert_key(s) "
-                    f"(ECE mean={payload.get('ece_mean')}, "
+                    f"(mean-per-alert ECE={payload.get('ece_mean')}, "
                     f"built {built_age_hr}h ago)"
                 )
             else:

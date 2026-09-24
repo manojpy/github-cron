@@ -1919,7 +1919,7 @@ def parameter_autopsy(
         "higher_is_worse": higher_is_worse,
     }
 
-# ═════════════════════════════════════════════════════════���������������═════════════
+# ═════════════════════════════════════════════════════════�����������������═════════════
 #  PHASE 3 — CONDITIONAL ALERT GATING
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -4101,13 +4101,21 @@ def build_calibration_curves(
                 "wilson_lo": round(lo, 4), "wilson_hi": round(hi, 4),
             })
         total = len(ak_rows)
-        ece = sum((bk["n"] / total) * abs(bk["observed"] - bk["predicted"]) for bk in out)
-        curves[ak] = {"buckets": out, "ece": round(ece, 4), "n": total}
-
+        ece = sum(
+            (bk["n"] / total) * abs(bk["observed"] - bk["predicted"])
+            for bk in out
+        )
+        curves[ak] = {
+            "buckets": out,
+            "ece": round(ece, 4),
+            "n": total,
+        }
     ece_values = [c["ece"] for c in curves.values()]
+
     return {
         "curves": curves,
         "ece_mean": round(statistics.fmean(ece_values), 4) if ece_values else None,
+        "ece_mean_label": "mean_per_alert_ece",
         "built_at": int(time.time()),
     }
 

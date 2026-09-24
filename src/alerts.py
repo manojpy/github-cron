@@ -2356,27 +2356,48 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             if not should_send:
                 logger_pair.info(
                     f"[{pair_name}] Coalesced {direction} dedup — "
-                    f"suppressing Telegram send only, recording state+outcome"
+                    f"Telegram send suppressed; removing pending real-outcome "
+                    f"records because no alert was delivered."
                 )
-                coalesced_activations = [
-                    (f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None)
-                    for _, _, alert_key in alerts_to_send
-                ]
-                if coalesced_activations:
-                    await sdb.atomic_batch_update(coalesced_activations)
+
+                # These pending outcomes were created before the coalescing
+                # decision. Since no Telegram alert was actually delivered,
+                # they must not remain in the real-trade population.
                 if cfg.ENABLE_WIN_RATE_FILTER and not cfg.DRY_RUN_MODE:
-                    await _record_win_rates()
+                    await asyncio.gather(
+                        *(
+                            sdb.cancel_pending_outcome(
+                                pair_name,
+                                alert_key,
+                                ts_curr,
+                            )
+                            for _, _, alert_key in alerts_to_send
+                        )
+                    )
+
                 await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
+
                 return pair_name, {
                     "state": "COALESCED",
                     "ts": int(time.time()),
                     "summary": {
                         "alerts": 0,
-                        "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                        "future_cloud": (
+                            "green"
+                            if cloud_up
+                            else "red"
+                            if cloud_down
+                            else "neutral"
+                        ),
                         "hist_rma": round(hist_curr, 4),
-                        "suppression": f"Coalesced within {cfg.COALESCE_DEDUP_WINDOW_SEC}s — message suppressed, outcome recorded",
+                        "suppression": (
+                            f"Coalesced within "
+                            f"{cfg.COALESCE_DEDUP_WINDOW_SEC}s — "
+                            f"message suppressed; no real outcome recorded"
+                        ),
                     },
                 }, None
+
         elif alerts_to_send:
             keys_to_check = [alert_key for _, _, alert_key in alerts_to_send]
             claim_results = await sdb.batch_check_recent_alerts(pair_name, keys_to_check, ts_curr)

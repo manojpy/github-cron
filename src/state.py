@@ -897,6 +897,35 @@ class RedisStateStore:
         if confluence_votes is not None:
             await self.record_vote_count(alert_key, confluence_votes)
 
+    async def cancel_pending_outcome(
+        self,
+        pair: str,
+        alert_key: str,
+        entry_ts: int,
+    ) -> bool:
+        """Remove a pending real outcome when the alert was never delivered.
+
+        A coalesced alert must not remain in the real-outcome population,
+        because no Telegram alert was actually delivered to the user.
+        """
+        if self.degraded or not self._redis:
+            return False
+
+        key = f"{RedisKeyPrefix.OUTCOME_PENDING}{pair}:{alert_key}:{entry_ts}"
+
+        try:
+            deleted = await asyncio.wait_for(
+                _rc(self._redis).delete(key),
+                timeout=2.0,
+            )
+            return bool(deleted)
+        except Exception as e:
+            logger.warning(
+                f"Failed to cancel pending outcome for "
+                f"{pair}:{alert_key}:{entry_ts}: {e}"
+            )
+            return False
+
     async def record_shadow_pending_outcome(
         self,
         pair: str,
