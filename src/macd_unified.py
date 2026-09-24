@@ -50,14 +50,34 @@ from alerts import (
 
 _pair_eval_counter = 0
 _CLUSTER_CACHE_MISS = object()
+_run_once_sdb: Optional["RedisStateStore"] = None
+
 
 def _sync_signal_handler(sig: int, frame: Any) -> None:
     logger.warning(f"Received signal {sig}, initiating async shutdown...")
     try:
         loop = asyncio.get_running_loop()
-        loop.call_soon_threadsafe(shutdown_event.set)
     except RuntimeError:
-        pass
+        return
+
+    loop.call_soon_threadsafe(shutdown_event.set)
+
+    # File-backed state only flushes on close(). If the container is
+    # SIGKILL'd before the run finishes its finally block, that run's
+    # writes are lost. Schedule the flush now so it can complete inside
+    # the workflow's --kill-after=15s grace window.
+    sdb = _run_once_sdb
+    if sdb is not None and getattr(sdb, "_redis", None) is not None:
+        loop.call_soon_threadsafe(
+            lambda: asyncio.create_task(_flush_state_on_signal(sdb))
+        )
+
+async def _flush_state_on_signal(sdb: "RedisStateStore") -> None:
+    try:
+        await asyncio.wait_for(sdb.close(), timeout=10.0)
+        logger.info("File state flushed on shutdown signal")
+    except Exception as e:
+        logger.error(f"State flush on shutdown signal failed: {e}")
 
 signal.signal(signal.SIGTERM, _sync_signal_handler)
 signal.signal(signal.SIGINT, _sync_signal_handler)
@@ -1066,14 +1086,19 @@ async def run_once() -> Optional[bool]:
             return False
 
         logger_run.info(f"🔄 Processing {len(pairs_to_process)} pairs from config")
-
-        logger_run.debug("Connecting to Redis...")
+        logger_run.debug("Connecting to state backend...")
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
+
+        # Publish the live sdb to the module-level signal handler so a
+        # SIGTERM mid-run can flush file-backed state before SIGKILL.
+        global _run_once_sdb
+        _run_once_sdb = sdb
 
         if sdb and not sdb.degraded:
             try:
                 cb_state_raw = await sdb.get_metadata("circuit_breaker_state")
+
                 if cb_state_raw:
                     await fetcher.circuit_breaker.restore(json_loads(cb_state_raw))
             except Exception as e:
