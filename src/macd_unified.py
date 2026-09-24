@@ -670,10 +670,16 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             if raw:
                 payload = json_loads(raw)
                 calibration_curves = payload.get("curves", {}) or {}
+                built_at = payload.get("built_at")
+                built_age_hr = (
+                    round((time.time() - built_at) / 3600, 1)
+                    if built_at else None
+                )
                 logger_main.info(
                     f"🎯 Calibration curves pre-loaded: "
                     f"{len(calibration_curves)} alert_key(s) "
-                    f"(ECE mean={payload.get('ece_mean')})"
+                    f"(ECE mean={payload.get('ece_mean')}, "
+                    f"built {built_age_hr}h ago)"
                 )
             else:
                 logger_main.info("🎯 Calibration curves: none stored yet (gate will fail-open)")
