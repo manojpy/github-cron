@@ -948,6 +948,7 @@ class BrainEngine:
         """Build the full recommendation set: per-alert verdicts, a confluence
         threshold suggestion, shadow-mode insight, and a machine-readable
         config patch."""
+        engine.clear_ev_first_cache()
         real_rows, shadow_rows = await self._get_rows()
         audit = get_audit() 
         recommendations: List[Dict[str, Any]] = []
@@ -1282,7 +1283,7 @@ class BrainEngine:
                 else:
                     await self.sdb.save_threshold_value(target_floor)
 
-            # ── Net EV + Kelly sizing at recommended threshold ───────────────
+            # ���─ Net EV + Kelly sizing at recommended threshold ───────────────
             rec_subset_kelly = [
                 r for r in real_rows if r["score"] >= target_floor
             ] if target_floor else []

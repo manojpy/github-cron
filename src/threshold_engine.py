@@ -21,7 +21,21 @@ CapRow = Tuple[float, int, float, float]  # (cap, n, wr, wilson_lower_bound)
 
 # ── Per-report-cycle memo for ev_first_objective ──
 
-_EV_FIRST_CACHE: Dict[Tuple[int, int, int, float, float], Dict[str, Any]] = {}
+_EV_FIRST_CACHE: Dict[Tuple[int, Any, Any, int, float, float], Dict[str, Any]] = {}
+
+def _ev_first_cache_key(
+    rows: List[Row], min_sample: int, fee_pct: float, slippage_pct: float,
+) -> Tuple[int, Any, Any, int, float, float]:
+    n = len(rows)
+    first_ts = rows[0].get("entry_ts", 0) if n else 0
+    last_ts = rows[-1].get("entry_ts", 0) if n else 0
+    return (n, first_ts, last_ts, min_sample, fee_pct, slippage_pct)
+
+def clear_ev_first_cache() -> None:
+    """Drop all memoised ev_first_objective() results. Call at the top of
+    each Brain report cycle to bound memory growth in a long-running
+    process; safe to call anytime since the cache is purely an optimization."""
+    _EV_FIRST_CACHE.clear()
 
 def wilson_ci(wins: int, n: int, z: float = 1.96) -> Tuple[float, float, float]:
     """Wilson score interval — reliable even for small n. Returns
@@ -1919,7 +1933,7 @@ def parameter_autopsy(
         "higher_is_worse": higher_is_worse,
     }
 
-# ═════════════════════════════════════════════════════════�������������������═════════════
+# ═════════════════════════════════════════════════════════���������������������═════════════
 #  PHASE 3 — CONDITIONAL ALERT GATING
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -3304,7 +3318,7 @@ def ev_first_objective(
     if len(rows) < min_sample:
         return {"valid": False, "error": "insufficient_data", "n": len(rows)}
 
-    _cache_key = (id(rows), len(rows), min_sample, fee_pct, slippage_pct)
+    _cache_key = _ev_first_cache_key(rows, min_sample, fee_pct, slippage_pct)
     _cached = _EV_FIRST_CACHE.get(_cache_key)
     if _cached is not None:
         return dict(_cached)
@@ -4190,8 +4204,9 @@ def calibration_gate_decision(
     if not buckets:
         return True, None, "no_curve"
     chosen = None
-    for bk in buckets:
-        if bk["lo"] <= conf_pct < bk["hi"]:
+    _last_idx = len(buckets) - 1
+    for idx, bk in enumerate(buckets):
+        if bk["lo"] <= conf_pct < bk["hi"] or (idx == _last_idx and conf_pct == bk["hi"]):
             chosen = bk
             break
     if chosen is None:
@@ -4223,8 +4238,9 @@ def ml_calibration_lookup(
     if not buckets:
         return None, "no_curve"
     chosen = None
-    for bk in buckets:
-        if bk["lo"] <= p_win < bk["hi"]:
+    _last_idx = len(buckets) - 1
+    for idx, bk in enumerate(buckets):
+        if bk["lo"] <= p_win < bk["hi"] or (idx == _last_idx and p_win == bk["hi"]):
             chosen = bk
             break
     if chosen is None:    
