@@ -39,20 +39,16 @@ WORKDIR /build
 COPY setup.py ./
 COPY src/cython_functions.pyx ./src/
 
-ARG CYTHON_STRICT=0
+ARG CYTHON_STRICT=1
 
 RUN set -e; \
     echo "🔨 Starting Cython compilation..."; \
     if python setup.py build_ext --inplace; then \
         echo "✅ Cython build successful"; \
     else \
-        echo "⚠️ Cython compilation failed!"; \
-        if [ "$CYTHON_STRICT" = "1" ]; then \
-            echo "❌ CYTHON_STRICT=1: Aborting build."; \
-            exit 1; \
-        else \
-            echo "⚠️ CYTHON_STRICT=0: continuing — bot will use Numba JIT fallback."; \
-        fi; \
+        echo "❌ Cython compilation failed."; \
+        echo "❌ Production image requires the Cython backend."; \
+        exit 1; \
     fi
 
 # ---------- STAGE 4: FINAL RUNTIME ----------
