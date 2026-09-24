@@ -326,13 +326,17 @@ jobs:
             exit 0
           fi
 
+
+
+
+
           if grep -q "RUN COMPLETE" "$LOG_FILE"; then
             STATUS="Success"
             DURATION=$(grep -oP "Duration:\s*\K[\d.]+(?=s)" "$LOG_FILE" | head -1 || echo "N/A")
             ALERTS=$(grep -oP "(?:Alerts|Sent):\s*\K\d+" "$LOG_FILE" | head -1 || echo "0")
             PAIRS=$(grep -oP "Pairs:\s*\K[\d/]+" "$LOG_FILE" | head -1 || echo "N/A")
             MEMORY=$(grep -oP "Memory:\s*\K\d+MB" "$LOG_FILE" | head -1 || echo "N/A")
-            REDIS_STATUS=$(grep -oP "Redis:\s*\K\w+" "$LOG_FILE" | head -1 || echo "UNKNOWN")
+            STATE_STATUS=$(grep -oP "State\([^)]*\):\s*\K\w+" "$LOG_FILE" | head -1 || echo "UNKNOWN")
           else
             STATUS="Failed"
             ERROR_MSG=$(grep -E "FATAL ERROR|Bot run failed|Error|ERROR" "$LOG_FILE" | head -1 | cut -c1-120 || echo "Unknown error")
@@ -343,7 +347,7 @@ jobs:
           echo "alerts=${ALERTS:-0}" >> $GITHUB_OUTPUT
           echo "pairs=${PAIRS:-N/A}" >> $GITHUB_OUTPUT
           echo "memory=${MEMORY:-N/A}" >> $GITHUB_OUTPUT
-          echo "redis_status=${REDIS_STATUS:-UNKNOWN}" >> $GITHUB_OUTPUT
+          echo "state_status=${STATE_STATUS:-UNKNOWN}" >> $GITHUB_OUTPUT
           echo "error_msg=${ERROR_MSG:-None}" >> $GITHUB_OUTPUT
 
       - name: 📋 Generate Summary Report
@@ -364,7 +368,7 @@ jobs:
             echo "- 📊 Alerts Sent: ${{ steps.results.outputs.alerts }}" >> $GITHUB_STEP_SUMMARY
             echo "- 📈 Pairs Scanned: ${{ steps.results.outputs.pairs }}" >> $GITHUB_STEP_SUMMARY
             echo "- 💾 Memory Used: ${{ steps.results.outputs.memory }}" >> $GITHUB_STEP_SUMMARY
-            echo "- 🗄️ Redis Status: ${{ steps.results.outputs.redis_status }}" >> $GITHUB_STEP_SUMMARY
+            echo "- 🗄️ State Backend: ${{ steps.results.outputs.state_status }}" >> $GITHUB_STEP_SUMMARY
           fi
 
       # PHASE 4: ARTIFACT UPLOAD & VISIBILITY
