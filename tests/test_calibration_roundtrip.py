@@ -94,23 +94,18 @@ def test_calibration_gate_out_of_range_fails_open():
     assert cal_wr is None
 
 def test_calibration_persistence_roundtrip():
-    """End-to-end: build → JSON-serialize → deserialize → gate lookup.
-
-    This exercises the actual shape the live gate consumes
-    (payload['curves']), not the raw dict returned by build_calibration_curves().
-    It does not touch Redis; it verifies that whatever brain.py writes to
-    Redis and whatever macd_unified.py reads back is what
-    calibration_gate_decision() sees at dispatch time.
-    """
-    import json
+    """... Uses bot_config.json_dumps/json_loads — the same orjson-backed
+    helpers brain.py and macd_unified.py actually call — rather than stdlib
+    json, so this test keeps matching production if the curve schema ever
+    grows a NumPy/datetime field instead of silently drifting from it."""
+    from bot_config import json_dumps, json_loads
 
     rows = [_row("test_buy", 70.0 + (i % 5), i < 10) for i in range(20)]
     built = build_calibration_curves(rows, bucket_pct=20.0, min_sample=5)
 
-    # brain.py persists the entire `built` dict via json_dumps (orjson).
-    # Emulate the exact serialize/deserialize path.
-    serialized = json.dumps(built)
-    loaded_payload = json.loads(serialized)
+    # brain.py persists the entire `built` dict via json_dumps.
+    serialized = json_dumps(built)
+    loaded_payload = json_loads(serialized)
 
     # macd_unified.py does: calibration_curves = payload.get("curves", {}) or {}
     loaded_curves = loaded_payload.get("curves", {}) or {}
