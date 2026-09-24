@@ -144,6 +144,15 @@ class _FileRedisAdapter:
 
     async def close(self) -> None:
         os.makedirs(self._dir, exist_ok=True)
+        now = time.time()
+        expired = [k for k, exp in self._ttls.items() if exp <= now]
+        for k in expired:
+            self._kv.pop(k, None)
+            self._hashes.pop(k, None)
+            self._lists.pop(k, None)
+            self._streams.pop(k, None)
+            self._ttls.pop(k, None)
+
         for name, data in (
             ("kv", self._kv), ("hashes", self._hashes),
             ("lists", self._lists), ("ttls", self._ttls),
@@ -152,16 +161,6 @@ class _FileRedisAdapter:
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, separators=(",", ":"), sort_keys=True)
-            os.replace(tmp, path)
-        for key, entries in self._streams.items():
-            maxlen = self._stream_maxlen.get(key)
-            if maxlen:
-                entries = entries[-maxlen:]
-            path = os.path.join(self._streams_dir, f"{key}.jsonl")
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                for eid, fields in entries:
-                    f.write(json.dumps([eid, fields], separators=(",", ":")) + "\n")
             os.replace(tmp, path)
 
     async def ping(self) -> bool:
