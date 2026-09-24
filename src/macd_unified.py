@@ -1094,7 +1094,6 @@ async def run_once() -> Optional[bool]:
 
         # Publish the live sdb to the module-level signal handler so a
         # SIGTERM mid-run can flush file-backed state before SIGKILL.
-        global _run_once_sdb
         _run_once_sdb = sdb
 
         if sdb and not sdb.degraded:
