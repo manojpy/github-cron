@@ -199,6 +199,12 @@ class _FileRedisAdapter:
                 n += 1
         return n
 
+    async def unlink(self, *keys: str) -> int:
+        """Alias for delete — _clear_all_redis_states and CLEAR_REDIS call
+        unlink(), which in real Redis frees memory in a background thread.
+        The file adapter just calls delete()."""
+        return await self.delete(*keys)
+
     async def exists(self, *keys: str) -> int:
         n = 0
         for k in keys:
