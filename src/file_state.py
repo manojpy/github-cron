@@ -163,6 +163,17 @@ class _FileRedisAdapter:
                 json.dump(data, f, separators=(",", ":"), sort_keys=True)
             os.replace(tmp, path)
 
+        for key, entries in self._streams.items():
+            maxlen = self._stream_maxlen.get(key)
+            if maxlen:
+                entries = entries[-maxlen:]
+            path = os.path.join(self._streams_dir, f"{key}.jsonl")
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                for eid, fields in entries:
+                    f.write(json.dumps([eid, fields], separators=(",", ":")) + "\n")
+            os.replace(tmp, path)
+
     async def ping(self) -> bool:
         return True
 
