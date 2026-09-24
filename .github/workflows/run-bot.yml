@@ -152,8 +152,14 @@ jobs:
         id: brain_depth
         run: |
           NOW=$(date -u +%s)
+          # BRAIN_REPORT_ON_DEMAND is a separate force-report switch read
+          # inside the bot itself (macd_unified.py, run_once). This workflow
+          # step has no visibility into it otherwise, so a report forced that
+          # way runs against a shallow 3-day checkout instead of the full
+          # archive it actually needs. Parse it here so both triggers agree.
+          ON_DEMAND=$(python3 -c "import json; print(json.load(open('config_macd.json')).get('BRAIN_REPORT_ON_DEMAND', False))" 2>/dev/null || echo "False")
           # 900 s = one 15-minute slot; 24 slots = 6 hours (00:00/06:00/12:00/18:00 UTC).
-          if [ "${{ inputs.brain_report }}" = "true" ] || [ $(( (NOW / 900) % 24 )) -eq 0 ]; then
+          if [ "${{ inputs.brain_report }}" = "true" ] || [ "$ON_DEMAND" = "True" ] || [ $(( (NOW / 900) % 24 )) -eq 0 ]; then
             echo "brain_full=true"  >> "$GITHUB_OUTPUT"
             echo "archive_days=185" >> "$GITHUB_OUTPUT"
             echo "🧠 Brain-report run: full 185-day archive"
