@@ -54,7 +54,7 @@ jobs:
           echo "## 🔎 mypy Type Check" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
            mypy src/macd_unified.py src/aot_bridge.py src/numeric_selftest.py \
-             src/bot_config.py src/state.py src/fetcher.py src/indicators.py src/file_state.py \
+             src/bot_config.py src/state.py src/fetcher.py src/indicators.py \
              src/gates.py src/alerts.py src/threshold_engine.py src/brain.py src/brain_enhanced.py src/brain_audit.py src/outcome_storage.py \
              src/apply_config_override.py src/archive_reader.py src/repair_ledger.py \
             --ignore-missing-imports 2>&1 | tee -a $GITHUB_STEP_SUMMARY
@@ -167,7 +167,6 @@ jobs:
                 "/app/src/indicators.py"
                 "/app/src/gates.py"
                 "/app/src/alerts.py"
-                "/app/src/file_state.py"
                 "/app/src/threshold_engine.py"        
                 "/app/src/brain.py"
                 "/app/src/brain_enhanced.py"   
@@ -238,7 +237,7 @@ jobs:
 
       - uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: 📦 Clone FULL outcome data repository
         env:
@@ -252,9 +251,9 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
           DELTA_API_BASE: ${{ secrets.DELTA_API_BASE }}
           OUTCOME_DATA_DIR: outcome-data
-          STATE_BACKEND: file
           BRAIN_ARCHIVE_SHALLOW: "false"
         run: |
           pip install --quiet -r requirements.txt
@@ -268,10 +267,9 @@ jobs:
           cd outcome-data
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f reports state 2>/dev/null || true   # full clone here, so no --sparse needed
-
+          git add -f reports 2>/dev/null || true   # full clone here, so no --sparse needed
           if git diff --cached --quiet; then
-            echo "No new Brain report or state changes to persist."
+            echo "No new Brain report to persist."
             exit 0
           fi
           git commit -m "chore: brain report $(date -u +%Y-%m-%dT%H:%M:%SZ)"
