@@ -1288,7 +1288,7 @@ class BrainEngine:
                 else:
                     await self.sdb.save_threshold_value(target_floor)
 
-            # ���─ Net EV + Kelly sizing at recommended threshold ───────────────
+            # ─ Net EV + Kelly sizing at recommended threshold ───────────────
             rec_subset_kelly = [
                 r for r in real_rows if r["score"] >= target_floor
             ] if target_floor else []
@@ -1869,10 +1869,10 @@ class BrainEngine:
                     "severity": "medium" if miscal else ("low" if calibration_persisted else "high"),
                     "message": (
                         (
-                            f"🎯 Calibration gate armed: dispatch filters on calibrated WR, "
+                            "🎯 Calibration gate armed: dispatch filters on calibrated WR, "
                             f"not raw confluence %. "
                             if calibration_persisted else
-                            f"⚠️ Calibration curves computed but NOT persisted to Redis — "
+                            "⚠️ Calibration curves computed but NOT persisted to Redis — "
                             f"live dispatch gate will fail-open on a stale/missing curve until "
                             f"the next successful persist. "
                         )
