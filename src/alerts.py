@@ -53,6 +53,10 @@ from indicators import (
 
 from threshold_engine import hash_config_state
 
+# Distinguishes "caller didn't pass this" from "caller passed None on purpose"
+# (None is a legitimate value for e.g. last_processed — no candle seen yet).
+_SENTINEL_UNSET = object()
+
 def escape_markdown_v2(text: str) -> str:
     return CompiledPatterns.ESCAPE_MARKDOWN.sub(r'\\\g<0>', str(text))
 
@@ -980,13 +984,16 @@ def validate_alert_definitions() -> None:
 validate_alert_definitions()
 
 async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[Dict[str, np.ndarray]],
-    reference_time: int, sdb: RedisStateStore, correlation_id: str, logger_pair: logging.Logger
+    reference_time: int, sdb: RedisStateStore, correlation_id: str, logger_pair: logging.Logger,
+    disabled_alert_keys: Optional[Set[str]] = None,
+    last_processed: Union[int, None, object] = _SENTINEL_UNSET,
 ) -> Union[Tuple[Dict[str, Any], Dict[str, bool], List[Tuple[str, str, str]]], Tuple[str, Dict[str, Any]], Tuple[str, Dict[str, Any], None], None]:
     pair_name = gr.pair_name
     i15 = gr.i15
     
     # ── CRITICAL FIX: Skip if this exact candle was already processed ──
-    last_processed = await sdb.get_last_processed_candle_ts(pair_name)
+    if last_processed is _SENTINEL_UNSET:
+        last_processed = await sdb.get_last_processed_candle_ts(pair_name)
     if last_processed == gr.ts_curr:
         logger_pair.debug(f"[{pair_name}] Candle {gr.ts_curr} already processed — skipping")
         return pair_name, {
@@ -1352,8 +1359,12 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
 
         all_redis_alert_keys = list(ALERT_KEYS.values())
         previous_states = await sdb.batch_get_all_alert_states(pair_name, all_redis_alert_keys)
-        
-        disabled_alert_keys = await sdb.get_disabled_alert_keys()
+
+        # disabled_alert_keys is normally pre-loaded once per run by the
+        # caller and passed in (identical for every pair, so re-fetching it
+        # per pair is pure waste); only fetch here if no caller ever passed it.
+        if disabled_alert_keys is None:
+            disabled_alert_keys = await sdb.get_disabled_alert_keys()
         # Brain-disabled keys are still evaluated (never dispatched) so the
         # Brain gets fresh post-disable evidence for its re-enable decision.
         _track_disabled = bool(
@@ -1615,8 +1626,11 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     ml_market_state_model: Optional[Dict[str, Any]] = None,
     ml_calibration_curve: Optional[Dict[str, Any]] = None,
     batch_mode: bool = False,
+    pair_thresholds: Optional[Dict[str, float]] = None,
+    open_positions_run: Union[List[Dict[str, Any]], None, object] = _SENTINEL_UNSET,
+    last_processed: Union[int, None, object] = _SENTINEL_UNSET,
+    kill_switch_active_run: Union[bool, object] = _SENTINEL_UNSET,
 ) -> Optional[Tuple[str, Dict[str, Any], Optional[AlertPayload]]]:
-
     def _confluence_for(alert_key: str) -> Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]:
         if alert_key in BUY_ALERT_KEYS:
             return confluence_score_buy, confluence_total_buy, confluence_votes_buy
@@ -1627,30 +1641,41 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     _disabled_hits = context.pop("brain_disabled_hits", None) or []
 
     if cfg.ENABLE_KILL_SWITCH and sdb and not sdb.degraded and sdb._redis:
-        try:
-            if await sdb._safe_redis_op(
-                lambda: _rc(sdb._redis).exists("brain:kill_switch_active"),
-                2.0, "kill_switch_poll",
-            ):
-                logger_pair.warning(f"[{pair_name}] Kill switch active — dispatch blocked")
-                return pair_name, {
-                    "state": "KILL_SWITCH",
-                    "ts": int(time.time()),
-                    "summary": {"alerts": 0, "future_cloud": "neutral",
-                                "hist_rma": 0.0, "suppression": "kill switch active"},
-                }, None
-        except Exception:
-            pass
+        if kill_switch_active_run is _SENTINEL_UNSET:
+            try:
+                is_active = bool(await sdb._safe_redis_op(
+                    lambda: _rc(sdb._redis).exists("brain:kill_switch_active"),
+                    2.0, "kill_switch_poll",
+                ))
+            except Exception:
+                is_active = False
+        else:
+            is_active = bool(kill_switch_active_run)
+        if is_active:
+            logger_pair.warning(f"[{pair_name}] Kill switch active — dispatch blocked")
+            return pair_name, {
+                "state": "KILL_SWITCH",
+                "ts": int(time.time()),
+                "summary": {"alerts": 0, "future_cloud": "neutral",
+                            "hist_rma": 0.0, "suppression": "kill switch active"},
+            }, None
 
     if cfg.ENABLE_PORTFOLIO_HEAT_GATE and sdb and not sdb.degraded and sdb._redis:
-        try:
-            raw = await sdb._safe_redis_op(
-                lambda: _rc(sdb._redis).get("open_positions"),
-                2.0, "open_positions_get",
-            )
-            open_positions = json_loads(raw) if raw else []
-        except Exception:
-            open_positions = []
+        # open_positions is normally pre-loaded once per run by the caller
+        # and passed in — it doesn't change while the bot loops through
+        # pairs, so a per-pair GET is pure waste. Only fetch here if no
+        # caller ever passed it.
+        if open_positions_run is _SENTINEL_UNSET:
+            try:
+                raw = await sdb._safe_redis_op(
+                    lambda: _rc(sdb._redis).get("open_positions"),
+                    2.0, "open_positions_get",
+                )
+                open_positions = json_loads(raw) if raw else []
+            except Exception:
+                open_positions = []
+        else:
+            open_positions = open_positions_run or []
         direction = "buy" if gr.buy_common else ("sell" if gr.sell_common else None)
         if direction:
             verdict = engine.portfolio_heat_check(
@@ -1677,7 +1702,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 }, None
 
     # ── CRITICAL FIX: Skip if this exact candle was already processed ──
-    last_processed = await sdb.get_last_processed_candle_ts(pair_name)
+    if last_processed is _SENTINEL_UNSET:
+        last_processed = await sdb.get_last_processed_candle_ts(pair_name)
+
     if last_processed == ts_curr:
         logger_pair.debug(f"[{pair_name}] Candle {ts_curr} already processed — skipping dispatch")
         return pair_name, {
@@ -1743,12 +1770,16 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             capped_alerts = raw_alerts
 
         alerts_to_send = capped_alerts[:cfg.MAX_ALERTS_PER_PAIR]
-        if _disabled_hits:
+         if _disabled_hits:
             _dis_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
             if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
-                _pair_floor = await sdb.get_pair_threshold(pair_name)
+                _pair_floor = (
+                    pair_thresholds.get(pair_name) if pair_thresholds is not None
+                    else await sdb.get_pair_threshold(pair_name)
+                )
                 if _pair_floor is not None:
                     _dis_floor = _pair_floor
+
             _dis_pass = _disabled_hits_passing_confluence(_disabled_hits, _confluence_for, _dis_floor)
             if _dis_pass:
                 await _record_counterfactual_block(
@@ -1823,10 +1854,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         # ── Existing confluence gate, but with macro multiplier ─────────────
         if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
-
             abs_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
             if alerts_to_send and getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
-                pair_floor = await sdb.get_pair_threshold(pair_name)
+                pair_floor = (
+                    pair_thresholds.get(pair_name) if pair_thresholds is not None
+                    else await sdb.get_pair_threshold(pair_name)
+                )
                 if pair_floor is not None:
                     abs_floor = pair_floor
 

@@ -230,8 +230,7 @@ class BotConfig(BaseModel):
     _validation_warnings: List[str] = PrivateAttr(default_factory=list)
     TELEGRAM_BOT_TOKEN: str = Field(..., min_length=1)
     TELEGRAM_CHAT_ID: str = Field(..., min_length=1)
-    REDIS_URL: str = Field(default="", description="Required only when STATE_BACKEND=redis. Empty is valid on the file backend.")
-    STATE_BACKEND: str = Field(default="file", description="'file' (default) or 'redis'. Selects the state backend in state.py.")
+    REDIS_URL: str = Field(..., min_length=1)
     DELTA_API_BASE: str = Field(..., min_length=1)
     DEBUG_MODE: bool = Field(default=False)
     SEND_TEST_MESSAGE: bool = Field(default=True, description="Send test message on startup")
@@ -809,20 +808,11 @@ def load_config() -> BotConfig:
             except Exception:
                 data[field_name] = env_value
 
-    required_always = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "DELTA_API_BASE")
-    for key in required_always:
+    for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "REDIS_URL", "DELTA_API_BASE"):
         val = data.get(key, "")
         if not val or val.startswith("__SET_IN_"):
             print(f"❌ ERROR: Missing required config: {key}", file=sys.stderr)
             print("❌ Set this in your CI/CD secrets (GitHub Actions → Secrets, GitLab → Variables)", file=sys.stderr)
-            sys.exit(1)
-
-    _backend = str(data.get("STATE_BACKEND", "file")).lower()
-    if _backend == "redis":
-        val = data.get("REDIS_URL", "")
-        if not val or val.startswith("__SET_IN_"):
-            print("❌ ERROR: Missing required config: REDIS_URL (STATE_BACKEND=redis)", file=sys.stderr)
-            print("❌ Set REDIS_URL in your CI/CD secrets, or set STATE_BACKEND=file.", file=sys.stderr)
             sys.exit(1)
     try:
         return BotConfig(**data)
@@ -977,19 +967,16 @@ def validate_runtime_config() -> None:
     warnings = []
     if hasattr(cfg, '_validation_warnings'):
         warnings.extend(cfg._validation_warnings)
-
-    if getattr(cfg, "STATE_BACKEND", "file").lower() == "redis":
-        try:
-            from urllib.parse import urlparse
-            parsed = urlparse(cfg.REDIS_URL)
-            if parsed.scheme not in ('redis', 'rediss'):
-                errors.append(f"Invalid REDIS_URL scheme: {parsed.scheme} (must be redis:// or rediss://)")
-            if not parsed.hostname:
-                errors.append("REDIS_URL missing hostname")
-        except Exception as e:
-            errors.append(f"Failed to parse REDIS_URL: {e}")
-    else:
-        logger.debug(f"STATE_BACKEND={cfg.STATE_BACKEND} — REDIS_URL validation skipped")
+    
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(cfg.REDIS_URL)
+        if parsed.scheme not in ('redis', 'rediss'):
+            errors.append(f"Invalid REDIS_URL scheme: {parsed.scheme} (must be redis:// or rediss://)")
+        if not parsed.hostname:
+            errors.append("REDIS_URL missing hostname")
+    except Exception as e:
+        errors.append(f"Failed to parse REDIS_URL: {e}")
     
     if errors:
         logger.critical("Configuration validation FAILED:")

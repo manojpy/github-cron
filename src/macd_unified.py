@@ -10,7 +10,7 @@ import uuid
 import argparse
 import psutil
 import gc
-from typing import Dict, Any, Optional, Tuple, List, cast 
+from typing import Dict, Any, Optional, Tuple, Set, List, cast 
 from datetime import datetime, timezone
 import numpy as np
 
@@ -50,33 +50,14 @@ from alerts import (
 
 _pair_eval_counter = 0
 _CLUSTER_CACHE_MISS = object()
-_run_once_sdb: Optional["RedisStateStore"] = None
 
 def _sync_signal_handler(sig: int, frame: Any) -> None:
     logger.warning(f"Received signal {sig}, initiating async shutdown...")
     try:
         loop = asyncio.get_running_loop()
+        loop.call_soon_threadsafe(shutdown_event.set)
     except RuntimeError:
-        return
-
-    loop.call_soon_threadsafe(shutdown_event.set)
-
-    # File-backed state only flushes on close(). If the container is
-    # SIGKILL'd before the run finishes its finally block, that run's
-    # writes are lost. Schedule the flush now so it can complete inside
-    # the workflow's --kill-after=15s grace window.
-    sdb = _run_once_sdb
-    if sdb is not None and getattr(sdb, "_redis", None) is not None:
-        loop.call_soon_threadsafe(
-            lambda: asyncio.create_task(_flush_state_on_signal(sdb))
-        )
-
-async def _flush_state_on_signal(sdb: "RedisStateStore") -> None:
-    try:
-        await asyncio.wait_for(sdb.close(), timeout=10.0)
-        logger.info("File state flushed on shutdown signal")
-    except Exception as e:
-        logger.error(f"State flush on shutdown signal failed: {e}")
+        pass
 
 signal.signal(signal.SIGTERM, _sync_signal_handler)
 signal.signal(signal.SIGINT, _sync_signal_handler)
@@ -89,8 +70,7 @@ def print_startup_banner_once() -> None:
     _STARTUP_BANNER_PRINTED = True
     logger.info(
         f"📡 Bot v{__version__} | Pairs: {len(cfg.PAIRS)} | Workers: {cfg.MAX_PARALLEL_FETCH} | "
-        f"Timeout: {cfg.RUN_TIMEOUT_SECONDS}s | State Backend: {cfg.STATE_BACKEND} | "
-        f"Lock TTL: {cfg.REDIS_LOCK_EXPIRY}s"
+        f"Timeout: {cfg.RUN_TIMEOUT_SECONDS}s | Redis Lock: {cfg.REDIS_LOCK_EXPIRY}s"
     )
 print_startup_banner_once()
 
@@ -123,7 +103,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     gate_cache: Optional[Dict[str, Any]] = None,
     calibration_curves: Optional[Dict[str, Any]] = None,
     ml_market_state_model: Optional[Dict[str, Any]] = None,
-    ml_calibration_curve: Optional[Dict[str, Any]] = None) -> Optional[Tuple[str, Dict[str, Any], Optional[Any]]]:
+    ml_calibration_curve: Optional[Dict[str, Any]] = None,
+    disabled_alert_keys_run: Optional[Set[str]] = None,
+    pair_thresholds_run: Optional[Dict[str, float]] = None,
+    open_positions_run: Optional[List[Dict[str, Any]]] = None,
+    kill_switch_active_run: bool = False) -> Optional[Tuple[str, Dict[str, Any], Optional[Any]]]:
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     pair_oi = (oi_gate_data or {}).get(pair_name)
@@ -181,7 +165,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         score, total = (score_buy, total_buy) if buy_side else (score_sell, total_sell)
         abs_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
         if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
-            pair_floor = await sdb.get_pair_threshold(pair_name)
+            pair_floor = (
+                pair_thresholds_run.get(pair_name) if pair_thresholds_run is not None
+                else await sdb.get_pair_threshold(pair_name)
+            )
             if pair_floor is not None:
                 abs_floor = pair_floor
         pct_floor = total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
@@ -250,9 +237,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         alerts_sent_ref = []
     if alerts_sent_lock is None:
         alerts_sent_lock = asyncio.Lock()
-
     try: 
-        alert_result = await _eval_alerts(gr, data_5m, data_daily, reference_time, sdb, correlation_id, logger_pair)
+        last_processed = await sdb.get_last_processed_candle_ts(pair_name)
+        alert_result = await _eval_alerts(
+            gr, data_5m, data_daily, reference_time, sdb, correlation_id, logger_pair,
+            disabled_alert_keys=disabled_alert_keys_run,
+            last_processed=last_processed,
+        )
         if alert_result is None:
             return None
 
@@ -289,7 +280,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             ml_market_state_model=ml_market_state_model,
             ml_calibration_curve=ml_calibration_curve, 
             batch_mode=getattr(cfg, "ENABLE_BATCHED_ALERTS", True),
-        )
+            pair_thresholds=pair_thresholds_run,
+            open_positions_run=open_positions_run,
+            last_processed=last_processed,
+            kill_switch_active_run=kill_switch_active_run,
+        )       
     finally:
         PAIR_ID.set("")
         global _pair_eval_counter
@@ -316,8 +311,12 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
                        parsed_cache: Optional[Dict[str, Any]] = None,
                        calibration_curves: Optional[Dict[str, Any]] = None, 
                        ml_market_state_model: Optional[Dict[str, Any]] = None,
-                       ml_calibration_curve: Optional[Dict[str, Any]] = None):
-    p_name, symbol, candles = task_data
+                       ml_calibration_curve: Optional[Dict[str, Any]] = None,
+                       disabled_alert_keys_run: Optional[Set[str]] = None,
+                       pair_thresholds_run: Optional[Dict[str, float]] = None,
+                       open_positions_run: Optional[List[Dict[str, Any]]] = None,
+                       kill_switch_active_run: bool = False):
+    p_name, symbol, candles = task_data                 
     try:
         pd_15m, pd_5m, data_daily = (parsed_cache or {}).get(p_name, (None, None, None))
 
@@ -344,6 +343,10 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
             calibration_curves=calibration_curves,
             ml_market_state_model=ml_market_state_model,
             ml_calibration_curve=ml_calibration_curve,
+            disabled_alert_keys_run=disabled_alert_keys_run,
+            pair_thresholds_run=pair_thresholds_run,
+            open_positions_run=open_positions_run,
+            kill_switch_active_run=kill_switch_active_run,
         )
         return result
     except asyncio.CancelledError:
@@ -764,9 +767,48 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             ml_market_state_model = None
             ml_calibration_curve = None
 
+    # ── Disabled-alert-keys, pair-thresholds, open-positions: loaded ONCE
+    disabled_alert_keys_run: Set[str] = set()
+    if state_db and not state_db.degraded:
+        try:
+            disabled_alert_keys_run = await state_db.get_disabled_alert_keys()
+        except Exception as e:
+            logger_main.warning(f"Disabled-alert-keys pre-load failed (fail-open): {e}")
+            disabled_alert_keys_run = set()
 
+    pair_thresholds_run: Dict[str, float] = {}
+    if cfg.ENABLE_PAIR_THRESHOLDS and state_db and not state_db.degraded:
+        try:
+            pair_thresholds_run = await state_db.get_pair_thresholds()
+        except Exception as e:
+            logger_main.warning(f"Pair-thresholds pre-load failed (fail-open): {e}")
+            pair_thresholds_run = {}
+
+    open_positions_run: List[Dict[str, Any]] = []
+    if cfg.ENABLE_PORTFOLIO_HEAT_GATE and state_db and not state_db.degraded and state_db._redis:
+        try:
+            raw_open_positions = await state_db._safe_redis_op(
+                lambda: _rc(state_db._redis).get("open_positions"),
+                2.0, "open_positions_runload",
+            )
+            open_positions_run = json_loads(raw_open_positions) if raw_open_positions else []
+        except Exception as e:
+            logger_main.warning(f"Open-positions pre-load failed (fail-open): {e}")
+            open_positions_run = []
+
+    kill_switch_active_run: bool = False
+    if cfg.ENABLE_KILL_SWITCH and state_db and not state_db.degraded and state_db._redis:
+        try:
+            kill_switch_active_run = bool(await state_db._safe_redis_op(
+                lambda: _rc(state_db._redis).exists("brain:kill_switch_active"),
+                2.0, "kill_switch_poll_runload",
+            ))
+        except Exception as e:
+            logger_main.warning(f"Kill-switch pre-load failed (fail-open): {e}")
+            kill_switch_active_run = False
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
     prepared_tasks = []
+
     parsed_cache: Dict[str, Tuple[Optional[PriceData], Optional[PriceData], Optional[Dict[str, np.ndarray]]]] = {}
     for pair_name, symbol in valid_tasks:
         candles = all_candles.get(symbol, {})
@@ -905,6 +947,10 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 calibration_curves=calibration_curves,
                 ml_market_state_model=ml_market_state_model,
                 ml_calibration_curve=ml_calibration_curve,
+                disabled_alert_keys_run=disabled_alert_keys_run,
+                pair_thresholds_run=pair_thresholds_run,
+                open_positions_run=open_positions_run,
+                kill_switch_active_run=kill_switch_active_run,
             )
     results = await asyncio.gather(
         *[_bounded_eval(t) for t in prepared_tasks],
@@ -1037,8 +1083,6 @@ async def run_once() -> Optional[bool]:
     TRACE_ID.set(correlation_id)
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
     start_time = time.time()
-    global _run_once_sdb
-    _run_once_sdb = None
     sdb: Optional[RedisStateStore] = None
     lock: Optional[RedisLock] = None
     fetcher: Optional[DataFetcher] = None
@@ -1088,18 +1132,14 @@ async def run_once() -> Optional[bool]:
             return False
 
         logger_run.info(f"🔄 Processing {len(pairs_to_process)} pairs from config")
-        logger_run.debug("Connecting to state backend...")
+
+        logger_run.debug("Connecting to Redis...")
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
-
-        # Publish the live sdb to the module-level signal handler so a
-        # SIGTERM mid-run can flush file-backed state before SIGKILL.
-        _run_once_sdb = sdb
 
         if sdb and not sdb.degraded:
             try:
                 cb_state_raw = await sdb.get_metadata("circuit_breaker_state")
-
                 if cb_state_raw:
                     await fetcher.circuit_breaker.restore(json_loads(cb_state_raw))
             except Exception as e:
@@ -1363,9 +1403,7 @@ async def run_once() -> Optional[bool]:
         final_memory_mb = process.memory_info().rss / 1024 / 1024
         memory_delta = final_memory_mb - container_memory_mb
         run_duration = time.time() - start_time
-
-        state_backend = os.environ.get("STATE_BACKEND", "file").lower()
-        state_status = "OK" if (sdb and not sdb.degraded) else "DEGRADED"
+        redis_status = "OK" if (sdb and not sdb.degraded) else "DEGRADED"
 
         summary = (
             f"🎯🌏 RUN COMPLETE | "
@@ -1374,7 +1412,7 @@ async def run_once() -> Optional[bool]:
             f"Alerts: {alerts_sent_ref[0]} | "
             f"OI/Funding blocks: {fetcher_stats.get('oi_funding_blocks', 0)} | "
             f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
-            f"State({state_backend}): {state_status}"
+            f"Redis: {redis_status}"
         )
         logger_run.info(summary)
 
@@ -1461,14 +1499,12 @@ async def run_once() -> Optional[bool]:
         if sdb:
             try:
                 await asyncio.wait_for(sdb.close(), timeout=3.0)
-                logger_run.debug("✅ State backend closed")
+                logger_run.debug("✅ Redis connection closed")
             except asyncio.TimeoutError:
-                logger_run.error("Timeout closing state backend")
+                logger_run.error("Timeout closing Redis")
             except Exception as e:
-                logger_run.error(f"Error closing state backend: {e}", exc_info=False)
-
-        _run_once_sdb = None
-
+                logger_run.error(f"Error closing Redis: {e}", exc_info=False)
+                
         try:
             await asyncio.wait_for(
                 RedisStateStore.shutdown_global_pool(),
