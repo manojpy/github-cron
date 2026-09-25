@@ -1636,11 +1636,13 @@ class RedisStateStore:
 
         keys = await self._fetch_pending_keys(
             pair,
+            "_shadow_pending_outcome_keys_by_pair",
             RedisKeyPrefix.SHADOW_PENDING,
+            logger_pair,
+            "shadow",
         )
         if not keys:
             return
-
         try:
             raw_values = await asyncio.wait_for(
                 _rc(self._redis).mget(keys),
