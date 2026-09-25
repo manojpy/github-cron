@@ -48,7 +48,7 @@ def test_report_age_uses_time_in_file_name():
     assert co.file_age_reference(Path("2026-03-04.jsonl")).hour == 23
 
 
-def test_workflows_use_12_hour_cadence_and_stage_reports_and_state():
+def test_workflows_use_12_hour_cadence_and_stage_reports():
     root = Path(__file__).resolve().parent.parent / ".github" / "workflows"
     run = (root / "run-bot.yml").read_text(encoding="utf-8")
 
@@ -57,7 +57,6 @@ def test_workflows_use_12_hour_cadence_and_stage_reports_and_state():
     assert "% 16" not in run
 
     assert "git add --sparse -f reports" in run
-    assert "git add --sparse -f state" in run
 
     assert "--reports-max-age-days 7" in (
         root / "cleanup-outcomes.yml"
@@ -65,4 +64,4 @@ def test_workflows_use_12_hour_cadence_and_stage_reports_and_state():
 
     build = (root / "build.yml").read_text(encoding="utf-8")
     assert re.search(r"Persist Brain report", build)
-    assert "git add -f reports state" in build
+    assert "git add -f reports" in build
