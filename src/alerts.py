@@ -1770,7 +1770,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             capped_alerts = raw_alerts
 
         alerts_to_send = capped_alerts[:cfg.MAX_ALERTS_PER_PAIR]
-         if _disabled_hits:
+        if _disabled_hits:
             _dis_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
             if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
                 _pair_floor = (
@@ -2604,7 +2604,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         # ═══════════════════════════════════════════════��════════════════════
         # IMMEDIATE MODE  →  legacy per-pair Telegram send (unchanged logic)
-        # ════════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════���═════════════════════════════
         async def _refund_alert_budget(n: int) -> None:
             """Undo the optimistic budget reservation when a send does not go out."""
             if n > 0 and alerts_sent_ref is not None and alerts_sent_lock is not None:
