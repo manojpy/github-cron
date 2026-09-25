@@ -48,9 +48,8 @@ import threshold_engine as engine
 from indicators import (
     calculate_alert_indicators_numpy, validate_indicators_dict, validate_vwap_cross,
     validate_cloud_cross, validate_conversion_cross, validate_equilibrium_cross,
-    _fib_reversal_confluence_vote,
+    _fib_reversal_confluence_vote, _prior_leg_direction,
 )
-
 from threshold_engine import hash_config_state
 
 # Distinguishes "caller didn't pass this" from "caller passed None on purpose"
@@ -1186,8 +1185,9 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             ppohist_reversal_sell = (sell_common_wick and ppohist_curr < 0 and ppohist_m3 < ppohist_m2 < ppohist_m1 and ppohist_curr < ppohist_m1)
 
         if cfg.ENABLE_STRONG_REVERSAL_ALERT:
-            strong_reversal_buy = (buy_trend_common_relaxed and reversal_bullish)
-            strong_reversal_sell = (sell_trend_common_relaxed and reversal_bearish)
+            prior_leg = _prior_leg_direction(data_15m.close, data_15m.high, data_15m.low, i15 - 1, Constants.REVERSAL_PRIOR_LEG_LOOKBACK)
+            strong_reversal_buy = bool(buy_trend_common_relaxed and prior_leg == -1 and reversal_bullish)
+            strong_reversal_sell = bool(sell_trend_common_relaxed and prior_leg == 1 and reversal_bearish)
         else:
             strong_reversal_buy, strong_reversal_sell = False, False
 
@@ -2604,7 +2604,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         # ═══════════════════════════════════════════════��════════════════════
         # IMMEDIATE MODE  →  legacy per-pair Telegram send (unchanged logic)
-        # ══════════════════════════════════════���═════════════════════════════
+        # ══════════════════════════════════════����═════════════════════════════
         async def _refund_alert_budget(n: int) -> None:
             """Undo the optimistic budget reservation when a send does not go out."""
             if n > 0 and alerts_sent_ref is not None and alerts_sent_lock is not None:

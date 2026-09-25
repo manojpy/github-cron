@@ -284,13 +284,15 @@ class BrainEngine:
         return f"{conf_pct:.0f}% confluence, shadow WR {wr:.0%} over {total} tracked rejections"
 
     # ── Calibration live gate ────────────────────────────────────────────
-
-    async def _persist_calibration_curves(self, calib: Dict[str, Any]) -> None:
+    async def _persist_calibration_curves(self, calib: Dict[str, Any]) -> bool:
+        """Returns True only if the write to Redis actually succeeded, so the
+        caller can report calibration_persistence accurately instead of
+        assuming success just because the curves were computed."""
         if self.sdb.degraded or not self.sdb._redis:
             logging.getLogger("macd_bot").warning(
                 "Calibration curve persistence skipped: Redis unavailable or state degraded."
             )
-            return
+            return False
 
         try:
             result = await self.sdb._safe_redis_op(
@@ -314,11 +316,14 @@ class BrainEngine:
                     "Calibration curve persistence returned None — "
                     "Redis write may not have completed."
                 )
+                return False
+            return True
 
         except Exception as e:
             logging.getLogger("macd_bot").error(
                 f"Calibration curve persistence FAILED: {e}"
             )
+            return False
 
     async def _load_calibration_curve(self, alert_key: str) -> Optional[Dict[str, Any]]:
         now = time.time()
@@ -1850,8 +1855,9 @@ class BrainEngine:
             shadow_rows=shadow_rows,
         )
         if calib.get("curves"):
-            await self._persist_calibration_curves(calib)
+            calibration_persisted = await self._persist_calibration_curves(calib)
             ai_metrics["calibration_ece_mean"] = calib.get("ece_mean")
+            ai_metrics["calibration_persistence"] = "SUCCESS" if calibration_persisted else "FAILED"
             if getattr(cfg, "ENABLE_CALIBRATION_GATE", False):
                 miscal = sorted(
                     ((ak, c["ece"], c["n"]) for ak, c in calib["curves"].items()
@@ -1860,11 +1866,17 @@ class BrainEngine:
                 )
                 recommendations.append({
                     "type": "calibration_gate_active",
-                    "severity": "medium" if miscal else "low",
+                    "severity": "medium" if miscal else ("low" if calibration_persisted else "high"),
                     "message": (
-                        f"🎯 Calibration gate armed: dispatch filters on calibrated WR, "
-                        f"not raw confluence %. "
-                        f"Mean per-alert ECE {calib.get('ece_mean', 0):.3f} "
+                        (
+                            f"🎯 Calibration gate armed: dispatch filters on calibrated WR, "
+                            f"not raw confluence %. "
+                            if calibration_persisted else
+                            f"⚠️ Calibration curves computed but NOT persisted to Redis — "
+                            f"live dispatch gate will fail-open on a stale/missing curve until "
+                            f"the next successful persist. "
+                        )
+                        + f"Mean per-alert ECE {calib.get('ece_mean', 0):.3f} "
                         f"(historical/in-sample over per-alert-key curves — "
                         f"not a global OOS ECE)."
                         + (

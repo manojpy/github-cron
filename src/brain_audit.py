@@ -39,7 +39,7 @@ from bot_config import cfg, format_ist_time
 
 _log = logging.getLogger("macd_bot")
 
-
+ACTION_GATE_MIN_ROWS = getattr(cfg, "BRAIN_AUDIT_MIN_ROWS_FOR_RECOMMENDATION", 100)
 # ══════════════════════════════════════════════════════════════════════
 #  ENUMS & CONSTANTS
 # ══════════════════════════════════════════════════════════════════════
@@ -523,7 +523,7 @@ class BrainAuditLayer:
             return False
         if self._history.actual_days < 21:
             return False
-        if self._n_rows < 100:
+        if self._n_rows < ACTION_GATE_MIN_ROWS:
             return False
         entry = self._analysis_health.get(analysis_name)
         if entry and not entry.status.allows_recommendation:

@@ -503,10 +503,20 @@ class RedisStateStore:
             result = await asyncio.wait_for(coro, timeout=timeout)
             return parser(result) if parser else result
         except (asyncio.TimeoutError, RedisConnectionError, RedisError) as e:
-            logger.error(f"Redis {op_name} failed: {e}")
+            if _is_quota_exceeded_error(e):
+                # Fatal, retry-proof condition (Aiven OOM / provider quota) —
+                # route through the central handler so degraded mode and
+                # _quota_exhausted engage even when this surfaces through a
+                # plain get/set rather than one of the batch operations.
+                await self._record_redis_failure(op_name, e)
+            else:
+                logger.error(f"Redis {op_name} failed: {e}")
             return None
         except Exception as e:
-            logger.error(f"Failed to {op_name}: {e}")
+            if _is_quota_exceeded_error(e):
+                await self._record_redis_failure(op_name, e)
+            else:
+                logger.error(f"Failed to {op_name}: {e}")
             return None
 
     async def get_valkey_usage_snapshot(self) -> Dict[str, Optional[float]]:
@@ -873,16 +883,12 @@ class RedisStateStore:
         if self.degraded or not self._redis:
             return False
         key = f"{RedisKeyPrefix.LAST_PROCESSED_CANDLE}{pair_name}"
-        try:
-            await self._safe_redis_op(
-                lambda: _rc(self._redis).set(key, str(ts), ex=self.expiry_seconds),
-                2.0,
-                f"last_processed_candle_set:{pair_name}",
-            )
-            return True
-        except Exception as e:
-            logger.warning(f"Failed to set last_processed_candle for {pair_name}: {e}")
-            return False
+        result = await self._safe_redis_op(
+            lambda: _rc(self._redis).set(key, str(ts), ex=self.expiry_seconds),
+            2.0,
+            f"last_processed_candle_set:{pair_name}",
+        )
+        return bool(result)
 
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int, window_sec: Optional[int] = None) -> bool:
         if self.degraded:
@@ -1630,21 +1636,16 @@ class RedisStateStore:
 
         keys = await self._fetch_pending_keys(
             pair,
-            "_shadow_pending_outcome_keys_by_pair",
             RedisKeyPrefix.SHADOW_PENDING,
-            logger_pair,
-            "shadow pending",
         )
         if not keys:
             return
+
         try:
-            async with self._redis.pipeline() as read_pipe:
-                for key in keys:
-                    read_pipe.get(key)
-                raw_values = await asyncio.wait_for(
-                    _execute_pipeline(read_pipe),
-                    timeout=2.0,
-                )
+            raw_values = await asyncio.wait_for(
+                _rc(self._redis).mget(keys),
+                timeout=2.0,
+            )
         except Exception as e:
             logger_pair.warning(
                 f"Failed to batch-fetch shadow pending outcomes for {pair}: {e}"
@@ -1659,7 +1660,6 @@ class RedisStateStore:
         try:
             async with self._redis.pipeline() as write_pipe:
                 pending_writes = 0
-
                 for key, raw in zip(keys, raw_values):
                     try:
                         result, skip_reason = self._parse_pending_outcome_row(
@@ -1681,6 +1681,7 @@ class RedisStateStore:
                         conf_total = result["conf_total"]
                         conf_votes = result["conf_votes"]
                         row_context = result.get("context") or {}
+
                         shadow_adx_val = row_context.get("adx_val")
                         shadow_rejection_reason = row_context.get("rejection_reason")
                         shadow_effective_score = row_context.get("effective_score")
@@ -1698,6 +1699,7 @@ class RedisStateStore:
                             and conf_total > 0
                         ):
                             conf_pct = (conf_score / conf_total) * 100.0
+
                             if not getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                                 shadow_stream_fields: Dict[StreamField, StreamField] = {
                                     "pair": str(pair),
@@ -1708,9 +1710,7 @@ class RedisStateStore:
                                     "pct_move": f"{pct_move:.4f}",
                                     "win": "1" if win else "0",
                                     "entry_ts": str(entry_ts),
-                                    "session": _get_session_from_ts(entry_ts)
-                                    if entry_ts
-                                    else "dead",
+                                    "session": _get_session_from_ts(entry_ts) if entry_ts else "dead",
                                     "mae": f"{mae:.5f}" if mae is not None else "",
                                     "mfe": f"{mfe:.5f}" if mfe is not None else "",
                                     "close_win": "1" if result.get("close_win", win) else "0",
@@ -1722,9 +1722,7 @@ class RedisStateStore:
                                         else ""
                                     ),
                                     "outcome_reason": result.get("outcome_reason", "unknown"),
-                                    "votes": json_dumps(conf_votes)
-                                    if conf_votes is not None
-                                    else "",
+                                    "votes": json_dumps(conf_votes) if conf_votes is not None else "",
                                     "adx_val": str(shadow_adx_val) if shadow_adx_val is not None else "",
                                     "rejection_reason": shadow_rejection_reason or "",
                                     "effective_score": str(shadow_effective_score) if shadow_effective_score is not None else "",
@@ -1738,16 +1736,16 @@ class RedisStateStore:
                                     maxlen=2000,
                                     approximate=True,
                                 )
+
                             if conf_pct >= hiconf_pct:
-                                hiconf_key = (
-                                    f"{RedisKeyPrefix.SHADOW_HICONF_STATS}{alert_key}"
-                                )
+                                hiconf_key = f"{RedisKeyPrefix.SHADOW_HICONF_STATS}{alert_key}"
                                 write_pipe.hincrby(
                                     hiconf_key,
                                     "wins" if win else "losses",
                                     1,
                                 )
                                 write_pipe.expire(hiconf_key, stats_ttl)
+
                         write_pipe.delete(key)
                         pending_writes += 1
                         resolved_count += 1
@@ -1775,6 +1773,7 @@ class RedisStateStore:
                                     "session": _get_session_from_ts(entry_ts) if entry_ts else "dead",
                                     "votes": conf_votes,
                                     "shadow": True,
+                                    "_stream_id": f"{pair}:{alert_key}:{entry_ts}",
                                     # ─ Three-metric fields ──
                                     "close_win": result.get("close_win", win),
                                     "mfe_win": result.get("mfe_win", False),
@@ -1802,6 +1801,21 @@ class RedisStateStore:
                         continue
 
                 if pending_writes:
+                    # Archive FIRST, then delete pending + update stats — same
+                    # safety ordering as the real-outcome path. If the file
+                    # write fails we bail out before the Redis pipeline runs,
+                    # so the shadow pending outcomes stay in Redis and are
+                    # retried next run instead of being lost from the archive.
+                    if resolved_for_file and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                        try:
+                            from outcome_storage import append_outcome_batch
+                            append_outcome_batch(resolved_for_file, shadow=True)
+                        except Exception as e:
+                            logger_pair.error(
+                                f"[{pair}] Shadow file archive write failed — {resolved_count} "
+                                f"resolved shadow outcome(s) left PENDING in Redis for retry: {e}"
+                            )
+                            return
                     await asyncio.wait_for(_execute_pipeline(write_pipe), timeout=2.0)
 
         except Exception as e:
@@ -1812,7 +1826,7 @@ class RedisStateStore:
 
         if resolved_count:
             logger_pair.debug(
-                f"[{pair}] Shadow outcome resolution | resolved={resolved_count}"
+                f"[{pair}] Shadow outcome resolution| resolved={resolved_count}"
             )
 
     async def get_alert_win_rate(self, pair: str, alert_key: str) -> Tuple[Optional[float], int]:
@@ -1981,7 +1995,7 @@ class RedisStateStore:
             await self._record_redis_failure("atomic_batch_update", e)
             return False
 
-    # ── CUSUM state persistence ─────────────────────────────────────────
+    # ── CUSUM state persistence ────────────────────────────────���────────
     async def load_cusum_state(self, alert_key: str) -> Optional[Dict[str, Any]]:
         """Load persisted CUSUM accumulator for one alert_key."""
         if self.degraded or not self._redis:

@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 
 from brain_audit import (
     DataCoverage, HealthStatus, RecommendationTier, get_audit, reset_audit,
+    ACTION_GATE_MIN_ROWS,
 )
 
 from archive_reader import load_archived_outcomes
@@ -1312,7 +1313,7 @@ class BrainEngineV2(BaseBrainEngine):
         list — the old behaviour, which flickers run-to-run.
         """
         gate: Dict[str, bool] = {
-            "data_quality": len(real_rows) >= 100,
+            "data_quality": len(real_rows) >= ACTION_GATE_MIN_ROWS,
             "oos_prediction": False,
             "profitability": False,
             "stability": True,
