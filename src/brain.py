@@ -874,8 +874,8 @@ class BrainEngine:
                             f"🚨 CUSUM EDGE DECAY on {alert_key}: "
                             f"drift detected after {det.n} outcomes "
                             f"(s_neg={det.s_neg:.2f} > h={det.h:.1f}). "
-                            f"All config patches FROZEN for this alert. "
-                            f"Manual review required."
+                            "All config patches FROZEN for this alert. "
+                            "Manual review required."
                         ),
                     })
                     break
@@ -1040,7 +1040,7 @@ class BrainEngine:
                             f"{sample_label} across {len(s['pairs'])} pairs "
                             f"(95% CI upper bound {hi:.0%} < {disable_wr:.0%}); "
                             f"net EV {ev_obj.get('net_ev', 0):+.3f}%/trade. "
-                            f"Evidence supports disabling — review before applying."
+                            "Evidence supports disabling — review before applying."
                         ),
                     })
                 else:
@@ -1053,7 +1053,7 @@ class BrainEngine:
                             f"{sample_label} (95% CI upper bound {hi:.0%} < "
                             f"{disable_wr:.0%}), but net EV "
                             f"{ev_obj.get('net_ev', 0):+.3f}%/trade is positive. "
-                            f"Keeping ENABLED — low WR alone is not a disable condition."
+                            "Keeping ENABLED — low WR alone is not a disable condition."
                         ),
                     })
                 
@@ -1071,7 +1071,7 @@ class BrainEngine:
                             f"{sample_label}, net EV "
                             f"{ev_obj.get('net_ev', 0):+.3f}%/trade, "
                             f"(≥{auto_disable_min} required). "
-                            f"[Pending action gate]"
+                            "[Pending action gate]"
                         ),
                     })
             elif lo >= cfg.MIN_WIN_RATE:
@@ -1435,13 +1435,13 @@ class BrainEngine:
                         lines.append(
                             f"  {ak}: recent netEV {v['recent']['net_ev']:+.2f}% (n={v['recent']['n']}) "
                             f"vs {long_days}d {v['long']['net_ev']:+.2f}% (n={v['long']['n']}) — "
-                            f"historically good, currently weak"
+                            "historically good, currently weak"
                         )
                     for ak, v in sorted(emerging, key=lambda t: -t[1]["recent_vs_long_ev_gap"])[:3]:
                         lines.append(
                             f"  {ak}: recent netEV {v['recent']['net_ev']:+.2f}% (n={v['recent']['n']}) "
                             f"vs {long_days}d {v['long']['net_ev']:+.2f}% (n={v['long']['n']}) — "
-                            f"newly emerging, not yet in the long-history baseline"
+                            "newly emerging, not yet in the long-history baseline"
                         )
                     always_weak_note = (
                         f"\n{len(always_weak)} alert(s) confirmed weak in both windows — not a temporary dip."
@@ -1870,15 +1870,15 @@ class BrainEngine:
                     "message": (
                         (
                             "🎯 Calibration gate armed: dispatch filters on calibrated WR, "
-                            f"not raw confluence %. "
+                            "not raw confluence %. "
                             if calibration_persisted else
                             "⚠️ Calibration curves computed but NOT persisted to Redis — "
-                            f"live dispatch gate will fail-open on a stale/missing curve until "
-                            f"the next successful persist. "
+                            "live dispatch gate will fail-open on a stale/missing curve until "
+                            "the next successful persist. "
                         )
                         + f"Mean per-alert ECE {calib.get('ece_mean', 0):.3f} "
-                        f"(historical/in-sample over per-alert-key curves — "
-                        f"not a global OOS ECE)."
+                        "(historical/in-sample over per-alert-key curves — "
+                        "not a global OOS ECE)."
                         + (
                             " Most miscalibrated: "
                             + ", ".join(f"{ak} (ECE {ece:.2f}, n={n})" for ak, ece, n in miscal[:5])
