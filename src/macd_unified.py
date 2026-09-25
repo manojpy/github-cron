@@ -107,7 +107,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     disabled_alert_keys_run: Optional[Set[str]] = None,
     pair_thresholds_run: Optional[Dict[str, float]] = None,
     open_positions_run: Optional[List[Dict[str, Any]]] = None,
-    kill_switch_active_run: bool = False) -> Optional[Tuple[str, Dict[str, Any], Optional[Any]]]:
+    kill_switch_active_run: bool = False,
+    last_processed_candles_run: Optional[Dict[str, Optional[int]]] = None,
+) -> Optional[Tuple[str, Dict[str, Any], Optional[Any]]]:
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     pair_oi = (oi_gate_data or {}).get(pair_name)
@@ -237,8 +239,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         alerts_sent_ref = []
     if alerts_sent_lock is None:
         alerts_sent_lock = asyncio.Lock()
-    try: 
-        last_processed = await sdb.get_last_processed_candle_ts(pair_name)
+    try:  
+        if last_processed_candles_run is not None:
+            last_processed = last_processed_candles_run.get(pair_name)
+        else:
+            last_processed = await sdb.get_last_processed_candle_ts(pair_name)
         alert_result = await _eval_alerts(
             gr, data_5m, data_daily, reference_time, sdb, correlation_id, logger_pair,
             disabled_alert_keys=disabled_alert_keys_run,
@@ -315,7 +320,8 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
                        disabled_alert_keys_run: Optional[Set[str]] = None,
                        pair_thresholds_run: Optional[Dict[str, float]] = None,
                        open_positions_run: Optional[List[Dict[str, Any]]] = None,
-                       kill_switch_active_run: bool = False):
+                       kill_switch_active_run: bool = False,
+                       last_processed_candles_run: Optional[Dict[str, Optional[int]]] = None):
     p_name, symbol, candles = task_data                 
     try:
         pd_15m, pd_5m, data_daily = (parsed_cache or {}).get(p_name, (None, None, None))
@@ -347,6 +353,7 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
             pair_thresholds_run=pair_thresholds_run,
             open_positions_run=open_positions_run,
             kill_switch_active_run=kill_switch_active_run,
+            last_processed_candles_run=last_processed_candles_run,
         )
         return result
     except asyncio.CancelledError:
@@ -806,6 +813,19 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         except Exception as e:
             logger_main.warning(f"Kill-switch pre-load failed (fail-open): {e}")
             kill_switch_active_run = False
+
+    # ── Last-processed candle timestamps: load ONCE per run ──
+    # One MGET replaces one GET per pair during evaluation.
+    last_processed_candles_run: Dict[str, Optional[int]] = {}
+    if state_db and not state_db.degraded:
+        try:
+            last_processed_candles_run = await state_db.get_last_processed_candle_ts_bulk(
+                pairs_to_process
+            )
+        except Exception as e:
+            logger_main.warning(f"Last-processed-candle bulk pre-load failed (fail-open): {e}")
+            last_processed_candles_run = {}
+
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
     prepared_tasks = []
 
@@ -951,6 +971,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 pair_thresholds_run=pair_thresholds_run,
                 open_positions_run=open_positions_run,
                 kill_switch_active_run=kill_switch_active_run,
+                last_processed_candles_run=last_processed_candles_run,
             )
     results = await asyncio.gather(
         *[_bounded_eval(t) for t in prepared_tasks],
@@ -1136,6 +1157,14 @@ async def run_once() -> Optional[bool]:
         logger_run.debug("Connecting to Redis...")
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
+
+        valkey_usage_start: Dict[str, Optional[float]] = {}
+        if sdb and not sdb.degraded:
+            try:
+                valkey_usage_start = await sdb.get_valkey_usage_snapshot()
+            except Exception as e:
+                logger_run.debug(f"Valkey start snapshot unavailable: {e}")
+                valkey_usage_start = {}
 
         if sdb and not sdb.degraded:
             try:
@@ -1405,6 +1434,17 @@ async def run_once() -> Optional[bool]:
         run_duration = time.time() - start_time
         redis_status = "OK" if (sdb and not sdb.degraded) else "DEGRADED"
 
+        valkey_usage_end: Dict[str, Optional[float]] = {}
+        if sdb and not sdb.degraded:
+            try:
+                valkey_usage_end = await sdb.get_valkey_usage_snapshot()
+            except Exception as e:
+                logger_run.debug(f"Valkey end snapshot unavailable: {e}")
+                valkey_usage_end = {}
+
+        redis_mem_pct = valkey_usage_end.get("memory_pct")
+        redis_mem_field = f" ({redis_mem_pct}% mem)" if redis_mem_pct is not None else ""
+
         summary = (
             f"🎯🌏 RUN COMPLETE | "
             f"Duration: {run_duration:.1f}s | "
@@ -1412,9 +1452,20 @@ async def run_once() -> Optional[bool]:
             f"Alerts: {alerts_sent_ref[0]} | "
             f"OI/Funding blocks: {fetcher_stats.get('oi_funding_blocks', 0)} | "
             f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
-            f"Redis: {redis_status}"
+            f"Redis: {redis_status}{redis_mem_field}"
         )
         logger_run.info(summary)
+
+        start_commands = valkey_usage_start.get("total_commands_processed")
+        end_commands = valkey_usage_end.get("total_commands_processed")
+        if start_commands is not None and end_commands is not None and end_commands >= start_commands:
+            logger_run.info(f"🗄️ Valkey commands this run: {int(end_commands - start_commands)}")
+
+        if redis_mem_pct is not None:
+            if redis_mem_pct >= 90:
+                logger_run.critical(f"🚨 Redis/Valkey memory CRITICAL — {redis_mem_pct}% of plan limit")
+            elif redis_mem_pct >= 80:
+                logger_run.warning(f"⚠️ Redis/Valkey memory high — {redis_mem_pct}% of plan limit")
 
         if cfg.ENABLE_BRAIN and not _ALERT_ONLY_MODE:
             try:

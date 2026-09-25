@@ -509,6 +509,51 @@ class RedisStateStore:
             logger.error(f"Failed to {op_name}: {e}")
             return None
 
+    async def get_valkey_usage_snapshot(self) -> Dict[str, Optional[float]]:
+        """One-call snapshot of Valkey resource usage: total commands
+        processed (server-wide, cumulative — diff two snapshots for a
+        per-run delta) and current memory usage vs. the plan's maxmemory.
+        Uses a single bare INFO call (no section arg, which returns every
+        section) so one snapshot costs exactly one command, not two."""
+        snapshot: Dict[str, Optional[float]] = {
+            "total_commands_processed": None,
+            "used_memory_bytes": None,
+            "maxmemory_bytes": None,
+            "memory_pct": None,
+        }
+        if self.degraded or not self._redis:
+            return snapshot
+        info = await self._safe_redis_op(
+            lambda: _rc(self._redis).info(),
+            2.0,
+            "info",
+        )
+        if not isinstance(info, dict):
+            return snapshot
+        total_commands = info.get("total_commands_processed")
+        if total_commands is not None:
+            try:
+                snapshot["total_commands_processed"] = float(total_commands)
+            except (TypeError, ValueError):
+                pass
+        used = info.get("used_memory")
+        maxmem = info.get("maxmemory")
+        try:
+            if used is not None:
+                snapshot["used_memory_bytes"] = float(used)
+        except (TypeError, ValueError):
+            pass
+        try:
+            if maxmem is not None:
+                snapshot["maxmemory_bytes"] = float(maxmem)
+        except (TypeError, ValueError):
+            pass
+        if snapshot["used_memory_bytes"] is not None and snapshot["maxmemory_bytes"]:
+            snapshot["memory_pct"] = round(
+                (snapshot["used_memory_bytes"] / snapshot["maxmemory_bytes"]) * 100, 1
+            )
+        return snapshot
+
     async def get(self, key: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
         return await self._safe_redis_op(
             lambda: _rc(self._redis).get(f"{self.state_prefix}{key}"),
@@ -795,6 +840,33 @@ class RedisStateStore:
             return int(raw)
         except (ValueError, TypeError):
             return None
+
+    async def get_last_processed_candle_ts_bulk(
+        self, pair_names: Sequence[str]
+    ) -> Dict[str, Optional[int]]:
+        """Load the last-processed candle timestamp for all requested pairs
+        with one MGET, instead of one GET per pair."""
+        if self.degraded or not self._redis or not pair_names:
+            return {pair: None for pair in pair_names}
+        pairs = list(pair_names)
+        keys = [f"{RedisKeyPrefix.LAST_PROCESSED_CANDLE}{pair}" for pair in pairs]
+        raw_values = await self._safe_redis_op(
+            lambda: _rc(self._redis).mget(keys),
+            3.0,
+            "last_processed_candle_mget",
+        )
+        if raw_values is None:
+            return {pair: None for pair in pairs}
+        result: Dict[str, Optional[int]] = {}
+        for pair, raw in zip(pairs, raw_values):
+            if raw is None:
+                result[pair] = None
+                continue
+            try:
+                result[pair] = int(raw)
+            except (ValueError, TypeError):
+                result[pair] = None
+        return result
 
     async def set_last_processed_candle_ts(self, pair_name: str, ts: int) -> bool:
         """Mark a candle timestamp as processed for this pair."""
