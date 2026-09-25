@@ -1969,7 +1969,7 @@ class BrainEngine:
                     )
                     if not _same_sample:
                         _caveat = (
-                            f" ⚠️ Different evaluation samples: "
+                            " ⚠️ Different evaluation samples: "
                             f"ML n={_ml_n}, conf_pct n={_conf_n}."
                             f"{_populations_note} "
                             f"ECE values are descriptive only — not a valid "
@@ -1977,7 +1977,7 @@ class BrainEngine:
                         )
                     else:
                         _caveat = (
-                            f" Evaluation sample sizes are similar "
+                            " Evaluation sample sizes are similar "
                             f"(ML n={_ml_n}, conf_pct n={_conf_n})."
                             f"{_populations_note} "
                             f"Treat as descriptive, not a model-selection verdict."
