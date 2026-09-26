@@ -49,8 +49,7 @@ _BLOCKED = {"actionable": False, "data_quality": True, "oos_prediction": False,
             "profitability": False, "stability": False, "risk": False, "execution": True}
 _OPEN = {k: True for k in _BLOCKED}
 
-
-def _report(rows, gate=_BLOCKED, net_ev=-0.38, days_override=None, patch=None):
+def _report(rows, gate=_BLOCKED, net_ev=-0.38, days_override=None, patch=None, ai_extra=None):
     a = get_audit()
     a.begin_cycle()
     a.set_history_coverage(rows, requested_days=180)
@@ -59,14 +58,13 @@ def _report(rows, gate=_BLOCKED, net_ev=-0.38, days_override=None, patch=None):
     a.set_reconciliation(pending_count=45, resolved_this_run=0, archived_this_run=0,
                          total_archived=len(rows), loaded_by_brain=len(rows), shadow_loaded=0)
     a.record_analysis("monte_carlo", HealthStatus.INSUFFICIENT_DATA, detail="need 21 days")
+    ai_metrics = {"net_ev": net_ev, "action_gate": gate, **(ai_extra or {})}
     recs = {"_real_rows": rows, "_shadow_rows": [], "config_patch": patch or [],
-            "ai_metrics": {"net_ev": net_ev, "action_gate": gate}, "_archive_stats": {}}
+            "ai_metrics": ai_metrics, "_archive_stats": {}}
     return be.build_brain_report(recs, cfg)
-
 
 def _plain(msgs):
     return "\n".join(re.sub(r"\\(.)", r"\1", m) for m in msgs)
-
 
 def test_confidence_is_capped_by_history_span():
     a = get_audit()
@@ -89,6 +87,35 @@ def test_all_sixteen_sections_in_order_and_fit_telegram():
     assert all(len(m) <= 4096 for m in msgs)
     assert text.index("05 │") < text.index("THE EVIDENCE BEHIND") < text.index("06 │")
 
+def test_counterfactual_candidate_vs_control_shows_top5_and_verdicts():
+    scenarios = [
+        {"label": "Threshold +1", "ev": 0.81, "gross_ev": 0.90, "delta_ev": 0.39, "delta_n": -40,
+         "n": 284, "wr": 0.61, "shadow_validated": True, "shadow_n": 137, "shadow_delta_ev": 0.31, "shadow_wr": 0.58},
+        {"label": "RSI cap -3", "ev": 0.55, "gross_ev": 0.60, "delta_ev": 0.13, "delta_n": -10,
+         "n": 198, "wr": 0.57, "shadow_validated": True, "shadow_n": 8, "shadow_delta_ev": 0.10, "shadow_wr": 0.56},
+        {"label": "Combined", "ev": 0.91, "gross_ev": 1.00, "delta_ev": 0.49, "delta_n": -60,
+         "n": 142, "wr": 0.63, "shadow_validated": False, "shadow_n": 22, "shadow_delta_ev": -0.05, "shadow_wr": 0.45},
+        {"label": "Threshold +2", "ev": 0.30, "gross_ev": 0.35, "delta_ev": -0.12, "delta_n": -80,
+         "n": 90, "wr": 0.52, "shadow_validated": None, "shadow_n": None, "shadow_delta_ev": None, "shadow_wr": None},
+        {"label": "Session filter", "ev": 0.60, "gross_ev": 0.65, "delta_ev": 0.18, "delta_n": -20,
+         "n": 300, "wr": 0.59, "shadow_validated": True, "shadow_n": 15, "shadow_delta_ev": 0.20, "shadow_wr": 0.60},
+        {"label": "Worst — should not appear in section 11", "ev": 0.10, "gross_ev": 0.12, "delta_ev": -0.30,
+         "delta_n": -5, "n": 50, "wr": 0.48, "shadow_validated": True, "shadow_n": 20,
+         "shadow_delta_ev": -0.10, "shadow_wr": 0.40},
+    ]
+    text = _plain(_report(_rows(_SPEC), ai_extra={"counterfactual_scenarios": scenarios}))
+    sec11 = text[text.index("11 │"):text.index("12 │")]
+    assert "CANDIDATE vs CONTROL" in sec11
+    assert sec11.index("Combined") < sec11.index("Threshold +1") < sec11.index("Session filter")
+    assert "Worst — should not appear in section 11" not in sec11
+    assert "PROMOTION-ELIGIBLE" in sec11
+    assert "REJECTED" in sec11
+    assert "NOT YET (need 15 shadow, have 8)" in sec11
+    assert "NOT YET (shadow inconclusive)" in sec11
+
+    sec16 = text[text.index("16 │"):]
+    assert "Worst — should not appear in section 11" in sec16
+    assert "ShadowΔEV" in sec16 and "GrossEV" in sec16
 
 def test_low_history_says_diagnose_and_never_advises_disabling():
     text = _plain(_report(_rows(_SPEC)))
