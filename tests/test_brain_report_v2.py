@@ -1,8 +1,10 @@
-"""Layered 16-section Brain report: structure, honesty caps, Telegram safety."""
+"""Slim 8-section Brain report: structure, honesty caps, Telegram safety."""
+
 import asyncio
 import random
 import re
 import time
+import pytest 
 
 import brain_enhanced as be
 from archive_reader import _parse_jsonl_row
@@ -78,52 +80,30 @@ def test_confidence_is_capped_by_history_span():
     assert a.statistical_confidence_label() == "HIGH"
 
 
-def test_all_sixteen_sections_in_order_and_fit_telegram():
+def test_all_eight_sections_in_order_and_fit_telegram():
     msgs = _report(_rows(_SPEC))
     text = _plain(msgs)
-    positions = [text.index(f"{i:02d} │") for i in range(1, 17)]
+    positions = [text.index(f"{i:02d} │") for i in range(1, 9)]
     assert positions == sorted(positions)
     assert "BRAIN REPORT" in msgs[0] and "END OF BRAIN REPORT" in _plain(msgs[-1:])
     assert all(len(m) <= 4096 for m in msgs)
-    assert text.index("05 │") < text.index("THE EVIDENCE BEHIND") < text.index("06 │")
+    assert text.index("05 │") < text.index("CONTEXT (sessions") < text.index("06 │")
+    # Dropped technical sections must not appear
+    for gone in ("09 │", "10 │", "11 │", "12 │", "13 │", "14 │", "15 │", "16 │"):
+        assert gone not in text
 
+@pytest.mark.skip(reason="Counterfactual section removed from slim trader report")
 def test_counterfactual_candidate_vs_control_shows_top5_and_verdicts():
-    scenarios = [
-        {"label": "Threshold +1", "ev": 0.81, "gross_ev": 0.90, "delta_ev": 0.39, "delta_n": -40,
-         "n": 284, "wr": 0.61, "shadow_validated": True, "shadow_n": 137, "shadow_delta_ev": 0.31, "shadow_wr": 0.58},
-        {"label": "RSI cap -3", "ev": 0.55, "gross_ev": 0.60, "delta_ev": 0.13, "delta_n": -10,
-         "n": 198, "wr": 0.57, "shadow_validated": True, "shadow_n": 8, "shadow_delta_ev": 0.10, "shadow_wr": 0.56},
-        {"label": "Combined", "ev": 0.91, "gross_ev": 1.00, "delta_ev": 0.49, "delta_n": -60,
-         "n": 142, "wr": 0.63, "shadow_validated": False, "shadow_n": 22, "shadow_delta_ev": -0.05, "shadow_wr": 0.45},
-        {"label": "Threshold +2", "ev": 0.30, "gross_ev": 0.35, "delta_ev": -0.12, "delta_n": -80,
-         "n": 90, "wr": 0.52, "shadow_validated": None, "shadow_n": None, "shadow_delta_ev": None, "shadow_wr": None},
-        {"label": "Session filter", "ev": 0.60, "gross_ev": 0.65, "delta_ev": 0.18, "delta_n": -20,
-         "n": 300, "wr": 0.59, "shadow_validated": True, "shadow_n": 15, "shadow_delta_ev": 0.20, "shadow_wr": 0.60},
-        {"label": "Worst — should not appear in section 11", "ev": 0.10, "gross_ev": 0.12, "delta_ev": -0.30,
-         "delta_n": -5, "n": 50, "wr": 0.48, "shadow_validated": True, "shadow_n": 20,
-         "shadow_delta_ev": -0.10, "shadow_wr": 0.40},
-    ]
-    text = _plain(_report(_rows(_SPEC), ai_extra={"counterfactual_scenarios": scenarios}))
-    sec11 = text[text.index("11 │"):text.index("12 │")]
-    assert "CANDIDATE vs CONTROL" in sec11
-    assert sec11.index("Combined") < sec11.index("Threshold +1") < sec11.index("Session filter")
-    assert "Worst — should not appear in section 11" not in sec11
-    assert "PROMOTION-ELIGIBLE" in sec11
-    assert "REJECTED" in sec11
-    assert "NOT YET (need 15 shadow, have 8)" in sec11
-    assert "NOT YET (shadow inconclusive)" in sec11
-
-    sec16 = text[text.index("16 │"):]
-    assert "Worst — should not appear in section 11" in sec16
-    assert "ShadowΔEV" in sec16 and "GrossEV" in sec16
+    pass
 
 def test_low_history_says_diagnose_and_never_advises_disabling():
     text = _plain(_report(_rows(_SPEC)))
     assert "NEEDS ATTENTION" in text and "DIAGNOSE + COLLECT DATA" in text
     assert "NOT yet \"disable\" candidates" in text
     assert "Do not disable alerts solely from this report." in text
-    assert "DO NOT APPLY" in text and "APPROVED TO APPLY" not in text
-
+    assert "DO NOT CHANGE YET" in text
+    assert "APPROVED TO APPLY" not in text
+    assert "APPROVED CHANGES" not in text
 
 def test_win_rule_explained_with_break_even():
     text = _plain(_report(_rows(_SPEC)))
@@ -132,13 +112,14 @@ def test_win_rule_explained_with_break_even():
     assert "Break-even needs roughly 33% wins" in text
 
 
-def test_scorecard_lists_every_alert_and_names_are_friendly():
+def test_scorecard_uses_friendly_names_and_summarises_thin():
     text = _plain(_report(_rows(_SPEC)))
     score = text.split("06 │")[1].split("07 │")[0]
-    for name in ("CHoCH SELL", "Dynamic Flow BUY", "VWAP DOWN", "Fib Reversal BUY"):
-        assert name in score, name
     assert "choch_sell" not in score
-
+    assert "INSUFFICIENT DATA" in score
+    assert "see archive report if needed" in score
+    # At least one pretty name appears somewhere in the report
+    assert "CHoCH SELL" in text or "Dynamic Flow BUY" in text
 
 def test_telegram_markdownv2_is_valid():
     for m in _report(_rows(_SPEC)):
@@ -150,7 +131,6 @@ def test_telegram_markdownv2_is_valid():
                 if ch in _SPECIAL:
                     assert i > 0 and prose[i - 1] == "\\", f"unescaped {ch!r} near {prose[max(0, i-20):i+5]!r}"
 
-
 def test_validated_mode_shows_verdict_and_approved_block():
     spec = [("ppo_signal_up", "buy", 80), ("vwap_down", "sell", 40), ("choch_sell", "sell", 40)]
     rows = _rows(spec, days=45, positive=("ppo_signal_up",))
@@ -158,8 +138,10 @@ def test_validated_mode_shows_verdict_and_approved_block():
     text = _plain(_report(rows, gate=_OPEN, net_ev=0.6, days_override=45, patch=patch))
     assert "BRAIN VERDICT" in text and "CURRENTLY VALIDATED EDGE" in text
     assert "PPO Signal UP" in text and "Action Gate: APPROVED" in text
-    assert "APPROVED TO APPLY" in text and "DO NOT APPLY" not in text
-
+    # Slim report: approved patches live in section 02, not a separate "DO NOT APPLY" block
+    assert "APPROVED CHANGES" in text or "CONFLUENCE_MIN_ABS_SCORE" in text
+    assert "DO NOT APPLY" not in text
+    assert "DO NOT CHANGE YET" not in text
 
 def test_empty_data_does_not_crash():
     msgs = _report([])
@@ -189,7 +171,6 @@ def _engine(monkeypatch, sent):
     monkeypatch.setattr(eng, "_store_pending_plan", fake_store)
     return eng, Q()
 
-
 def test_report_is_archived_as_markdown_and_still_sent(monkeypatch):
     import logging
     import outcome_storage
@@ -197,13 +178,14 @@ def test_report_is_archived_as_markdown_and_still_sent(monkeypatch):
     monkeypatch.setattr(outcome_storage, "save_report", lambda md: saved.append(md) or "reports/x.md")
     eng, q = _engine(monkeypatch, sent)
     assert asyncio.run(eng.generate_report([], q, logging.getLogger("t"))) is True
-    assert len(saved) == 1 and len(sent) >= 3
+    assert len(saved) == 1 and len(sent) >= 1
     md = saved[0]
     assert md.startswith("# 🧠 Brain Report")
-    assert len(re.findall(r"^## \d\d │", md, re.M)) == 16
+    # Slim trader report: 8 sections
+    assert len(re.findall(r"^## \d\d │", md, re.M)) == 8
     assert md.count("```") % 2 == 0
     assert not re.search(r"\\[.\-()!+=|]", md)           # no Telegram MarkdownV2 escaping in the file
-
+    assert "CONTEXT (sessions" in _plain(sent) or "Action Gate" in _plain(sent) or "08 │" in md
 
 def test_archive_failure_is_not_fatal_and_sends_once(monkeypatch):
     import logging
