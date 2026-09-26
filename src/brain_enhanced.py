@@ -888,6 +888,27 @@ def _config_json_block(F: Dict[str, Any], cfg) -> Optional[str]:
         changes["CONFLUENCE_MIN_ABS_SCORE"] = round(F["rec_thr"]["recommended"], 1)
     return json.dumps(changes, indent=1) if changes else None
 
+def _cf_verdict(scenario: Dict[str, Any], cfg) -> Tuple[str, str]:
+    """Shadow status + promotion verdict for one counterfactual scenario.
+
+    Returns (shadow_status, verdict), both short emoji-prefixed strings for
+    display. Promotion requires shadow_validated is True AND the shadow
+    sample clears BRAIN_COUNTERFACTUAL_PROMOTE_MIN_SHADOW — mirrors how
+    _shadow_weight_check already gates weight-change promotion, applied
+    here to threshold/gate candidates.
+    """
+    sv = scenario.get("shadow_validated")
+    shadow_n = scenario.get("shadow_n") or 0
+    min_shadow = getattr(cfg, "BRAIN_COUNTERFACTUAL_PROMOTE_MIN_SHADOW", 15)
+    if sv is None:
+        return "🟡 too thin to validate", "🕒 NOT YET (shadow inconclusive)"
+    if sv is False:
+        return f"🔴 disagrees (n={shadow_n})", "🚫 REJECTED (curve-fit risk)"
+    if shadow_n >= min_shadow:
+        return f"🟢 confirmed (n={shadow_n})", "✅ PROMOTION-ELIGIBLE"
+    return (f"🟢 confirmed (n={shadow_n})",
+            f"🕒 NOT YET (need {min_shadow} shadow, have {shadow_n})")
+
 def _sec_sims(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(11, "🧪 SIMULATIONS / WHAT-IF ANALYSIS")]
     gate = F["gate"]
@@ -930,10 +951,33 @@ def _sec_sims(F: Dict[str, Any], cfg) -> List[_Piece]:
         elif p.get("current") is not None and p.get("suggested") is not None:
             cand.append(f"🔬 {p['path']}: {p['current']} → {p['suggested']}"
                         f" — {'🚫 blocked' if blocked else '✅ approved'}")
+
     if cand:
         out.append(_p("🔬 CANDIDATE SETTINGS (what the Brain would change):\n\n" + "\n".join(cand)))
-    return out
 
+    # ── Candidate vs Control (counterfactual simulator, best 5 by EV) ──
+    # Full numeric detail (gross EV, delta_n, shadow WR) lives in the
+    # Technical Appendix (section 16); this stays short for Telegram.
+    cf_scenarios = sorted(
+        F["ai"].get("counterfactual_scenarios") or [],
+        key=lambda s: s.get("ev", float("-inf")),
+        reverse=True,
+    )[:5]
+    if cf_scenarios:
+        lines = []
+        for i, s in enumerate(cf_scenarios, 1):
+            shadow_status, verdict = _cf_verdict(s, cfg)
+            lines.append(
+                f"{i}. {s.get('label', '?')}\n"
+                f"   EV: {F['net_ev']:+.2f}% → {s.get('ev', 0.0):+.2f}% "
+                f"(Δ{s.get('delta_ev', 0.0):+.2f}%, n={s.get('n', 0)})\n"
+                f"   Shadow: {shadow_status} → {verdict}"
+            )
+        out.append(_p(
+            "🥇 CANDIDATE vs CONTROL (top 5 by EV, control = current live config):\n\n"
+            + "\n\n".join(lines)
+        ))
+    return out
 
 def _sec_recs(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(12, "🤖 BRAIN RECOMMENDATIONS")]
@@ -1105,11 +1149,26 @@ def _sec_appendix(F: Dict[str, Any], cfg) -> List[_Piece]:
             f"{p.get('path')}: {p.get('current')} → {p.get('suggested')}"
             f"{' [blocked]' if p.get('_blocked_by_action_gate') else ''}"
             for p in F["cfg_patch"][:20])))
+    cf_all = F["ai"].get("counterfactual_scenarios") or []
+    if cf_all:
+        cf_rows = [("Scenario", "N", "WR", "EV", "GrossEV", "Δn", "ShadowN", "ShadowΔEV", "ShadowWR", "Valid")]
+        for s in sorted(cf_all, key=lambda s: s.get("ev", float("-inf")), reverse=True):
+            sv = s.get("shadow_validated")
+            cf_rows.append((
+                str(s.get("label", "?")), str(s.get("n", 0)), f"{s.get('wr', 0.0):.0%}",
+                f"{s.get('ev', 0.0):+.2f}", f"{s.get('gross_ev', 0.0):+.2f}",
+                f"{s.get('delta_n', 0):+d}",
+                str(s.get("shadow_n")) if s.get("shadow_n") is not None else "n/a",
+                f"{s['shadow_delta_ev']:+.2f}" if s.get("shadow_delta_ev") is not None else "n/a",
+                f"{s['shadow_wr']:.0%}" if s.get("shadow_wr") is not None else "n/a",
+                "yes" if sv is True else "no" if sv is False else "n/a",
+            ))
+        out.append(_p("• Full counterfactual scenario table (all evaluated, unranked cap)"))
+        out.extend(_c_split(_table(cf_rows, "lrrrrrrrrr")))
     out.append(_p("Also computed but not shown here: Monte Carlo, CUSUM, walk-forward, calibration, "
                   "permutation importance, hierarchical analysis and weight optimisation "
                   "(each appears in 'Analysis health' above when it ran)."))
     return out
-
 
 _REPORT_SECTIONS = (
     ("EXECUTIVE SUMMARY", _sec_summary), ("WHAT TO DO NOW", _sec_do_now),
