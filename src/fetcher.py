@@ -983,6 +983,81 @@ def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool,
 
     return False, False, ""
 
+def detect_reversal_candle_pattern_with_context(
+    data_15m: "PriceData",
+    i: int,
+) -> Tuple[bool, bool, str, int]:
+    """
+    Pattern-aware reversal detection that also exposes the exact prior-leg
+    direction used by detect_reversal_candle_pattern().
+
+    Returns:
+        (
+            reversal_bullish,
+            reversal_bearish,
+            pattern_name,
+            prior_leg_direction,
+        )
+
+    prior_leg_direction:
+        -1 = prior counter-trend leg was bearish/down
+         1 = prior counter-trend leg was bullish/up
+         0 = unavailable / no detected reversal pattern
+
+    IMPORTANT:
+    The reference candle is deliberately pattern-aware.
+
+    3-candle reversal patterns:
+        Morning Star
+        Evening Star
+        Three White Soldiers
+        Three Black Crows
+
+    use i-3 because detect_reversal_candle_pattern() evaluates their
+    prior leg from i-3.
+
+    2/1-candle reversal patterns use i-1 because the existing detector
+    evaluates their prior leg from i-1.
+
+    This keeps Strong Reversal aligned with the exact pullback context
+    that produced the reversal pattern and avoids independently
+    recalculating the leg at i-1.
+    """
+    reversal_bullish, reversal_bearish, pattern_name = (
+        detect_reversal_candle_pattern(data_15m, i)
+    )
+
+    if not (reversal_bullish or reversal_bearish) or not pattern_name:
+        return reversal_bullish, reversal_bearish, pattern_name, 0
+
+    if pattern_name in {
+        "Morning Star",
+        "Evening Star",
+        "Three White Soldiers",
+        "Three Black Crows",
+    }:
+        reference_idx = i - 3
+    else:
+        reference_idx = i - 1
+
+    if reference_idx < 0 or reference_idx >= len(data_15m.close):
+        return reversal_bullish, reversal_bearish, pattern_name, 0
+
+    prior_leg_direction = _prior_leg_direction(
+        data_15m.close,
+        data_15m.high,
+        data_15m.low,
+        reference_idx,
+        Constants.REVERSAL_PRIOR_LEG_LOOKBACK,
+    )
+
+    return (
+        reversal_bullish,
+        reversal_bearish,
+        pattern_name,
+        prior_leg_direction,
+    )
+
 def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[PriceData]:
     try:   
         if not result or not isinstance(result, dict):

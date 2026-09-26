@@ -38,8 +38,11 @@ from bot_config import (
 from fetcher import (
     PriceData, DataFetcher, SessionManager, compute_backoff, validate_indicator_values,
     CandleSnapshot, cross_check_15m_against_5m,
-    confirm_candle_unchanged, verify_mark_price_agrees, detect_reversal_candle_pattern,
+    confirm_candle_unchanged, verify_mark_price_agrees,
+    detect_reversal_candle_pattern,
+    detect_reversal_candle_pattern_with_context,
 )
+
 from state import RedisStateStore, TokenBucket, _rc
 
 from gates import GateResult, IndicatorCache
@@ -1120,7 +1123,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 )
 
         # Reversal-candle pattern is detected once, unconditionally, so that
-        reversal_bullish, reversal_bearish, reversal_pattern_name = detect_reversal_candle_pattern(data_15m, i15)
+        (reversal_bullish, reversal_bearish, reversal_pattern_name, reversal_prior_leg_direction) = detect_reversal_candle_pattern_with_context(data_15m, i15)
+
 
         # Shared "wick ratio OR strong reversal candle" condition, and the
         #   *_common_wick         = strict trend/volatility gate (buy_trend_common) + wick-or-pattern
@@ -1185,9 +1189,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             ppohist_reversal_sell = (sell_common_wick and ppohist_curr < 0 and ppohist_m3 < ppohist_m2 < ppohist_m1 and ppohist_curr < ppohist_m1)
 
         if cfg.ENABLE_STRONG_REVERSAL_ALERT:
-            prior_leg = _prior_leg_direction(data_15m.close, data_15m.high, data_15m.low, i15 - 1, Constants.REVERSAL_PRIOR_LEG_LOOKBACK)
-            strong_reversal_buy = bool(buy_trend_common_relaxed and prior_leg == -1 and reversal_bullish)
-            strong_reversal_sell = bool(sell_trend_common_relaxed and prior_leg == 1 and reversal_bearish)
+            strong_reversal_buy = bool(buy_trend_common_relaxed and reversal_bullish and reversal_prior_leg_direction == -1)
+            strong_reversal_sell = bool(sell_trend_common_relaxed and reversal_bearish and reversal_prior_leg_direction == 1)
         else:
             strong_reversal_buy, strong_reversal_sell = False, False
 
