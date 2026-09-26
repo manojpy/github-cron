@@ -1304,27 +1304,9 @@ class RedisStateStore:
         else:
             outcome_reason = "no_hit"
 
-        # ── PRIMARY WIN: configurable ──
-        primary_metric = getattr(cfg, "OUTCOME_PRIMARY_METRIC", "mfe")
-        if primary_metric == "mfe":
-            if tp_first is True:
-                win = True
-            elif tp_first is False:
-                win = False
-            elif mfe_win and not mae_loss:
-                win = True       # hit TP, never hit SL
-            elif mae_loss and not mfe_win:
-                win = False      # hit SL, never hit TP
-            else:
-                win = close_win  # neither hit, or ambiguous → fall back to close
-        else:
-            win = close_win
-
-        win_weight = _compute_win_weight(rr_achieved, win)
-
         # ── NET P&L (cost-adjusted, fill-aware when available) ──
-        # FIX (Priority 1): pct_move is already computed from anchor_price
-        # (fill_price), so net_pnl_pct is consistent.
+        # Moved ABOVE win determination so OUTCOME_PRIMARY_METRIC=
+        # "net_pnl_pct" can actually use it as the win label.
         fee_pct = getattr(cfg, "BRAIN_FEE_PCT", 0.0006)
         slip_pct = getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003)
         base_cost_pct = (fee_pct * 2 + slip_pct * 2) * 100  # round-trip, in %
@@ -1338,8 +1320,6 @@ class RedisStateStore:
                 entry_slip_pct = (fill_p - sig_p) / sig_p * 100
             else:
                 entry_slip_pct = (sig_p - fill_p) / sig_p * 100
-            # Naming fix (Secondary): this is measured entry slippage +
-            # assumed exit slippage, not "realized" exit slippage.
             realized_cost = (fee_pct * 2) * 100 + abs(entry_slip_pct) * 2
         else:
             realized_cost = base_cost_pct
@@ -1349,6 +1329,25 @@ class RedisStateStore:
         else:
             net_pnl_pct = -pct_move - realized_cost
 
+        # ── PRIMARY WIN: configurable ──
+        primary_metric = getattr(cfg, "OUTCOME_PRIMARY_METRIC", "mfe")
+        if primary_metric == "mfe":
+            if tp_first is True:
+                win = True
+            elif tp_first is False:
+                win = False
+            elif mfe_win and not mae_loss:
+                win = True       # hit TP, never hit SL
+            elif mae_loss and not mfe_win:
+                win = False      # hit SL, never hit TP
+            else:
+                win = close_win  # neither hit, or ambiguous → fall back to close
+        elif primary_metric == "net_pnl_pct":
+            win = net_pnl_pct > 0
+        else:
+            win = close_win
+
+        win_weight = _compute_win_weight(rr_achieved, win)
         return {
             "alert_key": key.split(":")[-2],
             "direction": direction,
