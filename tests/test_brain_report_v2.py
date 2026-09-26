@@ -4,7 +4,6 @@ import asyncio
 import random
 import re
 import time
-import pytest 
 
 import brain_enhanced as be
 from archive_reader import _parse_jsonl_row
@@ -88,13 +87,38 @@ def test_all_eight_sections_in_order_and_fit_telegram():
     assert "BRAIN REPORT" in msgs[0] and "END OF BRAIN REPORT" in _plain(msgs[-1:])
     assert all(len(m) <= 4096 for m in msgs)
     assert text.index("05 │") < text.index("CONTEXT (sessions") < text.index("06 │")
+  
     # Dropped technical sections must not appear
     for gone in ("09 │", "10 │", "11 │", "12 │", "13 │", "14 │", "15 │", "16 │"):
         assert gone not in text
 
-@pytest.mark.skip(reason="Counterfactual section removed from slim trader report")
-def test_counterfactual_candidate_vs_control_shows_top5_and_verdicts():
-    pass
+def test_counterfactual_candidates_beat_control_shown_in_what_to_do_now():
+    scenarios = [
+        {"label": "Threshold +1", "ev": 0.81, "delta_ev": 0.39,
+         "n": 284, "shadow_validated": True, "shadow_n": 137},
+        {"label": "RSI cap -3", "ev": 0.55, "delta_ev": 0.13,
+         "n": 198, "shadow_validated": True, "shadow_n": 8},
+        {"label": "Combined", "ev": 0.91, "delta_ev": 0.49,
+         "n": 142, "shadow_validated": False, "shadow_n": 22},
+        {"label": "Threshold +2 (worse than control)", "ev": 0.30, "delta_ev": -0.12,
+         "n": 90, "shadow_validated": None, "shadow_n": None},
+        {"label": "Session filter", "ev": 0.50, "delta_ev": 0.08,
+         "n": 300, "shadow_validated": True, "shadow_n": 15},
+        {"label": "4th best — should be cut by the top-3 cap", "ev": 0.45, "delta_ev": 0.03,
+         "n": 60, "shadow_validated": True, "shadow_n": 20},
+    ]
+    text = _plain(_report(_rows(_SPEC), ai_extra={"counterfactual_scenarios": scenarios}))
+    sec2 = text[text.index("02 │"):text.index("03 │")]
+    assert "CANDIDATE CONFIGS" in sec2
+    # Ranked best (Combined, ev=0.91) to 3rd (RSI cap -3, ev=0.55); Session
+    # filter (0.50) and the 4th-best (0.45) are positive but cut by the cap.
+    assert sec2.index("Combined") < sec2.index("Threshold +1") < sec2.index("RSI cap -3")
+    assert "Threshold +2 (worse than control)" not in sec2   # delta_ev < 0, never a candidate
+    assert "Session filter" not in sec2                       # positive but outside top 3
+    assert "4th best — should be cut by the top-3 cap" not in sec2
+    assert "PROMOTION-ELIGIBLE" in sec2                       # Threshold +1: validated, n=137 >= 15
+    assert "REJECTED" in sec2                                 # Combined: shadow disagrees
+    assert "NOT YET (need 15 shadow, have 8)" in sec2         # RSI cap -3: validated but thin
 
 def test_low_history_says_diagnose_and_never_advises_disabling():
     text = _plain(_report(_rows(_SPEC)))
