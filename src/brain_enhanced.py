@@ -763,8 +763,12 @@ def _sec_scorecard(F: Dict[str, Any], cfg) -> List[_Piece]:
     _group("🟡 PROMISING — NEED MORE EVIDENCE", [a["name"] for a in promising])
     _group("🔴 UNDERPERFORMING — INVESTIGATE", [a["name"] for a in F["weak"]])
     thin = sorted(F["thin"], key=lambda a: -a["n"])
-    _group(f"⚪ INSUFFICIENT DATA ({len(thin)} alert types, fewer than 10 trades)",
-           [a["name"] for a in thin])
+    # Names omitted on purpose: 20–30 thin alerts bloat Telegram without aiding decisions.
+    _group(
+        f"⚪ INSUFFICIENT DATA ({len(thin)} alert types, <10 trades)",
+        [],
+        empty=f"{len(thin)} types — see archive report if needed.",
+    )
     zero = len(F["alerts"]) - len(validated) - len(promising) - len(F["weak"]) - len(thin)
     if zero > 0:
         out.append(_p(f"➖ {zero} alert(s) with exactly zero net EV are not listed above."))
@@ -793,7 +797,7 @@ def _sec_coins(F: Dict[str, Any], cfg) -> List[_Piece]:
 
 
 def _sec_sessions(F: Dict[str, Any], cfg) -> List[_Piece]:
-    out = [_hdr(8, "⏰ SESSION / TIME ANALYSIS")]
+    out = [_hdr(7, "⏰ SESSION / TIME ANALYSIS")]
     sess = F["sessions"]                                     # worst-first
     if not sess:
         out.append(_p("No session data yet."))
@@ -1019,8 +1023,7 @@ def _sec_recs(F: Dict[str, Any], cfg) -> List[_Piece]:
 
 def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     g = F["gate"]
-    out = [_hdr(13, '🛡️ ACTION GATE — "CAN THE BRAIN SAFELY CHANGE ANYTHING?"')]
-
+    out = [_hdr(8, '🛡️ ACTION GATE — "CAN THE BRAIN SAFELY CHANGE ANYTHING?"')]
     labels = [("data_quality", "Minimum trades"), ("oos_prediction", "OOS EV"),
               ("profitability", "Net EV confidence"), ("stability", "CUSUM drift"),
               ("risk", "Drawdown budget"), ("execution", "Cost assumptions")]
@@ -1171,14 +1174,14 @@ def _sec_appendix(F: Dict[str, Any], cfg) -> List[_Piece]:
     return out
 
 _REPORT_SECTIONS = (
-    ("EXECUTIVE SUMMARY", _sec_summary), ("WHAT TO DO NOW", _sec_do_now),
-    ("PROFITABILITY", _sec_profit), ("LOSS DIAGNOSIS", _sec_loss),
-    ("POSITIVE SIGNS", _sec_positive), ("ALERT SCORECARD", _sec_scorecard),
-    ("COIN ANALYSIS", _sec_coins), ("SESSION ANALYSIS", _sec_sessions),
-    ("FILTER ANALYSIS", _sec_filters), ("INVESTIGATION", _sec_investigation),
-    ("SIMULATIONS", _sec_sims), ("RECOMMENDATIONS", _sec_recs),
-    ("ACTION GATE", _sec_gate), ("DATA QUALITY", _sec_quality),
-    ("EVIDENCE", _sec_evidence), ("TECHNICAL APPENDIX", _sec_appendix),
+    ("EXECUTIVE SUMMARY", _sec_summary),
+    ("WHAT TO DO NOW", _sec_do_now),
+    ("PROFITABILITY", _sec_profit),
+    ("LOSS DIAGNOSIS", _sec_loss),
+    ("POSITIVE SIGNS", _sec_positive),
+    ("ALERT SCORECARD", _sec_scorecard),
+    ("SESSION ANALYSIS", _sec_sessions),
+    ("ACTION GATE", _sec_gate),
 )
 
 def build_brain_report_sections(recs: Dict[str, Any], cfg) -> Tuple[List[List["_Piece"]], str]:
@@ -1231,9 +1234,9 @@ def render_report_messages(sections: List[List[_Piece]], stamp: str) -> List[str
             if cur and len(cur) + len(piece) + 2 > _MSG_LIMIT:
                 _flush()
             cur = f"{cur}\n\n{piece}" if cur else piece
-            
+
         if idx == _HUMAN_SECTIONS:
-            divider = _p("▼ SECTIONS 06–16: THE EVIDENCE BEHIND THE ABOVE ▼")
+            divider = _p("▼ CONTEXT (sessions · gate) ▼")
             if cur and len(cur) + len(divider) + 2 > _MSG_LIMIT:
                 _flush()
             cur = f"{cur}\n\n{divider}" if cur else divider
@@ -1271,7 +1274,7 @@ def render_report_markdown(sections: List[List[_Piece]], stamp: str) -> str:
             else:
                 out.append(_md_prose(raw))
         if idx == _HUMAN_SECTIONS:
-            out.append("---\n\n*Sections 06–16: the evidence behind the above.*")
+            out.append("---\n\n*Context: sessions and action gate.*")
     out.append("---\n\n*End of Brain report.*")
     return "\n\n".join(out) + "\n"
 
