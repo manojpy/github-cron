@@ -70,16 +70,10 @@ def print_startup_banner_once() -> None:
     _STARTUP_BANNER_PRINTED = True
     logger.info(
         f"📡 Bot v{__version__} | Pairs: {len(cfg.PAIRS)} | Workers: {cfg.MAX_PARALLEL_FETCH} | "
-        f"Timeout: {cfg.RUN_TIMEOUT_SECONDS}s | Redis Lock: {cfg.REDIS_LOCK_EXPIRY}s"
-    )
-    # Brain mode line: answers "what is actually active?" without grepping
-    # config_macd.json — shadow/auto-apply/auto-disable are the three flags
-    # that silently change Brain behaviour between reports.
-    brain_on = getattr(cfg, "ENABLE_BRAIN", False)
-    logger.info(
-        f"🧠 Brain: {'ON' if brain_on else 'OFF'} | "
+        f"Timeout: {cfg.RUN_TIMEOUT_SECONDS}s | Redis Lock: {cfg.REDIS_LOCK_EXPIRY}s | "
+        f"🧠 Brain: {'ON' if getattr(cfg, 'ENABLE_BRAIN', False) else 'OFF'} | "
         f"Shadow: {'ON' if getattr(cfg, 'BRAIN_SHADOW_MODE', True) else 'OFF'} | "
-        f"Auto-apply weights: {'ON' if getattr(cfg, 'BRAIN_AUTO_APPLY_DYNAMIC_WEIGHTS', False) else 'OFF'} | "
+        f"Auto-apply: {'ON' if getattr(cfg, 'BRAIN_AUTO_APPLY_DYNAMIC_WEIGHTS', False) else 'OFF'} | "
         f"Auto-disable: {'ON' if getattr(cfg, 'BRAIN_AUTO_DISABLE_ENABLED', True) else 'OFF'} | "
         f"Primary metric: {getattr(cfg, 'OUTCOME_PRIMARY_METRIC', 'mfe')}"
     )
