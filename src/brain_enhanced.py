@@ -644,11 +644,31 @@ def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
             dont.append("Do not disable alerts solely from this report.")
             dont.append("Do not change confluence weights.")
             dont.append("Do not change adaptive thresholds.")
+
         if F["rec_thr_ok"]:
             dont.append("Do not apply the simulated entry-bar change.")
         if F["low_trust"]:
             dont.append(f"Do not optimise from the current {_fmt_span(F['days'])} sample.")
         out.append(_p("🚫 DO NOT CHANGE YET\n\n" + "\n".join(f"• {x}" for x in dont)))
+
+    # ── Candidate vs Control (counterfactual simulator) ──
+    # Only scenarios that actually beat the live config, top 3 — this report
+    # is meant to be scannable, not a full simulation log. Silent when
+    # nothing currently beats control.
+    beats_control = sorted(
+        (s for s in (F["ai"].get("counterfactual_scenarios") or []) if s.get("delta_ev", 0.0) > 0),
+        key=lambda s: s.get("ev", float("-inf")),
+        reverse=True,
+    )[:3]
+    if beats_control:
+        lines = []
+        for s in beats_control:
+            _, verdict = _cf_verdict(s, cfg)
+            lines.append(
+                f"• {s.get('label', '?')}: {F['net_ev']:+.2f}% → {s.get('ev', 0.0):+.2f}% "
+                f"(n={s.get('n', 0)}) — {verdict}"
+            )
+        out.append(_p("🥇 CANDIDATE CONFIGS (beat current live config)\n\n" + "\n".join(lines)))
     return out
 
 def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
@@ -955,32 +975,8 @@ def _sec_sims(F: Dict[str, Any], cfg) -> List[_Piece]:
         elif p.get("current") is not None and p.get("suggested") is not None:
             cand.append(f"🔬 {p['path']}: {p['current']} → {p['suggested']}"
                         f" — {'🚫 blocked' if blocked else '✅ approved'}")
-
     if cand:
         out.append(_p("🔬 CANDIDATE SETTINGS (what the Brain would change):\n\n" + "\n".join(cand)))
-
-    # ── Candidate vs Control (counterfactual simulator, best 5 by EV) ──
-    # Full numeric detail (gross EV, delta_n, shadow WR) lives in the
-    # Technical Appendix (section 16); this stays short for Telegram.
-    cf_scenarios = sorted(
-        F["ai"].get("counterfactual_scenarios") or [],
-        key=lambda s: s.get("ev", float("-inf")),
-        reverse=True,
-    )[:5]
-    if cf_scenarios:
-        lines = []
-        for i, s in enumerate(cf_scenarios, 1):
-            shadow_status, verdict = _cf_verdict(s, cfg)
-            lines.append(
-                f"{i}. {s.get('label', '?')}\n"
-                f"   EV: {F['net_ev']:+.2f}% → {s.get('ev', 0.0):+.2f}% "
-                f"(Δ{s.get('delta_ev', 0.0):+.2f}%, n={s.get('n', 0)})\n"
-                f"   Shadow: {shadow_status} → {verdict}"
-            )
-        out.append(_p(
-            "🥇 CANDIDATE vs CONTROL (top 5 by EV, control = current live config):\n\n"
-            + "\n\n".join(lines)
-        ))
     return out
 
 def _sec_recs(F: Dict[str, Any], cfg) -> List[_Piece]:
@@ -1147,27 +1143,12 @@ def _sec_appendix(F: Dict[str, Any], cfg) -> List[_Piece]:
     ledger = (F["ai"] or {}).get("repair_ledger")
     if ledger:
         out.append(_p("• Repair ledger\n" + "\n".join(f"{k}: {v}" for k, v in list(ledger.items())[:10])))
+
     if F["cfg_patch"]:
         out.append(_p("• Full Brain candidate table\n" + "\n".join(
             f"{p.get('path')}: {p.get('current')} → {p.get('suggested')}"
             f"{' [blocked]' if p.get('_blocked_by_action_gate') else ''}"
             for p in F["cfg_patch"][:20])))
-    cf_all = F["ai"].get("counterfactual_scenarios") or []
-    if cf_all:
-        cf_rows = [("Scenario", "N", "WR", "EV", "GrossEV", "Δn", "ShadowN", "ShadowΔEV", "ShadowWR", "Valid")]
-        for s in sorted(cf_all, key=lambda s: s.get("ev", float("-inf")), reverse=True):
-            sv = s.get("shadow_validated")
-            cf_rows.append((
-                str(s.get("label", "?")), str(s.get("n", 0)), f"{s.get('wr', 0.0):.0%}",
-                f"{s.get('ev', 0.0):+.2f}", f"{s.get('gross_ev', 0.0):+.2f}",
-                f"{s.get('delta_n', 0):+d}",
-                str(s.get("shadow_n")) if s.get("shadow_n") is not None else "n/a",
-                f"{s['shadow_delta_ev']:+.2f}" if s.get("shadow_delta_ev") is not None else "n/a",
-                f"{s['shadow_wr']:.0%}" if s.get("shadow_wr") is not None else "n/a",
-                "yes" if sv is True else "no" if sv is False else "n/a",
-            ))
-        out.append(_p("• Full counterfactual scenario table (all evaluated, unranked cap)"))
-        out.extend(_c_split(_table(cf_rows, "lrrrrrrrrr")))
     out.append(_p("Also computed but not shown here: Monte Carlo, CUSUM, walk-forward, calibration, "
                   "permutation importance, hierarchical analysis and weight optimisation "
                   "(each appears in 'Analysis health' above when it ran)."))
