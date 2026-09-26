@@ -51,7 +51,7 @@ import threshold_engine as engine
 from indicators import (
     calculate_alert_indicators_numpy, validate_indicators_dict, validate_vwap_cross,
     validate_cloud_cross, validate_conversion_cross, validate_equilibrium_cross,
-    _fib_reversal_confluence_vote, _prior_leg_direction,
+    _fib_reversal_confluence_vote,
 )
 from threshold_engine import hash_config_state
 
