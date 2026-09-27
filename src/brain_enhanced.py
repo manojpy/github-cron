@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 import asyncio
-import json
 import logging
 import random
 import time
@@ -15,7 +14,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from brain_audit import (
-    DataCoverage, HealthStatus, RecommendationTier, get_audit, reset_audit,
+    DataCoverage, HealthStatus, get_audit, reset_audit,
     ACTION_GATE_MIN_ROWS,
 )
 
@@ -600,6 +599,27 @@ def _sec_verdict(F: Dict[str, Any], cfg) -> List[_Piece]:
     ))
     return out
 
+def _cf_verdict(scenario: Dict[str, Any], cfg) -> Tuple[str, str]:
+    """Shadow status + promotion verdict for one counterfactual scenario.
+
+    Returns (shadow_status, verdict), both short emoji-prefixed strings for
+    display. Promotion requires shadow_validated is True AND the shadow
+    sample clears BRAIN_COUNTERFACTUAL_PROMOTE_MIN_SHADOW — mirrors how
+    _shadow_weight_check already gates weight-change promotion, applied
+    here to threshold/gate candidates.
+    """
+    sv = scenario.get("shadow_validated")
+    shadow_n = scenario.get("shadow_n") or 0
+    min_shadow = getattr(cfg, "BRAIN_COUNTERFACTUAL_PROMOTE_MIN_SHADOW", 15)
+    if sv is None:
+        return "🟡 too thin to validate", "🕒 NOT YET (shadow inconclusive)"
+    if sv is False:
+        return f"🔴 disagrees (n={shadow_n})", "🚫 REJECTED (curve-fit risk)"
+    if shadow_n >= min_shadow:
+        return f"🟢 confirmed (n={shadow_n})", "✅ PROMOTION-ELIGIBLE"
+    return (f"🟢 confirmed (n={shadow_n})",
+            f"🕒 NOT YET (need {min_shadow} shadow, have {shadow_n})")
+
 def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
     n, wr = F["n"], F["wr"]
     out = [_hdr(2, "🚦 WHAT SHOULD I DO NOW?")]
@@ -794,28 +814,6 @@ def _sec_scorecard(F: Dict[str, Any], cfg) -> List[_Piece]:
         out.append(_p(f"➖ {zero} alert(s) with exactly zero net EV are not listed above."))
     return out
 
-def _sec_coins(F: Dict[str, Any], cfg) -> List[_Piece]:
-    out = [_hdr(7, '🪙 COIN ANALYSIS — "WHERE ARE WE WINNING/LOSING?"')]
-    pairs = F["pairs"]
-    if len(pairs) < 2:
-        out.append(_p("Not enough trades per coin yet (need at least 5 on two coins)."))
-    else:
-        worst, best = pairs[0], pairs[-1]
-
-        def _ev_txt(n_: int) -> str:
-            r = _evidence_rank(n_, F["days"])
-            return f"{_LADDER[r]} {'TOO SMALL' if r == 0 else 'INVESTIGATE' if r == 1 else 'MEANINGFUL'}"
-
-        out.append(_p(f"🟢 POSITIVE OBSERVATION\n\n{best[0]}\nWR: {best[1]:.0%} | Trades: {best[2]}\n"
-                      f"Evidence: {_ev_txt(best[2])}"))
-        out.append(_p(f"🔴 NEGATIVE OBSERVATION\n\n{worst[0]}\nWR: {worst[1]:.0%} | Trades: {worst[2]}\n"
-                      f"Evidence: {_ev_txt(worst[2])}"))
-        out.append(_p(f"{len(pairs)} coins have at least 5 trades."))
-    out.append(_p("🧠 RULE:\n\nNo coin should be recommended for removal or increased weight unless "
-                  "minimum sample + statistical validation requirements are satisfied."))
-    return out
-
-
 def _sec_sessions(F: Dict[str, Any], cfg) -> List[_Piece]:
     out = [_hdr(7, "⏰ SESSION / TIME ANALYSIS")]
     sess = F["sessions"]                                     # worst-first
@@ -842,180 +840,57 @@ def _sec_sessions(F: Dict[str, Any], cfg) -> List[_Piece]:
                       f"observations rather than confirmed conclusions."))
     return out
 
+def _confidence_tier(value: Optional[float], high: float, medium: float) -> str:
+    """Map a 0-1 confidence-like score to a HIGH/MEDIUM/NOT READY tier.
+    None (score not computable yet, e.g. insufficient data) reports N/A
+    rather than a false NOT READY — those are different situations."""
+    if value is None:
+        return "⚪ N/A"
+    if value >= high:
+        return "🟢 HIGH"
+    if value >= medium:
+        return "🟡 MEDIUM"
+    return "🔴 NOT READY"
 
-def _sec_filters(F: Dict[str, Any], cfg) -> List[_Piece]:
-    out = [_hdr(9, "🧩 FILTER / CONFLUENCE ANALYSIS")]
-    groups: Dict[str, list] = defaultdict(list)
-    for r in F["shadow_rows"]:
-        groups[r.get("rejection_reason") or "win_rate_filter"].append(r)
-    for must in ("calibration_gate", "confluence_gate", "win_rate_filter"):
-        groups.setdefault(must, [])
-    min_s = getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
 
-    rows = [("", "FILTER", "TRADES", "EV", "VERDICT")]
-    for reason in sorted(groups):
-        g = groups[reason]
-        label = reason.replace("_gate", "").replace("_", " ").capitalize()
-        if not g:
-            rows.append(("⚪", label, "0", "n/a", ""))
-            continue
-        try:
-            ev = engine.ev_first_objective(g, min_sample=min_s)
-        except Exception:
-            ev = {"valid": False}
-        if not ev.get("valid"):
-            rows.append(("⚪", label, str(len(g)), "n/a", f"need {min_s}"))
-        else:
-            ne, pe = ev.get("net_ev", 0.0), ev.get("p_ev_positive", 0.0)
-            if ne > 0 and pe >= 0.65:
-                emoji, verdict = "🟡", "may over-block"
-            else:
-                emoji, verdict = "🟢", "filters losers"
-            rows.append((emoji, label, str(len(g)), f"{ne:+.2f}%", verdict))
-    out.extend(_c_split(_table(rows, "llrrl")))
-    out.append(_p(
-        "🧠 QUESTION THE BRAIN IS TRYING TO ANSWER:\n\n"
-        "\"Are my filters removing bad trades or accidentally removing profitable trades?\"\n\n"
-        f"Shadow Mode: {'🟢 ON' if F['shadow_on'] else '🔴 OFF'}"
-        + (f" ({len(F['shadow_rows'])} rejected trades tracked)" if F["shadow_rows"] else "")
-        + "\n\nRejected trades → eventual outcome → \"Was this rejection actually beneficial?\""
-    ))
-    return out
-
-def _sec_investigation(F: Dict[str, Any], cfg) -> List[_Piece]:
-    out = [_hdr(10, '🔬 BRAIN INVESTIGATION — "WHAT ARE WE TESTING?"')]
-    topics = ["Entry quality", "BUY vs SELL performance", "Alert-family performance",
-              "Coin performance", "Session performance", "Confluence score", "Volatility regime",
-              "Trend/range regime", "Filter effectiveness", "Fees/slippage impact",
-              "Alert combinations", "Entry timing"]
-    nums = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫"
-    out.append(_p("The Brain is currently investigating:\n\n"
-                  + "\n".join(f"{nums[i]} {t}" for i, t in enumerate(topics))))
-    blockers = _active_blockers(F)
-    supp = F["audit"].suppressed_analysis_names()
-    if supp:
-        blockers.append(f"{len(supp)} advanced analyses waiting for history")
-    out.append(_p("CURRENT BLOCKERS:\n\n" + ("\n".join(f"🔴 {b}" for b in blockers) if blockers
-                                            else "🟢 None")))
-    return out
-
-def _config_json_block(F: Dict[str, Any], cfg) -> Optional[str]:
-    changes: Dict[str, Any] = {}
-    for p in F["cfg_patch"]:
-        if p.get("_blocked_by_action_gate"):
-            continue
-        if p.get("path") == "CONFLUENCE_WEIGHTS":
-            changes["CONFLUENCE_WEIGHTS"] = p.get("suggested", {})
-        elif p.get("current") is not None and p.get("suggested") is not None:
-            changes[p["path"]] = p["suggested"]
-    if F["rec_thr_ok"] and F["thr_tier"] == RecommendationTier.ACTIONABLE:
-        changes["CONFLUENCE_MIN_ABS_SCORE"] = round(F["rec_thr"]["recommended"], 1)
-    return json.dumps(changes, indent=1) if changes else None
-
-def _cf_verdict(scenario: Dict[str, Any], cfg) -> Tuple[str, str]:
-    """Shadow status + promotion verdict for one counterfactual scenario.
-
-    Returns (shadow_status, verdict), both short emoji-prefixed strings for
-    display. Promotion requires shadow_validated is True AND the shadow
-    sample clears BRAIN_COUNTERFACTUAL_PROMOTE_MIN_SHADOW — mirrors how
-    _shadow_weight_check already gates weight-change promotion, applied
-    here to threshold/gate candidates.
+def _confidence_breakdown(F: Dict[str, Any], cfg) -> List[Tuple[str, str, str]]:
+    """(axis, tier, detail) for the four independent confidence axes —
+    MODEL (classifier calibration), DATA (sample size), CHANGE (does a
+    candidate beat control with confidence), DEPLOYMENT (survived OOS and
+    currently stable). Kept separate rather than blended into one score:
+    a change can be HIGH-confidence on thin evidence, or well-evidenced but
+    not yet deployment-ready — one number hides exactly that distinction.
     """
-    sv = scenario.get("shadow_validated")
-    shadow_n = scenario.get("shadow_n") or 0
-    min_shadow = getattr(cfg, "BRAIN_COUNTERFACTUAL_PROMOTE_MIN_SHADOW", 15)
-    if sv is None:
-        return "🟡 too thin to validate", "🕒 NOT YET (shadow inconclusive)"
-    if sv is False:
-        return f"🔴 disagrees (n={shadow_n})", "🚫 REJECTED (curve-fit risk)"
-    if shadow_n >= min_shadow:
-        return f"🟢 confirmed (n={shadow_n})", "✅ PROMOTION-ELIGIBLE"
-    return (f"🟢 confirmed (n={shadow_n})",
-            f"🕒 NOT YET (need {min_shadow} shadow, have {shadow_n})")
-
-def _sec_sims(F: Dict[str, Any], cfg) -> List[_Piece]:
-    out = [_hdr(11, "🧪 SIMULATIONS / WHAT-IF ANALYSIS")]
     gate = F["gate"]
-    if F["rec_thr_ok"]:
-        rt = F["rec_thr"]
-        validated = F["thr_tier"] == RecommendationTier.ACTIONABLE
-        out.append(_p("CONFLUENCE MIN SCORE"))
-        out.append(_c("\n".join(_kv_table([
-            ("Current", f"{cfg.CONFLUENCE_MIN_ABS_SCORE:.0f}"),
-            ("Simulation", f"{rt['recommended']:.0f}"),
-        ]))))
-        out.append(_p((
-            f"Historical simulated WR: {rt.get('rec_wr', 0):.0%}\n\n"
-            f"Status:\n{'✅ VALIDATED' if validated else '🚫 NOT VALIDATED'}\n\n"
-            + ("" if validated else "Reason:\nIn-sample simulation only.")
-        ).rstrip()))
-        checks = [
-            ("Minimum sample reached", gate.get("data_quality")),
-            ("Walk-forward validation passes", gate.get("oos_prediction")),
-            ("Out-of-sample EV positive", gate.get("oos_prediction")),
-            ("Drawdown acceptable", gate.get("risk")),
-            ("No active drift problem", gate.get("stability")),
-        ]
-        out.append(_p("The Brain will NOT recommend implementation until:\n\n"
-                      + "\n".join(f"{'✅' if ok else '❌'} {label}" for label, ok in checks)))
-    else:
-        out.append(_p("No entry-bar simulation is available yet."))
-    cand: List[str] = []
-    for p in F["cfg_patch"]:
-        blocked = bool(p.get("_blocked_by_action_gate"))
-        if p.get("path") == "CONFLUENCE_WEIGHTS":
-            cur, sug = p.get("current", {}) or {}, p.get("suggested", {}) or {}
-            for vote, new_w in sug.items():
-                old_w = cur.get(vote, CONFLUENCE_WEIGHTS.get(vote, 0.0))
-                if abs(new_w - old_w) >= 0.05:
-                    cand.append(f"{'⬆️' if new_w > old_w else '⬇️'} weight {vote}: {old_w:.1f} → {new_w:.1f}"
-                                f" — {'🚫 blocked' if blocked else '✅ approved'}")
-            if blocked and not sug:
-                cand.append("⚖️ CONFLUENCE_WEIGHTS: candidate changes — 🚫 blocked")
-        elif p.get("current") is not None and p.get("suggested") is not None:
-            cand.append(f"🔬 {p['path']}: {p['current']} → {p['suggested']}"
-                        f" — {'🚫 blocked' if blocked else '✅ approved'}")
-    if cand:
-        out.append(_p("🔬 CANDIDATE SETTINGS (what the Brain would change):\n\n" + "\n".join(cand)))
-    return out
+    rows: List[Tuple[str, str, str]] = []
 
-def _sec_recs(F: Dict[str, Any], cfg) -> List[_Piece]:
-    out = [_hdr(12, "🤖 BRAIN RECOMMENDATIONS")]
-    act: List[str] = []
-    recon_ok = F["recon"] is not None and F["recon"].status == HealthStatus.OK
-    if F["wr"] < 0.10 or not recon_ok:
-        act.append("Verify outcome recording.")
-    act.append("Keep collecting data.")
-    act.append("Keep Shadow Mode enabled." if F["shadow_on"] else "Turn Shadow Mode ON.")
-    if F["wr"] < 0.10 and F["n"]:
-        act.append(f"Investigate the {F['wr']:.0%} WR.")
-    if F["gate"].get("stability") is False or F["gate"].get("risk") is False:
-        act.append("Investigate current drift/drawdown.")
-    out.append(_p("### 🔴 ACT NOW\n\n" + "\n".join(f"{i}. {x}" for i, x in enumerate(act, 1))))
-    watch = []
-    for a in F["weak"]:
-        if a["name"] not in watch:
-            watch.append(a["name"])
-        if len(watch) >= 6:
-            break
-    out.append(_p("### 🟡 WATCH\n\n" + ("\n".join(f"{i}. {x}" for i, x in enumerate(watch, 1))
-                                       if watch else "Nothing flagged.")))
-    cands = [a["name"] for a in F["good"][:3]]
-    out.append(_p("### 🟢 POTENTIAL FUTURE CANDIDATES\n\n"
-                  + ("\n".join(f"{i}. {x}" for i, x in enumerate(cands, 1)) if cands else "None yet.")
-                  + ("\n\n⚠️ None is currently validated enough to increase weighting."
-                     if not any(a["rank"] == 4 for a in F["good"]) else "")))
-    if F["gate_ok"] and not F["low_trust"]:
-        blk = _config_json_block(F, cfg)
-        out.append(_p("### ✅ APPROVED TO APPLY\n\n" + ("Copy into config_macd.json:" if blk
-                                                       else "No change is supported by the evidence.")))
-        if blk:
-            out.append(_c(blk))
+    brier = F["ai"].get("brier_score")
+    if brier is None:
+        rows.append(("MODEL", "⚪ N/A", "no calibration data yet"))
     else:
-        out.append(_p("### 🚫 DO NOT APPLY\n\n• Alert disabling\n• Weight changes\n• Threshold changes\n"
-                      "• Confluence score change\n• Automatic Brain plan"))
-    return out
+        tier = "🟢 HIGH" if brier < 0.20 else "🟡 MEDIUM" if brier < 0.25 else "🔴 NOT READY"
+        rows.append(("MODEL", tier, f"Brier {brier:.2f}"))
 
+    rank = _evidence_rank(F["n"], F["days"])
+    data_tier = "🔴 NOT READY" if rank == 0 else "🟡 MEDIUM" if rank == 1 else "🟢 HIGH"
+    rows.append(("DATA", data_tier, f"{F['n']} trades, {_fmt_days(F['days'])}"))
+
+    p_thr = getattr(cfg, "BRAIN_EV_GATE_P_THRESHOLD", 0.85)
+    change_p = gate.get("profit_p_ev_positive")
+    ev_p5 = gate.get("ev_p5")
+    change_tier = _confidence_tier(change_p, high=p_thr, medium=max(0.0, p_thr - 0.15))
+    change_detail = (f"P(EV>0) {change_p:.0%}, EV p5 {ev_p5:+.2f}%"
+                      if change_p is not None and ev_p5 is not None else "insufficient data")
+    rows.append(("CHANGE", change_tier, change_detail))
+
+    oos_p = gate.get("oos_p_ev_positive")
+    deploy_tier = _confidence_tier(oos_p, high=0.70, medium=0.55)
+    deploy_detail = f"OOS P(EV>0) {oos_p:.0%}" if oos_p is not None else "walk-forward not run"
+    if gate.get("stability") is False:
+        deploy_tier = "🔴 NOT READY"
+        deploy_detail += ", active drift"
+    rows.append(("DEPLOYMENT", deploy_tier, deploy_detail))
+    return rows
 
 def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     g = F["gate"]
@@ -1027,131 +902,20 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     # without needing to wrap because the pairs are built inline here.
     rows = [(f"{'🟢' if g.get(k) else '🔴'} {lab}:", "PASS" if g.get(k) else "FAIL")
             for k, lab in labels]
+
     out.extend(_c_split(_table(rows, "ll")))
+    out.append(_p("CONFIDENCE BREAKDOWN\n\n" + "\n".join(
+        f"{axis.ljust(12)}{tier}  ({detail})" for axis, tier, detail in _confidence_breakdown(F, cfg)
+    )))
     out.append(_p(
         "OVERALL:\n\n"
+
         + ("🟢 BRAIN ACTION GATE = PASSED\n\nMeaning:\n\n\"The Brain's evidence is strong enough to "
            "recommend specific changes to the live strategy.\""
            if F["gate_ok"] else
            "🔴 BRAIN ACTION GATE = BLOCKED\n\nMeaning:\n\n\"The Brain may analyse and recommend what "
            "to investigate, but it is not sufficiently confident to modify the live strategy.\"")
     ))
-    return out
-
-
-def _sec_quality(F: Dict[str, Any], cfg) -> List[_Piece]:
-    out = [_hdr(14, "📊 DATA QUALITY & RECONCILIATION")]
-    cov, rec, st = F["coverage"], F["recon"], F["archive_stats"]
-
-    def _n(v: Any) -> str:
-        return "n/a" if v is None else str(v)
-
-    rows = []
-    if cov:
-        rows += [("Requested history", f"{cov.requested_days} days"),
-                 ("Available", f"{cov.actual_days:.1f} days"),
-                 ("Coverage", f"{cov.coverage_ratio:.0%}"),
-                 ("Resolved trades", str(cov.n_rows))]
-    if rec:
-        rows += [("Pending at start", _n(rec.pending_count)),
-                 ("Resolved this run", _n(rec.resolved_this_run)),
-                 ("Archived this run", _n(rec.archived_this_run)),
-                 ("Archive lines read", _n(rec.total_archived)),
-                 ("Loaded by Brain", str(rec.loaded_by_brain)),
-                 ("Shadow loaded", str(rec.shadow_loaded))]
-    if rows:
-        out.extend(_c_split(_table(rows, "lr")))
-    status_rows = []
-    if rec:
-        status_rows.append(("Outcome reconciliation", f"{rec.status.icon} {rec.status.value}"))
-    else:
-        status_rows.append(("Outcome reconciliation", "⚪ no data"))
-    migrated, dropped = st.get("migrated_forward", 0), st.get("dropped_unmigratable", 0)
-    status_rows.append(("Schema migration", (
-        "🟠 " + f"{dropped} rows could not be migrated" if dropped
-        else f"🟡 {migrated} old rows upgraded (some fields empty)" if migrated else "🟢 OK")))
-    out.append(_c("\n".join(_kv_table(status_rows))))
-    lines: List[str] = []
-    if rec:
-        lines += [f"⚠️ {note}" for note in rec.notes]
-        for label, val in (("Stale-schema rows excluded", rec.archive_rejects_stale_schema),
-                           ("Signal-only rows excluded", rec.archive_rejects_signal_only),
-                           ("Malformed rows excluded", rec.archive_rejects_malformed)):
-            if val:
-                lines.append(f"{label}: {val}")
-    if cov and cov.warnings:
-        lines += [f"⚠️ {w}" for w in cov.warnings]
-    if lines:
-        out.append(_p("\n".join(lines)))
-    supp = F["audit"].suppressed_analysis_names()
-    if supp:
-        out.append(_p("Advanced analyses blocked (not enough history yet):\n\n"
-                      + "\n".join(f"• {s.replace('_', ' ').title()}" for s in supp)))
-    return out
-
-
-def _sec_evidence(F: Dict[str, Any], cfg) -> List[_Piece]:
-    out = [_hdr(15, "📈 EVIDENCE / CONFIDENCE")]
-    days, n, g = F["days"], F["n"], F["gate"]
-    recon_ok = F["recon"] is not None and F["recon"].status == HealthStatus.OK
-    out.extend(_c_split(_kv_table([
-        ("Data integrity", '🟢 GOOD' if recon_ok else '🟡 CHECK'),
-        ("Trade count", '🟢 GOOD' if n >= 100 else '🟡 OK' if n >= 30 else '🔴 POOR'),
-        ("History depth", '🟢 GOOD' if (days or 0) >= 30 else '🟡 FAIR' if (days or 0) >= 14 else '🔴 POOR'),
-        ("Market regime coverage", '🟢 GOOD' if (days or 0) >= 30 else '🟡 FAIR' if (days or 0) >= 14 else '🔴 POOR'),
-        ("OOS validation", '🟢 PASSED' if g.get('oos_prediction') else '🔴 BLOCKED'),
-        ("Statistical confidence", _conf_status(F['conf'])),
-        ("Strategy-change confidence", '🟢 HIGH' if F['gate_ok'] else '🔴 LOW'),
-    ])))
-    used = sorted({a["rank"] for a in F["alerts"]})
-    ladder = "\n".join(f"{_LADDER[i]} {_LADDER_NAMES[i]}" for i in range(5))
-    now = " / ".join(_LADDER[i] for i in used) if used else "⚪"
-    out.append(_p(f"CONFIDENCE LADDER\n\n{ladder}\n\nMost current findings:\n{now}\n\n"
-                  + ("Therefore:\nNo aggressive optimisation yet." if F["low_trust"] or not F["gate_ok"]
-                     else "Therefore:\nValidated findings may be acted on, one change at a time.")))
-    return out
-
-
-def _sec_appendix(F: Dict[str, Any], cfg) -> List[_Piece]:
-    out = [_hdr(16, "📚 TECHNICAL APPENDIX")]
-    out.append(_p("Detailed data for advanced users."))
-    rows = [("Alert", "N", "WR", "EV", "P>0")]
-    for a in sorted(F["alerts"], key=lambda a: -a["n"]):
-        ev = f"{a['ev']:+.2f}" if a["ev"] is not None else "n/a"
-        pv = f"{a['p']:.0%}" if a["p"] is not None else "n/a"
-        rows.append((f"{_LADDER[a['rank']]} {a['key']}",
-                     str(a['n']), f"{a['wr']:.0%}", ev, pv))
-    out.append(_p("• Full alert-by-alert statistics (EV = net % per trade, P>0 = P(EV>0))"))
-    out.extend(_c_split(_table(rows, "lrrrr")))
-    ev_obj = F["ev_obj"] or {}
-    if ev_obj:
-        out.append(_p("• Portfolio EV: net " + f"{ev_obj.get('net_ev', 0):+.2f}%"
-                      + (f", P5 {ev_obj['ev_p5']:+.2f}%" if ev_obj.get("ev_p5") is not None else "")
-                      + (f", P(EV>0) {ev_obj['p_ev_positive']:.0%}" if ev_obj.get("p_ev_positive") is not None else "")
-                      + (f", max drawdown {ev_obj['max_drawdown_pct']:.1f}%" if ev_obj.get("max_drawdown_pct") is not None else "")))
-    health = F["audit"].analysis_health_entries()
-    if health:
-        out.append(_p("• Analysis health\n" + "\n".join(e.report_line.strip() for e in health)))
-    g = F["gate"]
-    if g:
-        out.append(_p("• Gate diagnostics\n" + "\n".join(
-            f"{'✅' if v else '❌'} {k}" for k, v in g.items() if isinstance(v, bool))))
-    st = F["archive_stats"]
-    if st:
-        out.append(_p("• Archive reconciliation\n" + "\n".join(
-            f"{k}: {v}" for k, v in st.items() if isinstance(v, (int, float)))))
-    ledger = (F["ai"] or {}).get("repair_ledger")
-    if ledger:
-        out.append(_p("• Repair ledger\n" + "\n".join(f"{k}: {v}" for k, v in list(ledger.items())[:10])))
-
-    if F["cfg_patch"]:
-        out.append(_p("• Full Brain candidate table\n" + "\n".join(
-            f"{p.get('path')}: {p.get('current')} → {p.get('suggested')}"
-            f"{' [blocked]' if p.get('_blocked_by_action_gate') else ''}"
-            for p in F["cfg_patch"][:20])))
-    out.append(_p("Also computed but not shown here: Monte Carlo, CUSUM, walk-forward, calibration, "
-                  "permutation importance, hierarchical analysis and weight optimisation "
-                  "(each appears in 'Analysis health' above when it ran)."))
     return out
 
 _REPORT_SECTIONS = (
@@ -1355,7 +1119,7 @@ class BrainEngineV2(BaseBrainEngine):
         this cycle. Without it, the check falls back to this report's rec
         list — the old behaviour, which flickers run-to-run.
         """
-        gate: Dict[str, bool] = {
+        gate: Dict[str, Any] = {
             "data_quality": len(real_rows) >= ACTION_GATE_MIN_ROWS,
             "oos_prediction": False,
             "profitability": False,
@@ -1376,6 +1140,10 @@ class BrainEngineV2(BaseBrainEngine):
             rwc = engine.rolling_walk_forward(real_rows, n_folds=5)
             if rwc.get("valid"):
                 gate["oos_prediction"] = rwc["p_ev_positive"] >= 0.70
+                # Kept alongside the boolean (not just pass/fail) so the
+                # Confidence Breakdown can show a HIGH/MEDIUM/NOT READY
+                # tier for DEPLOYMENT instead of collapsing it to one bit.
+                gate["oos_p_ev_positive"] = rwc["p_ev_positive"]
 
         # Profitability: net EV must be positive with high confidence
         ev_obj = engine.ev_first_objective(real_rows, min_sample=min_sample)
@@ -1385,7 +1153,10 @@ class BrainEngineV2(BaseBrainEngine):
                 ev_obj["p_ev_positive"] >= getattr(cfg, "BRAIN_EV_GATE_P_THRESHOLD", 0.85)
                 and ev_obj["ev_p5"] > getattr(cfg, "BRAIN_EV_GATE_P5_FLOOR", -0.10)
             )
-    
+            # Same reasoning as oos_p_ev_positive above, for CHANGE.
+            gate["profit_p_ev_positive"] = ev_obj["p_ev_positive"]
+            gate["ev_p5"] = ev_obj["ev_p5"]
+
         # ── Stability: no active CUSUM edge-decay alarm. Prefer the
         if active_drift_keys:
             gate["stability"] = False
@@ -1407,8 +1178,10 @@ class BrainEngineV2(BaseBrainEngine):
         fee_pct = getattr(cfg, "BRAIN_FEE_PCT", 0.0006)
         slip_pct = getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003)
         gate["execution"] = fee_pct > 0 and slip_pct > 0
-
-        gate["actionable"] = all(gate.values())
+ 
+        _GATE_KEYS = ("data_quality", "oos_prediction", "profitability",
+                      "stability", "risk", "execution")
+        gate["actionable"] = all(gate[k] for k in _GATE_KEYS)
         return gate
 
     @staticmethod
