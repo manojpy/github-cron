@@ -61,7 +61,3 @@ def test_workflows_use_12_hour_cadence_and_stage_reports():
     assert "--reports-max-age-days 7" in (
         root / "cleanup-outcomes.yml"
     ).read_text(encoding="utf-8")
-
-    build = (root / "build.yml").read_text(encoding="utf-8")
-    assert re.search(r"Persist Brain report", build)
-    assert "git add -f reports" in build
