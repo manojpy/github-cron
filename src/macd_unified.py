@@ -1596,90 +1596,6 @@ async def run_once() -> Optional[bool]:
             logger_run.debug(f"GC error: {e}")
 
         logger_run.debug("🧹 Resource cleanup finished")
-
-async def run_brain_only() -> Optional[bool]:
-    """Brain-only execution path: load archive → analyze → report → save plan.
-    Skips all fetching, gate evaluation, and alert dispatch.
-    Intended to run on a separate cron schedule from the alert path."""
-    correlation_id = uuid.uuid4().hex[:8]
-    TRACE_ID.set(correlation_id)
-    logger_run = logging.getLogger(f"macd_bot.brain.{correlation_id}")
-    start_time = time.time()
-
-    logger_run.info("🧠 BRAIN-ONLY MODE — skipping alert evaluation entirely")
-
-    if not getattr(cfg, "ENABLE_BRAIN", True):
-        logger_run.warning("ENABLE_BRAIN is off — nothing to do in brain-only mode.")
-        return True
-
-    if not cfg.ENABLE_WIN_RATE_FILTER:
-        logger_run.warning(
-            "ENABLE_BRAIN is on but ENABLE_WIN_RATE_FILTER is off — "
-            "brain has no data source, skipping."
-        )
-        return True
-
-    if getattr(cfg, "DRY_RUN_MODE", False):
-        logger_run.info("DRY_RUN_MODE is on — skipping brain report (outcome data would be synthetic).")
-        return True
-
-    sdb: Optional[RedisStateStore] = None
-    telegram_queue: Optional[TelegramQueue] = None
-
-    try:
-        # ── Connect to Redis (needed for CUSUM state, calibration, plan storage) ──
-        sdb = RedisStateStore(cfg.REDIS_URL)
-        await sdb.connect()
-
-        if sdb.degraded:
-            logger_run.warning("Redis degraded — brain-only run will use file archive only.")
-
-        telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
-
-        # ── Run Brain analysis ──
-        from brain_enhanced import BrainEngineV2
-        brain = BrainEngineV2(sdb)
-
-        # Bypass BRAIN_ARCHIVE_SHALLOW guard: brain-only mode is
-        # specifically for full-depth analysis on the complete archive.
-        # The workflow running --brain-only checks out the full archive.
-        _original_shallow = getattr(cfg, "BRAIN_ARCHIVE_SHALLOW", False)
-        cfg.BRAIN_ARCHIVE_SHALLOW = False
-        try:
-            success = await brain.send_report_now(
-                list(cfg.PAIRS), telegram_queue, logger_run
-            )
-        finally:
-            cfg.BRAIN_ARCHIVE_SHALLOW = _original_shallow
-
-        elapsed = time.time() - start_time
-        logger_run.info(
-            f"🧠 Brain-only run {'succeeded' if success else 'FAILED'} "
-            f"in {elapsed:.1f}s"
-        )
-        return success
-
-    except Exception as e:
-        logger_run.critical(f"Brain-only run failed: {e}", exc_info=True)
-        if telegram_queue:
-            try:
-                await telegram_queue.send(escape_markdown_v2(
-                    f"❌ {cfg.BOT_NAME} \\- BRAIN\\-ONLY FAILED\n"
-                    f"Error: {str(e)[:200]}\n"
-                    f"Time: {format_ist_time()}"
-                ))
-            except Exception:
-                pass
-        return False
-
-    finally:
-        if sdb:
-            try:
-                await sdb.close()
-            except Exception:
-                pass
-        TRACE_ID.set("")
-
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -1732,10 +1648,6 @@ if __name__ == "__main__":
     parser.add_argument("--validate-only", action="store_true", help="Validate config and exit")
     parser.add_argument("--skip-warmup", action="store_true", help="Skip Numba JIT warmup")
     parser.add_argument("--apply-brain", action="store_true", help="Apply the last Brain action plan and exit")
-    parser.add_argument("--brain-only", action="store_true",
-                        help="Run ONLY the Brain analysis cycle (load archive → analyze → report → save plan). "
-                             "Skips all fetching, gate evaluation, and alert dispatch. "
-                             "Use on a separate cron schedule from the alert path.")
     parser.add_argument("--alert-only", action="store_true",
                         help="Run ONLY the alert path (fetch → evaluate → resolve → dispatch). "
                              "Skips Brain analysis entirely. "
@@ -1778,19 +1690,6 @@ if __name__ == "__main__":
     if args.brain_only and args.alert_only:
         logger.critical("Cannot use --brain-only and --alert-only together.")
         sys.exit(1)
-
-    if args.brain_only:
-        if not args.skip_warmup:
-            warmup_if_needed()
-        try:
-            success = asyncio.run(run_brain_only())
-            sys.exit(0 if success else 1)
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            logger.info("Brain-only run stopped by user interrupt")
-            sys.exit(130)
-        except Exception as exc:
-            logger.critical(f"Brain-only fatal error: {exc}", exc_info=True)
-            sys.exit(1)
 
     if args.alert_only:
         _ALERT_ONLY_MODE = True
