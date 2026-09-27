@@ -1,5 +1,4 @@
 """Reports are kept 7 days (exact, from the file name); outcomes keep their own limit."""
-import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
