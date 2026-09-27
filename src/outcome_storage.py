@@ -76,7 +76,7 @@ os.makedirs(os.path.join(_OUTCOME_DIR, "reports"), exist_ok=True)
 for _sub in ("outcomes", "shadow", "reports"):
     _probe = os.path.join(_OUTCOME_DIR, _sub, ".write_probe")
     try:
-        with open(_probe, "w") as _f:
+        with open(_probe, "w", encoding="utf-8") as _f:
             _f.write("ok")
         os.remove(_probe)
     except OSError as _e:
