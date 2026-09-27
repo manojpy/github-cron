@@ -1,66 +1,113 @@
 # 🤖 MACD Unified Bot
 
-High-performance cryptocurrency trading alert bot with AOT compilation, Redis state management, and Telegram notifications. Runs on GitHub Actions every 15 minutes.
+High-performance cryptocurrency trading alert bot with AOT/Cython/Numba compilation, Redis state management, outcome tracking, and Telegram notifications. Designed to run on GitHub Actions every 15 minutes.
+
+**Version**: 1.8.x | **Python**: 3.11 | **Last audited**: 2026-09-27
+
+---
 
 ## 📋 Quick Overview
 
-- **What**: Analyzes crypto pairs (BTCUSD, ETHUSD, etc) using 20+ technical indicators
-- **When**: Runs on schedule via GitHub Actions cron (1, 16, 31, 46 minutes past every hour)
-- **Outputs**: Sends trading alerts to Telegram with smart deduplication
-- **Speed**: 25-35 seconds for 12 pairs (10-50x faster than pure Python via Numba AOT)
-- **Memory**: <900MB footprint with aggressive garbage collection
+| Aspect | Detail |
+|--------|--------|
+| **What** | Analyzes crypto pairs with 20+ technical indicators and confluence gates |
+| **When** | Intended every 15 minutes (1, 16, 31, 46 past the hour) via GitHub Actions |
+| **Outputs** | Telegram alerts with smart deduplication + optional Brain reports |
+| **Speed** | Typically 25–45 s for a full cycle (AOT path) |
+| **Memory** | Soft limit ~850 MB, container hard limit 900 MB |
+| **State** | Redis (dedup, locks, stats, config overrides) + file-based outcome archive |
+
+> **Important**: As of the latest code, `run-bot.yml` only declares `workflow_dispatch`.  
+> A `schedule` cron is **not** present in the workflow file.  
+> You must either add the cron block (recommended) or trigger the workflow externally at the desired times.  
+> The watchdog expects successful runs roughly every 15 minutes.
+
+---
 
 ## 🚀 Setup (5 Steps)
 
 ### 1. Fork & Configure Secrets
-```bash
-git clone https://github.com/manojpy/github-cron.git
-cd github-cron
-```
 
-Add to GitHub **Settings → Secrets and variables → Actions**:
+Add these in **Settings → Secrets and variables → Actions**:
+
 ```
-TELEGRAM_BOT_TOKEN     → Get from BotFather
-TELEGRAM_CHAT_ID       → Your Telegram chat ID
-REDIS_URL             → redis://user:pass@host:6379
-DELTA_API_BASE        → https://api.india.delta.exchange
+TELEGRAM_BOT_TOKEN     → from @BotFather
+TELEGRAM_CHAT_ID       → your chat / group ID
+REDIS_URL              → redis://user:pass@host:port  (or rediss://)
+DELTA_API_BASE         → https://api.india.delta.exchange
+DATA_REPO_TOKEN        → PAT with write access to the outcome-data repo
 ```
 
 ### 2. Edit Configuration
+
 ```bash
-# Edit config_macd.json
+# Edit the checked-in config
 nano config_macd.json
 ```
 
-Key settings:
+Key settings (see full file for 80+ options):
+
 ```json
 {
-  "PAIRS": ["BTCUSD", "ETHUSD", "AVAXUSD"],    // Trading pairs
-  "PPO_FAST": 7, "PPO_SLOW": 16,              // Indicator periods
-  "ENABLE_VWAP": true,                        // Features
-  "ENABLE_PIVOT": true,
-  "DRY_RUN_MODE": false                       // Test mode
+  "PAIRS": ["BTCUSD", "ETHUSD", "..."],   // currently ~30 pairs — consider ≤15–18 for safety
+  "MAX_PARALLEL_FETCH": 12,
+  "EVAL_CONCURRENCY_LIMIT": 4,
+  "RUN_TIMEOUT_SECONDS": 480,
+  "MEMORY_LIMIT_BYTES": 850000000,
+  "FAIL_ON_REDIS_DOWN": false,
+  "FAIL_ON_TELEGRAM_DOWN": false,
+  "DRY_RUN_MODE": false,
+  "ENABLE_BRAIN": true,
+  "BRAIN_SHADOW_MODE": true
 }
 ```
 
 ### 3. Push & Build
+
 ```bash
 git add config_macd.json
 git commit -m "Configure bot"
 git push
 ```
 
-This triggers `build.yml` → builds Docker image with AOT compilation
+This triggers `build.yml` → multi-stage Docker image with Cython + AOT compilation → push to `ghcr.io`.
 
 ### 4. Verify Build
-- Check **Actions tab** → **Build AOT Image** 
-- Wait for ✅ success (3-5 minutes)
 
-### 5. Run Bot
-- **Auto**: Bot runs on cron schedule
-- **Manual**: Actions tab → **Run MACD Unified Bot** → **Run workflow**
+- Actions tab → **Build AOT Image**  
+- Wait for ✅ (usually 3–6 minutes)
 
-Check results in Telegram inbox 📱
+### 5. Run the Bot
+
+- **Recommended**: Add a schedule to `run-bot.yml` (see below) so it runs automatically.  
+- **Manual**: Actions → **Run MACD Unified Bot** → Run workflow.  
+- Optional inputs: dry-run, Brain report, apply Brain plan, clear Redis, clear kill-switch.
+
+Results appear in Telegram and in the workflow summary / artifacts.
+
+---
+
+## ⏰ Scheduling (Critical)
+
+The workflow currently has **only** `workflow_dispatch`. To make it run on the 15-minute cadence the rest of the system expects, add:
+
+```yaml
+on:
+  schedule:
+    - cron: "1,16,31,46 * * * *"   # 1 minute after each 15 m candle close
+  workflow_dispatch:
+    # ... existing inputs ...
+```
+
+Keep the existing concurrency block:
+
+```yaml
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+```
+
+A separate **Watchdog** workflow (`watchdog.yml`) runs every 30 minutes and alerts on Telegram if no successful bot run has occurred for >40 minutes.
 
 ---
 
@@ -68,105 +115,101 @@ Check results in Telegram inbox 📱
 
 ```json
 {
-  // REQUIRED (from GitHub Secrets)
+  // REQUIRED (from GitHub Secrets — never commit real values)
   "TELEGRAM_BOT_TOKEN": "...",
   "TELEGRAM_CHAT_ID": "...",
   "REDIS_URL": "...",
   "DELTA_API_BASE": "https://api.india.delta.exchange",
 
-  // Pairs to monitor
-  "PAIRS": ["BTCUSD", "ETHUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD"],
+  // Pairs (keep conservative relative to 900 MB / 2 CPU container)
+  "PAIRS": ["BTCUSD", "ETHUSD", "..."],
 
-  // Indicator periods
-  "PPO_FAST": 7,           // PPO short EMA
-  "PPO_SLOW": 16,          // PPO long EMA
-  "PPO_SIGNAL": 5,         // PPO signal line
-  "RMA_50_PERIOD": 50,     // 50-bar MA
-  "RMA_200_PERIOD": 200,   // 200-bar MA
-  "SRSI_RSI_LEN": 21,      // RSI period
+  // Performance & limits
+  "MAX_PARALLEL_FETCH": 12,
+  "EVAL_CONCURRENCY_LIMIT": 4,
+  "HTTP_TIMEOUT": 10,
+  "RUN_TIMEOUT_SECONDS": 480,
+  "FETCH_PHASE_TIMEOUT_SEC": 60,
+  "MEMORY_LIMIT_BYTES": 850000000,
+  "MAX_ALERTS_PER_PAIR": 9,
+  "MAX_ALERTS_PER_RUN": 50,
 
-  // Performance
-  "MAX_PARALLEL_FETCH": 12,        // HTTP concurrency
-  "RUN_TIMEOUT_SECONDS": 300,      // 5-minute max execution
-  "HTTP_TIMEOUT": 8,               // Request timeout
-
-  // Features
-  "ENABLE_VWAP": true,             // Volume-weighted avg price
-  "ENABLE_PIVOT": true,            // Support/resistance levels
-  "CIRRUS_CLOUD_ENABLED": true,    // Trend indicator
+  // Redis
+  "REDIS_LOCK_EXPIRY": 900,
+  "STATE_EXPIRY_DAYS": 11,
+  "ALERT_DEDUP_WINDOW_SEC": 120,
+  "COALESCE_DEDUP_WINDOW_SEC": 900,
+  "FAIL_ON_REDIS_DOWN": false,
 
   // Resilience
-  "MEMORY_LIMIT_BYTES": 850000000, // 700MB soft limit
-  "FAIL_ON_REDIS_DOWN": false,     // Degrade gracefully
-  "FAIL_ON_TELEGRAM_DOWN": false   // Continue if Telegram fails
+  "FAIL_ON_TELEGRAM_DOWN": false,
+  "MAX_CANDLE_STALENESS_SEC": 1200,
+
+  // Brain / outcomes
+  "ENABLE_BRAIN": true,
+  "BRAIN_SHADOW_MODE": true,
+  "BRAIN_AUTO_APPLY_DYNAMIC_WEIGHTS": true,
+  "BRAIN_AUTO_DISABLE_ENABLED": true,
+  "OUTCOME_PRIMARY_METRIC": "net_pnl_pct"
 }
 ```
 
-See [config_macd.json](config_macd.json) for all 40+ options.
+Full option list lives in `config_macd.json` and is validated at startup by `bot_config.py`.
 
 ---
 
 ## 📊 Technical Stack
 
 | Component | Technology | Purpose |
-|-----------|-----------|---------|
-| **Language** | Python 3.11 | Core bot logic |
-| **Compilation** | Numba (JIT + AOT) | 20 indicator functions (30-50x speedup) |
-| **Async** | asyncio | Concurrent API fetches, parallel evaluation |
-| **State** | Redis | Alert deduplication, persistence |
-| **Notifications** | Telegram Bot API | Alert delivery |
-| **Deployment** | Docker + GitHub Actions | Automated build & execution |
-| **Container** | Ubuntu 24.04 slim | 900MB memory limit |
+|-----------|------------|---------|
+| Language | Python 3.11 | Core logic |
+| Compilation | Numba (JIT + AOT) + Cython | Fast indicator path |
+| Async | asyncio + aiohttp | Concurrent fetches & evaluation |
+| State | Redis / Valkey | Dedup, locks, stats, overrides |
+| Outcomes | JSONL files in separate repo | Brain analysis archive |
+| Notifications | Telegram Bot API | Alert delivery |
+| Deployment | Docker + GitHub Actions + GHCR | Build & scheduled/manual runs |
+| Container | Non-root, read-only rootfs | 900 MB memory limit |
 
 ---
 
-## 📈 Indicators (20 Functions)
+## 📈 Indicators & Signals (summary)
 
-**Moving Averages**: EMA, RMA, SMA  
-**Oscillators**: PPO, RSI, VWAP  
-**Filters**: Kalman, Range Filter, Smooth Range  
-**Momentum**: MMH (Magical Momentum Histogram)  
-**Trends**: Cirrus Cloud (multi-scale filtering)  
-**Patterns**: Wick quality checks, Pivot levels  
-**Statistics**: Rolling std dev, min/max via monotonic deques
+**Indicators** (Numba/AOT/Cython accelerated):  
+EMA / RMA / SMA, PPO, RSI / Stochastic RSI, VWAP, Kalman & Range filters, MMH, Cirrus Cloud, Ichimoku variants, ATR/ADX adaptive, volume/RVOL, pivots/CPR, dynamic flow, etc.
+
+**Alert families** (gated by confluence + many quality checks):  
+PPO crosses, RSI crosses, VWAP, pivots (P/R1–R3/S1–S3), MMH reversals, cloud/CHOCH/fib/strong-reversal, and more.  
+Alerts carry IST timestamp, price, key indicator values, wick quality, and confluence score.
+
+Deduplication uses Redis (short window + optional coalescing). Candle non-repaint confirmation and mark-price agreement checks can release or keep the dedup claim.
 
 ---
 
-## 🔔 Alert Types (26 Signals)
+## 🧠 Brain & Outcomes
 
-| Category | Signals |
-|----------|---------|
-| **PPO** | Cross above/below signal, cross ±0, cross ±0.11 |
-| **RSI** | Cross above/below 50 (with PPO guard) |
-| **VWAP** | Cross above/below (20-min dedup) |
-| **Pivots** | Cross above/below P, R1/R2/R3, S1/S2/S3 |
-| **MMH** | Reversal UP, Reversal DOWN |
-
-All alerts include: timestamp (IST), price, indicator values, wick quality.
+- Real outcomes and shadow outcomes are written as daily JSONL files.
+- A separate data repository (`outcome-data`) is sparse-checked out (3 days for normal runs, 185 days for Brain-report runs).
+- Brain can emit reports, auto-apply dynamic confluence weights, and (when enabled) auto-disable under-performing alert keys.
+- Kill-switch logic exists but is off by default in the current config.
+- Cleanup workflow runs daily and prunes old archives / reports with size and age limits.
 
 ---
 
 ## 🔧 Local Development
 
-### Run Locally
 ```bash
 python3.11 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
 export PYTHONPATH="src:$PYTHONPATH"
-python src/macd_unified.py --validate-only  # Check config
-python src/macd_unified.py --debug          # Run with debug logs
+python src/macd_unified.py --validate-only   # config check
+python src/macd_unified.py --debug           # full run with debug logs
 ```
 
-### Build AOT Binary
-```bash
-cd src
-python aot_build.py --output-dir . --verify
-cd ..
-```
+Docker test (requires secrets and a config):
 
-### Docker Test
 ```bash
 docker build -t macd-local .
 docker run --rm \
@@ -182,37 +225,51 @@ docker run --rm \
 
 ## 🐛 Troubleshooting
 
-### Redis connection failed
+### Bot never runs on its own
+- Confirm a `schedule` cron exists in `run-bot.yml` **or** that an external system is calling `workflow_dispatch` at the expected times.
+- Check the Watchdog workflow for silence alerts.
+
+### Redis connection / quota / OOM
 ```
-❌ Check REDIS_URL format: redis://user:pass@host:port
+❌ REDIS_URL format or auth wrong
+❌ "max requests limit exceeded" or "OOM command not allowed"
 ✅ Test: redis-cli -u "$REDIS_URL" ping
+✅ On quota/OOM the bot stays degraded for the rest of the run (dedup disabled).
+✅ Prefer a plan with adequate request & memory headroom for 30 pairs.
 ```
 
 ### Circuit breaker OPENED
 ```
-❌ Delta API returning 5xx errors
-✅ Wait 30s: bot auto-recovers
-✅ Check: https://api.india.delta.exchange/status
+❌ Delta API returning repeated 5xx / network errors
+✅ Auto-recovers after recovery timeout (default 60 s)
 ```
 
-### Memory limit exceeded
+### Memory limit exceeded / timeout
 ```
-❌ Too many pairs (>15) or insufficient container memory
-✅ Reduce PAIRS list or split into 2 bots
-✅ Increase MEMORY_LIMIT_BYTES in Dockerfile
-```
-
-### Candle staleness error
-```
-❌ API data older than 20 minutes
-✅ Increase MAX_CANDLE_STALENESS_SEC: 1800
+❌ Too many pairs or heavy Brain full-archive run
+✅ Reduce PAIRS (recommended ≤15–18) or split bots
+✅ Check container logs for RSS vs MEMORY_LIMIT_BYTES
 ```
 
-### Rate limit exceeded
+### Candle staleness / unstable candle
 ```
-❌ Too many pairs or RATE_LIMIT_PER_MINUTE too high
-✅ Lower RATE_LIMIT_PER_MINUTE: 60 → 45
-✅ Reduce number of pairs
+❌ Data older than MAX_CANDLE_STALENESS_SEC or too soon after close
+✅ Workflow already warns when AGE < CANDLE_MIN_AGE_BUFFER or > staleness
+✅ Increase buffer or staleness only if you understand the risk
+```
+
+### Duplicate alerts
+```
+❌ Redis degraded (quota/OOM) → dedup intentionally skipped
+❌ Dedup window too short for your alert volume
+✅ Inspect Redis keys matching recent_alert:* and pair_state:*
+```
+
+### Outcomes not persisted
+```
+❌ DATA_REPO_TOKEN missing or insufficient permissions
+❌ Concurrent push from cleanup workflow exhausted rebase retries
+✅ Check the "Persist outcomes" step logs and git status output
 ```
 
 ---
@@ -222,116 +279,93 @@ docker run --rm \
 ```
 github-cron/
 ├── src/
-│   ├── macd_unified.py              (3.5K lines - main bot)
-│   ├── numba_functions_shared.py    (1.2K lines - 20 JIT functions)
-│   ├── aot_bridge.py                (250 lines - AOT/JIT fallback)
-│   └── aot_build.py                 (400 lines - AOT compiler)
-│
+│   ├── macd_unified.py          # Main entry & orchestration
+│   ├── bot_config.py            # Config loading & validation
+│   ├── fetcher.py               # HTTP, rate limit, circuit breaker, caches
+│   ├── indicators.py            # Indicator helpers
+│   ├── gates.py                 # Confluence / quality gates
+│   ├── alerts.py                # Evaluation, formatting, Telegram queue
+│   ├── state.py                 # Redis store, locks, pipelines, quota handling
+│   ├── threshold_engine.py      # Calibration & thresholds
+│   ├── brain*.py                # Brain analysis, shadow, audit, repair
+│   ├── outcome_storage.py       # JSONL outcome writers
+│   ├── archive_reader.py        # Schema-aware outcome reading
+│   ├── aot_bridge.py / aot_meta.py / numba_functions_shared.py
+│   └── cython_functions.pyx
 ├── .github/workflows/
-│   ├── build.yml                    (Docker build + AOT compile)
-│   └── run-bot.yml                  (Execute bot on schedule)
-│
-├── config_macd.json                 (Configuration)
-├── Dockerfile                       (Multi-stage: deps → AOT → runtime)
-├── requirements.txt                 (Python dependencies)
-├── .dockerignore
-└── .gitignore
-
-Total: ~5,350 lines Python
+│   ├── build.yml                # Docker + AOT/Cython image → GHCR
+│   ├── run-bot.yml              # Main bot execution (currently dispatch-only)
+│   ├── watchdog.yml             # Silence / failure watchdog
+│   ├── cleanup-outcomes.yml     # Daily archive pruning
+│   └── ci.yml                   # Syntax & basic tests
+├── config_macd.json
+├── Dockerfile                   # Multi-stage, non-root, 900 MB limit
+├── requirements.txt
+└── tests/
 ```
 
 ---
 
-## 🎯 Architecture Overview
+## 🎯 Runtime Architecture (simplified)
 
 ```
-GitHub Actions (Cron every 15 min)
-    ↓
-build.yml (if code changed)
-    ├─ Install deps (UV + pip)
-    ├─ Compile AOT (aot_build.py → macd_aot_compiled.so)
-    ├─ Build Docker image (multi-stage, 900MB)
-    └─ Push to ghcr.io
-    ↓
-run-bot.yml (scheduled)
-    ├─ Verify secrets (Telegram, Redis, Delta API)
-    ├─ Pull Docker image
-    ├─ Mount config_macd.json
-    ├─ Run container (2 CPUs, 900MB memory, 5-min timeout)
-    ├─ Fetch candles (parallel, 3 resolutions × 12 pairs)
-    ├─ Calculate indicators (AOT compiled, ~5ms per pair)
-    ├─ Evaluate alerts (check 26 conditions)
-    ├─ Deduplicate (Redis Lua scripts)
-    ├─ Send Telegram (batched, rate-limited)
-    └─ Upload logs on failure
+GitHub Actions (schedule or dispatch)
+        │
+        ▼
+run-bot.yml
+  • sparse-checkout config
+  • pull GHCR image
+  • decide Brain archive depth (3 d vs 185 d)
+  • sparse-clone outcome-data repo
+  • docker run (2 CPU, 900 MB, 660 s outer timeout)
+        │
+        ▼
+macd_unified.py
+  • connect Redis (with quota/OOM detection)
+  • optional CLEAR_REDIS / CLEAR_KILL_SWITCH
+  • parallel candle fetch (15 m / 5 m / daily)
+  • indicator calc (AOT path preferred)
+  • gate + alert evaluation
+  • Redis pipelines for state / dedup / stats
+  • Telegram queue (coalesced / batched)
+  • write outcomes → mounted data repo
+        │
+        ▼
+Persist step (rebase + retry push to outcome-data)
 ```
 
 ---
 
-## 📊 Performance
+## 🔐 Security Notes
 
-| Task | AOT | JIT | Speedup |
-|------|-----|-----|---------|
-| Startup | 0.5s | 0.5s | 1x |
-| PPO (350 bars) | 0.4ms | 12ms | **30x** |
-| RSI (350 bars) | 0.3ms | 10ms | **33x** |
-| 12 pairs, all indicators | 200ms | 2.5s | **12.5x** |
-| Full cycle (fetch + eval + alert) | 25-35s | 30-40s | 1.2x |
+- Secrets live only in GitHub Secrets / environment; never in the repo.
+- Container runs as non-root (`appuser`), read-only root filesystem, limited tmpfs.
+- Redis and Telegram URLs/tokens are redacted in normal logging paths.
+- Outcome data repo access is token-scoped.
 
 ---
 
-## 🔐 Security
+## 📈 Monitoring Checklist
 
-- ✅ Secrets never in repo (GitHub Secrets only)
-- ✅ Redacted from logs (TOKEN, chat_id, redis:// masked)
-- ✅ TLS 1.2+ for all API calls
-- ✅ Non-root container user
-- ✅ Read-only filesystem (except /tmp)
-- ✅ OHLC validation on every candle
-- ✅ Redis data TTL: 30 days auto-expiry
-
----
-
-## 📈 Monitoring
-
-### Check Logs
-```bash
-# GitHub Actions → Workflow run → Logs
-# Or: Actions → Run MACD Unified Bot → View summary
-```
-
-### Manual Verification
-```bash
-# Validate config
-python src/macd_unified.py --validate-only
-
-# Check Redis state
-redis-cli -u "$REDIS_URL" KEYS "pair_state:*" | head -5
-
-# Check dedup window
-redis-cli -u "$REDIS_URL" SCAN 0 MATCH "recent_alert:*"
-
-# Watch Docker logs
-docker logs -f macd_bot_runner
-```
+1. Watchdog Telegram alerts (silence or failed conclusion).
+2. Workflow summary: duration, alerts sent, pairs scanned, memory, Redis status.
+3. Artifacts: `bot-execution-logs-*` (7-day retention).
+4. Redis: `KEYS pair_state:*`, `SCAN … MATCH recent_alert:*`, memory / command stats.
+5. Outcome-data repo: daily JSONL growth and Brain reports under `reports/`.
 
 ---
 
 ## 🤝 Support
 
-**Issues**: Submit GitHub issues with logs + config (secrets redacted)  
-**Questions**: Check Actions workflow summary for detailed report  
-**Contributions**: PRs welcome for features, bug fixes, optimizations
+- Open issues with redacted logs + relevant config snippets.
+- Prefer the workflow summary and uploaded log artifact when reporting failures.
+- PRs welcome for bug fixes, clearer limits, and additional tests.
 
 ---
 
-## 📚 Resources
+**Resources**
 
-- [Numba Documentation](https://numba.readthedocs.io/)
+- [Numba](https://numba.readthedocs.io/)
 - [Delta Exchange API](https://api.india.delta.exchange/)
 - [Telegram Bot API](https://core.telegram.org/bots/api)
-- [Redis Documentation](https://redis.io/docs/)
-
----
-
-**Version**: 1.8.0-stable | **Last Updated**: 2025-01-22
+- [Redis / Valkey](https://redis.io/docs/)
