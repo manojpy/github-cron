@@ -931,13 +931,12 @@ async def dispatch_combined_alerts(
         else:
             # Send failed. Keep the dedup claims so the alert cannot
             # re-fire on the next run until the dedup window expires.
+            for dk in p.dedup_keys:
+                await sdb.release_recent_alert(p.pair_name, dk)
             logger_run.warning(
-                f"Individual send failed for {p.pair_name} — keeping dedup claims "
-                f"({p.dedup_keys}) so it won't re-fire until window expires"
+                f"Individual send failed for {p.pair_name} — dedup claims "
+                f"({p.dedup_keys}) released so it can retry next run"
             )
-    # Report the full delivered total — the caller logs this as "N alerts
-    # delivered", and silently returning only the fallback portion made
-    # partial-success batches look like complete failures.
     return already_sent + fallback_sent
 
 def validate_alert_definitions() -> None:
