@@ -1687,10 +1687,6 @@ if __name__ == "__main__":
         success = asyncio.run(apply_brain_and_exit())
         sys.exit(0 if success else 1)
 
-    if args.brain_only and args.alert_only:
-        logger.critical("Cannot use --brain-only and --alert-only together.")
-        sys.exit(1)
-
     if args.alert_only:
         _ALERT_ONLY_MODE = True
 
