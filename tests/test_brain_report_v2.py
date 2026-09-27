@@ -78,7 +78,6 @@ def test_confidence_is_capped_by_history_span():
     a._history.actual_days = 45
     assert a.statistical_confidence_label() == "HIGH"
 
-
 def test_all_eight_sections_in_order_and_fit_telegram():
     msgs = _report(_rows(_SPEC))
     text = _plain(msgs)
@@ -119,6 +118,30 @@ def test_counterfactual_candidates_beat_control_shown_in_what_to_do_now():
     assert "PROMOTION-ELIGIBLE" in sec2                       # Threshold +1: validated, n=137 >= 15
     assert "REJECTED" in sec2                                 # Combined: shadow disagrees
     assert "NOT YET (need 15 shadow, have 8)" in sec2         # RSI cap -3: validated but thin
+
+def test_confidence_breakdown_shows_four_independent_tiers():
+    gate = {**_OPEN, "profit_p_ev_positive": 0.91, "ev_p5": 0.12,
+            "oos_p_ev_positive": 0.61, "stability": True}
+    text = _plain(_report(_rows(_SPEC), gate=gate, ai_extra={"brier_score": 0.14}))
+    sec8 = text[text.index("08 │"):]
+    assert "CONFIDENCE BREAKDOWN" in sec8
+    assert "MODEL       🟢 HIGH" in sec8 and "Brier 0.14" in sec8
+    # _SPEC totals 90 trades over the default 2.5-day window: n>=60 alone
+    # would rank HIGH, but the short span caps it to MEDIUM.
+    assert "DATA        🟡 MEDIUM" in sec8 and "90 trades" in sec8
+    assert "CHANGE      🟢 HIGH" in sec8 and "P(EV>0) 91%" in sec8 and "EV p5 +0.12%" in sec8
+    assert "DEPLOYMENT  🟡 MEDIUM" in sec8 and "OOS P(EV>0) 61%" in sec8
+
+def test_confidence_breakdown_not_ready_on_active_drift_regardless_of_oos_score():
+    # A near-perfect OOS score must still show NOT READY once stability
+    # has failed — deploying into active drift is never "ready", whatever
+    # the historical walk-forward number says.
+    gate = {**_OPEN, "profit_p_ev_positive": 0.91, "ev_p5": 0.12,
+            "oos_p_ev_positive": 0.95, "stability": False}
+    text = _plain(_report(_rows(_SPEC), gate=gate, ai_extra={"brier_score": None}))
+    sec8 = text[text.index("08 │"):]
+    assert "MODEL       ⚪ N/A" in sec8 and "no calibration data yet" in sec8
+    assert "DEPLOYMENT  🔴 NOT READY" in sec8 and "active drift" in sec8
 
 def test_low_history_says_diagnose_and_never_advises_disabling():
     text = _plain(_report(_rows(_SPEC)))
