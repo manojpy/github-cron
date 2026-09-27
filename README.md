@@ -176,7 +176,7 @@ Full option list lives in `config_macd.json` and is validated at startup by `bot
 ## 📈 Indicators & Signals (summary)
 
 **Indicators** (Numba/AOT/Cython accelerated):  
-EMA / RMA / SMA, PPO, RSI / Stochastic RSI, VWAP, Kalman & Range filters, MMH, Cirrus Cloud, Ichimoku variants, ATR/ADX adaptive, volume/RVOL, pivots/CPR, dynamic flow, etc.
+EMA / RMA / SMA, PPO, RSI / Smoothed RSI, VWAP, Kalman & Range filters, MMH, Ichimoku Cloud, ATR/ADX adaptive, volume/RVOL, pivots/CPR, dynamic flow, etc.
 
 **Alert families** (gated by confluence + many quality checks):  
 PPO crosses, RSI crosses, VWAP, pivots (P/R1–R3/S1–S3), MMH reversals, cloud/CHOCH/fib/strong-reversal, and more.  
