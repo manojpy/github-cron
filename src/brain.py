@@ -13,7 +13,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from alerts import escape_markdown_v2
-from bot_config import cfg, json_dumps, format_ist_time, CONFLUENCE_WEIGHTS
+from bot_config import cfg, json_dumps, json_loads, format_ist_time, CONFLUENCE_WEIGHTS
 from state import RedisKeyPrefix, RedisStateStore, _rc
 import threshold_engine as engine
 
@@ -284,6 +284,7 @@ class BrainEngine:
         return f"{conf_pct:.0f}% confluence, shadow WR {wr:.0%} over {total} tracked rejections"
 
     # ── Calibration live gate ────────────────────────────────────────────
+
     async def _persist_calibration_curves(self, calib: Dict[str, Any]) -> bool:
         """Returns True only if the write to Redis actually succeeded, so the
         caller can report calibration_persistence accurately instead of
@@ -324,6 +325,93 @@ class BrainEngine:
                 f"Calibration curve persistence FAILED: {e}"
             )
             return False
+
+    async def maybe_refresh_calibration(self, logger_run: logging.Logger) -> None:
+        """Lightweight calibration rebuild, independent of the full Brain report.
+
+        Runs on every bot cycle when curves are missing or older than
+        CALIBRATION_REFRESH_MAX_AGE_HOURS. Uses Redis outcome streams only
+        (base _get_rows), so it works on shallow-archive / alert-only runs
+        and does not require the 185-day checkout.
+
+        Full Brain reports still rebuild curves as before; this path only
+        keeps the live gate fresh between those reports.
+        """
+        if not getattr(cfg, "ENABLE_CALIBRATION_GATE", False):
+            return
+        if not getattr(cfg, "ENABLE_BRAIN", True):
+            return
+        if getattr(cfg, "DRY_RUN_MODE", False):
+            return
+        if self.sdb.degraded or not self.sdb._redis:
+            logger_run.debug("Calibration refresh skipped: Redis unavailable or degraded")
+            return
+
+        max_age_hr = float(getattr(cfg, "CALIBRATION_REFRESH_MAX_AGE_HOURS", 2.0))
+
+        # ── Age check: skip if still fresh ──
+        try:
+            raw = await self.sdb._safe_redis_op(
+                lambda: _rc(self.sdb._redis).get(CALIBRATION_CURVES_KEY),
+                2.0,
+                "calibration_age_check",
+            )
+            if raw:
+                payload = json_loads(raw)
+                built_at = payload.get("built_at")
+                if built_at is not None:
+                    age_hr = (time.time() - float(built_at)) / 3600.0
+                    if age_hr < max_age_hr:
+                        logger_run.debug(
+                            f"Calibration curves fresh "
+                            f"({age_hr:.1f}h < {max_age_hr}h) — skip refresh"
+                        )
+                        return
+        except Exception as e:
+            logger_run.warning(
+                f"Calibration age check failed (will attempt rebuild): {e}"
+            )
+
+        # ── Rebuild from Redis streams (not file archive) ──
+        try:
+            logger_run.info(
+                f"🎯 Calibration refresh: curves missing or older than "
+                f"{max_age_hr}h — rebuilding from Redis streams..."
+            )
+            # Force base-class path so we never depend on archive depth.
+            real_rows, shadow_rows = await BrainEngine._get_rows(self)
+            calib = engine.build_calibration_curves(
+                real_rows,
+                bucket_pct=getattr(cfg, "CALIBRATION_BUCKET_PCT", 5.0),
+                min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
+                shadow_rows=shadow_rows,
+            )
+            if not calib.get("curves"):
+                logger_run.warning(
+                    "Calibration refresh: no curves built "
+                    "(insufficient samples across alert keys)"
+                )
+                return
+
+            ok = await self._persist_calibration_curves(calib)
+            n_keys = len(calib["curves"])
+            ece = calib.get("ece_mean")
+            if ok:
+                logger_run.info(
+                    f"✅ Calibration curves refreshed & persisted "
+                    f"({n_keys} alert_key(s), mean-per-alert ECE={ece})"
+                )
+            else:
+                logger_run.error(
+                    f"❌ Calibration curves built but NOT persisted "
+                    f"({n_keys} alert_key(s), ECE={ece}) — "
+                    f"previous curve (if any) remains live"
+                )
+        except Exception as e:
+            logger_run.warning(
+                f"Calibration refresh failed "
+                f"(gate continues on previous curve if present): {e}"
+            )
 
     async def _load_calibration_curve(self, alert_key: str) -> Optional[Dict[str, Any]]:
         now = time.time()

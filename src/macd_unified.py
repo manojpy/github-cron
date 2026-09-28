@@ -692,10 +692,21 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     else:
         state_db._shadow_pending_outcome_keys_by_pair = None
 
-    # ── Calibration curves: loaded ONCE per run ──
+    # ── Calibration curves: optional lightweight refresh, then load ONCE ──
     calibration_curves: Dict[str, Any] = {}
     if (cfg.ENABLE_CALIBRATION_GATE and cfg.ENABLE_BRAIN
             and state_db and not state_db.degraded and state_db._redis):
+        try:
+            # Refresh first so this run's gate uses a fresh curve when needed.
+            # Works on shallow-archive runs (Redis streams only).
+            from brain_enhanced import BrainEngineV2
+            _calib_brain = BrainEngineV2(state_db)
+            await _calib_brain.maybe_refresh_calibration(logger_main)
+        except Exception as e:
+            logger_main.warning(
+                f"Calibration refresh step failed (continuing with existing curve): {e}"
+            )
+
         try:
             from brain import CALIBRATION_CURVES_KEY
             raw = await state_db._safe_redis_op(
@@ -710,16 +721,17 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                     round((time.time() - built_at) / 3600, 1)
                     if built_at else None
                 )
-                _expected_cadence_hr = 6.0
+                _expected_cadence_hr = float(
+                    getattr(cfg, "CALIBRATION_REFRESH_MAX_AGE_HOURS", 2.0)
+                )
                 if built_age_hr is not None and built_age_hr >= _expected_cadence_hr:
                     _missed_cycles = int(built_age_hr // _expected_cadence_hr) - 1
                     if built_age_hr >= (_expected_cadence_hr * 2):
                         logger_main.error(
                             f"🚨 Calibration curves are {built_age_hr}h old — "
-                            f"approximately {_missed_cycles} Brain refresh cycle(s) did NOT "
-                            f"persist a new curve. Check brain report logs for persistence "
-                            f"failures, or verify the full-archive Brain run is actually "
-                            f"executing. Live calibration gate is using STALE historical "
+                            f"approximately {_missed_cycles} refresh cycle(s) did NOT "
+                            f"persist a new curve. Check Redis / calibration refresh "
+                            f"logs. Live calibration gate is using STALE historical "
                             f"calibration."
                         )
                     else:
@@ -736,7 +748,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                     f"built {built_age_hr}h ago)"
                 )
             else:
-                logger_main.info("🎯 Calibration curves: none stored yet (gate will fail-open)")
+                logger_main.info(
+                    "🎯 Calibration curves: none stored yet (gate will fail-open)"
+                )
         except Exception as e:
             logger_main.warning(f"Calibration curve pre-load failed (fail-open): {e}")
             calibration_curves = {}

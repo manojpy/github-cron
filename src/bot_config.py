@@ -498,6 +498,7 @@ class BotConfig(BaseModel):
     CALIBRATION_BUCKET_PCT: float = Field(default=5.0, ge=1.0, le=20.0)
     CALIBRATION_MIN_SAMPLE: int = Field(default=15, ge=5, le=200)
     CALIBRATION_SLACK: float = Field(default=0.05, ge=0.0, le=0.20) 
+    CALIBRATION_REFRESH_MAX_AGE_HOURS: float = Field(default=2.0, ge=0.5, le=48.0) 
     ENABLE_PORTFOLIO_HEAT_GATE: bool = Field(default=False) 
     MAX_CONCURRENT_POSITIONS: int = Field(default=6, ge=1, le=50)
     MAX_NET_DIRECTIONAL_POSITIONS: int = Field(default=4, ge=1, le=50) 
