@@ -729,10 +729,10 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                     if built_age_hr >= (_expected_cadence_hr * 2):
                         logger_main.error(
                             f"🚨 Calibration curves are {built_age_hr}h old — "
-                            f"approximately {_missed_cycles} refresh cycle(s) did NOT "
-                            f"persist a new curve. Check Redis / calibration refresh "
-                            f"logs. Live calibration gate is using STALE historical "
-                            f"calibration."
+                            f"approximately {_missed_cycles} expected refresh cycle(s) "
+                            f"without a successful rebuild. See earlier "
+                            f"'Calibration refresh' logs (often insufficient samples "
+                            f"or persist failure). Live gate is using STALE calibration."
                         )
                     else:
                         logger_main.warning(

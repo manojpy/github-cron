@@ -372,14 +372,19 @@ class BrainEngine:
                 f"Calibration age check failed (will attempt rebuild): {e}"
             )
 
-        # ── Rebuild from Redis streams (not file archive) ──
+        # ── Rebuild from best available source ──
         try:
             logger_run.info(
                 f"🎯 Calibration refresh: curves missing or older than "
-                f"{max_age_hr}h — rebuilding from Redis streams..."
+                f"{max_age_hr}h — rebuilding..."
             )
-            # Force base-class path so we never depend on archive depth.
-            real_rows, shadow_rows = await BrainEngine._get_rows(self)
+            real_rows, shadow_rows = await self._get_rows()
+            n_real, n_shadow = len(real_rows), len(shadow_rows)
+            logger_run.info(
+                f"🎯 Calibration refresh input: {n_real} real, "
+                f"{n_shadow} shadow rows"
+            )
+
             calib = engine.build_calibration_curves(
                 real_rows,
                 bucket_pct=getattr(cfg, "CALIBRATION_BUCKET_PCT", 5.0),
@@ -387,9 +392,16 @@ class BrainEngine:
                 shadow_rows=shadow_rows,
             )
             if not calib.get("curves"):
+                # Diagnose why: often min_sample not met per alert_key
+                from collections import Counter
+                ak_counts = Counter(r.get("alert_key") for r in real_rows)
+                top = ak_counts.most_common(5)
+                min_s = getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15)
                 logger_run.warning(
-                    "Calibration refresh: no curves built "
-                    "(insufficient samples across alert keys)"
+                    f"Calibration refresh: no curves built "
+                    f"(need ≥{min_s} samples/alert_key). "
+                    f"real={n_real} shadow={n_shadow} | "
+                    f"top alert_keys: {top}"
                 )
                 return
 
