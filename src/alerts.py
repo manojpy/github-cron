@@ -236,6 +236,51 @@ def _disabled_hits_passing_confluence(
             kept.append(hit)
     return kept
 
+def _format_brain_rejection(
+    pair_name: str,
+    alert_key: str,
+    *,
+    source: str,
+    p_profit: Optional[float] = None,
+    net_ev: Optional[float] = None,
+    evidence: Optional[str] = None,
+    n_oos: Optional[int] = None,
+    calibration: Optional[str] = None,
+    reason: Optional[str] = None,
+    edge_source: Optional[str] = None,
+    action: str = "BLOCKED",
+) -> str:
+    """Build a compact 'why Brain rejected' explanation for logs and
+    counterfactual extras. Hard signal rules already passed; Brain quality
+    or ML-EV is the layer that rejected dispatch.
+    """
+    lines = [
+        f"🧠 BRAIN REJECTED [{pair_name}] {alert_key}",
+        f"  source={source}  action={action}",
+    ]
+    if p_profit is not None:
+        try:
+            lines.append(f"  P(profit)={float(p_profit):.0%}")
+        except (TypeError, ValueError):
+            lines.append(f"  P(profit)={p_profit}")
+    if net_ev is not None:
+        try:
+            lines.append(f"  netEV={float(net_ev):+.3f}")
+        except (TypeError, ValueError):
+            lines.append(f"  netEV={net_ev}")
+    if evidence is not None:
+        lines.append(f"  evidence={evidence}" + (f" n={n_oos}" if n_oos is not None else ""))
+    elif n_oos is not None:
+        lines.append(f"  n={n_oos}")
+    if calibration:
+        lines.append(f"  calibration={calibration}")
+    if edge_source:
+        lines.append(f"  edge_source={edge_source}")
+    if reason:
+        lines.append(f"  reason={reason}")
+    lines.append("  signal_gates=PASS (Brain quality layer rejected)")
+    return "\n".join(lines)
+
 async def _record_counterfactual_block(
     sdb: "RedisStateStore",
     pair_name: str,
@@ -2074,22 +2119,34 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 )
 
                             if tq["verdict"] == "BLOCKED":
+                                _cal = None
+                                if isinstance(tq.get("calibration"), dict):
+                                    _cal = (
+                                        "PASS" if tq["calibration"].get("pass")
+                                        else f"FAIL ({tq['calibration'].get('reason', '?')})"
+                                    )
+                                reject_txt = _format_brain_rejection(
+                                    pair_name, alert_key,
+                                    source="quality",
+                                    p_profit=_p,
+                                    net_ev=_ev,
+                                    evidence=_evd,
+                                    n_oos=_n,
+                                    calibration=_cal,
+                                    reason=tq.get("reason"),
+                                    edge_source=_src or None,
+                                    action="BLOCKED",
+                                )
                                 alert_extra = (
                                     f"{alert_extra} | 🎯 Quality: BLOCKED "
-                                    f"(P(profit)={tq.get('p_ev_positive', 0):.0%}, "
-                                    f"netEV={tq.get('net_ev', 0):+.2f}%, "
-                                    f"evidence={tq.get('evidence_strength', '?')}, "
+                                    f"(P(profit)={_p:.0%}, netEV={_ev:+.2f}%, "
+                                    f"evidence={_evd}, n={_n}, "
                                     f"reason={tq.get('reason', 'n/a')})"
+                                    f" | Why Brain rejected: {tq.get('reason', 'n/a')}"
                                 )
-                                # Hard gate (only when explicitly enabled) — mirrors
-                                # ENABLE_ML_EV_GATE: annotate, record counterfactual,
-                                # skip Telegram dispatch and real-outcome recording.
+                                # Hard gate (only when explicitly enabled)
                                 if getattr(cfg, "ENABLE_QUALITY_HARD_BLOCK", False):
-                                    logger_pair.info(
-                                        f"[{pair_name}] quality hard-block dropped {alert_key}: "
-                                        f"verdict=BLOCKED reason={tq.get('reason', 'n/a')} "
-                                        f"netEV={tq.get('net_ev', 0):+.2f}%"
-                                    )
+                                    logger_pair.info(reject_txt)
                                     await _record_counterfactual_block(
                                         sdb, pair_name,
                                         [(alert_title, alert_extra, alert_key)],
@@ -2217,10 +2274,26 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                             )
                                     # Hard gate (only when explicitly enabled)
                                     if getattr(cfg, "ENABLE_ML_EV_GATE", False) and not qualify:
-                                        logger_pair.info(
-                                            f"[{pair_name}] ML-EV gate dropped {alert_key}: "
-                                            f"EV={ev.get('net_ev')} < {cfg.ML_EV_MIN_THRESHOLD}"
+                                        _ml_reason = (
+                                            f"ml_ev_below_floor: EV={ev.get('net_ev')} "
+                                            f"< {getattr(cfg, 'ML_EV_MIN_THRESHOLD', 0.0)} "
+                                            f"(p_cal={p_use:.0%}, {cal_reason})"
                                         )
+                                        reject_txt = _format_brain_rejection(
+                                            pair_name, alert_key,
+                                            source="ml_ev",
+                                            p_profit=p_use,
+                                            net_ev=ev.get("net_ev"),
+                                            calibration=cal_reason,
+                                            reason=_ml_reason,
+                                            action="BLOCKED",
+                                        )
+                                        alert_extra = (
+                                            f"{alert_extra} | 📐 ML-EV: BLOCKED "
+                                            f"(EV={ev.get('net_ev'):+.3f}R, p={p_use:.0%}) "
+                                            f"| Why Brain rejected: {_ml_reason}"
+                                        )
+                                        logger_pair.info(reject_txt)
                                         await _record_counterfactual_block(
                                             sdb, pair_name,
                                             [(alert_title, alert_extra, alert_key)],
