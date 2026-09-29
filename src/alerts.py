@@ -2072,7 +2072,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     f"(live={tq['market_state_live']}, "
                                     f"ev_bucket_p={tq.get('p_ev_positive', 0):.3f})"
                                 )
-
                             if tq["verdict"] == "BLOCKED":
                                 alert_extra = (
                                     f"{alert_extra} | 🎯 Quality: BLOCKED "
@@ -2081,6 +2080,24 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     f"evidence={tq.get('evidence_strength', '?')}, "
                                     f"reason={tq.get('reason', 'n/a')})"
                                 )
+                                if getattr(cfg, "ENABLE_QUALITY_HARD_BLOCK", False):
+                                    logger_pair.info(
+                                        f"[{pair_name}] Quality hard-block dropped "
+                                        f"{alert_key}: {tq.get('reason', 'n/a')}"
+                                    )
+                                    await _record_counterfactual_block(
+                                        sdb, pair_name,
+                                        [(alert_title, alert_extra, alert_key)],
+                                        ts_curr, close_curr,
+                                        block_reason="quality_hard_block",
+                                        confluence_scores={
+                                            alert_key: _confluence_for(alert_key)
+                                        },
+                                        gr=gr, context=context,
+                                        logger_pair=logger_pair,
+                                    )
+                                    continue
+
                                 # Hard gate (only when explicitly enabled) — mirrors
                                 # ENABLE_ML_EV_GATE: annotate, record counterfactual,
                                 # skip Telegram dispatch and real-outcome recording.

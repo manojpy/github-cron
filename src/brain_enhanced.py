@@ -1410,6 +1410,26 @@ class BrainEngineV2(BaseBrainEngine):
                         e["auto_rolled_back"] = True
                         e["rolled_back_at"] = int(time.time())
 
+            # ── Champion/challenger: periodic promotion check. force=False
+            # always, so this stays a no-op reporting "shadow_only_requires_force"
+            # while CHALLENGER_SHADOW_ONLY is True — promotion still requires
+            # an explicit force=True call elsewhere, this just makes the
+            # gate's decision visible every report cycle instead of the
+            # challenger sitting unchecked in Redis indefinitely. ──
+            if getattr(cfg, "ENABLE_CHAMPION_CHALLENGER", False):
+                try:
+                    promo = await self.maybe_promote_challenger()
+                    if promo.get("promoted"):
+                        logger.warning(
+                            f"🏆 Challenger promoted to champion (live "
+                            f"dynamic_weights): {promo.get('meta')}"
+                        )
+                        ai_metrics["challenger_promotion"] = promo
+                    elif promo.get("reason") != "no_challenger":
+                        logger.info(f"🧪 Challenger not promoted: {promo.get('reason')}")
+                except Exception as e:
+                    logger.warning(f"Challenger promotion check failed: {e}")
+
             self._repair_success_rates = await repair_success_rates(self.sdb)
             self._ledger_stats = await ledger_stats(self.sdb)
             ai_metrics["repair_ledger"] = dict(self._ledger_stats)
