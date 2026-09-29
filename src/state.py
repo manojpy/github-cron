@@ -764,6 +764,7 @@ class RedisStateStore:
                 "the re-enable probation window (BRAIN_REENABLE_PROBATION_DAYS) "
                 "will not apply correctly for this key until this succeeds"
             )
+        return True
 
     async def get_pair_thresholds(self) -> Dict[str, float]:
         """All pair -> confluence-abs-score-floor overrides currently stored,
