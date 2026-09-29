@@ -4518,74 +4518,29 @@ def trade_quality_score(
     use_market_state_live: bool = False,
     ml_calibration_curve: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Contextual quality decision layer for a single prospective trade.
-
-    Pipeline (always recorded on result["pipeline"]):
-      context → historical edge → P(profit)/EV → calibration →
-      OOS/sample gate → risk gate → verdict + action
-
-    Verdicts: BLOCKED | MONITOR | HIGH | MEDIUM | LOW
-    Actions:  block | monitor | dispatch
-
-    Hard signal rules are NOT changed here — this only judges quality.
-    Dispatch suppression of BLOCKED is controlled by ENABLE_QUALITY_HARD_BLOCK.
-    """
+    """Unified quality assessment for a single prospective trade."""
     result: Dict[str, Any] = {
         "pair": row.get("pair"),
         "alert_key": row.get("alert_key"),
         "direction": row.get("direction"),
     }
-    pipeline: Dict[str, Any] = {
-        "hard_veto": "pending",
-        "historical_edge": "pending",
-        "market_state": "pending",
-        "calibration": "pending",
-        "oos_sample": "pending",
-        "regime": "pending",
-        "risk_gate": "pending",
-        "composite": "pending",
-    }
-
     # ── Layer 1: Hard vetoes ──
     if kill_switch_active:
-        pipeline["hard_veto"] = "fail:kill_switch"
-        result["pipeline"] = pipeline
         result["verdict"] = "BLOCKED"
-        result["action"] = "block"
         result["reason"] = "kill_switch_active"
-        result["evidence_strength"] = "n/a"
         return result
     if portfolio_blocked:
-        pipeline["hard_veto"] = "fail:portfolio_heat"
-        result["pipeline"] = pipeline
         result["verdict"] = "BLOCKED"
-        result["action"] = "block"
         result["reason"] = "portfolio_heat_limit"
-        result["evidence_strength"] = "n/a"
         return result
-    pipeline["hard_veto"] = "pass"
 
-    # ── Layer 2: Probabilistic / historical edge ──
-    p_profit = float(ev_model_result.get("p_ev_positive", 0.5) or 0.5)
-    net_ev = float(ev_model_result.get("net_ev", 0.0) or 0.0)
-    ev_p5 = float(ev_model_result.get("ev_p5", net_ev) or net_ev)
-    # Prefer hierarchical leaf n when present (set by get_trade_quality)
-    n_oos = int(
-        ev_model_result.get("net_ev_leaf_n")
-        or ev_model_result.get("n")
-        or 0
-    )
-    edge_source = ev_model_result.get("net_ev_source", "alert_baseline")
-    pipeline["historical_edge"] = {
-        "status": "ok",
-        "source": edge_source,
-        "p_profit": round(p_profit, 4),
-        "net_ev": round(net_ev, 4),
-        "n": n_oos,
-        "leaf_key": ev_model_result.get("net_ev_leaf_key"),
-    }
+    # ── Layer 2: Probabilistic assessment ──
+    p_profit = ev_model_result.get("p_ev_positive", 0.5)
+    net_ev = ev_model_result.get("net_ev", 0.0)
+    ev_p5 = ev_model_result.get("ev_p5", net_ev)
+    n_oos = ev_model_result.get("n", 0)
 
-    # ── Layer 2b: live per-trade market-state prediction ──
+    # ── Layer 2b: live per-trade market-state prediction (item #12).
     market_state_p_win_cal = market_state_p_win
     calibration_reason = None
     if market_state_p_win is not None and ml_calibration_curve:
@@ -4596,30 +4551,18 @@ def trade_quality_score(
             market_state_p_win_cal = p_cal
 
     p_profit_effective = p_profit
-    if market_state_p_win_cal is not None and use_market_state_live:
-        p_profit_effective = 0.5 * p_profit + 0.5 * market_state_p_win_cal
-
+    if market_state_p_win_cal is not None:
+        if use_market_state_live:
+            p_profit_effective = 0.5 * p_profit + 0.5 * market_state_p_win_cal
     per_trade = None
     if (market_state_p_win is not None
             and market_state_p_win_cal is not None
             and use_market_state_live):
-        rr = (row.get("context") or {}).get("rr", 2.0)
+        rr = (row.get("context") or {}).get("rr", 2.0)  # or from MAE/MFE profile
         per_trade = per_trade_ev(market_state_p_win_cal, reward_r=float(rr))
         per_trade["p_raw"] = round(market_state_p_win, 4)
         per_trade["calibration_reason"] = calibration_reason or "no_curve"
         result["per_trade_ev"] = per_trade
-        pipeline["market_state"] = {
-            "status": "live",
-            "p_win": round(float(market_state_p_win_cal), 4),
-            "p_raw": round(float(market_state_p_win), 4),
-        }
-    elif market_state_p_win is not None:
-        pipeline["market_state"] = {
-            "status": "shadow",
-            "p_win": round(float(market_state_p_win_cal or market_state_p_win), 4),
-        }
-    else:
-        pipeline["market_state"] = {"status": "unavailable"}
 
     # ── Layer 3: Calibration ──
     cal_wr = None
@@ -4629,74 +4572,29 @@ def trade_quality_score(
             calibration_curve, conf_pct,
             target_wr=target_wr, min_sample=calibration_min_sample, slack=calibration_slack,
         )
+
         result["calibration"] = {
             "pass": ok, "calibrated_wr": cal_wr, "reason": reason,
         }
         if not ok:
-            pipeline["calibration"] = {"status": "fail", "reason": reason}
-            pipeline["oos_sample"] = "skipped"
-            pipeline["regime"] = "skipped"
-            pipeline["risk_gate"] = "skipped"
-            pipeline["composite"] = "skipped"
-            result["pipeline"] = pipeline
             result["verdict"] = "BLOCKED"
-            result["action"] = "block"
             result["reason"] = f"calibration_gate: {reason}"
-            result["p_ev_positive"] = round(p_profit, 3)
-            result["net_ev"] = round(net_ev, 4)
-            result["n_oos"] = n_oos
-            result["evidence_strength"] = (
-                "strong" if n_oos >= 200
-                else "moderate" if n_oos >= 50
-                else "weak"
-            )
             return result
-        pipeline["calibration"] = {
-            "status": "pass",
-            "calibrated_wr": cal_wr,
-            "reason": reason,
-        }
-    else:
-        pipeline["calibration"] = {"status": "no_curve"}
 
-    # ── Layer 4: Regime compatibility ──
+    # ── Layer 4: Regime compatibility ─
     regime_ok = True
-    regime_label = "unknown"
     if regime_info and regime_info.get("valid"):
         adx = (row.get("context") or {}).get("adx_val")
         if adx is not None:
             median_adx = regime_info.get("median_adx", adx)
-            regime_label = "trending" if adx >= median_adx else "ranging"
-            reg_data = regime_info.get("regimes", {}).get(regime_label, {})
+            regime = "trending" if adx >= median_adx else "ranging"
+            reg_data = regime_info.get("regimes", {}).get(regime, {})
             if reg_data.get("valid") and reg_data.get("wr", 0.5) < 0.40:
                 regime_ok = False
                 result["regime_warning"] = (
-                    f"{regime_label} regime WR={reg_data['wr']:.0%}"
+                    f"{regime} regime WR={reg_data['wr']:.0%}"
                 )
-    pipeline["regime"] = {
-        "status": "ok" if regime_ok else "warn",
-        "label": regime_label,
-        "compatible": regime_ok,
-    }
-
-    # ── Layer 5: OOS / sample-quality gate ──
-    min_oos = int(getattr(cfg, "QUALITY_MIN_OOS_ACTIONABLE", 30))
-    if n_oos >= 200:
-        evidence_strength = "strong"
-    elif n_oos >= 50:
-        evidence_strength = "moderate"
-    elif n_oos >= min_oos:
-        evidence_strength = "limited"
-    else:
-        evidence_strength = "weak"
-    pipeline["oos_sample"] = {
-        "status": "ok" if n_oos >= min_oos else "thin",
-        "n": n_oos,
-        "min_actionable": min_oos,
-        "evidence_strength": evidence_strength,
-    }
-
-    # ── Layer 6: Composite score ──
+    # ── Layer 5: Composite score ──
     evidence_factor = min(1.0, n_oos / 200.0)
     quality = (
         0.40 * p_profit_effective
@@ -4705,59 +4603,19 @@ def trade_quality_score(
         + 0.10 * (0.5 if regime_ok else 0.0)
         + 0.10 * (cal_wr if cal_wr is not None else 0.5)
     )
-    pipeline["composite"] = {
-        "status": "ok",
-        "quality_score": round(quality, 3),
-        "p_effective": round(p_profit_effective, 4),
-    }
 
-    # ── Layer 7: Risk gate + verdict ──
+    # ─Verdict ──
     if quality >= 0.70 and p_profit_effective >= 0.85 and ev_p5 > -0.10:
-        prior = "HIGH"
+        verdict = "HIGH"
     elif quality >= 0.50 and p_profit_effective >= 0.65:
-        prior = "MEDIUM"
+        verdict = "MEDIUM"
     else:
-        prior = "LOW"
-    verdict = prior
-    reason = None
+        verdict = "LOW"
 
-    block_neg = bool(getattr(cfg, "QUALITY_BLOCK_ON_NEGATIVE_EV", True))
-    if block_neg and n_oos >= min_oos and net_ev < 0.0 and p_profit_effective < target_wr:
-        verdict = "BLOCKED"
-        reason = (
-            f"negative_edge: netEV={net_ev:+.3f} p={p_profit_effective:.0%} "
-            f"n={n_oos}"
-        )
-        pipeline["risk_gate"] = {"status": "fail", "reason": reason}
-    elif evidence_strength in ("weak", "limited") and prior != "HIGH":
-        verdict = "MONITOR"
-        reason = (
-            f"insufficient_evidence: n={n_oos} evidence={evidence_strength} "
-            f"composite_would_be={prior}"
-        )
-        pipeline["risk_gate"] = {"status": "monitor", "reason": reason}
-    elif (not regime_ok) and prior == "LOW":
-        verdict = "MONITOR"
-        reason = result.get("regime_warning", "regime_incompatible")
-        pipeline["risk_gate"] = {"status": "monitor", "reason": reason}
-    else:
-        pipeline["risk_gate"] = {"status": "pass"}
-
-    if verdict == "BLOCKED":
-        action = "block"
-    elif verdict == "MONITOR":
-        action = "monitor"
-    else:
-        action = "dispatch"
-
-    result["pipeline"] = pipeline
     result.update({
         "verdict": verdict,
-        "action": action,
-        "reason": reason,
         "quality_score": round(quality, 3),
         "p_ev_positive": round(p_profit, 3),
-        "p_profit_effective": round(p_profit_effective, 3),
         "market_state_p_win": (
             round(market_state_p_win_cal, 3) if market_state_p_win_cal is not None else None
         ),
@@ -4768,9 +4626,12 @@ def trade_quality_score(
         "net_ev": round(net_ev, 4),
         "ev_p5": round(ev_p5, 4),
         "n_oos": n_oos,
-        "evidence_strength": evidence_strength,
+        "evidence_strength": (
+            "strong" if n_oos >= 200
+            else "moderate" if n_oos >= 50
+            else "weak"
+        ),
         "regime_compatible": regime_ok,
-        "edge_source": edge_source,
     })
 
     # Advisory size hint only — never used to place orders in this bot
@@ -4781,13 +4642,13 @@ def trade_quality_score(
             hint = float(getattr(cfg, "BRAIN_SIZE_HINT_HIGH", 1.0))
         elif result.get("verdict") == "MEDIUM":
             hint = float(getattr(cfg, "BRAIN_SIZE_HINT_MEDIUM", 0.5))
-        elif result.get("verdict") == "MONITOR":
-            hint = float(getattr(cfg, "BRAIN_SIZE_HINT_LOW", 0.25)) * 0.5
         else:
             hint = float(getattr(cfg, "BRAIN_SIZE_HINT_LOW", 0.25))
-        if result.get("evidence_strength") in ("weak", "limited"):
+        # Shrink further if evidence is weak
+        if result.get("evidence_strength") == "weak":
             hint *= 0.5
         result["size_hint"] = round(max(0.0, min(1.0, hint)), 3)
         result["size_hint_note"] = "advisory_only"
 
     return result
+    
