@@ -2168,28 +2168,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                         logger_pair=logger_pair,
                                     )
                                     continue
-
-                                # Hard gate (only when explicitly enabled) — mirrors
-                                # ENABLE_ML_EV_GATE: annotate, record counterfactual,
-                                # skip Telegram dispatch and real-outcome recording.
-                                if getattr(cfg, "ENABLE_QUALITY_HARD_BLOCK", False):
-                                    logger_pair.info(
-                                        f"[{pair_name}] quality hard-block dropped {alert_key}: "
-                                        f"verdict=BLOCKED reason={tq.get('reason', 'n/a')} "
-                                        f"netEV={tq.get('net_ev', 0):+.2f}%"
-                                    )
-                                    await _record_counterfactual_block(
-                                        sdb, pair_name,
-                                        [(alert_title, alert_extra, alert_key)],
-                                        ts_curr, close_curr,
-                                        block_reason="quality_hard_block",
-                                        confluence_scores={
-                                            alert_key: _confluence_for(alert_key)
-                                        },
-                                        gr=gr, context=context,
-                                        logger_pair=logger_pair,
-                                    )
-                                    continue
                             else:
                                 alert_extra = (
                                     f"{alert_extra} | 🎯 Quality: {tq['verdict']} "

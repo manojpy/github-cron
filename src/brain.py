@@ -611,9 +611,12 @@ class BrainEngine:
                 p_hier = float(leaf["shrunk_wr"])
                 n = float(leaf["n"])
                 k = float(getattr(cfg, "HIERARCHICAL_SHRINKAGE_K", 20.0))
-                w = n / (n + k)
+                w = n / (n + k)      
                 ev_model_result["p_ev_positive"] = (1.0 - w) * p_model + w * p_hier
+            if "shrunk_wr" in leaf:
+                ev_model_result["hierarchical_wr"] = float(leaf["shrunk_wr"])
             ev_model_result["net_ev_source"] = "hierarchical_shrunk"
+
             ev_model_result["net_ev_leaf_n"] = leaf["n"]
             ev_model_result["net_ev_leaf_key"] = leaf_key
         else:
