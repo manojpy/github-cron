@@ -284,6 +284,8 @@ class RedisStateStore:
         self._connection_attempts = 0
         self._quota_exhausted: bool = False
         self._last_connect_error: Optional[Exception] = None
+        self._last_recovery_attempt_ts: float = 0.0
+        self._recovery_lock = asyncio.Lock()
 
         if cfg.DEBUG_MODE and logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -325,6 +327,37 @@ class RedisStateStore:
                 logger.critical(f"Redis reconnect failed after '{operation}' — staying degraded for remainder of run")
         except Exception as reconnect_exc:
             logger.critical(f"Redis reconnect attempt itself failed: {reconnect_exc} — staying degraded")
+
+    async def maybe_recover_from_degraded(self, cooldown_sec: float = 30.0) -> bool:
+        """Mid-run health probe. _record_redis_failure only reconnects once,
+        at the moment of the failure — if that single attempt doesn't land,
+        the store stays degraded (dedup, state persistence, dynamic
+        weights, etc. all soft-fail or fail-open/closed) for the rest of an
+        8-minute run even if Redis recovers seconds later. Call this
+        periodically (e.g. once per pair) from the run loop; it no-ops
+        instantly unless currently degraded, and retries at most once every
+        `cooldown_sec` even under concurrent callers. Returns True if the
+        store is healthy (already, or as of this call).
+        """
+        if not self.degraded:
+            return True
+        if self._quota_exhausted:
+            return False  # reconnecting can't fix a quota/OOM condition
+        async with self._recovery_lock:
+            if not self.degraded:
+                return True
+            now = time.time()
+            if now - self._last_recovery_attempt_ts < cooldown_sec:
+                return False
+            self._last_recovery_attempt_ts = now
+            try:
+                reconnected = await self._attempt_connect(timeout=3.0)
+            except Exception as exc:
+                logger.debug(f"Mid-run Redis recovery probe failed: {exc}")
+                return False
+            if reconnected:
+                logger.info("♻️ Redis recovered mid-run — degraded mode cleared")
+            return reconnected
 
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
         try:
@@ -726,8 +759,11 @@ class RedisStateStore:
                     hist["disabled_at"].pop(alert_key, None)
                 await self.set_metadata(BRAIN_KEY_HISTORY_METADATA_KEY, json_dumps(hist))
         except Exception as e:
-            logger.debug(f"Could not record disable/enable time for '{alert_key}': {e}")
-        return True
+            logger.warning(
+                f"Could not record disable/enable time for '{alert_key}': {e} — "
+                "the re-enable probation window (BRAIN_REENABLE_PROBATION_DAYS) "
+                "will not apply correctly for this key until this succeeds"
+            )
 
     async def get_pair_thresholds(self) -> Dict[str, float]:
         """All pair -> confluence-abs-score-floor overrides currently stored,
@@ -1110,14 +1146,13 @@ class RedisStateStore:
             async with self._redis.pipeline() as pipe:
                 pipe.lpush(key, str(count))
                 pipe.ltrim(key, 0, self.VOTE_COUNT_HISTORY_MAX - 1)
-
                 await self._safe_redis_op(
                     lambda: pipe.execute(),
                     2.0,
                     f"vote_count_save:{alert_key}",
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Vote-count history save failed for '{alert_key}': {e}")
 
     async def get_vote_count_history(self, alert_key: str) -> List[int]:
         if self.degraded or not self._redis:
@@ -1602,8 +1637,12 @@ class RedisStateStore:
                         timeout=2.0,
                     )
         except Exception as e:
-            logger_pair.debug(f"Failed to persist resolved outcomes for {pair}: {e}")
+            dup_risk = " — resolved_for_file was already archived, so a retry next run may re-append duplicate row(s)" if resolved_for_file else ""
+            logger_pair.warning(
+                f"[{pair}] Failed to persist resolved outcomes (Redis pipeline): {e}{dup_risk}"
+            )
             return
+        
         self._run_resolved_total += resolved_count
         logger_pair.debug(
             f"[{pair}] Outcome resolution | "
@@ -1614,6 +1653,11 @@ class RedisStateStore:
             f"missing_score={missing_score_count} | "
             f"bad_payload={bad_payload_count}"
         )
+        if bad_payload_count:
+            logger_pair.warning(
+                f"[{pair}] {bad_payload_count} pending outcome(s) had a malformed "
+                "payload and were dropped this run (see prior debug lines for keys)"
+            )
 
     async def resolve_shadow_pending_outcomes(
         self,
@@ -1820,8 +1864,9 @@ class RedisStateStore:
                     await asyncio.wait_for(_execute_pipeline(write_pipe), timeout=2.0)
 
         except Exception as e:
-            logger_pair.debug(
-                f"Failed to persist resolved shadow outcomes for {pair}: {e}"
+            dup_risk = " — resolved_for_file was already archived, so a retry next run may re-append duplicate row(s)" if resolved_for_file else ""
+            logger_pair.warning(
+                f"[{pair}] Failed to persist resolved shadow outcomes (Redis pipeline): {e}{dup_risk}"
             )
             return
 
@@ -2021,8 +2066,8 @@ class RedisStateStore:
                 lambda: _rc(self._redis).set(key, json_dumps(state), ex=30 * 86400),
                 2.0, f"cusum_save:{alert_key}",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"CUSUM state save failed for '{alert_key}': {e}")
 
     async def load_cusum_watermark(self, alert_key: str) -> int:
         """Last entry_ts already fed into this alert_key's CUSUM detector.
@@ -2047,8 +2092,8 @@ class RedisStateStore:
                 lambda: _rc(self._redis).set(key, str(entry_ts), ex=30 * 86400),
                 2.0, f"cusum_watermark_save:{alert_key}",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"CUSUM watermark save failed for '{alert_key}': {e}")
 
     async def load_cusum_bulk(
         self, alert_keys: List[str],
@@ -2130,8 +2175,8 @@ class RedisStateStore:
                 await self._safe_redis_op(
                     lambda: pipe.execute(), 2.0, f"threshold_history_save:{key_suffix or 'global'}",
                 )
-        except Exception:
-            pass       
+        except Exception as e:
+            logger.warning(f"Threshold-history save failed for '{key_suffix or 'global'}': {e}")
 
 class RedisLock:    
     RELEASE_LUA = """

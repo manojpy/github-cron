@@ -109,6 +109,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     calibration_curves: Optional[Dict[str, Any]] = None,
     ml_market_state_model: Optional[Dict[str, Any]] = None,
     ml_calibration_curve: Optional[Dict[str, Any]] = None,
+    brain_engine: Optional[Any] = None,
     disabled_alert_keys_run: Optional[Set[str]] = None,
     pair_thresholds_run: Optional[Dict[str, float]] = None,
     open_positions_run: Optional[List[Dict[str, Any]]] = None,
@@ -289,6 +290,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             calibration_curves=calibration_curves,
             ml_market_state_model=ml_market_state_model,
             ml_calibration_curve=ml_calibration_curve, 
+            brain_engine=brain_engine,
             batch_mode=getattr(cfg, "ENABLE_BATCHED_ALERTS", True),
             pair_thresholds=pair_thresholds_run,
             open_positions_run=open_positions_run,
@@ -322,6 +324,7 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
                        calibration_curves: Optional[Dict[str, Any]] = None, 
                        ml_market_state_model: Optional[Dict[str, Any]] = None,
                        ml_calibration_curve: Optional[Dict[str, Any]] = None,
+                       brain_engine: Optional[Any] = None,
                        disabled_alert_keys_run: Optional[Set[str]] = None,
                        pair_thresholds_run: Optional[Dict[str, float]] = None,
                        open_positions_run: Optional[List[Dict[str, Any]]] = None,
@@ -354,6 +357,7 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
             calibration_curves=calibration_curves,
             ml_market_state_model=ml_market_state_model,
             ml_calibration_curve=ml_calibration_curve,
+            brain_engine=brain_engine,
             disabled_alert_keys_run=disabled_alert_keys_run,
             pair_thresholds_run=pair_thresholds_run,
             open_positions_run=open_positions_run,
@@ -558,7 +562,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
         if miss_symbols:
             daily_task = asyncio.gather(*(
-                fetcher.fetch_daily_cached(
+                fetcher.fetch_daily_and_cache(
                     state_db, sym, daily_limit, reference_time,
                     allow_cache_write=daily_cache_settled,
                 )
@@ -793,6 +797,15 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             ml_market_state_model = None
             ml_calibration_curve = None
 
+    brain_engine_shared: Optional[Any] = None
+    if cfg.ENABLE_BRAIN and state_db and not state_db.degraded:
+        try:
+            from brain_enhanced import BrainEngineV2
+            brain_engine_shared = BrainEngineV2(state_db)
+        except Exception as e:
+            logger_main.warning(f"Shared brain engine init failed (fail-open): {e}")
+            brain_engine_shared = None
+
     # ── Disabled-alert-keys, pair-thresholds, open-positions: loaded ONCE
     disabled_alert_keys_run: Set[str] = set()
     if state_db and not state_db.degraded:
@@ -971,9 +984,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     logger_main.debug(f"🧠 Phase 3: Evaluating {len(prepared_tasks)} pairs...")
     eval_start = time.time()
     eval_semaphore = asyncio.Semaphore(cfg.EVAL_CONCURRENCY_LIMIT)  # NEW, e.g. 5
-
     async def _bounded_eval(t):
         async with eval_semaphore:
+            await state_db.maybe_recover_from_degraded()
             return await guarded_eval(
                 t, state_db, telegram_queue, correlation_id,
                 reference_time, fetcher, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
@@ -986,6 +999,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 calibration_curves=calibration_curves,
                 ml_market_state_model=ml_market_state_model,
                 ml_calibration_curve=ml_calibration_curve,
+                brain_engine=brain_engine_shared,
                 disabled_alert_keys_run=disabled_alert_keys_run,
                 pair_thresholds_run=pair_thresholds_run,
                 open_positions_run=open_positions_run,
@@ -1036,8 +1050,12 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                         f"🛑 KILL SWITCH TRIPPED: {ks_state['reason']}\n"
                         f"Dispatch blocked for {ttl // 3600}h."
                     ))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger_main.error(
+                        f"Kill switch tripped ({ks_state['reason']}) but the "
+                        f"Telegram notification failed to send: {e} — dispatch "
+                        "IS blocked, but no alert was sent about it"
+                    )           
         except Exception as e:
             logger_main.warning(f"Kill switch evaluation failed (fail-open): {e}")
 

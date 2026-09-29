@@ -1618,6 +1618,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     calibration_curves: Optional[Dict[str, Any]] = None,
     ml_market_state_model: Optional[Dict[str, Any]] = None,
     ml_calibration_curve: Optional[Dict[str, Any]] = None,
+    brain_engine: Optional[Any] = None,
     batch_mode: bool = False,
     pair_thresholds: Optional[Dict[str, float]] = None,
     open_positions_run: Union[List[Dict[str, Any]], None, object] = _SENTINEL_UNSET,
@@ -1955,13 +1956,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             )
             current_session = _get_session_from_ts(ts_curr) if getattr(cfg, "ENABLE_SESSION_FILTER", False) else None
             surviving_alerts = []
-            brain_engine = None
-            if cfg.ENABLE_BRAIN:
-                try:
-                    from brain_enhanced import BrainEngineV2 as BrainEngine
-                    brain_engine = BrainEngine(sdb)
-                except Exception as e:
-                    logger_pair.debug(f"Brain engine init failed: {e}")
          
             for alert_title, alert_extra, alert_key in alerts_to_send:
                 direction = "buy" if alert_key in BUY_ALERT_KEYS else "sell"

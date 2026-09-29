@@ -2244,8 +2244,12 @@ class BrainEngine:
                 lambda: _rc(self.sdb._redis).decrby(RedisKeyPrefix.BRAIN_RUN_COUNTER, 1),
                 2.0, "brain_run_counter_rollback",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logging.getLogger("macd_bot").warning(
+                f"Brain run-counter rollback failed after a report error: {e} — "
+                "the counter may now be off by one, which can skew when the "
+                "next report is due"
+            )
 
     @staticmethod
     def _truncate_telegram(lines: List[str], limit: int = 4000) -> str:
