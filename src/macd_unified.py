@@ -497,7 +497,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     correlation_id: str, lock: Optional[RedisLock], reference_time: int,
     alerts_sent_ref: Optional[List[int]] = None,
     alerts_sent_lock: Optional[asyncio.Lock] = None,
-    max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN) -> List[Tuple[str, Dict[str, Any]]]:
+    max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[str]]:
 
     # Narrow the Optional refs once here so the rest of the body (and the
     # dispatch_combined_alerts call in particular) can use them as non-Optional.
@@ -505,6 +505,10 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         alerts_sent_ref = []
     if alerts_sent_lock is None:
         alerts_sent_lock = asyncio.Lock()
+
+    deferred_pairs: List[str] = []
+    memory_soft_stop = False
+    soft_limit_ratio = cfg.MEMORY_SOFT_STOP_RATIO
 
     ticker_task = None
     if cfg.ENABLE_OI_FUNDING_FILTER:
@@ -984,9 +988,29 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     logger_main.debug(f"🧠 Phase 3: Evaluating {len(prepared_tasks)} pairs...")
     eval_start = time.time()
     eval_semaphore = asyncio.Semaphore(cfg.EVAL_CONCURRENCY_LIMIT)  # NEW, e.g. 5
+
     async def _bounded_eval(t):
+        nonlocal memory_soft_stop
+        pair_name = t[0]
         async with eval_semaphore:
             await state_db.maybe_recover_from_degraded()
+
+            # Soft pair budget: skip remaining pairs if RSS is already high
+            try:
+                _rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+                _lim_mb = cfg.MEMORY_LIMIT_BYTES / (1024 * 1024)
+                if _lim_mb > 0 and (_rss_mb / _lim_mb) >= soft_limit_ratio:
+                    memory_soft_stop = True
+            except Exception:
+                pass
+
+            if memory_soft_stop:
+                deferred_pairs.append(pair_name)
+                logger_main.warning(
+                    f"⏸️ Soft pair budget — deferring {pair_name} "
+                    f"(RSS high, will not schedule more pairs this run)"
+                )
+                return None
             return await guarded_eval(
                 t, state_db, telegram_queue, correlation_id,
                 reference_time, fetcher, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
@@ -1044,7 +1068,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                     ),
                     2.0, "kill_switch_set",
                 )
-                logger_main.critical(f"🛑 KILL SWITCH: {ks_state['reason']}")
+                logger_main.critical(f" KILL SWITCH: {ks_state['reason']}")
                 try:
                     await telegram_queue.send(escape_markdown_v2(
                         f"🛑 KILL SWITCH TRIPPED: {ks_state['reason']}\n"
@@ -1132,7 +1156,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         f"🎯🧠 Knox: {knox_approved} approved, {knox_rejected} rejected "
         f"({len(pairs_to_process)} total evaluated)"
     )
-    return valid_results
+    return valid_results, deferred_pairs
 
 async def run_once() -> Optional[bool]:
     MAX_ALERTS_PER_RUN = cfg.MAX_ALERTS_PER_RUN
@@ -1441,12 +1465,11 @@ async def run_once() -> Optional[bool]:
 
         logger_run.info("Starting evaluation phase...")  
         alerts_sent_ref = [0] 
-        all_results = await process_pairs_with_workers(
+        all_results, deferred_pairs = await process_pairs_with_workers(
             fetcher, products_map, pairs_to_process, sdb, telegram_queue, 
             correlation_id, lock, reference_time,
             alerts_sent_ref, alerts_sent_lock, MAX_ALERTS_PER_RUN
-        ) 
-
+        )
         logger_run.debug("Cleanup phase with normal garbage collection...")
 
         fetcher_stats = fetcher.get_stats()
@@ -1482,16 +1505,55 @@ async def run_once() -> Optional[bool]:
         redis_mem_pct = valkey_usage_end.get("memory_pct")
         redis_mem_field = f" ({redis_mem_pct}% mem)" if redis_mem_pct is not None else ""
 
+        deferred_n = len(deferred_pairs)
         summary = (
             f"🎯🌏 RUN COMPLETE | "
             f"Duration: {run_duration:.1f}s | "
             f"Pairs: {len(all_results)}/{len(pairs_to_process)} | "
+            f"Deferred: {deferred_n} | "
             f"Alerts: {alerts_sent_ref[0]} | "
             f"OI/Funding blocks: {fetcher_stats.get('oi_funding_blocks', 0)} | "
             f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
             f"Redis: {redis_status}{redis_mem_field}"
         )
         logger_run.info(summary)
+        if deferred_n:
+            logger_run.warning(
+                f"⏸️ Deferred pairs this run (memory soft-stop): {deferred_pairs[:20]}"
+                + (" ..." if deferred_n > 20 else "")
+            )
+
+        # Structured summary for workflow artifacts / external monitors
+        try:
+            structured = {
+                "correlation_id": correlation_id,
+                "duration_sec": round(run_duration, 2),
+                "pairs_configured": len(pairs_to_process),
+                "pairs_completed": len(all_results),
+                "pairs_deferred": deferred_n,
+                "deferred_pairs": deferred_pairs[:50],
+                "alerts_sent": alerts_sent_ref[0],
+                "oi_funding_blocks": fetcher_stats.get("oi_funding_blocks", 0),
+                "memory_mb_start": round(container_memory_mb, 1),
+                "memory_mb_end": round(final_memory_mb, 1),
+                "memory_delta_mb": round(memory_delta, 1),
+                "redis_status": redis_status,
+                "redis_mem_pct": redis_mem_pct,
+                "brain_enabled": bool(getattr(cfg, "ENABLE_BRAIN", False)),
+                "timestamp": int(time.time()),
+            }
+            summary_path = os.environ.get(
+                "RUN_SUMMARY_PATH", "/tmp/data-repo/run_summary.json"
+            )
+            try:
+                os.makedirs(os.path.dirname(summary_path) or ".", exist_ok=True)
+            except Exception:
+                pass
+            with open(summary_path, "w", encoding="utf-8") as fh:
+                fh.write(json_dumps(structured))
+            logger_run.info(f"Structured run summary written → {summary_path}")
+        except Exception as e:
+            logger_run.debug(f"Could not write structured run summary: {e}")
 
         start_commands = valkey_usage_start.get("total_commands_processed")
         end_commands = valkey_usage_end.get("total_commands_processed")

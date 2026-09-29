@@ -4611,6 +4611,7 @@ def trade_quality_score(
         verdict = "MEDIUM"
     else:
         verdict = "LOW"
+
     result.update({
         "verdict": verdict,
         "quality_score": round(quality, 3),
@@ -4632,6 +4633,22 @@ def trade_quality_score(
         ),
         "regime_compatible": regime_ok,
     })
-    return result
 
+    # Advisory size hint only — never used to place orders in this bot
+    if getattr(cfg, "ENABLE_BRAIN_SIZE_HINT", False):
+        if result.get("verdict") == "BLOCKED":
+            hint = float(getattr(cfg, "BRAIN_SIZE_HINT_BLOCKED", 0.0))
+        elif result.get("verdict") == "HIGH":
+            hint = float(getattr(cfg, "BRAIN_SIZE_HINT_HIGH", 1.0))
+        elif result.get("verdict") == "MEDIUM":
+            hint = float(getattr(cfg, "BRAIN_SIZE_HINT_MEDIUM", 0.5))
+        else:
+            hint = float(getattr(cfg, "BRAIN_SIZE_HINT_LOW", 0.25))
+        # Shrink further if evidence is weak
+        if result.get("evidence_strength") == "weak":
+            hint *= 0.5
+        result["size_hint"] = round(max(0.0, min(1.0, hint)), 3)
+        result["size_hint_note"] = "advisory_only"
+
+    return result
     

@@ -1376,6 +1376,40 @@ class BrainEngineV2(BaseBrainEngine):
             )
             if fresh:
                 logger.info(f"📒 Repair ledger: evaluated {len(fresh)} pending repair(s)")
+
+            # ── Auto-rollback: clear dynamic weights if a weight repair hurt ──
+            if getattr(cfg, "BRAIN_AUTO_ROLLBACK_HURT", True) and fresh:
+                weight_categories = {
+                    "weight_optimizer",
+                    "dynamic_weights",
+                    "confluence_weights",
+                    "vote_weights",
+                }
+                hurt_weight_repairs = [
+                    e for e in fresh
+                    if e.get("verdict") == "hurt"
+                    and (
+                        e.get("category") in weight_categories
+                        or e.get("type") in weight_categories
+                        or "weight" in str(e.get("type", "")).lower()
+                        or "weight" in str(e.get("category", "")).lower()
+                    )
+                ]
+                if hurt_weight_repairs:
+                    cleared = await self.sdb.clear_dynamic_weights()
+                    ids = [
+                        e.get("id") or e.get("repair_id")
+                        for e in hurt_weight_repairs
+                    ]
+                    logger.warning(
+                        f"↩️ Auto-rollback: cleared dynamic_weights after "
+                        f"{len(hurt_weight_repairs)} hurt repair(s): {ids} "
+                        f"(cleared={cleared})"
+                    )
+                    for e in hurt_weight_repairs:
+                        e["auto_rolled_back"] = True
+                        e["rolled_back_at"] = int(time.time())
+
             self._repair_success_rates = await repair_success_rates(self.sdb)
             self._ledger_stats = await ledger_stats(self.sdb)
             ai_metrics["repair_ledger"] = dict(self._ledger_stats)
@@ -1581,7 +1615,7 @@ class BrainEngineV2(BaseBrainEngine):
                             f"({len(holdout_rows_wf)} rows after split)"
                         )
 
-                # ── Shadow out-of-sample veto ─────────�������────────────
+                # ── Shadow out-of-sample veto ─────────────────────
                 shadow_weight_ok, shadow_weight_note = True, ""
                 if (wopt.get("walk_forward_passed") and conf_score >= min_conf
                 and len(shadow_rows) >= 15 and oos_weight_ok):
@@ -1629,15 +1663,38 @@ class BrainEngineV2(BaseBrainEngine):
                     else:
                         shadow_note = f"Shadow⚠️ vetoed ({shadow_weight_note}) but OOS EV strictly improved, so approving."
 
-                    config_patch.append({
-                        "path": "CONFLUENCE_WEIGHTS",
-                        "current": dict(CONFLUENCE_WEIGHTS),
-                        "suggested": wopt["suggested_weights"],
-                        "reason": (
-                            f"Logistic-regression optimal ({wf_status}, conf={conf_score:.2f}). "
-                            f"{oos_weight_note}. {shadow_note}"
-                        ),
-                    })
+                    if getattr(cfg, "ENABLE_CHAMPION_CHALLENGER", False):
+                        # Store as challenger only — does not enter pending live plan
+                        meta = {
+                            "source": "weight_optimizer",
+                            "n_oos": int(wopt.get("n_oos") or wopt.get("n_samples") or 0),
+                            "net_ev": wopt.get("net_ev"),
+                            "champion_net_ev": wopt.get("baseline_net_ev"),
+                            "shadow_only": bool(getattr(cfg, "CHALLENGER_SHADOW_ONLY", True)),
+                            "confidence": conf_score,
+                        }
+                        ok = await self.sdb.set_challenger_weights(
+                            wopt["suggested_weights"], meta=meta,
+                        )
+                        recommendations.append({
+                            "type": "weight_optimizer",
+                            "severity": "medium",
+                            "message": (
+                                f"🧪 Challenger weights stored (shadow only), "
+                                f"not applied live. ok={ok}, n={meta['n_oos']}, "
+                                f"conf={conf_score:.0%}. {oos_weight_note}"
+                            ),
+                        })
+                    else:
+                        config_patch.append({
+                            "path": "CONFLUENCE_WEIGHTS",
+                            "current": dict(CONFLUENCE_WEIGHTS),
+                            "suggested": wopt["suggested_weights"],
+                            "reason": (
+                                f"Logistic-regression optimal ({wf_status}, conf={conf_score:.2f}). "
+                                f"{oos_weight_note}. {shadow_note}"
+                            ),
+                        })
                 else:
                     if not wopt.get("walk_forward_passed"):
                         reason = "walk-forward FAILED"
@@ -2266,6 +2323,41 @@ class BrainEngineV2(BaseBrainEngine):
         result["ai_metrics"] = ai_metrics
         result["_archive_stats"] = audit._archive_stats or {}
         _phase_mark("audit_attach")
+
+        # ── Champion/challenger promotion check (gated) ─────────────────
+        # Challenger weights accumulate via weight_optimizer / apply_pending_plan
+        # when ENABLE_CHAMPION_CHALLENGER is on. Promotion is intentionally not
+        # automatic while CHALLENGER_SHADOW_ONLY is True (safe-by-default).
+        if getattr(cfg, "ENABLE_CHAMPION_CHALLENGER", False):
+            try:
+                promo = await self.maybe_promote_challenger(force=False)
+                ai_metrics["challenger_promotion"] = promo
+                if promo.get("promoted"):
+                    meta = promo.get("meta") or {}
+                    recommendations.append({
+                        "type": "challenger_promotion",
+                        "severity": "high",
+                        "message": (
+                            "🏆 Challenger promoted to champion "
+                            f"(n_oos={meta.get('n_oos')}, "
+                            f"net_ev={meta.get('net_ev')}, "
+                            f"champion_net_ev={meta.get('champion_net_ev')})."
+                        ),
+                    })
+                    result["recommendations"] = recommendations
+                    result["recommendation_count"] = len(recommendations)
+                    logger.info(
+                        f"🏆 Challenger promoted to champion: {promo}"
+                    )
+                else:
+                    logger.info(
+                        f"🧪 Challenger promotion skipped: {promo.get('reason')}"
+                    )
+            except Exception as e:
+                audit.record_analysis_exception("challenger_promotion", e)
+                logger.warning(f"Challenger promotion check failed: {e}")
+            _phase_mark("challenger_promotion")
+
         return result
 
     # ── Baseline wrapper that also exposes raw rows ─────────────────────
@@ -2561,6 +2653,35 @@ class BrainEngineV2(BaseBrainEngine):
         except Exception:
             return None
 
+    async def maybe_promote_challenger(self, force: bool = False) -> Dict[str, Any]:
+        """Promote challenger → live champion only if gates pass (or force=True)."""
+        blob = await self.sdb.get_challenger_weights()
+        if not blob or not blob.get("weights"):
+            return {"promoted": False, "reason": "no_challenger"}
+
+        meta = blob.get("meta") or {}
+        n_oos = int(meta.get("n_oos") or 0)
+        min_n = int(getattr(cfg, "CHALLENGER_MIN_OOS_SAMPLE", 80))
+        min_lift = float(getattr(cfg, "CHALLENGER_MIN_EV_LIFT", 0.02))
+        ch_ev = meta.get("net_ev")
+        base_ev = meta.get("champion_net_ev")
+
+        if not force:
+            if n_oos < min_n:
+                return {"promoted": False, "reason": f"n_oos={n_oos}<{min_n}"}
+            if ch_ev is None or base_ev is None:
+                return {"promoted": False, "reason": "missing_ev"}
+            if float(ch_ev) < float(base_ev) + min_lift:
+                return {
+                    "promoted": False,
+                    "reason": f"ev_lift={float(ch_ev)-float(base_ev):.4f}<{min_lift}",
+                }
+            if getattr(cfg, "CHALLENGER_SHADOW_ONLY", True) and not force:
+                return {"promoted": False, "reason": "shadow_only_requires_force"}
+
+        ok = await self.sdb.promote_challenger_to_champion()
+        return {"promoted": bool(ok), "reason": "ok" if ok else "redis_failed", "meta": meta}
+
     async def apply_pending_plan(self, telegram_queue, logger_run) -> bool:
         """Apply the last generated action plan. Returns True if any changes were applied."""
         try:
@@ -2622,6 +2743,7 @@ class BrainEngineV2(BaseBrainEngine):
                 )
 
             # Apply root-cause weight adjustments via dynamic weights
+            # (or store as challenger when ENABLE_CHAMPION_CHALLENGER is on)
             weight_adj = plan.get("weight_adjustments", [])
             if weight_adj and plan_gate_passed:
                 weights = dict(CONFLUENCE_WEIGHTS)
@@ -2630,22 +2752,46 @@ class BrainEngineV2(BaseBrainEngine):
                     suggested = adj.get("suggested")
                     if vote in weights and suggested is not None:
                         weights[vote] = suggested
-                if await self.sdb.set_dynamic_weights(weights):
-                    applied_live = True
-                    for adj in weight_adj:
-                        applied.append(
-                            f"⚖️ {adj.get('vote')}: "
-                            f"{adj.get('current')} → {adj.get('suggested')}"
+
+                if getattr(cfg, "ENABLE_CHAMPION_CHALLENGER", False):
+                    # Shadow path: store as challenger only — does not affect live gates
+                    meta = {
+                        "source": "root_cause_weight_adj",
+                        "n_oos": 0,
+                        "net_ev": None,
+                        "champion_net_ev": None,
+                        "shadow_only": bool(getattr(cfg, "CHALLENGER_SHADOW_ONLY", True)),
+                        "votes": [a.get("vote") for a in weight_adj],
+                    }
+                    ok = await self.sdb.set_challenger_weights(weights, meta=meta)
+                    if ok:
+                        for adj in weight_adj:
+                            applied.append(
+                                f"🧪 Challenger ⚖️ {adj.get('vote')}: "
+                                f"{adj.get('current')} → {adj.get('suggested')}"
+                            )
+                        logger_run.info(
+                            "🧪 Challenger weights stored (shadow), not live: "
+                            f"{[a.get('vote') for a in weight_adj]} ok={ok}"
                         )
-                    logger_run.info(
-                        "Applied brain root-cause weight cuts: "
-                        f"{[a.get('vote') for a in weight_adj]}"
-                    )
+                    # Do NOT set applied_live — live CONFLUENCE_WEIGHTS unchanged
+                else:
+                    # Legacy path: write live dynamic weights (existing behavior)
+                    if await self.sdb.set_dynamic_weights(weights):
+                        applied_live = True
+                        for adj in weight_adj:
+                            applied.append(
+                                f"⚖️ {adj.get('vote')}: "
+                                f"{adj.get('current')} → {adj.get('suggested')}"
+                            )
+                        logger_run.info(
+                            "Applied brain root-cause weight cuts: "
+                            f"{[a.get('vote') for a in weight_adj]}"
+                        )
             elif weight_adj and not plan_gate_passed:
                 logger_run.warning(
                     "Skipping root-cause weight adjustments — plan did not pass action gate"
-                )         
-
+                )
             if applied:
                 # ── Ledger: mark all repairs in this plan as applied ──
                 plan_ts = plan.get("generated_at", int(time.time()))

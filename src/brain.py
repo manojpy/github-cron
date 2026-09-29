@@ -631,15 +631,41 @@ class BrainEngine:
             regime = "trending" if leaf_adx >= median_adx else "ranging"
         else:
             regime = "unknown"
-        leaf = leaves.get(f"{pair}|{alert_key}|{direction}|{regime}")
+
         ev_model_result = dict(ev_model_result)
+        leaf_key = f"{pair}|{alert_key}|{direction}|{regime}"
+        leaf = leaves.get(leaf_key)
+
+        # Hierarchical fallback chain when exact leaf is thin/missing:
+        # pair+alert+dir+regime → any same pair+alert+dir → alert baseline
+        if not leaf:
+            # same pair + alert + direction, any regime
+            prefix = f"{pair}|{alert_key}|{direction}|"
+            candidates = [
+                v for k, v in leaves.items()
+                if k.startswith(prefix) and v.get("n", 0) > 0
+            ]
+            if candidates:
+                # prefer largest n
+                leaf = max(candidates, key=lambda x: x.get("n", 0))
+                leaf_key = f"{pair}|{alert_key}|{direction}|*"
+
         if leaf:
             ev_model_result["net_ev"] = leaf["shrunk_net_ev"]
+            # optional: also bias p if you store shrunk_wr on leaves
+            if "shrunk_wr" in leaf and leaf.get("n", 0) >= 10:
+                # mild blend toward hierarchical WR without discarding model p
+                p_model = float(ev_model_result.get("p_ev_positive", 0.5) or 0.5)
+                p_hier = float(leaf["shrunk_wr"])
+                n = float(leaf["n"])
+                k = float(getattr(cfg, "HIERARCHICAL_SHRINKAGE_K", 20.0))
+                w = n / (n + k)
+                ev_model_result["p_ev_positive"] = (1.0 - w) * p_model + w * p_hier
             ev_model_result["net_ev_source"] = "hierarchical_shrunk"
             ev_model_result["net_ev_leaf_n"] = leaf["n"]
+            ev_model_result["net_ev_leaf_key"] = leaf_key
         else:
             ev_model_result["net_ev_source"] = "alert_baseline"
-
         row = {
             "pair": pair,
             "alert_key": alert_key,

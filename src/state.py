@@ -840,6 +840,59 @@ class RedisStateStore:
             logger.warning(f"Failed to clear dynamic_weights: {e}")
             return False
 
+    async def set_challenger_weights(
+        self, weights: Dict[str, float], meta: Optional[Dict[str, Any]] = None,
+        ttl: int = 30 * 86400,
+    ) -> bool:
+        """Store challenger weights + metadata. Never used as live weights
+        unless explicitly promoted."""
+        if self.degraded or not self._redis:
+            return False
+        try:
+            payload = {"weights": weights, "meta": meta or {}, "stored_at": int(time.time())}
+            await self.set_metadata("challenger_weights", json_dumps(payload), ttl=ttl)
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to persist challenger_weights: {e}")
+            return False
+
+    async def get_challenger_weights(self) -> Optional[Dict[str, Any]]:
+        if self.degraded or not self._redis:
+            return None
+        try:
+            raw = await self.get_metadata("challenger_weights")
+            if not raw:
+                return None
+            data = json_loads(raw)
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            logger.warning(f"Failed to load challenger_weights: {e}")
+            return None
+
+    async def clear_challenger_weights(self) -> bool:
+        if self.degraded or not self._redis:
+            return False
+        try:
+            await self._redis.delete(f"{self.meta_prefix}challenger_weights")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to clear challenger_weights: {e}")
+            return False
+
+    async def promote_challenger_to_champion(self) -> bool:
+        """Copy challenger → dynamic_weights (live), then clear challenger.
+        Call only after OOS gates pass and operator/plan approves."""
+        blob = await self.get_challenger_weights()
+        if not blob or not blob.get("weights"):
+            return False
+        ok = await self.set_dynamic_weights(blob["weights"])
+        if ok:
+            await self.clear_challenger_weights()
+        return ok
+
+
+
+
     async def batch_get_metadata(self, keys: List[str], timeout: float = 5.0) -> Dict[str, Optional[str]]:
         """Fetch many metadata keys in ONE Redis round-trip (pipeline)."""
         if not self._redis or self.degraded or not keys:
@@ -1623,9 +1676,11 @@ class RedisStateStore:
                     # the pending outcomes stay in Redis and are retried next run
                     # instead of being lost from the Brain archive.
                     if resolved_for_file and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
-                        try:
+                        try:                    
                             from outcome_storage import append_outcome_batch
-                            append_outcome_batch(resolved_for_file, shadow=False)
+                            await asyncio.to_thread(
+                                append_outcome_batch, resolved_for_file, False
+                            )
                             self._run_archived_total += len(resolved_for_file)
                         except Exception as e:
                             logger_pair.error(
@@ -1855,7 +1910,9 @@ class RedisStateStore:
                     if resolved_for_file and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                         try:
                             from outcome_storage import append_outcome_batch
-                            append_outcome_batch(resolved_for_file, shadow=True)
+                            await asyncio.to_thread(
+                                append_outcome_batch, resolved_for_file, True
+                            )
                         except Exception as e:
                             logger_pair.error(
                                 f"[{pair}] Shadow file archive write failed — {resolved_count} "

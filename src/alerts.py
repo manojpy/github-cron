@@ -2009,7 +2009,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
                 if failing_rate is None:
                     # Passed both gates — keep it.
-                    # ── Trade-quality label (report-only, never gates dispatch) ──
+                    # ── Trade-quality label (advisory; hard-blocks only when ENABLE_QUALITY_HARD_BLOCK) ──
                     if brain_engine and alert_total and alert_total > 0 and alert_score is not None:
                         try:
                             live_context = {
@@ -2072,17 +2072,47 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     f"(live={tq['market_state_live']}, "
                                     f"ev_bucket_p={tq.get('p_ev_positive', 0):.3f})"
                                 )
+
                             if tq["verdict"] == "BLOCKED":
                                 alert_extra = (
                                     f"{alert_extra} | 🎯 Quality: BLOCKED "
-                                    f"({tq.get('reason', 'n/a')})"
+                                    f"(P(profit)={tq.get('p_ev_positive', 0):.0%}, "
+                                    f"netEV={tq.get('net_ev', 0):+.2f}%, "
+                                    f"evidence={tq.get('evidence_strength', '?')}, "
+                                    f"reason={tq.get('reason', 'n/a')})"
                                 )
+                                # Hard gate (only when explicitly enabled) — mirrors
+                                # ENABLE_ML_EV_GATE: annotate, record counterfactual,
+                                # skip Telegram dispatch and real-outcome recording.
+                                if getattr(cfg, "ENABLE_QUALITY_HARD_BLOCK", False):
+                                    logger_pair.info(
+                                        f"[{pair_name}] quality hard-block dropped {alert_key}: "
+                                        f"verdict=BLOCKED reason={tq.get('reason', 'n/a')} "
+                                        f"netEV={tq.get('net_ev', 0):+.2f}%"
+                                    )
+                                    await _record_counterfactual_block(
+                                        sdb, pair_name,
+                                        [(alert_title, alert_extra, alert_key)],
+                                        ts_curr, close_curr,
+                                        block_reason="quality_hard_block",
+                                        confluence_scores={
+                                            alert_key: _confluence_for(alert_key)
+                                        },
+                                        gr=gr, context=context,
+                                        logger_pair=logger_pair,
+                                    )
+                                    continue
                             else:
                                 alert_extra = (
                                     f"{alert_extra} | 🎯 Quality: {tq['verdict']} "
                                     f"(P(profit)={tq.get('p_ev_positive', 0):.0%}, "
                                     f"netEV={tq.get('net_ev', 0):+.2f}%)"
                                 )
+                                if tq.get("size_hint") is not None:
+                                    alert_extra = (
+                                        f"{alert_extra} | size_hint={tq['size_hint']:.2f}"
+                                        f" (advisory)"
+                                    )
                                 plan = tq.get("trade_plan")
                                 if plan:
                                     alert_extra = (
@@ -2095,6 +2125,31 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                             else f" (n={plan['n']})"
                                         )
                                     )
+
+                        # ── Why it survived (interpretability only) ──
+                        if getattr(cfg, "ENABLE_ALERT_WHY_SURVIVED", True):
+                            try:
+                                checks = []
+                                if alert_votes:
+                                    for name, ok in sorted(alert_votes.items()):
+                                        if ok is True:
+                                            checks.append(f"✓ {name}")
+                                        elif ok is False:
+                                            checks.append(f"✗ {name}")
+                                if checks:
+                                    shown = checks[:8]
+                                    more = (
+                                        f" +{len(checks) - 8}"
+                                        if len(checks) > 8
+                                        else ""
+                                    )
+                                    alert_extra = (
+                                        f"{alert_extra} | Why: "
+                                        + ", ".join(shown)
+                                        + more
+                                    )
+                            except Exception:
+                                pass
 
                         # ── ML-EV shadow / hard qualification ──
                         if (
