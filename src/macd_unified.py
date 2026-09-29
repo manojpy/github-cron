@@ -541,6 +541,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     all_candles: Dict[str, Dict[str, Any]] = {}
     daily_task = None
     miss_symbols: List[str] = []
+    daily_cache_hits = 0
+    daily_cache_misses = 0
+    daily_cache_bypassed = False
 
     if fetch_daily and daily_symbols:
         day_key = get_utc_date_key(reference_time)
@@ -555,14 +558,18 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 raw = cached_map.get(ck)
                 if raw:
                     all_candles.setdefault(sym, {})["D"] = json_loads(raw)
+                    daily_cache_hits += 1
                 else:
                     miss_symbols.append(sym)
+                    daily_cache_misses += 1
         else:
+            daily_cache_bypassed = True
             logger_main.info(
                 f"📅 Daily cache bypassed — {seconds_into_utc_day}s into UTC day "
                 f"(< {Constants.DAILY_CACHE_SETTLE_SEC}s settle window), fetching {len(daily_symbols)} daily bar(s) live"
             )
             miss_symbols = list(daily_symbols)
+            daily_cache_misses = len(miss_symbols)
 
         if miss_symbols:
             daily_task = asyncio.gather(*(
@@ -587,9 +594,25 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 daily_data = None
             all_candles.setdefault(symbol, {})["D"] = daily_data
 
+    # Expose cache stats for structured run summary
+    _daily_cache_stats = {
+        "hits": daily_cache_hits,
+        "misses": daily_cache_misses,
+        "bypassed_settle_window": daily_cache_bypassed,
+        "symbols_requested": len(daily_symbols) if (fetch_daily and daily_symbols) else 0,
+    }
+    try:
+        setattr(fetcher, "_last_daily_cache_stats", _daily_cache_stats)
+    except Exception:
+        pass
+    if daily_cache_hits or daily_cache_misses:
+        logger_main.info(
+            f"📅 Daily cache: hits={daily_cache_hits} misses={daily_cache_misses}"
+            + (" (settle bypass)" if daily_cache_bypassed else "")
+        )
+
     fetch_elapsed = time.time() - fetch_start
     logger_main.info(f"🌀 Phase 1 complete: {fetch_elapsed:.1f}s")
-
     oi_gate_data: Dict[str, Dict[str, Any]] = {}
 
     if cfg.ENABLE_OI_FUNDING_FILTER:
@@ -1540,6 +1563,7 @@ async def run_once() -> Optional[bool]:
                 "redis_status": redis_status,
                 "redis_mem_pct": redis_mem_pct,
                 "brain_enabled": bool(getattr(cfg, "ENABLE_BRAIN", False)),
+                "daily_cache": getattr(fetcher, "_last_daily_cache_stats", None),
                 "timestamp": int(time.time()),
             }
             summary_path = os.environ.get(

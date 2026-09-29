@@ -808,6 +808,403 @@ def confidence_label(n: int, wilson_lo: float, wilson_hi: float) -> str:
         return "HIGH"
     return "VERY HIGH"
 
+def sample_evidence_state(
+    n: int,
+    oos_validated: bool = False,
+    insufficient_n: int = 15,
+    shadow_n: int = 50,
+    eligible_n: int = 100,
+) -> str:
+    """Explicit sample-aware learning states (roadmap item #24).
+
+    n < insufficient_n          → INSUFFICIENT  (no adjustment)
+    insufficient_n ≤ n < shadow → SHADOW        (monitor / simulate only)
+    shadow ≤ n < eligible       → ELIGIBLE      (candidate for change)
+    n ≥ eligible + OOS pass     → ACTIONABLE
+    n ≥ eligible without OOS    → ELIGIBLE
+    """
+    if n < insufficient_n:
+        return "INSUFFICIENT"
+    if n < shadow_n:
+        return "SHADOW"
+    if n < eligible_n:
+        return "ELIGIBLE"
+    if oos_validated:
+        return "ACTIONABLE"
+    return "ELIGIBLE"
+
+# Canonical alert-family taxonomy used by family analysis and registry.
+_ALERT_FAMILY_PREFIXES: List[Tuple[str, str]] = [
+    ("pivot_", "Pivot"),
+    ("strong_reversal_", "Reversal"),
+    ("choch_", "Reversal"),
+    ("fib_reversal_", "Reversal"),
+    ("ob_reversal_", "Order-block"),
+    ("vwap_", "VWAP"),
+    ("ppo_signal_", "Trend continuation"),
+    ("ppo_zero_", "Trend continuation"),
+    ("ppo_adaptive_", "Trend continuation"),
+    ("ppohist_", "Trend continuation"),
+    ("hist_rma_", "Trend continuation"),
+    ("rsi_", "Trend continuation"),
+    ("cloud_cross_", "Pattern"),
+    ("tk_conversion_", "Pattern"),
+    ("kijun_cross_", "Pattern"),
+    ("equilibrium_cross_", "Pattern"),
+    ("dynamic_flow_", "Confluence"),
+]
+
+def alert_family_of(alert_key: str) -> str:
+    """Map an alert_key to its learning family. Shared by reports and analysis."""
+    key = str(alert_key or "").lower()
+    for prefix, family in _ALERT_FAMILY_PREFIXES:
+        if key.startswith(prefix):
+            return family
+    return "Other"
+
+def alert_family_analysis(
+    rows: List[Row],
+    min_sample: int = 20,
+    shrinkage_k: float = 20.0,
+) -> Dict[str, Any]:
+    """Alert-family intelligence (roadmap item #9).
+
+    Treats families as separate learning entities:
+      Family → Pair → Regime → Historical outcome
+    Uses empirical-Bayes shrinkage toward the global family mean so thin
+    pair/regime leaves cannot dominate.
+    """
+    result: Dict[str, Any] = {"valid": False, "families": {}, "n_total": len(rows)}
+    if not rows:
+        result["error"] = "no_rows"
+        return result
+
+    by_family: DefaultDict[str, List[Row]] = defaultdict(list)
+    for r in rows:
+        fam = alert_family_of(str(r.get("alert_key") or ""))
+        by_family[fam].append(r)
+
+    families: Dict[str, Any] = {}
+    for fam, fam_rows in by_family.items():
+        n = len(fam_rows)
+        if n < min_sample:
+            families[fam] = {
+                "valid": False, "n": n, "error": "insufficient_sample",
+                "evidence_state": sample_evidence_state(n),
+            }
+            continue
+        wins = sum(1 for r in fam_rows if r.get("win"))
+        wr = wins / n
+        lo, hi, _ = wilson_ci(wins, n)
+        net_evs = [
+            float(r["net_pnl_pct"]) for r in fam_rows
+            if r.get("net_pnl_pct") is not None
+        ]
+        net_ev = (sum(net_evs) / len(net_evs)) if net_evs else 0.0
+
+        by_pair: DefaultDict[str, List[Row]] = defaultdict(list)
+        for r in fam_rows:
+            by_pair[str(r.get("pair") or "unknown")].append(r)
+        pairs: Dict[str, Any] = {}
+        for pair, pair_rows in by_pair.items():
+            pn = len(pair_rows)
+            if pn < max(5, min_sample // 4):
+                continue
+            pw = sum(1 for r in pair_rows if r.get("win"))
+            raw_wr = pw / pn
+            shrunk_wr = (pn * raw_wr + shrinkage_k * wr) / (pn + shrinkage_k)
+            pairs[pair] = {
+                "n": pn, "raw_wr": round(raw_wr, 4),
+                "shrunk_wr": round(shrunk_wr, 4),
+                "evidence_state": sample_evidence_state(pn),
+            }
+
+        families[fam] = {
+            "valid": True, "n": n, "wr": round(wr, 4),
+            "wilson_lo": lo, "wilson_hi": hi,
+            "confidence": confidence_label(n, lo, hi),
+            "net_ev": round(net_ev, 4),
+            "evidence_state": sample_evidence_state(n),
+            "pairs": pairs,
+        }
+
+    result["families"] = families
+    result["valid"] = any(f.get("valid") for f in families.values())
+    return result
+
+def regime_transition_analysis(
+    rows: List[Row],
+    min_sample: int = 15,
+    lookback_stable: int = 4,
+    post_window_hours: int = 6,
+) -> Dict[str, Any]:
+    """Detect regime transitions and compare post-transition vs stable outcomes
+    (roadmap item #15).
+    """
+    result: Dict[str, Any] = {
+        "valid": False, "n_total": len(rows),
+        "transitions": [], "post_transition": {}, "stable": {},
+    }
+    with_adx = [
+        r for r in rows
+        if r.get("adx_val") is not None and r.get("ts") is not None
+    ]
+    if len(with_adx) < min_sample * 2:
+        result["error"] = "insufficient_adx_tagged_rows"
+        return result
+
+    with_adx = sorted(with_adx, key=lambda r: int(r["ts"]))
+    adx_vals = sorted(r["adx_val"] for r in with_adx)
+    mid = len(adx_vals) // 2
+    median_adx = (
+        adx_vals[mid] if len(adx_vals) % 2
+        else (adx_vals[mid - 1] + adx_vals[mid]) / 2.0
+    )
+    result["median_adx"] = median_adx
+
+    def _reg(r: Row) -> str:
+        return "trending" if r["adx_val"] >= median_adx else "ranging"
+
+    post_window_sec = post_window_hours * 3600
+    transition_events: List[Dict[str, Any]] = []
+    stable_streak = 1
+    prev_reg = _reg(with_adx[0])
+
+    for i in range(1, len(with_adx)):
+        cur_reg = _reg(with_adx[i])
+        if cur_reg == prev_reg:
+            stable_streak += 1
+        else:
+            if stable_streak >= lookback_stable:
+                ts = int(with_adx[i]["ts"])
+                transition_events.append({
+                    "ts": ts,
+                    "from": prev_reg,
+                    "to": cur_reg,
+                    "stable_before": stable_streak,
+                })
+            stable_streak = 1
+            prev_reg = cur_reg
+
+    result["transitions"] = transition_events[-20:]
+    result["n_transitions"] = len(transition_events)
+
+    post_rows: List[Row] = []
+    stable_rows: List[Row] = []
+    stable_streak = 1
+    prev_reg = _reg(with_adx[0])
+    active_post_until: Optional[int] = None
+
+    for i, r in enumerate(with_adx):
+        cur_reg = _reg(r)
+        ts = int(r["ts"])
+        if i > 0 and cur_reg != prev_reg:
+            if stable_streak >= lookback_stable:
+                active_post_until = ts + post_window_sec
+            stable_streak = 1
+            prev_reg = cur_reg
+        else:
+            if i > 0:
+                stable_streak += 1
+
+        if active_post_until is not None and ts <= active_post_until:
+            post_rows.append(r)
+        else:
+            stable_rows.append(r)
+            if active_post_until is not None and ts > active_post_until:
+                active_post_until = None
+
+    def _bucket_stats(bucket: List[Row], label: str) -> Dict[str, Any]:
+        n = len(bucket)
+        if n < min_sample:
+            return {"valid": False, "n": n, "error": "insufficient_sample", "label": label}
+        wins = sum(1 for r in bucket if r.get("win"))
+        wr = wins / n
+        lo, hi, _ = wilson_ci(wins, n)
+        return {
+            "valid": True, "n": n, "wr": round(wr, 4),
+            "wilson_lo": lo, "wilson_hi": hi,
+            "confidence": confidence_label(n, lo, hi),
+            "evidence_state": sample_evidence_state(n),
+            "label": label,
+        }
+
+    result["post_transition"] = _bucket_stats(post_rows, "post_transition")
+    result["stable"] = _bucket_stats(stable_rows, "stable")
+    pt = result["post_transition"]
+    st = result["stable"]
+    if pt.get("valid") and st.get("valid"):
+        result["wr_gap"] = round(pt["wr"] - st["wr"], 4)
+        result["valid"] = True
+    elif st.get("valid") or pt.get("valid"):
+        result["valid"] = True
+    return result
+
+def strategy_vs_regime_attribution(
+    rows: List[Row],
+    min_sample: int = 30,
+    recent_fraction: float = 0.25,
+) -> Dict[str, Any]:
+    """Separate strategy degradation from market regime change (roadmap #17)."""
+    result: Dict[str, Any] = {
+        "valid": False, "n_total": len(rows),
+        "attribution": "unknown",
+    }
+    if len(rows) < min_sample:
+        result["error"] = "insufficient_sample"
+        result["evidence_state"] = sample_evidence_state(len(rows))
+        return result
+
+    sorted_rows = sorted(
+        [r for r in rows if r.get("ts") is not None],
+        key=lambda r: int(r["ts"]),
+    )
+    if len(sorted_rows) < min_sample:
+        result["error"] = "insufficient_timestamped"
+        return result
+
+    cut = max(min_sample // 2, int(len(sorted_rows) * (1.0 - recent_fraction)))
+    older = sorted_rows[:cut]
+    recent = sorted_rows[cut:]
+    if len(recent) < max(10, min_sample // 3):
+        result["error"] = "insufficient_recent"
+        return result
+
+    def _wr(bucket: List[Row]) -> Tuple[float, int]:
+        n = len(bucket)
+        if n == 0:
+            return 0.5, 0
+        return sum(1 for r in bucket if r.get("win")) / n, n
+
+    older_wr, older_n = _wr(older)
+    recent_wr, recent_n = _wr(recent)
+    result["older_wr"] = round(older_wr, 4)
+    result["older_n"] = older_n
+    result["recent_wr"] = round(recent_wr, 4)
+    result["recent_n"] = recent_n
+    result["wr_drop"] = round(older_wr - recent_wr, 4)
+
+    rb = regime_breakdown(rows, min_sample=max(10, min_sample // 2))
+    result["regime_breakdown"] = {
+        "valid": rb.get("valid"),
+        "median_adx": rb.get("median_adx"),
+        "regimes": rb.get("regimes"),
+    }
+
+    if not rb.get("valid"):
+        if result["wr_drop"] > 0.10 and recent_n >= min_sample // 2:
+            result["attribution"] = "possible_strategy_degradation"
+            result["detail"] = (
+                f"Recent WR {recent_wr:.0%} vs older {older_wr:.0%} "
+                f"(Δ{result['wr_drop']:+.0%}); regime data insufficient to separate causes."
+            )
+        else:
+            result["attribution"] = "no_significant_drop"
+            result["detail"] = "No material performance drop or insufficient regime tags."
+        result["valid"] = True
+        result["evidence_state"] = sample_evidence_state(len(rows))
+        return result
+
+    regimes = rb.get("regimes") or {}
+    recent_with_adx = [r for r in recent if r.get("adx_val") is not None]
+    median_adx = rb.get("median_adx")
+    if recent_with_adx and median_adx is not None:
+        n_trend = sum(1 for r in recent_with_adx if r["adx_val"] >= median_adx)
+        n_range = len(recent_with_adx) - n_trend
+        dominant = "trending" if n_trend >= n_range else "ranging"
+        dom_share = max(n_trend, n_range) / len(recent_with_adx)
+        result["recent_dominant_regime"] = dominant
+        result["recent_dominant_share"] = round(dom_share, 3)
+
+        hist_reg = regimes.get(dominant) or {}
+        if hist_reg.get("valid"):
+            hist_wr = hist_reg["wr"]
+            result["historical_regime_wr"] = round(hist_wr, 4)
+            result["historical_regime_n"] = hist_reg["n"]
+            if hist_reg["n"] < min_sample:
+                result["attribution"] = "insufficient_current_regime_evidence"
+                result["detail"] = (
+                    f"Recent market is {dominant} ({dom_share:.0%}) but historical "
+                    f"{dominant} sample is only n={hist_reg['n']} — do not change thresholds."
+                )
+            elif result["wr_drop"] > 0.08 and abs(hist_wr - older_wr) < 0.05:
+                result["attribution"] = "regime_mix_shift"
+                result["detail"] = (
+                    f"Overall WR dropped {result['wr_drop']:+.0%}, but historical "
+                    f"{dominant} edge remains {hist_wr:.0%} (n={hist_reg['n']}). "
+                    f"Likely regime mix shift, not strategy break."
+                )
+            elif result["wr_drop"] > 0.10 and hist_wr < older_wr - 0.05:
+                result["attribution"] = "possible_strategy_degradation"
+                result["detail"] = (
+                    f"Recent WR {recent_wr:.0%} and historical {dominant} WR {hist_wr:.0%} "
+                    f"both below older overall {older_wr:.0%} — edge may be decaying."
+                )
+            else:
+                result["attribution"] = "no_significant_drop"
+                result["detail"] = "Performance within normal variation for current regime mix."
+        else:
+            result["attribution"] = "insufficient_current_regime_evidence"
+            result["detail"] = (
+                f"Recent market is {dominant} but that regime lacks valid historical stats."
+            )
+    else:
+        result["attribution"] = "insufficient_current_regime_evidence"
+        result["detail"] = "Recent outcomes lack ADX tags for regime attribution."
+
+    result["valid"] = True
+    result["evidence_state"] = sample_evidence_state(len(rows))
+    return result
+
+def ensemble_decision(
+    bayesian_p: Optional[float] = None,
+    ml_p: Optional[float] = None,
+    ev_p: Optional[float] = None,
+    recent_wr: Optional[float] = None,
+    weights: Optional[Dict[str, float]] = None,
+    n_evidence: int = 0,
+    oos_validated: bool = False,
+) -> Dict[str, Any]:
+    """Blend hierarchical Bayesian + ML + EV model + recent performance
+    into one calibrated ensemble probability (roadmap item #22).
+    """
+    w = weights or {
+        "bayesian": 0.30, "ml": 0.30, "ev": 0.25, "recent": 0.15,
+    }
+    components: Dict[str, Optional[float]] = {
+        "bayesian": bayesian_p,
+        "ml": ml_p,
+        "ev": ev_p,
+        "recent": recent_wr,
+    }
+    active = {k: v for k, v in components.items() if v is not None}
+    if not active:
+        return {
+            "valid": False, "error": "no_components",
+            "ensemble_p": None,
+            "evidence_state": sample_evidence_state(n_evidence, oos_validated),
+        }
+
+    total_w = sum(w.get(k, 0.0) for k in active)
+    if total_w <= 0:
+        total_w = float(len(active))
+        norm_w = {k: 1.0 / total_w for k in active}
+    else:
+        norm_w = {k: w.get(k, 0.0) / total_w for k in active}
+
+    ensemble_p = sum(norm_w[k] * float(active[k]) for k in active)
+    contributions = {
+        k: {"value": round(float(active[k]), 4), "weight": round(norm_w[k], 3)}
+        for k in active
+    }
+    return {
+        "valid": True,
+        "ensemble_p": round(ensemble_p, 4),
+        "components": contributions,
+        "n_components": len(active),
+        "evidence_state": sample_evidence_state(n_evidence, oos_validated),
+    }
+
 def regime_breakdown(rows: List[Row], min_sample: int = 20) -> Dict[str, Any]:
     """Rule-based regime split — no clustering, no ML. Splits rows into
     'trending' vs 'ranging' at the MEDIAN adx_val actually present in this
@@ -4631,8 +5028,40 @@ def trade_quality_score(
             else "moderate" if n_oos >= 50
             else "weak"
         ),
+        "evidence_state": sample_evidence_state(
+            n_oos,
+            oos_validated=bool(ev_model_result.get("oos_validated")),
+            insufficient_n=int(getattr(cfg, "SAMPLE_INSUFFICIENT_N", 15)),
+            shadow_n=int(getattr(cfg, "SAMPLE_SHADOW_N", 50)),
+            eligible_n=int(getattr(cfg, "SAMPLE_ELIGIBLE_N", 100)),
+        ),
         "regime_compatible": regime_ok,
+        "alert_family": alert_family_of(str(row.get("alert_key") or "")),
     })
+
+    # ── Ensemble layer (roadmap #22): blend Bayesian + ML + EV + recent ──
+    if getattr(cfg, "ENABLE_ENSEMBLE_DECISION", True):
+        bayesian_p = ev_model_result.get("hierarchical_wr") or ev_model_result.get("bayesian_wr")
+        recent_wr = ev_model_result.get("recent_wr")
+        ens = ensemble_decision(
+            bayesian_p=float(bayesian_p) if bayesian_p is not None else None,
+            ml_p=float(market_state_p_win_cal) if market_state_p_win_cal is not None else None,
+            ev_p=float(p_profit) if p_profit is not None else None,
+            recent_wr=float(recent_wr) if recent_wr is not None else None,
+            weights={
+                "bayesian": float(getattr(cfg, "ENSEMBLE_WEIGHT_BAYESIAN", 0.30)),
+                "ml": float(getattr(cfg, "ENSEMBLE_WEIGHT_ML", 0.30)),
+                "ev": float(getattr(cfg, "ENSEMBLE_WEIGHT_EV", 0.25)),
+                "recent": float(getattr(cfg, "ENSEMBLE_WEIGHT_RECENT", 0.15)),
+            },
+            n_evidence=n_oos,
+            oos_validated=bool(ev_model_result.get("oos_validated")),
+        )
+        if ens.get("valid"):
+            result["ensemble_p"] = ens["ensemble_p"]
+            result["ensemble_components"] = ens.get("components")
+            if ens["ensemble_p"] is not None:
+                result["p_ev_positive_ensemble"] = ens["ensemble_p"]
 
     # Advisory size hint only — never used to place orders in this bot
     if getattr(cfg, "ENABLE_BRAIN_SIZE_HINT", False):

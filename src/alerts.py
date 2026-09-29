@@ -322,6 +322,27 @@ async def _record_counterfactual_block(
         if logger_pair is not None:
             logger_pair.debug(f"Counterfactual shadow write failed ({block_reason}): {e}")
 
+    # Structured "why rejected" surface (roadmap #26)
+    if getattr(cfg, "ENABLE_ALERT_WHY_REJECTED", True) and logger_pair is not None:
+        try:
+            for title, _extra, alert_key in alerts_to_send:
+                detail_bits = [f"reason={block_reason}"]
+                if effective_score is not None and effective_required is not None:
+                    detail_bits.append(
+                        f"score={effective_score:.1f}/{effective_required:.1f}"
+                    )
+                if confluence_scores and alert_key in confluence_scores:
+                    sc, tot, _ = confluence_scores[alert_key]
+                    if sc is not None and tot is not None:
+                        detail_bits.append(f"conf={sc:.1f}/{tot:.1f}")
+                logger_pair.info(
+                    f"🧠 BRAIN FILTER | {pair_name} {alert_key} | "
+                    f"Signal gates: PASS | Action: BLOCKED | "
+                    + " | ".join(detail_bits)
+                )
+        except Exception:
+            pass
+
 def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional[str] = None, score: Optional[float] = None, total: Optional[float] = None) -> str:
     if not title: 
         title = "ALERT"
@@ -754,6 +775,58 @@ SELL_ALERT_KEYS: Set[str] = {
 }
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
 
+ALERT_CONFIG_MAP: Dict[str, str] = {
+    "strong_reversal_buy": "ENABLE_STRONG_REVERSAL_ALERT",
+    "strong_reversal_sell": "ENABLE_STRONG_REVERSAL_ALERT",
+    "choch_buy": "ENABLE_CHOCH_ALERT",
+    "choch_sell": "ENABLE_CHOCH_ALERT",
+    "dynamic_flow_cross_buy": "ENABLE_DYNAMIC_FLOW_CROSS_ALERT",
+    "dynamic_flow_cross_sell": "ENABLE_DYNAMIC_FLOW_CROSS_ALERT",
+    "fib_reversal_buy": "ENABLE_FIB_REVERSAL_ALERT",
+    "fib_reversal_sell": "ENABLE_FIB_REVERSAL_ALERT",
+    "ob_reversal_buy": "ENABLE_OB_GATE",
+    "ob_reversal_sell": "ENABLE_OB_GATE",
+    "ppo_signal_up": "ENABLE_PPO_ALERTS",
+    "ppo_signal_down": "ENABLE_PPO_ALERTS",
+    "ppo_zero_up": "ENABLE_PPO_ALERTS",
+    "ppo_zero_down": "ENABLE_PPO_ALERTS",
+    "ppo_adaptive_up": "ENABLE_PPO_ALERTS",
+    "ppo_adaptive_down": "ENABLE_PPO_ALERTS",
+    "rsi_ema5_up": "ENABLE_RSI_ALERTS",
+    "rsi_ema5_down": "ENABLE_RSI_ALERTS",
+    "rsi_cross_adaptive_up": "ENABLE_RSI_ALERTS",
+    "rsi_cross_adaptive_down": "ENABLE_RSI_ALERTS",
+    "ppohist_buy": "ENABLE_PPOHIST_ALERT",
+    "ppohist_sell": "ENABLE_PPOHIST_ALERT",
+    "vwap_up": "ENABLE_VWAP",
+    "vwap_down": "ENABLE_VWAP",
+    "cloud_cross_up": "ENABLE_CLOUD_CROSS_ALERT",
+    "cloud_cross_down": "ENABLE_CLOUD_CROSS_ALERT",
+    "tk_conversion_up": "ENABLE_TK_CONVERSION_CROSS",
+    "tk_conversion_down": "ENABLE_TK_CONVERSION_CROSS",
+    "kijun_cross_up": "ENABLE_KIJUN_CROSS",
+    "kijun_cross_down": "ENABLE_KIJUN_CROSS",
+    "hist_rma_buy": "ENABLE_HIST_RMA",
+    "hist_rma_sell": "ENABLE_HIST_RMA",
+    "equilibrium_cross_up": "ENABLE_EQUILIBRIUM_CROSS",
+    "equilibrium_cross_down": "ENABLE_EQUILIBRIUM_CROSS",
+}
+ALERT_CONFIG_PREFIX_MAP: Dict[str, str] = {
+    "pivot_up_": "ENABLE_PIVOT",
+    "pivot_down_": "ENABLE_PIVOT",
+}
+
+
+def resolve_alert_config_path(alert_key: str) -> Optional[str]:
+    """Resolve alert_key → config enable flag. Single registry used by Brain."""
+    path = ALERT_CONFIG_MAP.get(alert_key)
+    if path:
+        return path
+    for prefix, mapped in ALERT_CONFIG_PREFIX_MAP.items():
+        if alert_key.startswith(prefix):
+            return mapped
+    return None
+
 async def _run_post_send_hooks(p: AlertPayload, sdb: RedisStateStore,
                                logger_run: logging.Logger) -> None:
     """Post-delivery bookkeeping for one payload. Each step is isolated so a
@@ -956,25 +1029,15 @@ def validate_alert_definitions() -> None:
             errors.append(f"Alert key {def_.key} missing from BUY_ALERT_KEYS/SELL_ALERT_KEYS")
 
     # ── FIX: cross-check that every alert key resolves to a config path
-    try:
-        from brain import _resolve_config_path  # local import avoids a cycle
-    except Exception:
-        _resolve_config_path = None  # type: ignore[assignment]
-
-    if _resolve_config_path is not None:
-        unmapped = [
-            d.key for d in ALERT_DEFINITIONS
-            if _resolve_config_path(d.key) is None
-        ]
-        if unmapped:
-            # Downgrade to a warning, not a hard error — the BotConfig
-            # doesn't yet forbid these, and existing deployments shouldn't
-            # crash on upgrade.
-            logger.warning(
-                f"⚠️ {len(unmapped)} alert key(s) have no _ALERT_CONFIG_MAP entry "
-                f"(Brain cannot auto-disable/reinstate them): {sorted(unmapped)}"
-            )
-
+    unmapped = [
+        d.key for d in ALERT_DEFINITIONS
+        if resolve_alert_config_path(d.key) is None
+    ]
+    if unmapped:
+        logger.warning(
+            f"⚠️ {len(unmapped)} alert key(s) have no ALERT_CONFIG_MAP entry "
+            f"(Brain cannot auto-disable/reinstate them): {sorted(unmapped)}"
+        )
     if errors:
         error_msg = "❌ ALERT DEFINITION VALIDATION FAILED:\n" + "\n".join(f"  - {e}" for e in errors)
         logger.critical(error_msg)
@@ -2081,15 +2144,23 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     f"reason={tq.get('reason', 'n/a')})"
                                 )
                                 if getattr(cfg, "ENABLE_QUALITY_HARD_BLOCK", False):
+                                    _qr = (
+                                        f"quality_hard_block|"
+                                        f"P(profit)={tq.get('p_ev_positive', 0):.0%}|"
+                                        f"netEV={tq.get('net_ev', 0):+.2f}%|"
+                                        f"evidence={tq.get('evidence_strength', '?')}|"
+                                        f"state={tq.get('evidence_state', '?')}|"
+                                        f"reason={tq.get('reason', 'n/a')}"
+                                    )
                                     logger_pair.info(
-                                        f"[{pair_name}] Quality hard-block dropped "
-                                        f"{alert_key}: {tq.get('reason', 'n/a')}"
+                                        f"🧠 BRAIN FILTER | {pair_name} {alert_key} | "
+                                        f"Signal gates: PASS | Quality: BLOCKED | {_qr}"
                                     )
                                     await _record_counterfactual_block(
                                         sdb, pair_name,
                                         [(alert_title, alert_extra, alert_key)],
                                         ts_curr, close_curr,
-                                        block_reason="quality_hard_block",
+                                        block_reason=_qr,
                                         confluence_scores={
                                             alert_key: _confluence_for(alert_key)
                                         },

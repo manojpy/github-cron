@@ -12,7 +12,7 @@ import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
-from alerts import escape_markdown_v2
+from alerts import escape_markdown_v2, resolve_alert_config_path
 from bot_config import cfg, json_dumps, json_loads, format_ist_time, CONFLUENCE_WEIGHTS
 from state import RedisKeyPrefix, RedisStateStore, _rc
 import threshold_engine as engine
@@ -20,64 +20,16 @@ import threshold_engine as engine
 from threshold_engine import CUSUMDetector, StabilityGate
 from brain_audit import get_audit, HealthStatus
 
-_ALERT_CONFIG_MAP = {
-    "strong_reversal_buy":  "ENABLE_STRONG_REVERSAL_ALERT",
-    "strong_reversal_sell": "ENABLE_STRONG_REVERSAL_ALERT",
-    "choch_buy":            "ENABLE_CHOCH_ALERT",
-    "choch_sell":           "ENABLE_CHOCH_ALERT",
-    "dynamic_flow_cross_buy":  "ENABLE_DYNAMIC_FLOW_CROSS_ALERT",
-    "dynamic_flow_cross_sell": "ENABLE_DYNAMIC_FLOW_CROSS_ALERT",
-    "fib_reversal_buy":     "ENABLE_FIB_REVERSAL_ALERT",
-    "fib_reversal_sell":    "ENABLE_FIB_REVERSAL_ALERT",
-    "ob_reversal_buy":      "ENABLE_OB_GATE",
-    "ob_reversal_sell":     "ENABLE_OB_GATE",
-    "ppo_signal_up":        "ENABLE_PPO_ALERTS",
-    "ppo_signal_down":      "ENABLE_PPO_ALERTS",
-    "ppo_zero_up":          "ENABLE_PPO_ALERTS",
-    "ppo_zero_down":        "ENABLE_PPO_ALERTS",
-    "ppo_adaptive_up":      "ENABLE_PPO_ALERTS",
-    "ppo_adaptive_down":    "ENABLE_PPO_ALERTS",
-    "rsi_ema5_up":          "ENABLE_RSI_ALERTS",
-    "rsi_ema5_down":        "ENABLE_RSI_ALERTS",
-    "rsi_cross_adaptive_up":   "ENABLE_RSI_ALERTS",
-    "rsi_cross_adaptive_down": "ENABLE_RSI_ALERTS",
-    "ppohist_buy":          "ENABLE_PPOHIST_ALERT",
-    "ppohist_sell":         "ENABLE_PPOHIST_ALERT",
-    # ── previously unmapped (added this revision) ──
-    "vwap_up":              "ENABLE_VWAP",
-    "vwap_down":            "ENABLE_VWAP",
-    "cloud_cross_up":       "ENABLE_CLOUD_CROSS_ALERT",
-    "cloud_cross_down":     "ENABLE_CLOUD_CROSS_ALERT",
-    "tk_conversion_up":     "ENABLE_TK_CONVERSION_CROSS",
-    "tk_conversion_down":   "ENABLE_TK_CONVERSION_CROSS",
-    "kijun_cross_up":       "ENABLE_KIJUN_CROSS",
-    "kijun_cross_down":     "ENABLE_KIJUN_CROSS",
-    "hist_rma_buy":         "ENABLE_HIST_RMA",
-    "hist_rma_sell":        "ENABLE_HIST_RMA",
-    "equilibrium_cross_up":   "ENABLE_EQUILIBRIUM_CROSS",
-    "equilibrium_cross_down": "ENABLE_EQUILIBRIUM_CROSS",
-}
-# pivot_up_r1 / pivot_down_s2 / etc. — variable-suffix family, matched by prefix
-_ALERT_CONFIG_PREFIX_MAP = {
-    "pivot_up_":   "ENABLE_PIVOT",
-    "pivot_down_": "ENABLE_PIVOT",
-}
-
 _OVERRIDE_COOLDOWN_PREFIX = "brain_override_cooldown:"
 CALIBRATION_CURVES_KEY = "brain:calibration_curves"
 QUALITY_INPUTS_KEY = "brain:quality_inputs"
 KILL_SWITCH_KEY = "brain:kill_switch_active"
 MARKET_STATE_MODEL_KEY = "brain:market_state_model"
-ML_CALIBRATION_KEY = "brain:ml_calibration_curve"   # NEW
+ML_CALIBRATION_KEY = "brain:ml_calibration_curve"
 
 def _resolve_config_path(alert_key: str) -> Optional[str]:
-    path = _ALERT_CONFIG_MAP.get(alert_key)
-    if path:
-        return path
-    for prefix, mapped in _ALERT_CONFIG_PREFIX_MAP.items():
-        if alert_key.startswith(prefix):
-            return mapped
-    return None
+    """Single registry: delegates to alerts.ALERT_CONFIG_MAP."""
+    return resolve_alert_config_path(alert_key)
 
 def _hget_int(data: dict, key: str, default: int = 0) -> int:
     value = data.get(key)
@@ -1289,7 +1241,7 @@ class BrainEngine:
                     "type": "unmapped_disable", "severity": "medium",
                     "message": (
                         f"{alert_key} is recommended for disable but has no entry in "
-                        f"_ALERT_CONFIG_MAP — no config_patch was emitted. Add a mapping or disable manually."
+                        f"ALERT_CONFIG_MAP — no config_patch was emitted. Add a mapping or disable manually."
                     ),
                 })
         threshold_rec: Dict[str, Any] = {}
@@ -1299,7 +1251,7 @@ class BrainEngine:
             real_rows, target_winrate=target_wr, min_sample=min_sample,
         ) if real_rows else {"valid": False}
 
-        # ── Brier Score / Calibration ────────────────────────────────────
+        # ── Brier Score / Calibration ─────────────────────────────���──────
         brier, cal_curve = engine.brier_score_and_calibration(real_rows)
         cal_alerts = engine.calibration_alert(real_rows)
         has_calibration_data = bool(cal_curve or cal_alerts)
@@ -1637,6 +1589,108 @@ class BrainEngine:
                             "\nDiagnostic only — no per-combo threshold applied yet."
                         ),
                     })
+
+        # ── Alert-family intelligence (roadmap #9) ──
+        if getattr(cfg, "ENABLE_ALERT_FAMILY_ANALYSIS", True) and real_rows:
+            try:
+                fam = engine.alert_family_analysis(
+                    real_rows,
+                    min_sample=getattr(cfg, "ALERT_FAMILY_MIN_SAMPLE", 20),
+                    shrinkage_k=getattr(cfg, "HIERARCHICAL_SHRINKAGE_K", 20.0),
+                )
+                ai_metrics["alert_family_analysis"] = fam
+                if fam.get("valid"):
+                    fam_lines = []
+                    for name, stats in sorted(
+                        (fam.get("families") or {}).items(),
+                        key=lambda kv: -(kv[1].get("n") or 0),
+                    ):
+                        if not stats.get("valid"):
+                            continue
+                        fam_lines.append(
+                            f"  • {name}: WR {stats['wr']:.0%} n={stats['n']} "
+                            f"netEV {stats.get('net_ev', 0):+.2f}% "
+                            f"[{stats.get('confidence', '?')}] "
+                            f"state={stats.get('evidence_state', '?')}"
+                        )
+                    if fam_lines:
+                        recommendations.append({
+                            "type": "alert_family_analysis",
+                            "severity": "low",
+                            "message": (
+                                "👨‍👩‍👧‍👦 Alert-family intelligence:\n"
+                                + "\n".join(fam_lines[:8])
+                                + "\nDiagnostic only — families are learning entities, not live gates."
+                            ),
+                        })
+            except Exception as e:
+                audit.record_analysis_exception("alert_family_analysis", e)
+
+        # ── Regime transition analysis (roadmap #15) ──
+        if getattr(cfg, "ENABLE_REGIME_TRANSITION_ANALYSIS", True) and real_rows:
+            try:
+                rta = engine.regime_transition_analysis(
+                    real_rows,
+                    min_sample=max(10, min_sample // 2),
+                    lookback_stable=getattr(cfg, "REGIME_TRANSITION_LOOKBACK_BARS", 4),
+                    post_window_hours=getattr(cfg, "REGIME_TRANSITION_POST_WINDOW_HOURS", 6),
+                )
+                ai_metrics["regime_transition_analysis"] = rta
+                if rta.get("valid"):
+                    pt = rta.get("post_transition") or {}
+                    st = rta.get("stable") or {}
+                    gap = rta.get("wr_gap")
+                    msg_parts = [
+                        f"🔄 Regime transitions detected: {rta.get('n_transitions', 0)}",
+                    ]
+                    if st.get("valid"):
+                        msg_parts.append(
+                            f"Stable regime WR {st['wr']:.0%} (n={st['n']})"
+                        )
+                    if pt.get("valid"):
+                        msg_parts.append(
+                            f"Post-transition WR {pt['wr']:.0%} (n={pt['n']})"
+                        )
+                    if gap is not None:
+                        msg_parts.append(f"gap {gap:+.0%}")
+                    recommendations.append({
+                        "type": "regime_transition_analysis",
+                        "severity": "medium" if gap is not None and abs(gap) > 0.08 else "low",
+                        "message": " | ".join(msg_parts)
+                        + " — diagnostic; alerts right after a regime flip may behave differently.",
+                    })
+            except Exception as e:
+                audit.record_analysis_exception("regime_transition_analysis", e)
+
+        # ── Strategy vs regime attribution (roadmap #17) ──
+        if getattr(cfg, "ENABLE_STRATEGY_VS_REGIME_ATTRIBUTION", True) and real_rows:
+            try:
+                sva = engine.strategy_vs_regime_attribution(
+                    real_rows,
+                    min_sample=getattr(cfg, "STRATEGY_VS_REGIME_MIN_SAMPLE", 30),
+                )
+                ai_metrics["strategy_vs_regime_attribution"] = sva
+                if sva.get("valid"):
+                    attr = sva.get("attribution", "unknown")
+                    sev = (
+                        "high" if attr == "possible_strategy_degradation"
+                        else "medium" if attr in (
+                            "insufficient_current_regime_evidence", "regime_mix_shift"
+                        )
+                        else "low"
+                    )
+                    recommendations.append({
+                        "type": "strategy_vs_regime_attribution",
+                        "severity": sev,
+                        "attribution": attr,
+                        "message": (
+                            f"🧭 Strategy vs regime: {attr.replace('_', ' ')}\n"
+                            f"{sva.get('detail', '')}"
+                        ),
+                    })
+            except Exception as e:
+                audit.record_analysis_exception("strategy_vs_regime_attribution", e)
+
         if target_floor is not None:
             attribution = engine.outcome_attribution(
                 real_rows, CONFLUENCE_WEIGHTS, threshold=target_floor, min_sample=min_sample,

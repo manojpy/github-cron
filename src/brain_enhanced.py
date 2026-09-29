@@ -93,9 +93,14 @@ def _pretty_alert(key: str) -> str:
     return " ".join(_TOKEN_NAMES.get(t.lower(), t.capitalize()) for t in toks) or _pretty_alert(key)
 
 def _alert_family(key: str) -> str:
-    """pivot_down_S1 -> 'Pivot'; dynamic_flow_cross_sell -> 'Dynamic Flow'."""
-    toks = [t for t in str(key).split("_") if t and t.lower() not in _DIRECTION_TOKENS]
-    return " ".join(_TOKEN_NAMES.get(t.lower(), t.capitalize()) for t in toks) or _pretty_alert(key)
+    """Canonical family label — delegates to threshold_engine.alert_family_of
+    so reports and hierarchical family analysis share one taxonomy."""
+    try:
+        from threshold_engine import alert_family_of
+        return alert_family_of(key)
+    except Exception:
+        toks = [t for t in str(key).split("_") if t and t.lower() not in _DIRECTION_TOKENS]
+        return " ".join(_TOKEN_NAMES.get(t.lower(), t.capitalize()) for t in toks) or _pretty_alert(key)
 
 class _Piece(str):
     """A rendered Telegram fragment that remembers its plain source text and
@@ -2544,7 +2549,7 @@ class BrainEngineV2(BaseBrainEngine):
                     weight_adjustments = [item for _, k, item in keep if k == "weight"]
                     disable_alerts = [item for _, k, item in keep if k == "disable"]
                     reinstate_alerts = [item for _, k, item in keep if k == "reinstate"]
-
+            
             plan_data = {
                 "generated_at": int(time.time()),
                 "_action_gate_passed": action_gate_passed,
@@ -2553,10 +2558,81 @@ class BrainEngineV2(BaseBrainEngine):
                 "reinstate_alerts": reinstate_alerts,
                 "weight_adjustments": weight_adjustments,
             }
+
+            if getattr(cfg, "ENABLE_BRAIN_PLAN_IDS", True):
+                try:
+                    counter_raw = await self.sdb.get_metadata("brain_plan_counter")
+                    counter = int(counter_raw or 0) + 1
+                    await self.sdb.set_metadata(
+                        "brain_plan_counter", str(counter), ttl=365 * 86400
+                    )
+                    plan_id = f"PLAN-{counter:03d}"
+                except Exception:
+                    plan_id = f"PLAN-{int(time.time())}"
+
+                data_window_days = getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", None)
+                param_diffs: List[Dict[str, Any]] = []
+                for p in config_patches:
+                    param_diffs.append({
+                        "field": p.get("field") or p.get("path"),
+                        "old": p.get("old_value") or p.get("old"),
+                        "new": p.get("new_value") or p.get("new") or p.get("value"),
+                        "reason": p.get("reason") or p.get("source"),
+                    })
+                for w in weight_adjustments:
+                    param_diffs.append({
+                        "field": f"weight:{w.get('vote')}",
+                        "old": w.get("current") or w.get("old"),
+                        "new": w.get("new") or w.get("proposed"),
+                        "reason": w.get("category") or "weight_adjustment",
+                    })
+                for ak in disable_alerts:
+                    param_diffs.append({
+                        "field": f"disable:{ak}",
+                        "old": "enabled",
+                        "new": "disabled",
+                        "reason": "brain_disable",
+                    })
+                for ak in reinstate_alerts:
+                    param_diffs.append({
+                        "field": f"reinstate:{ak}",
+                        "old": "disabled",
+                        "new": "enabled",
+                        "reason": "brain_reinstate",
+                    })
+
+                plan_data.update({
+                    "plan_id": plan_id,
+                    "model_version": recs.get("ai_metrics", {}).get("config_version")
+                        or recs.get("config_version"),
+                    "data_window_days": data_window_days,
+                    "training_timestamp": plan_data["generated_at"],
+                    "parameters_changed": param_diffs,
+                    "sample_size": {
+                        "real": recs.get("real_sample_size"),
+                        "shadow": recs.get("shadow_sample_size"),
+                    },
+                    "oos_result": (recs.get("ai_metrics") or {}).get("action_gate"),
+                    "calibration_result": (recs.get("ai_metrics") or {}).get("calibration_ece_mean"),
+                    "status": "pending",
+                    "evidence": {
+                        "action_gate_passed": action_gate_passed,
+                        "n_patches": len(config_patches),
+                        "n_disable": len(disable_alerts),
+                        "n_reinstate": len(reinstate_alerts),
+                        "n_weights": len(weight_adjustments),
+                    },
+                })
+                logging.getLogger("macd_bot").info(
+                    f"Brain plan stored: {plan_id} "
+                    f"(patches={len(config_patches)} disable={len(disable_alerts)} "
+                    f"reinstate={len(reinstate_alerts)} weights={len(weight_adjustments)})"
+                )
+
             await self.sdb.set_metadata(
                 "brain_pending_plan",
                 json_dumps(plan_data),
-                ttl=7 * 86400  # 7 days
+                ttl=7 * 86400
             )
         except Exception as e:
             logging.getLogger("macd_bot").warning(f"Failed to store pending plan: {e}")
