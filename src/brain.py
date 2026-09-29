@@ -607,12 +607,16 @@ class BrainEngine:
         votes: Optional[Dict[str, bool]] = None,
         session: str = "unknown",
     ) -> Optional[Dict[str, Any]]:
-        """Dispatch hook: report-only trade-quality verdict for one
-        prospective alert, from the per-alert EV/regime evidence the last
-        brain report persisted, optionally blended with a live per-trade
-        market-state prediction (item #12) once
-        ENABLE_MARKET_STATE_LIVE_SCORE is on. Returns None (never blocks
-        dispatch) on any missing/thin data."""
+        """Contextual quality decision for one prospective alert.
+        Pipeline (via trade_quality_score):
+          context → hierarchical historical edge → P(profit)/EV →
+          calibration → OOS/sample gate → risk gate → verdict + action
+        Verdicts: BLOCKED | MONITOR | HIGH | MEDIUM | LOW
+        Actions:  block | monitor | dispatch
+        Does not change hard signal rules. Dispatch suppression of BLOCKED
+        is controlled by ENABLE_QUALITY_HARD_BLOCK at the alerts layer.
+        Returns None when quality inputs are missing (fail-open).
+        """
         bundle = await self._load_quality_inputs()
         if not bundle:
             return None
@@ -637,24 +641,30 @@ class BrainEngine:
         leaf = leaves.get(leaf_key)
 
         # Hierarchical fallback chain when exact leaf is thin/missing:
-        # pair+alert+dir+regime → any same pair+alert+dir → alert baseline
+        # pair|alert|dir|regime → pair|alert|dir|* → *|alert|dir|* → alert baseline
         if not leaf:
-            # same pair + alert + direction, any regime
             prefix = f"{pair}|{alert_key}|{direction}|"
             candidates = [
                 v for k, v in leaves.items()
                 if k.startswith(prefix) and v.get("n", 0) > 0
             ]
             if candidates:
-                # prefer largest n
                 leaf = max(candidates, key=lambda x: x.get("n", 0))
                 leaf_key = f"{pair}|{alert_key}|{direction}|*"
+        if not leaf:
+            # any pair, same alert + direction (alert-family / global-alert)
+            suffix_parts = f"|{alert_key}|{direction}|"
+            candidates = [
+                v for k, v in leaves.items()
+                if suffix_parts in k and v.get("n", 0) > 0
+            ]
+            if candidates:
+                leaf = max(candidates, key=lambda x: x.get("n", 0))
+                leaf_key = f"*|{alert_key}|{direction}|*"
 
         if leaf:
             ev_model_result["net_ev"] = leaf["shrunk_net_ev"]
-            # optional: also bias p if you store shrunk_wr on leaves
             if "shrunk_wr" in leaf and leaf.get("n", 0) >= 10:
-                # mild blend toward hierarchical WR without discarding model p
                 p_model = float(ev_model_result.get("p_ev_positive", 0.5) or 0.5)
                 p_hier = float(leaf["shrunk_wr"])
                 n = float(leaf["n"])
@@ -1299,7 +1309,7 @@ class BrainEngine:
             real_rows, target_winrate=target_wr, min_sample=min_sample,
         ) if real_rows else {"valid": False}
 
-        # ── Brier Score / Calibration ────────────────────────────────────
+        # ── Brier Score / Calibration ─────────────────────────────���──────
         brier, cal_curve = engine.brier_score_and_calibration(real_rows)
         cal_alerts = engine.calibration_alert(real_rows)
         has_calibration_data = bool(cal_curve or cal_alerts)

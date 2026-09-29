@@ -534,6 +534,8 @@ class BotConfig(BaseModel):
     BRAIN_SIZE_HINT_MEDIUM: float = Field(default=0.5, ge=0.0, le=1.0)
     BRAIN_SIZE_HINT_LOW: float = Field(default=0.25, ge=0.0, le=1.0)
     BRAIN_SIZE_HINT_BLOCKED: float = Field(default=0.0, ge=0.0, le=1.0)
+    QUALITY_MIN_OOS_ACTIONABLE: int = Field(default=30, ge=5, le=500, description="Minimum OOS/leaf sample before trade-quality may emit HIGH/MEDIUM (below this, non-HIGH outcomes become MONITOR). Used by trade_quality_score sample gate.")
+    QUALITY_BLOCK_ON_NEGATIVE_EV: bool = Field(default=True, description="If True, trade_quality_score returns verdict=BLOCKED when net EV is negative, p_profit is below MIN_WIN_RATE, and n_oos >= QUALITY_MIN_OOS_ACTIONABLE. Dispatch suppression still requires ENABLE_QUALITY_HARD_BLOCK.")
     ENABLE_QUALITY_HARD_BLOCK: bool = Field(default=False, description="HARD gate: when trade-quality verdict is BLOCKED, suppress Telegram dispatch and record a counterfactual instead of only annotating the message. Keep False until quality labels have been observed in shadow for a full analysis window.")
 
     @field_validator('TELEGRAM_BOT_TOKEN')
