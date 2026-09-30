@@ -69,6 +69,16 @@ jobs:
       - run: pip install -r requirements.txt pytest
       - run: pip check
       - run: python -m pytest tests/ -q
+      - name: Numeric self-test (must pass before a build is trusted)
+        run: |
+          python - <<'PY'
+          import sys
+          import numeric_selftest
+          ok, failures = numeric_selftest.run_self_test()
+          for msg in failures:
+              print("FAIL:", msg)
+          sys.exit(0 if ok else 1)
+          PY
 
   actionlint:
     runs-on: ubuntu-latest

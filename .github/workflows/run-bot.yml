@@ -397,6 +397,7 @@ jobs:
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}"             --data-urlencode "text=${MSG}"             -o /dev/null -w "Telegram notify HTTP %{http_code}\n"
 
       - name: 📤 Persist outcomes to data repo
+        id: persist
         if: always()
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
@@ -472,6 +473,22 @@ jobs:
               git rebase --abort 2>/dev/null || true
               exit 1
             fi
+        
           done
           echo "::error::Could not push outcomes after 5 attempts"
           exit 1
+
+      # If the push above exhausted its retries, the runner's clone is about
+      # to be thrown away. Keep this run's resolved rows as an artifact so
+      # they can be re-committed by hand instead of being lost.
+      - name: 🛟 Preserve un-pushed outcomes
+        if: always() && steps.persist.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: unpushed-outcomes-${{ github.run_id }}
+          path: |
+            /tmp/data-repo/outcomes
+            /tmp/data-repo/shadow
+            /tmp/data-repo/brain_state.json
+          retention-days: 7
+          if-no-files-found: ignore
