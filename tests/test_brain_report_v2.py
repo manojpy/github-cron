@@ -1,4 +1,4 @@
-"""Slim 8-section Brain report: structure, honesty caps, Telegram safety."""
+"""Slim 9-section Brain report: structure, honesty caps, Telegram safety."""
 
 import asyncio
 import random
@@ -78,17 +78,17 @@ def test_confidence_is_capped_by_history_span():
     a._history.actual_days = 45
     assert a.statistical_confidence_label() == "HIGH"
 
-def test_all_eight_sections_in_order_and_fit_telegram():
+def test_all_nine_sections_in_order_and_fit_telegram():
     msgs = _report(_rows(_SPEC))
     text = _plain(msgs)
-    positions = [text.index(f"{i:02d} │") for i in range(1, 9)]
+    positions = [text.index(f"{i:02d} │") for i in range(1, 10)]  # 1..9
     assert positions == sorted(positions)
     assert "BRAIN REPORT" in msgs[0] and "END OF BRAIN REPORT" in _plain(msgs[-1:])
     assert all(len(m) <= 4096 for m in msgs)
-    assert text.index("05 │") < text.index("CONTEXT (sessions") < text.index("06 │")
-  
-    # Dropped technical sections must not appear
-    for gone in ("09 │", "10 │", "11 │", "12 │", "13 │", "14 │", "15 │", "16 │"):
+    # Human pack ends after section 06; context starts at 07
+    assert text.index("06 │") < text.index("CONTEXT (sessions") < text.index("07 │")
+
+    for gone in ("10 │", "11 │", "12 │", "13 │", "14 │", "15 │", "16 │"):
         assert gone not in text
 
 def test_counterfactual_candidates_beat_control_shown_in_what_to_do_now():
@@ -228,8 +228,8 @@ def test_report_is_archived_as_markdown_and_still_sent(monkeypatch):
     assert len(saved) == 1 and len(sent) >= 1
     md = saved[0]
     assert md.startswith("# 🧠 Brain Report")
-    # Slim trader report: 8 sections
-    assert len(re.findall(r"^## \d\d │", md, re.M)) == 8
+    # Slim trader report: 9 sections
+    assert len(re.findall(r"^## \d\d │", md, re.M)) == 9
     assert md.count("```") % 2 == 0
     assert not re.search(r"\\[.\-()!+=|]", md)           # no Telegram MarkdownV2 escaping in the file
     assert "CONTEXT (sessions" in _plain(sent) or "Action Gate" in _plain(sent) or "08 │" in md

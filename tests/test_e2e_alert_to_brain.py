@@ -13,8 +13,7 @@ from typing import Dict, Optional
 
 import pytest
 
-@pytest.mark.asyncio
-async def test_alert_pending_resolve_jsonl_brain_quality(tmp_path, monkeypatch):
+def test_alert_pending_resolve_jsonl_brain_quality(tmp_path, monkeypatch):
     """Smoke: resolved outcome → JSONL → trade_quality / calibration / ablation."""
     from outcome_storage import append_outcome_batch, OUTCOME_SCHEMA_VERSION
     import threshold_engine as engine
