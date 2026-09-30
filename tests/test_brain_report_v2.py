@@ -81,7 +81,7 @@ def test_confidence_is_capped_by_history_span():
 def test_all_nine_sections_in_order_and_fit_telegram():
     msgs = _report(_rows(_SPEC))
     text = _plain(msgs)
-    positions = [text.index(f"{i:02d} │") for i in range(1, 10)]  # 1..9
+    positions = [text.index(f"{i:02d} │") for i in range(1, 10)]  # 01..09
     assert positions == sorted(positions)
     assert "BRAIN REPORT" in msgs[0] and "END OF BRAIN REPORT" in _plain(msgs[-1:])
     assert all(len(m) <= 4096 for m in msgs)
@@ -107,30 +107,32 @@ def test_counterfactual_candidates_beat_control_shown_in_what_to_do_now():
          "n": 60, "shadow_validated": True, "shadow_n": 20},
     ]
     text = _plain(_report(_rows(_SPEC), ai_extra={"counterfactual_scenarios": scenarios}))
-    sec2 = text[text.index("02 │"):text.index("03 │")]
-    assert "CANDIDATE CONFIGS" in sec2
+    # WHAT TO DO NOW is section 03 after BRAIN DECISION was inserted as 01
+    sec3 = text[text.index("03 │"):text.index("04 │")]
+    assert "CANDIDATE CONFIGS" in sec3
     # Ranked best (Combined, ev=0.91) to 3rd (RSI cap -3, ev=0.55); Session
     # filter (0.50) and the 4th-best (0.45) are positive but cut by the cap.
-    assert sec2.index("Combined") < sec2.index("Threshold +1") < sec2.index("RSI cap -3")
-    assert "Threshold +2 (worse than control)" not in sec2   # delta_ev < 0, never a candidate
-    assert "Session filter" not in sec2                       # positive but outside top 3
-    assert "4th best — should be cut by the top-3 cap" not in sec2
-    assert "PROMOTION-ELIGIBLE" in sec2                       # Threshold +1: validated, n=137 >= 15
-    assert "REJECTED" in sec2                                 # Combined: shadow disagrees
-    assert "NOT YET (need 15 shadow, have 8)" in sec2         # RSI cap -3: validated but thin
+    assert sec3.index("Combined") < sec3.index("Threshold +1") < sec3.index("RSI cap -3")
+    assert "Threshold +2 (worse than control)" not in sec3   # delta_ev < 0, never a candidate
+    assert "Session filter" not in sec3                       # positive but outside top 3
+    assert "4th best — should be cut by the top-3 cap" not in sec3
+    assert "PROMOTION-ELIGIBLE" in sec3                       # Threshold +1: validated, n=137 >= 15
+    assert "REJECTED" in sec3                                 # Combined: shadow disagrees
+    assert "NOT YET (need 15 shadow, have 8)" in sec3         # RSI cap -3: validated but thin
 
 def test_confidence_breakdown_shows_four_independent_tiers():
     gate = {**_OPEN, "profit_p_ev_positive": 0.91, "ev_p5": 0.12,
             "oos_p_ev_positive": 0.61, "stability": True}
     text = _plain(_report(_rows(_SPEC), gate=gate, ai_extra={"brier_score": 0.14}))
-    sec8 = text[text.index("08 │"):]
-    assert "CONFIDENCE BREAKDOWN" in sec8
-    assert "MODEL       🟢 HIGH" in sec8 and "Brier 0.14" in sec8
+    # ACTION GATE is section 09
+    sec9 = text[text.index("09 │"):]
+    assert "CONFIDENCE BREAKDOWN" in sec9
+    assert "MODEL       🟢 HIGH" in sec9 and "Brier 0.14" in sec9
     # _SPEC totals 90 trades over the default 2.5-day window: n>=60 alone
     # would rank HIGH, but the short span caps it to MEDIUM.
-    assert "DATA        🟡 MEDIUM" in sec8 and "90 trades" in sec8
-    assert "CHANGE      🟢 HIGH" in sec8 and "P(EV>0) 91%" in sec8 and "EV p5 +0.12%" in sec8
-    assert "DEPLOYMENT  🟡 MEDIUM" in sec8 and "OOS P(EV>0) 61%" in sec8
+    assert "DATA        🟡 MEDIUM" in sec9 and "90 trades" in sec9
+    assert "CHANGE      🟢 HIGH" in sec9 and "P(EV>0) 91%" in sec9 and "EV p5 +0.12%" in sec9
+    assert "DEPLOYMENT  🟡 MEDIUM" in sec9 and "OOS P(EV>0) 61%" in sec9
 
 def test_confidence_breakdown_not_ready_on_active_drift_regardless_of_oos_score():
     # A near-perfect OOS score must still show NOT READY once stability
@@ -139,9 +141,10 @@ def test_confidence_breakdown_not_ready_on_active_drift_regardless_of_oos_score(
     gate = {**_OPEN, "profit_p_ev_positive": 0.91, "ev_p5": 0.12,
             "oos_p_ev_positive": 0.95, "stability": False}
     text = _plain(_report(_rows(_SPEC), gate=gate, ai_extra={"brier_score": None}))
-    sec8 = text[text.index("08 │"):]
-    assert "MODEL       ⚪ N/A" in sec8 and "no calibration data yet" in sec8
-    assert "DEPLOYMENT  🔴 NOT READY" in sec8 and "active drift" in sec8
+    # ACTION GATE is section 09
+    sec9 = text[text.index("09 │"):]
+    assert "MODEL       ⚪ N/A" in sec9 and "no calibration data yet" in sec9
+    assert "DEPLOYMENT  🔴 NOT READY" in sec9 and "active drift" in sec9
 
 def test_low_history_says_diagnose_and_never_advises_disabling():
     text = _plain(_report(_rows(_SPEC)))
@@ -161,7 +164,8 @@ def test_win_rule_explained_with_break_even():
 
 def test_scorecard_uses_friendly_names_and_summarises_thin():
     text = _plain(_report(_rows(_SPEC)))
-    score = text.split("06 │")[1].split("07 │")[0]
+    # ALERT SCORECARD is section 07; SESSION ANALYSIS is 08
+    score = text.split("07 │")[1].split("08 │")[0]
     assert "choch_sell" not in score
     assert "INSUFFICIENT DATA" in score
     assert "see archive report if needed" in score
@@ -185,7 +189,7 @@ def test_validated_mode_shows_verdict_and_approved_block():
     text = _plain(_report(rows, gate=_OPEN, net_ev=0.6, days_override=45, patch=patch))
     assert "BRAIN VERDICT" in text and "CURRENTLY VALIDATED EDGE" in text
     assert "PPO Signal UP" in text and "Action Gate: APPROVED" in text
-    # Slim report: approved patches live in section 02, not a separate "DO NOT APPLY" block
+    # Slim report: approved patches live in WHAT TO DO NOW (03), not a separate "DO NOT APPLY" block
     assert "APPROVED CHANGES" in text or "CONFLUENCE_MIN_ABS_SCORE" in text
     assert "DO NOT APPLY" not in text
     assert "DO NOT CHANGE YET" not in text
@@ -228,11 +232,15 @@ def test_report_is_archived_as_markdown_and_still_sent(monkeypatch):
     assert len(saved) == 1 and len(sent) >= 1
     md = saved[0]
     assert md.startswith("# 🧠 Brain Report")
-    # Slim trader report: 9 sections
+    # Slim trader report: 9 sections (includes BRAIN DECISION)
     assert len(re.findall(r"^## \d\d │", md, re.M)) == 9
     assert md.count("```") % 2 == 0
     assert not re.search(r"\\[.\-()!+=|]", md)           # no Telegram MarkdownV2 escaping in the file
-    assert "CONTEXT (sessions" in _plain(sent) or "Action Gate" in _plain(sent) or "08 │" in md
+    assert (
+        "CONTEXT (sessions" in _plain(sent)
+        or "Action Gate" in _plain(sent)
+        or "09 │" in md
+    )
 
 def test_archive_failure_is_not_fatal_and_sends_once(monkeypatch):
     import logging

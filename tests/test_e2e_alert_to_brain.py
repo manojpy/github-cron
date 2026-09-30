@@ -41,7 +41,7 @@ def test_alert_pending_resolve_jsonl_brain_quality(tmp_path, monkeypatch):
         "adx_val": 28.0,
         "session": "london",
     }
-    append_outcome_batch([row], is_shadow=False)
+    append_outcome_batch([row], shadow=False)
 
     files = list(Path(tmp_path).rglob("*.jsonl"))
     assert files, "resolved outcome was not written to JSONL"
