@@ -563,7 +563,7 @@ def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
 def _sec_verdict(F: Dict[str, Any], cfg) -> List[_Piece]:
     """End-state Section 1, shown only when the action gate passes."""
     g = F["gate"]
-    out = [_hdr(3, "🧠 BRAIN VERDICT")]
+    out = [_hdr(2, "🧠 BRAIN VERDICT")]
     out.append(_c("\n".join(_kv_table([
         ("System health", _recording_status(F).split(' ')[0]),
         ("Profitability", _profit_status(F['net_ev'], F['n']).split(' ')[0]),
