@@ -78,13 +78,16 @@ async def _redis_key_inventory(
     """Read-only Redis audit: key count and no-TTL key count per prefix
     (the text before the first ':'). Bounded by max_keys so it cannot
     run away on a large keyspace."""
+    client = sdb._redis
+    if client is None:
+        return {}
     inventory: Dict[str, Dict[str, int]] = {}
     batch: List[str] = []
 
     async def _flush() -> None:
         if not batch:
             return
-        pipe = sdb._redis.pipeline()
+        pipe = client.pipeline()
         for key in batch:
             pipe.ttl(key)
         ttls = await pipe.execute()
@@ -94,9 +97,8 @@ async def _redis_key_inventory(
             if ttl == -1:
                 entry["no_ttl"] += 1
         batch.clear()
-
     scanned = 0
-    async for key in sdb._redis.scan_iter(match="*", count=500):
+    async for key in client.scan_iter(match="*", count=500):
         batch.append(key)
         scanned += 1
         if len(batch) >= 500:

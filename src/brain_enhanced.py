@@ -2679,7 +2679,7 @@ class BrainEngineV2(BaseBrainEngine):
             )
             if plan_data.get("plan_id"):
                 await self._record_plan_event(
-                    plan_data["plan_id"],
+                    str(plan_data["plan_id"]),
                     "pending" if action_gate_passed else "blocked",
                     "action gate " + ("passed" if action_gate_passed else "did not pass"),
                 )

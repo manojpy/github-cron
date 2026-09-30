@@ -1330,9 +1330,9 @@ async def run_once() -> Optional[bool]:
                 try:
                     inv = await asyncio.wait_for(_redis_key_inventory(sdb), timeout=30.0)
                     logger_run.info("🗄️ Redis key inventory (prefix: keys / without TTL):")
-                    for prefix, e in sorted(inv.items(), key=lambda kv: -kv[1]["keys"]):
-                        flag = "  ⚠️ no TTL" if e["no_ttl"] else ""
-                        logger_run.info(f"   {prefix}: {e['keys']} / {e['no_ttl']}{flag}")
+                    for prefix, entry in sorted(inv.items(), key=lambda kv: -kv[1]["keys"]):
+                        flag = "  ⚠️ no TTL" if entry["no_ttl"] else ""
+                        logger_run.info(f"   {prefix}: {entry['keys']} / {entry['no_ttl']}{flag}")
                 except Exception as e:
                     logger_run.warning(f"Redis inventory failed: {e}")
             else:
