@@ -2210,7 +2210,7 @@ def is_vote_count_ood(
         "relaxed_mode": relaxed_mode,
     }
 
-# ══════════�����══════════════════════════════════════════��══════���══════════
+# ══════════������══════════════════════════════════════════��══════���══════════
 #  NEW: Block-Bootstrap EV Confidence Intervals  (Recommended.txt §6)
 # ═════════════════════════════════════════════════════════════════��═════
 
@@ -4632,7 +4632,9 @@ def fold_outcomes_into_calibration(
     touched: Set[str] = set()
     for r in rows:
         curve = curves.get(r.get("alert_key"))
-        buckets = (curve or {}).get("buckets") or []
+        if not curve:
+            continue
+        buckets = curve.get("buckets") or []
         if not buckets or r.get("conf_pct") is None:
             continue
         conf = float(r["conf_pct"])

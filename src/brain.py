@@ -294,7 +294,7 @@ class BrainEngine:
         ):
             try:
                 entries = await self.sdb._safe_redis_op(
-                    lambda k=key: _rc(self.sdb._redis).xrevrange(k, count=1),
+                    lambda: _rc(self.sdb._redis).xrevrange(key, count=1),
                     3.0, f"calibration_stream_tip:{kind}",
                 )
             except Exception:
@@ -333,8 +333,8 @@ class BrainEngine:
         ):
             start = self._next_stream_id(cursors[kind])
             entries = await self.sdb._safe_redis_op(
-                lambda k=key, s0=start: _rc(self.sdb._redis).xrange(
-                    k, min=s0, max="+", count=cap,
+                lambda: _rc(self.sdb._redis).xrange(
+                    key, min=start, max="+", count=cap,
                 ),
                 5.0, f"calibration_fold_read:{kind}",
             )
