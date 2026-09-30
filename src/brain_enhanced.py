@@ -968,6 +968,16 @@ def _sec_reasoning_chain(F: Dict[str, Any], cfg) -> List[_Piece]:
 
         oos_line = "PASS" if gate.get("oos_prediction") else "FAIL / unavailable"
         drift_line = "NONE detected" if gate.get("stability") else "CUSUM drift active"
+        _ss = (ai.get("strategy_state") or {}).get("state")
+        _ss_text = {
+            "STRATEGY_DEGRADED": "strategy degraded (drop persists within the same regimes)",
+            "REGIME_UNDERREPRESENTED": "current regime underrepresented in history — not proof of decay",
+            "REGIME_SHIFT": "regime mix shifted to a weaker regime — expected dip",
+            "DEGRADED_REGIME_UNKNOWN": "WR fell; ADX data too thin to attribute",
+            "STABLE": "no significant WR drop",
+        }.get(_ss or "")
+        if _ss_text:
+            drift_line = f"{drift_line} | {_ss_text}"
 
         if F.get("gate_ok") and net_ev > 0 and conf in ("MODERATE", "HIGH"):
             decision = "APPROVED — evidence supports limited parameter change (still via shadow/plan)"
@@ -2136,7 +2146,7 @@ class BrainEngineV2(BaseBrainEngine):
 
         _phase_mark("regime_profiles")
 
-        # ── Config Version Regression ──────���─────────────────────────────
+        # ── Config Version Regression ───────────────────────────────────
         version_comparisons = compare_config_versions(
             real_rows, min_sample=self._phase_samples["config_regression"]
         )
@@ -2174,6 +2184,36 @@ class BrainEngineV2(BaseBrainEngine):
         ai_metrics["config_comparisons"] = version_comparisons
 
         _phase_mark("config_version_regression")
+
+        # ── Strategy degradation vs regime (roadmap #17) ─────────────────
+        try:
+            _state = engine.classify_strategy_state(real_rows)
+            ai_metrics["strategy_state"] = _state
+            _st = _state["state"]
+            if _st == "STRATEGY_DEGRADED":
+                recommendations.append({
+                    "type": "strategy_state", "severity": "high",
+                    "message": (
+                        f"🚨 Strategy degraded: WR {_state['older_wr']:.0%}→{_state['recent_wr']:.0%} "
+                        f"and still {_state['mix_adjusted_drop']:.0%} below what the regime mix "
+                        f"predicts. {_state['action']}."
+                    ),
+                })
+            elif _st in ("REGIME_UNDERREPRESENTED", "REGIME_SHIFT", "DEGRADED_REGIME_UNKNOWN"):
+                _label = {
+                    "REGIME_UNDERREPRESENTED": "current regime underrepresented in history",
+                    "REGIME_SHIFT": "regime mix shifted toward a historically weaker regime",
+                    "DEGRADED_REGIME_UNKNOWN": "drop cannot be attributed (thin ADX data)",
+                }[_st]
+                recommendations.append({
+                    "type": "strategy_state", "severity": "low",
+                    "message": (
+                        f"ℹ️ WR {_state['older_wr']:.0%}→{_state['recent_wr']:.0%}: {_label}. "
+                        f"{_state['action']}. Not evidence the strategy broke."
+                    ),
+                })
+        except Exception as e:
+            logging.getLogger("macd_bot").debug(f"Strategy-state classification failed (non-fatal): {e}")
 
         # ── AI/ML: OOS Permutation Importance (EV-based, walk-forward) ────
         # FIX: honor cfg.BRAIN_PERMUTATION_IMPORTANCE — previously this

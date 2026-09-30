@@ -1651,6 +1651,127 @@ def direction_split(rows: List[Row]) -> Tuple[Optional[float], int, Optional[flo
     sell_wr = sum(r["win"] for r in sells) / len(sells) if sells else None
     return buy_wr, len(buys), sell_wr, len(sells)
 
+def classify_strategy_state(
+    rows: List[Row],
+    recent_days: int = 14,
+    min_recent: int = 20,
+    min_older: int = 40,
+    min_regime_n: int = 15,
+    drop_threshold: float = 0.10,
+    alpha: float = 0.10,
+    trend_adx: float = 25.0,
+    degraded_alpha: float = 0.05,
+) -> Dict[str, Any]:
+    """Is a recent win-rate drop 'the strategy broke' or 'we are in a regime
+    the history barely covers'? (roadmap #17)
+
+    Regime = trending if adx_val >= ``trend_adx`` (fixed), else ranging. A
+    median split would put half of the history in each regime by construction,
+    so an underrepresented regime could never be detected.
+
+    States: INSUFFICIENT_DATA, STABLE, DEGRADED_REGIME_UNKNOWN,
+    REGIME_UNDERREPRESENTED, REGIME_SHIFT, STRATEGY_DEGRADED (the hardest to
+    earn, since it is the costly label). Advisory only; never changes a gate.
+    """
+    now_ts = int(time.time())
+    cutoff = now_ts - recent_days * 86400
+    recent = [r for r in rows if r.get("entry_ts", 0) >= cutoff]
+    older = [r for r in rows if 0 < r.get("entry_ts", 0) < cutoff]
+    out: Dict[str, Any] = {
+        "state": "INSUFFICIENT_DATA", "recent_n": len(recent), "older_n": len(older),
+        "recent_wr": None, "older_wr": None, "drop": None,
+        "expected_recent_wr": None, "mix_adjusted_drop": None,
+        "regimes": {}, "action": "collect more outcomes before judging",
+    }
+    if len(recent) < min_recent or len(older) < min_older:
+        return out
+
+    r_wr = sum(1 for r in recent if r["win"]) / len(recent)
+    o_wr = sum(1 for r in older if r["win"]) / len(older)
+    drop = o_wr - r_wr
+    out.update({"recent_wr": round(r_wr, 4), "older_wr": round(o_wr, 4), "drop": round(drop, 4)})
+
+    # One-sided two-proportion z-test: is recent WR really below older WR?
+    pooled = (sum(1 for r in recent if r["win"]) + sum(1 for r in older if r["win"])) / (
+        len(recent) + len(older))
+    se = math.sqrt(max(pooled * (1 - pooled), 1e-12) * (1 / len(recent) + 1 / len(older)))
+    z = drop / se if se > 0 else 0.0
+    p_value = 0.5 * math.erfc(z / math.sqrt(2))
+    out["p_value"] = round(p_value, 4)
+
+    if drop < drop_threshold or p_value > alpha:
+        out.update({"state": "STABLE", "action": "no action"})
+        return out
+
+    older_adx = sorted(float(r["adx_val"]) for r in older if r.get("adx_val") is not None)
+    has_adx = lambda r: r.get("adx_val") is not None  # noqa: E731
+    if (len(older_adx) < 0.6 * len(older)
+            or sum(1 for r in recent if has_adx(r)) < 0.6 * len(recent)):
+        out.update({
+            "state": "DEGRADED_REGIME_UNKNOWN",
+            "action": "win rate fell but ADX coverage is too thin to separate decay from regime",
+        })
+        return out
+
+    def regime_of(r: Row) -> Optional[str]:
+        if r.get("adx_val") is None:
+            return None
+        return "trending" if float(r["adx_val"]) >= trend_adx else "ranging"
+
+    recent_r = [r for r in recent if regime_of(r)]
+    older_r = [r for r in older if regime_of(r)]
+    regimes: Dict[str, Any] = {}
+    for name in ("trending", "ranging"):
+        o = [r for r in older_r if regime_of(r) == name]
+        c = [r for r in recent_r if regime_of(r) == name]
+        regimes[name] = {
+            "older_n": len(o), "recent_n": len(c),
+            "older_wr": round(sum(1 for r in o if r["win"]) / len(o), 4) if o else None,
+            "recent_wr": round(sum(1 for r in c if r["win"]) / len(c), 4) if c else None,
+            "recent_share": round(len(c) / len(recent_r), 4) if recent_r else 0.0,
+        }
+    out["regimes"] = regimes
+
+    thin = [n for n, g in regimes.items()
+            if g["recent_share"] >= 0.25 and g["older_n"] < min_regime_n]
+    if thin:
+        out.update({
+            "state": "REGIME_UNDERREPRESENTED", "underrepresented": thin,
+            "action": (
+                f"recent trades are in {', '.join(thin)} where history has "
+                f"<{min_regime_n} trades: do not retune; keep shadow-logging"
+            ),
+        })
+        return out
+
+    expected = sum(
+        g["recent_share"] * g["older_wr"] for g in regimes.values() if g["older_wr"] is not None
+    )
+    mix_adj = expected - r_wr
+    out["expected_recent_wr"] = round(expected, 4)
+    out["mix_adjusted_drop"] = round(mix_adj, 4)
+    # Variance of (expected - recent): recent sampling noise PLUS the noise in
+    # the per-regime historical WRs the expectation is built from.
+    var_recent = max(r_wr * (1 - r_wr), 1e-12) / len(recent)
+    var_expected = sum(
+        (g["recent_share"] ** 2) * (g["older_wr"] * (1 - g["older_wr"])) / g["older_n"]
+        for g in regimes.values() if g["older_wr"] is not None and g["older_n"] > 0
+    )
+    se_mix = math.sqrt(var_recent + var_expected)
+    mix_p = 0.5 * math.erfc((mix_adj / se_mix) / math.sqrt(2)) if se_mix > 0 else 1.0
+    out["mix_adjusted_p_value"] = round(mix_p, 4)
+    if mix_adj >= 0.6 * drop_threshold and mix_p <= degraded_alpha:
+        out.update({
+            "state": "STRATEGY_DEGRADED",
+            "action": "win rate is down even within the same regimes: review recent changes, freeze retuning",
+        })
+    else:
+        out.update({
+            "state": "REGIME_SHIFT",
+            "action": "drop is explained by more trades in a historically weaker regime: expected, do not retune",
+        })
+    return out
+
 def detect_temporal_drift(rows: List[Row], window_days: int = 14):
     """Compare win rate of recent outcomes vs older ones. Uses wall-clock
     time (time.time()) as "now" — NOT the last trade's timestamp, which
@@ -2210,7 +2331,7 @@ def is_vote_count_ood(
         "relaxed_mode": relaxed_mode,
     }
 
-# ══════════������══════════════════════════════════════════��══════���══════════
+# ══════════�������══════════════════════════════════════════��══════���══════════
 #  NEW: Block-Bootstrap EV Confidence Intervals  (Recommended.txt §6)
 # ═════════════════════════════════════════════════════════════════��═════
 

@@ -249,6 +249,136 @@ def _disabled_hits_passing_confluence(
             kept.append(hit)
     return kept
 
+def build_survival_checklist(
+    *,
+    score: Optional[float],
+    total: Optional[float],
+    required: Optional[float],
+    win_rate: Optional[float],
+    win_sample: int,
+    cal_wr: Optional[float],
+    cal_reason: Optional[str],
+    tq: Optional[Dict[str, Any]],
+) -> str:
+    """Compact one-line 'why this alert survived' checklist (roadmap #25).
+
+    ✓ = passed on evidence, ○ = not evaluated / fail-open, ⚠ = passed with a warning.
+    """
+    bits: List[str] = []
+    if score is not None and total:
+        need = f" (need {required:.0f})" if required is not None else ""
+        bits.append(f"✓ gates {score:.0f}/{total:.0f}{need}")
+    if win_rate is not None:
+        bits.append(f"✓ WR {win_rate:.0%} n={win_sample}")
+    else:
+        bits.append("○ WR no history")
+    if cal_reason == "ok" and cal_wr is not None:
+        bits.append(f"✓ calib {cal_wr:.0%}")
+    elif cal_reason in ("thin_bucket_fail_open", "out_of_range_fail_open", "no_curve"):
+        bits.append("○ calib thin")
+    if tq and tq.get("verdict") and tq["verdict"] != "BLOCKED":
+        p = tq.get("p_ev_positive")
+        ev = tq.get("net_ev")
+        detail = ""
+        if p is not None and ev is not None:
+            detail = f" P={p:.0%} EV={ev:+.2f}%"
+        bits.append(f"✓ brain {tq['verdict']}{detail}")
+        if tq.get("drift_warning"):
+            bits.append("⚠ drift")
+        if tq.get("regime_warning"):
+            bits.append(f"⚠ {tq['regime_warning']}")
+    return " · ".join(bits)
+
+def build_brain_filter_message(
+    *,
+    pair: str,
+    alert_key: str,
+    gate: str,
+    lines: List[str],
+    tq: Optional[Dict[str, Any]] = None,
+    score: Optional[float] = None,
+    total: Optional[float] = None,
+) -> str:
+    """MarkdownV2 'BRAIN FILTER' rejection message (roadmap #26)."""
+    e = escape_markdown_v2
+    out = [f"🧠 *BRAIN FILTER* \\- *{e(pair)}* {e(alert_key)}"]
+    sig = "✅ Signal gates: PASS"
+    if score is not None and total:
+        sig += f" ({score:.0f}/{total:.0f})"
+    out.append(e(sig))
+    out.append(e(f"⛔ Brain: BLOCKED - {gate}"))
+    if tq:
+        bits = []
+        if tq.get("p_ev_positive") is not None:
+            bits.append(f"P(profit) {float(tq['p_ev_positive']):.0%}")
+        if tq.get("net_ev") is not None:
+            bits.append(f"netEV {float(tq['net_ev']):+.2f}%")
+        ev_state = tq.get("evidence_state") or tq.get("evidence_strength")
+        if ev_state:
+            n_oos = tq.get("n_oos")
+            bits.append(f"evidence {ev_state}" + (f" (n={n_oos})" if n_oos else ""))
+        if bits:
+            out.append(e("📉 " + " · ".join(bits)))
+        warn = []
+        if tq.get("drift_warning"):
+            warn.append("recent WR drift")
+        if tq.get("regime_warning"):
+            warn.append(str(tq["regime_warning"]))
+        if warn:
+            out.append(e("⚠️ " + " · ".join(warn)))
+    for ln in lines:
+        if ln:
+            out.append(e("• " + ln))
+    out.append(e("Not sent as a trade alert; shadow-logged for review."))
+    return "\n".join(out)
+
+async def _notify_brain_filter(
+    telegram_queue: "TelegramQueue",
+    sdb: "RedisStateStore",
+    *,
+    pair_name: str,
+    alert_key: str,
+    gate: str,
+    lines: List[str],
+    tq: Optional[Dict[str, Any]] = None,
+    score: Optional[float] = None,
+    total: Optional[float] = None,
+    logger_pair: Optional[logging.Logger] = None,
+) -> bool:
+    """Send a BRAIN FILTER Telegram message, rate-limited. Never raises.
+
+    Off unless ENABLE_BRAIN_FILTER_TELEGRAM. Capped per run, de-duplicated per
+    pair+alert+gate by a Redis cooldown key. If Redis is degraded it does NOT
+    send (no cooldown could be recorded, so it could spam).
+    """
+    if not getattr(cfg, "ENABLE_BRAIN_FILTER_TELEGRAM", False):
+        return False
+    try:
+        cap = int(getattr(cfg, "BRAIN_FILTER_TELEGRAM_MAX_PER_RUN", 3))
+        sent = int(getattr(telegram_queue, "_brain_filter_sent", 0))
+        if sent >= cap:
+            return False
+        if sdb is None or sdb.degraded or not getattr(sdb, "_redis", None):
+            return False
+        cooldown = int(getattr(cfg, "BRAIN_FILTER_TELEGRAM_COOLDOWN_SEC", 3600))
+        key = f"brain_filter_tg:{pair_name}:{alert_key}:{gate}"
+        claimed = await sdb._safe_redis_op(
+            lambda: _rc(sdb._redis).set(key, "1", nx=True, ex=cooldown),
+            2.0, "brain_filter_tg_claim",
+        )
+        if not claimed:
+            return False
+        telegram_queue._brain_filter_sent = sent + 1  # type: ignore[attr-defined]
+        msg = build_brain_filter_message(
+            pair=pair_name, alert_key=alert_key, gate=gate,
+            lines=lines, tq=tq, score=score, total=total,
+        )
+        return bool(await telegram_queue.send(msg))
+    except Exception as e:
+        if logger_pair is not None:
+            logger_pair.debug(f"BRAIN FILTER Telegram failed for {alert_key}: {e}")
+        return False
+
 async def _record_counterfactual_block(
     sdb: "RedisStateStore",
     pair_name: str,
@@ -2031,6 +2161,16 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         gr=gr, context=context,
                         logger_pair=logger_pair,
                     )
+                    _o_score, _o_total, _ = _confluence_for(alert_key)
+                    await _notify_brain_filter(
+                        telegram_queue, sdb,
+                        pair_name=pair_name, alert_key=alert_key, gate="unusual vote pattern",
+                        lines=[
+                            f"vote count {detail['current_count']} outside historical range "
+                            f"[{detail['hist_p5']:.1f}-{detail['hist_p95']:.1f}] (n={detail['n_history']})"
+                        ],
+                        score=_o_score, total=_o_total, logger_pair=logger_pair,
+                    )
                     continue
                 ood_survivors.append((alert_title, alert_extra, alert_key))
             alerts_to_send = ood_survivors
@@ -2063,6 +2203,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             )
 
                 alert_score, alert_total, alert_votes = _confluence_for(alert_key)
+                _survive_cal_wr: Optional[float] = None
+                _survive_cal_reason: Optional[str] = None
 
                 # ── Calibration gate (independent of the win-rate filter) ──
                 if (cfg.ENABLE_CALIBRATION_GATE
@@ -2077,6 +2219,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
                             slack=getattr(cfg, "CALIBRATION_SLACK", 0.05),
                         )
+                        _survive_cal_wr, _survive_cal_reason = cal_wr, _reason
                         if not ok:
                             logger_pair.info(
                                 f"[{pair_name}] calibration gate dropped {alert_key}: "
@@ -2090,6 +2233,15 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 confluence_scores={alert_key: _confluence_for(alert_key)},
                                 gr=gr, context=context,
                                 logger_pair=logger_pair,
+                            )
+                            await _notify_brain_filter(
+                                telegram_queue, sdb,
+                                pair_name=pair_name, alert_key=alert_key, gate="calibration gate",
+                                lines=[
+                                    f"calibrated WR {cal_wr:.0%} below {cfg.MIN_WIN_RATE:.0%} "
+                                    f"floor at confluence {conf_pct:.0f}%"
+                                ] if cal_wr is not None else [],
+                                score=alert_score, total=alert_total, logger_pair=logger_pair,
                             )
                             continue
 
@@ -2190,6 +2342,14 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                         gr=gr, context=context,
                                         logger_pair=logger_pair,
                                     )
+                                    await _notify_brain_filter(
+                                        telegram_queue, sdb,
+                                        pair_name=pair_name, alert_key=alert_key,
+                                        gate="quality hard block",
+                                        lines=[f"reason: {tq.get('reason', 'n/a')}"],
+                                        tq=tq, score=alert_score, total=alert_total,
+                                        logger_pair=logger_pair,
+                                    )
                                     continue
                             else:
                                 alert_extra = (
@@ -2227,6 +2387,25 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
                         # ── Why it survived (interpretability only) ──
                         if getattr(cfg, "ENABLE_ALERT_WHY_SURVIVED", True):
+                            try:
+                                try:
+                                    # Defined only when the confluence gate branch ran.
+                                    _req: Optional[float] = (
+                                        _required_confluence(alert_total)
+                                        if cfg.ENABLE_CONFLUENCE_GATE else None
+                                    )
+                                except NameError:
+                                    _req = None
+                                _chk = build_survival_checklist(
+                                    score=alert_score, total=alert_total, required=_req,
+                                    win_rate=win_rate, win_sample=int(sample or 0),
+                                    cal_wr=_survive_cal_wr, cal_reason=_survive_cal_reason,
+                                    tq=tq,
+                                )
+                                if _chk:
+                                    alert_extra = f"{alert_extra} | Why: {_chk}"
+                            except Exception as e:
+                                logger_pair.debug(f"Survival checklist failed for {alert_key}: {e}")
                             try:
                                 checks = []
                                 if alert_votes:
@@ -2329,6 +2508,17 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                                 alert_key: _confluence_for(alert_key)
                                             },
                                             gr=gr, context=context,
+                                            logger_pair=logger_pair,
+                                        )
+                                        await _notify_brain_filter(
+                                            telegram_queue, sdb,
+                                            pair_name=pair_name, alert_key=alert_key,
+                                            gate="ML expected value",
+                                            lines=[
+                                                f"ML EV {ev.get('net_ev')} below floor "
+                                                f"{cfg.ML_EV_MIN_THRESHOLD}"
+                                            ],
+                                            tq=tq, score=alert_score, total=alert_total,
                                             logger_pair=logger_pair,
                                         )
                                         continue
