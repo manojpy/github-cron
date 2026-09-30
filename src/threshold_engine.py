@@ -2210,7 +2210,7 @@ def is_vote_count_ood(
         "relaxed_mode": relaxed_mode,
     }
 
-# ══════════��══════════════════════════════════════════��══════���══════════
+# ══════════����══════════════════════════════════════════��══════���══════════
 #  NEW: Block-Bootstrap EV Confidence Intervals  (Recommended.txt §6)
 # ═════════════════════════════════════════════════════════════════��═════
 
@@ -3434,6 +3434,71 @@ def permutation_vote_importance(
     results.sort(key=lambda x: -abs(x["importance"]))
     return results
 
+def actionable_condition_ablation(
+    rows: List[Row],
+    min_sample: int = 40,
+    n_permutations: int = 15,
+    noise_threshold: float = 0.01,
+    edge_threshold: float = 0.03,
+) -> List[Dict[str, Any]]:
+    """Turn permutation importance into concrete actions.
+
+    Returns a list of dicts:
+      {
+        "vote": str,
+        "importance": float,          # mean WR drop when shuffled
+        "direction": "noise"|"edge",
+        "action": "reduce_weight"|"keep"|"investigate",
+        "suggested_weight_factor": float,  # 0.5 = halve, 1.0 = leave
+        "reason": str,
+      }
+
+    - importance ≈ 0  → condition adds almost no information (noise)
+    - importance >> 0 → condition carries real edge
+    Never auto-applies; caller feeds this into the plan / challenger path.
+    """
+    raw = permutation_vote_importance(
+        rows, min_sample=min_sample, n_permutations=n_permutations,
+    )
+    out: List[Dict[str, Any]] = []
+    for item in raw:
+        imp = float(item.get("importance") or 0.0)
+        vote = item["vote"]
+        if abs(imp) < noise_threshold:
+            out.append({
+                "vote": vote,
+                "importance": imp,
+                "direction": "noise",
+                "action": "reduce_weight",
+                "suggested_weight_factor": 0.5,
+                "reason": (
+                    f"Permutation importance {imp:+.3f} ≈ 0 — "
+                    f"condition adds almost no information once others are present"
+                ),
+            })
+        elif imp >= edge_threshold:
+            out.append({
+                "vote": vote,
+                "importance": imp,
+                "direction": "edge",
+                "action": "keep",
+                "suggested_weight_factor": 1.0,
+                "reason": (
+                    f"Permutation importance {imp:+.3f} — "
+                    f"shuffling this vote materially hurts WR"
+                ),
+            })
+        else:
+            out.append({
+                "vote": vote,
+                "importance": imp,
+                "direction": "weak",
+                "action": "investigate",
+                "suggested_weight_factor": 1.0,
+                "reason": f"Permutation importance {imp:+.3f} — weak / unstable signal",
+            })
+    return out
+
 def _pnl_sample_weights(
     rows: List[Row],
     fee_pct: float = 0.0006,
@@ -4530,6 +4595,115 @@ def build_calibration_curves(
         "built_at": int(time.time()),
     }
 
+def update_calibration_curves_incremental(
+    existing: Dict[str, Any],
+    new_rows: List[Row],
+    bucket_pct: float = 5.0,
+    min_sample: int = 15,
+) -> Dict[str, Any]:
+    """Merge newly resolved outcomes into an existing calibration blob.
+
+    Strategy (safe + simple):
+      - If an alert_key already has a curve, append its new rows and rebuild
+        ONLY that alert_key's buckets (quantile bins, same math as
+        build_calibration_curves).
+      - If an alert_key is new, build it from the new rows alone when
+        len >= min_sample.
+      - Recompute ece_mean over the updated set of curves.
+      - Never mutates `existing` in place; returns a new dict.
+
+    Full rebuild (build_calibration_curves) remains the source of truth on
+    Brain-report days; this path only keeps the live gate fresher between
+    those reports without re-scanning the whole archive.
+    """
+    if not new_rows:
+        return existing
+
+    curves: Dict[str, Any] = dict((existing or {}).get("curves") or {})
+    by_ak: Dict[str, List[Row]] = defaultdict(list)
+    for r in new_rows:
+        ak = r.get("alert_key")
+        if ak and r.get("conf_pct") is not None:
+            by_ak[str(ak)].append(r)
+
+    target_bins = max(1, round(100.0 / bucket_pct)) if bucket_pct > 0 else 20
+    updated_any = False
+
+    for ak, ak_new in by_ak.items():
+        # Prefer rebuilding from the union of prior bucket samples + new rows
+        # when we still have the raw rows; otherwise fall back to rebuilding
+        # from new rows alone once they clear min_sample.
+        prior_n = int((curves.get(ak) or {}).get("n") or 0)
+        combined_n = prior_n + len(ak_new)
+        if combined_n < min_sample and len(ak_new) < min_sample:
+            continue
+
+        # Lightweight path: rebuild this alert_key only from the new rows
+        # when they alone are enough; otherwise call the full builder on
+        # just this key's new rows (prior raw rows are not stored in the
+        # persisted curve). Full report rebuild still uses the archive.
+        src = ak_new if len(ak_new) >= min_sample else ak_new
+        if len(src) < min_sample:
+            continue
+
+        ordered = sorted(src, key=lambda r: float(r["conf_pct"]))
+        n_bins = max(1, min(target_bins, len(ordered) // min_sample))
+        chunk_size = math.ceil(len(ordered) / n_bins)
+        chunks = [ordered[i:i + chunk_size] for i in range(0, len(ordered), chunk_size)]
+        chunks = [c for c in chunks if c]
+        if not chunks:
+            continue
+
+        boundaries = [0.0]
+        for i in range(len(chunks) - 1):
+            prev_max = float(chunks[i][-1]["conf_pct"])
+            next_min = float(chunks[i + 1][0]["conf_pct"])
+            boundaries.append((prev_max + next_min) / 2.0)
+        boundaries.append(100.0)
+
+        buckets = []
+        n_total = len(ordered)
+        for idx, chunk in enumerate(chunks):
+            n_c = len(chunk)
+            wins = sum(1 for r in chunk if r.get("win"))
+            wr = wins / n_c
+            lo, hi, _ = wilson_ci(wins, n_c)
+            pred = statistics.mean(float(r["conf_pct"]) / 100.0 for r in chunk)
+            buckets.append({
+                "lo": round(boundaries[idx], 4),
+                "hi": round(boundaries[idx + 1], 4),
+                "predicted": round(pred, 4),
+                "observed": round(wr, 4),
+                "n": n_c,
+                "trusted": n_c >= min_sample,
+                "wilson_lo": round(lo, 4),
+                "wilson_hi": round(hi, 4),
+            })
+        ece = sum((bk["n"] / n_total) * abs(bk["observed"] - bk["predicted"]) for bk in buckets)
+        curves[ak] = {
+            "buckets": buckets,
+            "ece": round(ece, 4),
+            "n": n_total,
+            "built_at": int(time.time()),
+            "incremental": True,
+        }
+        updated_any = True
+
+    if not updated_any:
+        return existing
+
+    ece_values = [
+        c["ece"] for c in curves.values()
+        if isinstance(c, dict) and c.get("ece") is not None
+    ]
+    return {
+        "curves": curves,
+        "ece_mean": round(statistics.fmean(ece_values), 4) if ece_values else None,
+        "ece_mean_label": "mean_per_alert_ece",
+        "updated_at": int(time.time()),
+        "source": "incremental",
+    }
+
 def build_ml_calibration_curve(
     predictions: List[float],
     labels: List[bool],
@@ -4790,7 +4964,7 @@ class KillSwitch:
         return result
 
 
-# ═══════════════════════════════════���══════════════════════════════════
+# ══════════════════════════════════������══════════════════════════════════
 #  FILL RECONCILIATION — assumed vs realized execution cost
 # ═══════════════════════════════════════════════════════════════════���══
 

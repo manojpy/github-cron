@@ -78,7 +78,7 @@ _LADDER = ["⚪", "🟡", "🟠", "🔵", "🟢"]          # Observation → Val
 _LADDER_NAMES = ["Observation", "Early evidence", "Meaningful evidence",
                  "Strong evidence", "Validated evidence"]
 _MSG_LIMIT = 3800                                   # rendered chars per Telegram message
-_HUMAN_SECTIONS = 5                                 # sections 1-5 are packed on their own
+_HUMAN_SECTIONS = 6                                 # sections 1-5 are packed on their own
 
 _TOKEN_NAMES = {
     "choch": "CHoCH", "ppo": "PPO", "vwap": "VWAP", "rsi": "RSI", "tk": "TK",
@@ -927,7 +927,81 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     ))
     return out
 
+def _sec_reasoning_chain(F: Dict[str, Any], cfg) -> List[_Piece]:
+    """Roadmap #19 — explicit Brain decision narrative."""
+    out = [_hdr(0, '🧠 BRAIN DECISION — "WHY THIS VERDICT?"')]
+    n, wr, net_ev, days = F["n"], F["wr"], F["net_ev"], F["days"]
+    gate = F.get("gate") or {}
+    ai = F.get("ai") or {}
+
+    # Market / regime (best-effort from available facts)
+    regime_bits = []
+    if F.get("sessions"):
+        top_sess = F["sessions"][0] if F["sessions"] else None
+        if top_sess:
+            regime_bits.append(f"weakest session={top_sess.get('session', '?')}")
+    market_line = ", ".join(regime_bits) if regime_bits else "regime tags limited in this window"
+
+    # Historical
+    hist_line = (
+        f"n={n} trades over {_fmt_days(days)} | "
+        f"WR={wr:.0%} | Net EV/trade={net_ev:+.2f}%"
+    )
+
+    # Recent (from ai_metrics if present)
+    recent_wr = ai.get("recent_wr")
+    recent_n = ai.get("recent_n")
+    if recent_wr is not None and recent_n:
+        recent_line = f"Recent WR={recent_wr:.0%} (n={recent_n})"
+    else:
+        recent_line = "recent window not separately scored this report"
+
+    # Calibration
+    ece = ai.get("calibration_ece_mean")
+    calib_line = (
+        f"mean-per-alert ECE={ece:.3f}" if ece is not None else "no calibration curve yet"
+    )
+    if ece is not None:
+        calib_line += " — GOOD" if ece < 0.08 else " — WATCH" if ece < 0.15 else " — POOR"
+
+    # OOS / gate
+    oos_ok = bool(gate.get("oos_prediction"))
+    oos_line = "PASS" if oos_ok else "FAIL / unavailable"
+
+    # Drift
+    stability_ok = bool(gate.get("stability"))
+    drift_line = "NONE detected" if stability_ok else "CUSUM drift active"
+
+    # Final decision language
+    if F["gate_ok"] and net_ev > 0 and F["conf"] in ("MODERATE", "HIGH"):
+        decision = "APPROVED — evidence supports limited parameter change (still via shadow/plan)"
+    elif F["gate_ok"]:
+        decision = "MONITOR — gate open but edge not strong enough to change live rules"
+    elif n < getattr(cfg, "ACTION_GATE_MIN_ROWS", 100):
+        decision = "BLOCKED — insufficient sample for any live change"
+    elif not stability_ok:
+        decision = "BLOCKED — drift detected; freeze parameter changes"
+    else:
+        decision = "BLOCKED — action gate not satisfied (see § ACTION GATE)"
+
+    lines = [
+        f"Market:     {market_line}",
+        f"Historical: {hist_line}",
+        f"Recent:     {recent_line}",
+        f"Calibration:{calib_line}",
+        f"OOS:        {oos_line}",
+        f"Drift:      {drift_line}",
+        f"Decision:   {decision}",
+    ]
+    out.append(_c("\n".join(lines)))
+    out.append(_p(
+        "Hard signal rules are unchanged. This block only states the Brain's "
+        "quality assessment and whether any plan is allowed to proceed."
+    ))
+    return out
+
 _REPORT_SECTIONS = (
+    ("BRAIN DECISION", _sec_reasoning_chain),   # roadmap #19 — first human section
     ("EXECUTIVE SUMMARY", _sec_summary),
     ("WHAT TO DO NOW", _sec_do_now),
     ("PROFITABILITY", _sec_profit),
@@ -2147,6 +2221,49 @@ class BrainEngineV2(BaseBrainEngine):
                     _rec["n_permutations"] = _perm_n
                 recommendations.append(_rec)
 
+            # ── Actionable ablation loop (roadmap #10) ─────────────────
+            try:
+                ablation = engine.actionable_condition_ablation(
+                    real_rows,
+                    min_sample=min_sample,
+                    n_permutations=_perm_n,
+                    noise_threshold=getattr(cfg, "ABLATION_NOISE_THRESHOLD", 0.01),
+                    edge_threshold=getattr(cfg, "ABLATION_EDGE_THRESHOLD", 0.03),
+                )
+                noise_votes = [a for a in ablation if a["action"] == "reduce_weight"]
+                if noise_votes:
+                    parts = [
+                        f"{a['vote']}(imp={a['importance']:+.3f}→×{a['suggested_weight_factor']})"
+                        for a in noise_votes[:5]
+                    ]
+                    recommendations.append({
+                        "type": "condition_ablation",
+                        "severity": "medium",
+                        "message": (
+                            "Conditions adding little information (candidate weight cuts): "
+                            + ", ".join(parts)
+                        ),
+                        "ablation": noise_votes[:5],
+                    })
+                    # Convert noise votes into plan weight_adjustments
+                    # (same shape root-cause already uses)
+                    weight_adjustments = recs.setdefault("weight_adjustments", [])
+                    for a in noise_votes[:5]:
+                        vote = a["vote"]
+                        current_w = CONFLUENCE_WEIGHTS.get(vote)
+                        if current_w is None or current_w <= 0:
+                            continue
+                        weight_adjustments.append({
+                            "vote": vote,
+                            "current": current_w,
+                            "suggested": round(current_w * a["suggested_weight_factor"], 2),
+                            "category": "condition_ablation",
+                            "reason": a["reason"],
+                        })
+            except Exception as e:
+                logging.getLogger("macd_bot").debug(
+                    f"Actionable ablation failed (non-fatal): {e}"
+                )
         _phase_mark("permutation_importance")
 
 # ── Benjamini-Hochberg FDR correction ────────────────────────
@@ -2214,7 +2331,7 @@ class BrainEngineV2(BaseBrainEngine):
         await self._remember_config_version(ai_metrics["config_version"])
         logger.info(f"⏱️   └ hash_and_remember: {time.time() - _hash_t0:.2f}s")
 
-        # ── Bonus-aware metrics ───────────────────────────────�����──────────
+        # ── Bonus-aware metrics ──���────────────────────────────�����──────────
         if real_rows:
             bonus_count = sum(1 for r in real_rows if r.get("bonus_win"))
             total_wins = sum(1 for r in real_rows if r["win"])

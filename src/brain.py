@@ -279,15 +279,12 @@ class BrainEngine:
             return False
 
     async def maybe_refresh_calibration(self, logger_run: logging.Logger) -> None:
-        """Lightweight calibration rebuild, independent of the full Brain report.
+        """Lightweight calibration refresh, independent of the full Brain report.
 
-        Runs on every bot cycle when curves are missing or older than
-        CALIBRATION_REFRESH_MAX_AGE_HOURS. Uses Redis outcome streams only
-        (base _get_rows), so it works on shallow-archive / alert-only runs
-        and does not require the 185-day checkout.
-
-        Full Brain reports still rebuild curves as before; this path only
-        keeps the live gate fresh between those reports.
+        1. If a curve blob already exists and we have only a small number of
+           newly resolved rows, update buckets incrementally.
+        2. Otherwise fall back to a full rebuild from Redis outcome streams
+           (same as before). Full Brain reports still rebuild from the archive.
         """
         if not getattr(cfg, "ENABLE_CALIBRATION_GATE", False):
             return
@@ -299,52 +296,51 @@ class BrainEngine:
             logger_run.debug("Calibration refresh skipped: Redis unavailable or degraded")
             return
 
-        max_age_hr = float(getattr(cfg, "CALIBRATION_REFRESH_MAX_AGE_HOURS", 2.0))
-
-        # ── Age check: skip if still fresh ──
         try:
-            raw = await self.sdb._safe_redis_op(
+            real_rows, shadow_rows = await self._get_rows(
+                sample_size=getattr(cfg, "CALIBRATION_REFRESH_SAMPLE", 500),
+            )
+            n_real = len(real_rows)
+            n_shadow = len(shadow_rows)
+            if n_real == 0 and n_shadow == 0:
+                logger_run.debug("Calibration refresh: no new rows")
+                return
+
+            # Try incremental path first
+            existing_raw = await self.sdb._safe_redis_op(
                 lambda: _rc(self.sdb._redis).get(CALIBRATION_CURVES_KEY),
-                2.0,
-                "calibration_age_check",
+                2.0, "calibration_load_for_incremental",
             )
-            if raw:
-                payload = json_loads(raw)
-                built_at = payload.get("built_at")
-                if built_at is not None:
-                    age_hr = (time.time() - float(built_at)) / 3600.0
-                    if age_hr < max_age_hr:
-                        logger_run.debug(
-                            f"Calibration curves fresh "
-                            f"({age_hr:.1f}h < {max_age_hr}h) — skip refresh"
-                        )
-                        return
-        except Exception as e:
-            logger_run.warning(
-                f"Calibration age check failed (will attempt rebuild): {e}"
+            existing: Dict[str, Any] = {}
+            if existing_raw:
+                try:
+                    existing = json_loads(existing_raw)
+                except Exception:
+                    existing = {}
+
+            use_incremental = (
+                bool(existing.get("curves"))
+                and n_real <= getattr(cfg, "CALIBRATION_INCREMENTAL_MAX_ROWS", 80)
             )
 
-        # ── Rebuild from best available source ──
-        try:
-            logger_run.info(
-                f"🎯 Calibration refresh: curves missing or older than "
-                f"{max_age_hr}h — rebuilding..."
-            )
-            real_rows, shadow_rows = await self._get_rows()
-            n_real, n_shadow = len(real_rows), len(shadow_rows)
-            logger_run.info(
-                f"🎯 Calibration refresh input: {n_real} real, "
-                f"{n_shadow} shadow rows"
-            )
+            if use_incremental:
+                calib = engine.update_calibration_curves_incremental(
+                    existing,
+                    real_rows,
+                    bucket_pct=getattr(cfg, "CALIBRATION_BUCKET_PCT", 5.0),
+                    min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
+                )
+                source = "incremental"
+            else:
+                calib = engine.build_calibration_curves(
+                    real_rows,
+                    bucket_pct=getattr(cfg, "CALIBRATION_BUCKET_PCT", 5.0),
+                    min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
+                    shadow_rows=shadow_rows,
+                )
+                source = "full"
 
-            calib = engine.build_calibration_curves(
-                real_rows,
-                bucket_pct=getattr(cfg, "CALIBRATION_BUCKET_PCT", 5.0),
-                min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
-                shadow_rows=shadow_rows,
-            )
             if not calib.get("curves"):
-                # Diagnose why: often min_sample not met per alert_key
                 from collections import Counter
                 ak_counts = Counter(r.get("alert_key") for r in real_rows)
                 top = ak_counts.most_common(5)
@@ -352,12 +348,29 @@ class BrainEngine:
                 logger_run.warning(
                     f"Calibration refresh: no curves built "
                     f"(need ≥{min_s} samples/alert_key). "
-                    f"real={n_real} shadow={n_shadow} | "
-                    f"top alert_keys: {top}"
+                    f"real={n_real} shadow={n_shadow} | top alert_keys: {top}"
                 )
                 return
 
             ok = await self._persist_calibration_curves(calib)
+            n_keys = len(calib["curves"])
+            ece = calib.get("ece_mean")
+            if ok:
+                logger_run.info(
+                    f"✅ Calibration curves refreshed ({source}) & persisted "
+                    f"({n_keys} alert_key(s), mean-per-alert ECE={ece})"
+                )
+            else:
+                logger_run.error(
+                    f"❌ Calibration curves built but NOT persisted "
+                    f"({n_keys} alert_key(s), ECE={ece}) — "
+                    f"previous curve (if any) remains live"
+                )
+        except Exception as e:
+            logger_run.warning(
+                f"Calibration refresh failed "
+                f"(gate continues on previous curve if present): {e}"
+            )
             n_keys = len(calib["curves"])
             ece = calib.get("ece_mean")
             if ok:

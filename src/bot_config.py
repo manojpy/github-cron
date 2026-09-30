@@ -498,6 +498,7 @@ class BotConfig(BaseModel):
     ENABLE_CALIBRATION_GATE: bool = Field(default=False) 
     CALIBRATION_BUCKET_PCT: float = Field(default=5.0, ge=1.0, le=20.0)
     CALIBRATION_MIN_SAMPLE: int = Field(default=15, ge=5, le=200)
+    CALIBRATION_INCREMENTAL_MAX_ROWS: int = Field(default=80, ge=10, le=500)     
     CALIBRATION_SLACK: float = Field(default=0.05, ge=0.0, le=0.20) 
     CALIBRATION_REFRESH_MAX_AGE_HOURS: float = Field(default=2.0, ge=0.5, le=48.0) 
     ENABLE_PORTFOLIO_HEAT_GATE: bool = Field(default=False) 
@@ -556,6 +557,8 @@ class BotConfig(BaseModel):
     ENABLE_QUALITY_HARD_BLOCK: bool = Field(default=False, description="HARD gate: when trade-quality verdict is BLOCKED, suppress Telegram dispatch and record a counterfactual instead of only annotating the message. Keep False until quality labels have been observed in shadow for a full analysis window.")
     CHALLENGER_MIN_CONSECUTIVE_PASSES: int = Field(default=3, ge=1, le=20, description="Consecutive, separately-spaced Brain evaluations the SAME challenger must pass before auto-promotion. A failed evaluation or a new challenger resets the streak.")
     CHALLENGER_STREAK_MIN_GAP_SEC: int = Field(default=3600, ge=60, le=86400, description="Minimum seconds between two evaluations that count toward the streak (maybe_promote_challenger runs more than once per Brain run).")
+    ABLATION_NOISE_THRESHOLD: float = Field(default=0.01, ge=0.0, le=0.20, description="Permutation importance |imp| below this → condition treated as noise " "(candidate for weight reduction). Advisory until plan gate passes.") 
+    ABLATION_EDGE_THRESHOLD: float = Field(default=0.03, ge=0.0, le=0.50, description="Permutation importance above this → condition treated as carrying real edge.") 
 
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
