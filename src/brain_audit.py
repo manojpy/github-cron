@@ -108,25 +108,6 @@ class RecommendationTier(int, Enum):
         }[self]
 
 
-class LifecycleState(str, Enum):
-    """#18 — Full lifecycle states for Brain plans and repairs."""
-    MONITOR = "MONITOR"
-    SHADOW = "SHADOW"
-    APPROVED = "APPROVED"
-    APPLIED = "APPLIED"
-    ROLLBACK = "ROLLBACK"
-
-    @property
-    def icon(self) -> str:
-        return {
-            LifecycleState.MONITOR: "⚪",
-            LifecycleState.SHADOW: "🟡",
-            LifecycleState.APPROVED: "🔵",
-            LifecycleState.APPLIED: "🟢",
-            LifecycleState.ROLLBACK: "↩️",
-        }[self]
-
-
 # Minimum sample requirements per analysis class
 _ANALYSIS_MIN_SAMPLES: Dict[str, int] = {
     "walk_forward": 60,
@@ -289,6 +270,7 @@ class BrainAuditLayer:
         # At report time:
         header = audit.build_data_quality_header()
     """
+
     def __init__(self) -> None:
         self._cycle_start: float = 0.0
         self._history: Optional[HistoryCoverage] = None
@@ -299,11 +281,6 @@ class BrainAuditLayer:
         self._n_shadow_rows: int = 0
         self._schema_version: Optional[int] = None
         self._archive_stats: Optional[Dict[str, int]] = None
-        # ── #18: Lifecycle tracking ──
-        self._lifecycle_state: LifecycleState = LifecycleState.MONITOR
-        self._lifecycle_transitions: List[Dict[str, Any]] = []
-        # ── #6: Auto-rollback events ──
-        self._rollback_events: List[Dict[str, Any]] = []
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -317,9 +294,6 @@ class BrainAuditLayer:
         self._n_rows = 0
         self._n_shadow_rows = 0
         self._archive_stats = None
-        self._lifecycle_state = LifecycleState.MONITOR
-        self._lifecycle_transitions = []
-        self._rollback_events = []
         # Drop the per-cycle EV bootstrap cache — see threshold_engine.
         # _EV_FIRST_CACHE. Stale entries from the previous report would
         # otherwise be keyed by a recycled id() and return the wrong result.
@@ -497,44 +471,6 @@ class BrainAuditLayer:
 
     def set_shadow_count(self, n_shadow: int) -> None:
         self._n_shadow_rows = n_shadow
-
-    # ── #18: Lifecycle state management ──────────────────────────────
-    def set_lifecycle_state(self, state: LifecycleState, note: str = "") -> None:
-        prev = self._lifecycle_state
-        self._lifecycle_state = state
-        self._lifecycle_transitions.append({
-            "from": prev.value,
-            "to": state.value,
-            "ts": int(time.time()),
-            "note": note,
-        })
-        _log.info(f"Brain lifecycle: {prev.icon} {prev.value} → {state.icon} {state.value} | {note}")
-
-    @property
-    def lifecycle_state(self) -> LifecycleState:
-        return self._lifecycle_state
-
-    # ── #6: Auto-rollback event recording ────────────────────────────
-    def record_rollback_event(
-        self,
-        plan_id: str,
-        reason: str,
-        pre_metrics: Dict[str, Any],
-        post_metrics: Dict[str, Any],
-    ) -> None:
-        self._rollback_events.append({
-            "plan_id": plan_id,
-            "reason": reason,
-            "pre": pre_metrics,
-            "post": post_metrics,
-            "ts": int(time.time()),
-        })
-        self.set_lifecycle_state(LifecycleState.ROLLBACK, reason)
-        _log.warning(f"↩️ ROLLBACK recorded for {plan_id}: {reason}")
-
-    @property
-    def rollback_events(self) -> List[Dict[str, Any]]:
-        return list(self._rollback_events)
 
     # ── Analysis Gating ───────────────────────────────────────────────
 
@@ -720,26 +656,6 @@ class BrainAuditLayer:
                 f"suppressed due to insufficient data: "
                 f"{', '.join(self._suppressed_analyses[:6])}"
             )
-
-        # ── #18: Lifecycle state ──
-        lines.append("")
-        lines.append(
-            f"   {self._lifecycle_state.icon} Lifecycle: "
-            f"{self._lifecycle_state.value}"
-        )
-        if self._lifecycle_transitions:
-            last_t = self._lifecycle_transitions[-1]
-            lines.append(
-                f"   Last transition: {last_t['from']} → {last_t['to']} "
-                f"({format_ist_time(last_t['ts'])})"
-            )
-
-        # ── #6: Rollback events ──
-        if self._rollback_events:
-            lines.append("")
-            lines.append(f"   ↩️ Auto-rollbacks this cycle: {len(self._rollback_events)}")
-            for rb in self._rollback_events[:3]:
-                lines.append(f"      {rb['plan_id']}: {rb['reason'][:80]}")
 
         lines.append("")
         return lines
@@ -983,11 +899,8 @@ class BrainAuditLayer:
             },
             "suppressed_analyses": self._suppressed_analyses,
             "statistical_confidence": self.statistical_confidence_label(),
-            # ── #18 + #6 ──
-            "lifecycle_state": self._lifecycle_state.value,
-            "lifecycle_transitions": self._lifecycle_transitions[-5:],
-            "rollback_events": self._rollback_events[-5:],
         }
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  MODULE-LEVEL SINGLETON (one per Brain cycle)

@@ -10,27 +10,9 @@ from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 
 from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError, CONFIG_OVERRIDE_ALLOWED_FIELDS, CONFIG_OVERRIDE_METADATA_KEY, BRAIN_DISABLED_KEYS_METADATA_KEY, PAIR_THRESHOLDS_METADATA_KEY, _get_session_from_ts
 from fetcher import compute_backoff
+
 StreamField = Union[bytes, memoryview, str, int, float]
 BRAIN_KEY_HISTORY_METADATA_KEY = "brain_alert_key_history"
-
-# ── Dead-letter + dedup-claim visibility ──────────────────────────────
-DEAD_LETTER_MAX = 200
-
-DEDUP_CLAIM_STATS: Dict[str, int] = {
-    "claimed": 0,
-    "released_send_fail": 0,
-    "released_reconfirm": 0,
-    "kept_repaint": 0,
-    "kept_mark_disagree": 0,
-    "expired_natural": 0,
-}
-
-def reset_dedup_claim_stats() -> None:
-    for k in DEDUP_CLAIM_STATS:
-        DEDUP_CLAIM_STATS[k] = 0
-
-def snapshot_dedup_claim_stats() -> Dict[str, int]:
-    return dict(DEDUP_CLAIM_STATS)
 
 if TYPE_CHECKING:
     from fetcher import PriceData
@@ -93,10 +75,12 @@ async def _blanket_reset_pair(sdb: RedisStateStore, pair_name: str, logger_pair:
 async def _redis_key_inventory(
     sdb: "RedisStateStore", max_keys: int = 20000,
 ) -> Dict[str, Dict[str, int]]:
+    """Read-only Redis audit: key count and no-TTL key count per prefix
+    (the text before the first ':'). Bounded by max_keys so it cannot
+    run away on a large keyspace."""
     client = sdb._redis
     if client is None:
         return {}
-
     inventory: Dict[str, Dict[str, int]] = {}
     batch: List[str] = []
 
@@ -108,20 +92,11 @@ async def _redis_key_inventory(
             pipe.ttl(key)
         ttls = await pipe.execute()
         for key, ttl in zip(batch, ttls):
-            prefix = str(key).split(":", 1)[0]
-            entry = inventory.setdefault(prefix, {
-                "keys": 0,
-                "no_ttl": 0,
-                "oldest_ttl_sec": -1,
-            })
+            entry = inventory.setdefault(str(key).split(":", 1)[0], {"keys": 0, "no_ttl": 0})
             entry["keys"] += 1
             if ttl == -1:
                 entry["no_ttl"] += 1
-            elif ttl > 0:
-                if entry["oldest_ttl_sec"] == -1 or ttl < entry["oldest_ttl_sec"]:
-                    entry["oldest_ttl_sec"] = ttl
         batch.clear()
-
     scanned = 0
     async for key in client.scan_iter(match="*", count=500):
         batch.append(key)
@@ -131,24 +106,6 @@ async def _redis_key_inventory(
         if scanned >= max_keys:
             break
     await _flush()
-
-    # Log a summary so it appears in workflow logs without extra plumbing
-    total_keys = sum(v["keys"] for v in inventory.values())
-    total_no_ttl = sum(v["no_ttl"] for v in inventory.values())
-    logger.info(
-        f"🔍 Redis key audit | total={total_keys} | "
-        f"no_ttl={total_no_ttl} | prefixes={len(inventory)}"
-    )
-    for prefix, info in sorted(inventory.items(), key=lambda x: -x[1]["keys"]):
-        ttl_note = (
-            f"oldest_ttl={info['oldest_ttl_sec']}s"
-            if info["oldest_ttl_sec"] > 0 else "no-ttl-keys"
-        )
-        logger.info(
-            f"   {prefix}: {info['keys']} keys | "
-            f"{info['no_ttl']} without TTL | {ttl_note}"
-        )
-
     return inventory
 
 async def _clear_all_redis_states(
@@ -320,55 +277,6 @@ class RedisKeyPrefix:
     VOTE_COUNT_HISTORY = "brain_vote_counts:"
     LAST_PROCESSED_CANDLE = "last_processed_candle:"  # NEW
 
-class DeadLetterQueue:
-    """Bounded in-memory + optional Redis list of Telegram sends that
-    failed after all retries. Gives operators a queryable surface
-    instead of silent loss."""
-
-    def __init__(self, maxlen: int = DEAD_LETTER_MAX):
-        self._items: List[Dict[str, Any]] = []
-        self._maxlen = maxlen
-
-    def push(self, pair: str, alert_keys: List[str], ts: int,
-             reason: str, msg_snippet: str = "") -> None:
-        entry = {
-            "pair": pair,
-            "alert_keys": alert_keys,
-            "ts": ts,
-            "reason": reason,
-            "snippet": msg_snippet[:200],
-            "recorded_at": int(time.time()),
-        }
-        self._items.append(entry)
-        if len(self._items) > self._maxlen:
-            self._items = self._items[-self._maxlen:]
-        logger.warning(
-            f"💀 DEAD LETTER | {pair} | {alert_keys} | {reason}"
-        )
-
-    def recent(self, n: int = 20) -> List[Dict[str, Any]]:
-        return list(self._items[-n:])
-
-    def count(self) -> int:
-        return len(self._items)
-
-    async def persist(self, sdb: "RedisStateStore") -> None:
-        """Best-effort flush to Redis so dead letters survive restarts."""
-        if sdb.degraded or not sdb._redis:
-            return
-        try:
-            await sdb.set_metadata(
-                "dead_letter_queue",
-                json_dumps(self._items[-50:]),
-                ttl=7 * 86400,
-            )
-        except Exception as e:
-            logger.debug(f"Dead-letter persist failed (non-fatal): {e}")
-
-
-# Module-level singleton
-dead_letter_queue = DeadLetterQueue()
-
 class RedisStateStore:
     POOL_MAX_AGE_SECONDS = 3600
     SCRIPT_RELOAD_LOCK_TIMEOUT = 2.0
@@ -416,7 +324,6 @@ class RedisStateStore:
         self._recovery_lock = asyncio.Lock()
         self.recovery_attempts: int = 0
         self.recovery_successes: int = 0
-        self._consecutive_recovery_ok: int = 0
 
         if cfg.DEBUG_MODE and logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -459,31 +366,23 @@ class RedisStateStore:
         except Exception as reconnect_exc:
             logger.critical(f"Redis reconnect attempt itself failed: {reconnect_exc} — staying degraded")
 
-    # Progressive re-enable: require N consecutive successful probes
-    # before clearing degraded mode, so a flapping connection doesn't
-    # toggle the store on/off every other pair.
-    RECOVERY_CONSECUTIVE_SUCCESSES_NEEDED = 2
-
     async def maybe_recover_from_degraded(self, cooldown_sec: Optional[float] = None) -> bool:
-        """Mid-run health probe with progressive re-enable (#1.4).
-
-        Instead of a single one-shot reconnect, the store now requires
-        ``RECOVERY_CONSECUTIVE_SUCCESSES_NEEDED`` consecutive successful
-        PING+write probes before clearing degraded mode.  This prevents
-        a flapping Redis from toggling dedup / state persistence on and
-        off every other pair.
-
-        Call this once per pair from the run loop; it no-ops instantly
-        unless currently degraded, and retries at most once every
-        ``cooldown_sec`` even under concurrent callers.
+        """Mid-run health probe. _record_redis_failure only reconnects once,
+        at the moment of the failure — if that single attempt doesn't land,
+        the store stays degraded (dedup, state persistence, dynamic
+        weights, etc. all soft-fail or fail-open/closed) for the rest of an
+        8-minute run even if Redis recovers seconds later. Call this
+        periodically (e.g. once per pair) from the run loop; it no-ops
+        instantly unless currently degraded, and retries at most once every
+        `cooldown_sec` even under concurrent callers. Returns True if the
+        store is healthy (already, or as of this call).
         """
         if not self.degraded:
             return True
         if self._quota_exhausted:
-            return False
+            return False  # reconnecting can't fix a quota/OOM condition
         if cooldown_sec is None:
             cooldown_sec = float(cfg.REDIS_RECOVERY_COOLDOWN_SEC)
-
         async with self._recovery_lock:
             if not self.degraded:
                 return True
@@ -492,68 +391,15 @@ class RedisStateStore:
                 return False
             self._last_recovery_attempt_ts = now
             self.recovery_attempts += 1
-
             try:
                 reconnected = await self._attempt_connect(timeout=3.0)
             except Exception as exc:
                 logger.debug(f"Mid-run Redis recovery probe failed: {exc}")
-                self._consecutive_recovery_ok = 0
                 return False
-
             if reconnected:
-                # ── Probe: a real write+read round-trip, not just PING ──
-                probe_ok = await self._recovery_write_probe()
-                if probe_ok:
-                    self._consecutive_recovery_ok = (
-                        getattr(self, "_consecutive_recovery_ok", 0) + 1
-                    )
-                else:
-                    self._consecutive_recovery_ok = 0
-
-                if self._consecutive_recovery_ok >= self.RECOVERY_CONSECUTIVE_SUCCESSES_NEEDED:
-                    self.recovery_successes += 1
-                    self.degraded = False
-                    self._consecutive_recovery_ok = 0
-                    logger.info(
-                        f"♻️ Redis recovered mid-run after "
-                        f"{self.RECOVERY_CONSECUTIVE_SUCCESSES_NEEDED}"
-                        f"consecutive probes — degraded mode cleared"
-                    )
-                    return True
-                else:
-                    logger.info(
-                        f"♻️ Redis probe OK "
-                        f"({self._consecutive_recovery_ok}/"
-                        f"{self.RECOVERY_CONSECUTIVE_SUCCESSES_NEEDED})"
-                        f"— still degraded until confirmed"
-                    )
-                    return False
-            else:
-                self._consecutive_recovery_ok = 0
-                return False
-
-    async def _recovery_write_probe(self) -> bool:
-        """Tiny SET+GET+DEL round-trip to confirm the connection is
-        actually usable, not just alive."""
-        if not self._redis:
-            return False
-        probe_key = f"{self.meta_prefix}recovery_probe"
-        try:
-            await asyncio.wait_for(
-                self._redis.set(probe_key, "1", ex=10),
-                timeout=2.0,
-            )
-            val = await asyncio.wait_for(
-                self._redis.get(probe_key),
-                timeout=2.0,
-            )
-            await asyncio.wait_for(
-                self._redis.delete(probe_key),
-                timeout=2.0,
-            )
-            return val == "1"
-        except Exception:
-            return False
+                self.recovery_successes += 1
+                logger.info("♻️ Redis recovered mid-run — degraded mode cleared")
+            return reconnected
 
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
         try:
@@ -1234,30 +1080,8 @@ class RedisStateStore:
         recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
         try:
             await asyncio.wait_for(_rc(self._redis).delete(recent_key), timeout=1.0)
-            DEDUP_CLAIM_STATS["released_send_fail"] += 1
         except Exception as e:
             logger.warning(f"Failed to release dedup claim for {pair}:{alert_key}: {e}")
-
-    async def get_recent_alert_count(self, pair: str, hours: int = 1) -> int:
-        """Count how many dedup keys exist for this pair (approximates
-        recent alert frequency). Used by the adaptive coalesce window."""
-        if self.degraded or not self._redis:
-            return 0
-        try:
-            pattern = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:*"
-            keys = []
-            async for k in _rc(self._redis).scan_iter(match=pattern, count=100):
-                keys.append(k)
-                if len(keys) > 50:
-                    break
-            return len(keys)
-        except Exception:
-            return 0
-
-
-
-
-
 
     VOTE_COUNT_HISTORY_MAX = 500
 
@@ -1888,28 +1712,18 @@ class RedisStateStore:
                         
                         continue
 
-                if pending_writes:  
-
+                if pending_writes:
+                    # Archive FIRST, then delete pending + update stats. If the file
+                    # write fails we bail out before the Redis pipeline executes, so
+                    # the pending outcomes stay in Redis and are retried next run
+                    # instead of being lost from the Brain archive.
                     if resolved_for_file and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
-                        try:
+                        try:                    
                             from outcome_storage import append_outcome_batch
-                            # ── Offload JSONL serialisation + fsync to a thread
-                            # so the event loop is never blocked by disk I/O
-                            # under load (#1.3 / performance).
-                            await asyncio.wait_for(
-                                asyncio.to_thread(
-                                    append_outcome_batch, resolved_for_file, False
-                                ),
-                                timeout=10.0,
+                            await asyncio.to_thread(
+                                append_outcome_batch, resolved_for_file, False
                             )
                             self._run_archived_total += len(resolved_for_file)
-                        except asyncio.TimeoutError:
-                            logger_pair.error(
-                                f"[{pair}] File archive write TIMED OUT — "
-                                f"{len(resolved_for_file)} outcome(s) left "
-                                f"PENDING for retry"
-                            )
-                            return
                         except Exception as e:
                             logger_pair.error(
                                 f"[{pair}] File archive write failed — {resolved_count} "
@@ -2130,22 +1944,17 @@ class RedisStateStore:
                         continue
 
                 if pending_writes:
+                    # Archive FIRST, then delete pending + update stats — same
+                    # safety ordering as the real-outcome path. If the file
+                    # write fails we bail out before the Redis pipeline runs,
+                    # so the shadow pending outcomes stay in Redis and are
+                    # retried next run instead of being lost from the archive.
                     if resolved_for_file and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                         try:
                             from outcome_storage import append_outcome_batch
-                            await asyncio.wait_for(
-                                asyncio.to_thread(
-                                    append_outcome_batch, resolved_for_file, True
-                                ),
-                                timeout=10.0,
+                            await asyncio.to_thread(
+                                append_outcome_batch, resolved_for_file, True
                             )
-                        except asyncio.TimeoutError:
-                            logger_pair.error(
-                                f"[{pair}] Shadow file archive write TIMED OUT — "
-                                f"{len(resolved_for_file)} shadow outcome(s) left "
-                                f"PENDING for retry"
-                            )
-                            return
                         except Exception as e:
                             logger_pair.error(
                                 f"[{pair}] Shadow file archive write failed — {resolved_count} "

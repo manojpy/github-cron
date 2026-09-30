@@ -21,7 +21,7 @@ from brain_audit import (
 from archive_reader import load_archived_outcomes
 from bot_config import cfg, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS, json_dumps, json_loads
 
-from state import RedisKeyPrefix, RedisStateStore, dead_letter_queue, snapshot_dedup_claim_stats
+from state import RedisKeyPrefix, RedisStateStore
 from brain import BrainEngine as BaseBrainEngine, _extract_p_value_for_fdr
 import threshold_engine as engine
 
@@ -1523,83 +1523,7 @@ class BrainEngineV2(BaseBrainEngine):
             audit.record_analysis_exception("repair_ledger", e)
             self._repair_success_rates = {}
             self._ledger_stats = {}
-
         _phase_mark("repair_ledger")
-
-        # ── #6: True auto-rollback loop ─────────────────────────────────
-        # After any applied plan, check whether the post-apply window
-        # shows objective deterioration (WR drop > threshold, EV flip
-        # negative, or CUSUM alarm).  If so, auto-revert the applied
-        # config overrides / dynamic weights.
-        try:
-            if getattr(cfg, "BRAIN_AUTO_ROLLBACK_HURT", True):
-                applied_plan_raw = await self.sdb.get_metadata("brain_last_applied_plan")
-                if applied_plan_raw:
-                    applied_plan = json_loads(applied_plan_raw)
-                    applied_ts = applied_plan.get("applied_at", 0)
-                    # Only check if the plan was applied > 2 hours ago
-                    if applied_ts and (time.time() - applied_ts) > 7200:
-                        # Compare pre-apply vs post-apply WR
-                        pre_rows = [
-                            r for r in real_rows
-                            if r.get("entry_ts", 0) < applied_ts
-                        ]
-                        post_rows = [
-                            r for r in real_rows
-                            if r.get("entry_ts", 0) >= applied_ts
-                        ]
-                        if len(pre_rows) >= 15 and len(post_rows) >= 10:
-                            pre_wr = sum(r["win"] for r in pre_rows) / len(pre_rows)
-                            post_wr = sum(r["win"] for r in post_rows) / len(post_rows)
-                            pre_ev, _, _ = engine.ev_and_kelly_for(pre_rows)
-                            post_ev, _, _ = engine.ev_and_kelly_for(post_rows)
-
-                            deterioration = (
-                                (pre_wr - post_wr) > 0.10
-                                or (pre_ev > 0 and post_ev < -0.05)
-                            )
-                            if deterioration:
-                                logger.warning(
-                                    f"↩️ AUTO-ROLLBACK TRIGGERED | "
-                                    f"pre WR={pre_wr:.0%} EV={pre_ev:+.2f}% → "
-                                    f"post WR={post_wr:.0%} EV={post_ev:+.2f}%"
-                                )
-                                # Revert dynamic weights
-                                await self.sdb.clear_dynamic_weights()
-                                # Revert config overrides
-                                for field in CONFIG_OVERRIDE_ALLOWED_FIELDS:
-                                    # Restore the pre-apply value if stored
-                                    pre_val = applied_plan.get("pre_apply", {}).get(field)
-                                    if pre_val is not None:
-                                        await self.sdb.write_config_override(field, pre_val)
-                                # Record the rollback event
-                                plan_id = applied_plan.get("plan_id", "unknown")
-                                await self._record_plan_event(
-                                    plan_id, "rolled_back",
-                                    f"Auto-rollback: WR {pre_wr:.0%}→{post_wr:.0%}, "
-                                    f"EV {pre_ev:+.2f}%→{post_ev:+.2f}%",
-                                )
-                                recommendations.append({
-                                    "type": "auto_rollback",
-                                    "severity": "critical",
-                                    "message": (
-                                        f"↩️ AUTO-ROLLBACK applied for {plan_id}: "
-                                        f"post-apply WR dropped to {post_wr:.0%} "
-                                        f"(was {pre_wr:.0%}), "
-                                        f"EV {post_ev:+.2f}% (was {pre_ev:+.2f}%). "
-                                        f"Dynamic weights cleared, config overrides reverted."
-                                    ),
-                                })
-                            else:
-                                logger.info(
-                                    f"✅ Post-apply check OK | "
-                                    f"pre WR={pre_wr:.0%} → post WR={post_wr:.0%}"
-                                )
-        except Exception as e:
-            audit.record_analysis_exception("auto_rollback_check", e)
-            logger.warning(f"Auto-rollback check failed (non-fatal): {e}")
-
-        _phase_mark("auto_rollback_check")
 
         # ── ML: contextual repair-effectiveness model ───────────────────
         # Learns P(repair helps | system state) from resolved ledger entries,
@@ -2788,23 +2712,15 @@ class BrainEngineV2(BaseBrainEngine):
                     disable_alerts = [item for _, k, item in keep if k == "disable"]
                     reinstate_alerts = [item for _, k, item in keep if k == "reinstate"]
             
-            # ── #18: Explicit lifecycle state ──────────────────────────────
-            _plan_real_rows = recs.get("_real_rows", []) or []
-            if action_gate_passed:
-                lifecycle_state = "APPROVED"
-            elif len(_plan_real_rows) >= ACTION_GATE_MIN_ROWS:
-                lifecycle_state = "SHADOW"
-            else:
-                lifecycle_state = "MONITOR"
             plan_data = {
                 "generated_at": int(time.time()),
                 "_action_gate_passed": action_gate_passed,
-                "_lifecycle_state": lifecycle_state,
                 "config_patch": config_patches,
                 "disable_alerts": disable_alerts,
                 "reinstate_alerts": reinstate_alerts,
                 "weight_adjustments": weight_adjustments,
             }
+
             if getattr(cfg, "ENABLE_BRAIN_PLAN_IDS", True):
                 try:
                     counter_raw = await self.sdb.get_metadata("brain_plan_counter")
@@ -3103,11 +3019,6 @@ class BrainEngineV2(BaseBrainEngine):
 
             plan_gate_passed = bool(plan.get("_action_gate_passed", False))
 
-            # ── #6: Store pre-apply snapshot for auto-rollback ──
-            pre_apply_snapshot: Dict[str, Any] = {}
-            for field in CONFIG_OVERRIDE_ALLOWED_FIELDS:
-                pre_apply_snapshot[field] = getattr(cfg, field, None)
-
             # Apply config changes
             for patch in plan.get("config_patch", []):
                 if not plan_gate_passed:
@@ -3201,18 +3112,6 @@ class BrainEngineV2(BaseBrainEngine):
                     "Skipping root-cause weight adjustments — plan did not pass action gate"
                 )
             if applied:
-                # ── #6: Persist the applied plan + pre-apply state ──
-                try:
-                    plan["_applied_at"] = int(time.time())
-                    plan["pre_apply"] = pre_apply_snapshot
-                    await self.sdb.set_metadata(
-                        "brain_last_applied_plan",
-                        json_dumps(plan),
-                        ttl=30 * 86400,
-                    )
-                except Exception as e:
-                    logger_run.debug(f"Failed to persist applied plan snapshot: {e}")
-
                 # ── Ledger: mark all repairs in this plan as applied ──
                 plan_ts = plan.get("generated_at", int(time.time()))
                 try:
@@ -3297,53 +3196,6 @@ class BrainEngineV2(BaseBrainEngine):
             except Exception as fallback_e:
                 logger_run.error(f"Fallback report also failed: {fallback_e}")
                 return False
-
-    def build_run_summary(self, recs: Dict[str, Any]) -> Dict[str, Any]:
-        """Structured JSON summary of the current run, suitable for a
-        health endpoint or CI artifact.  Complements the human-readable
-        Telegram report with machine-parseable fields."""
-        ai = recs.get("ai_metrics", {}) or {}
-        gate = ai.get("action_gate", {}) or {}
-        audit = get_audit()
-        span = audit.history_span()
-        rows = recs.get("_real_rows", []) or []
-        n = len(rows)
-        wins = sum(1 for r in rows if r["win"]) if rows else 0
-
-        return {
-            "timestamp": int(time.time()),
-            "version": getattr(cfg, "version", "unknown"),
-            "sample": {
-                "real": n,
-                "shadow": len(recs.get("_shadow_rows", []) or []),
-                "win_rate": round(wins / n, 4) if n else None,
-            },
-            "history": {
-                "actual_days": round(span[0], 1) if span else None,
-                "requested_days": span[1] if span else None,
-            },
-            "profitability": {
-                "net_ev": ai.get("net_ev"),
-                "p_ev_positive": (
-                    engine.ev_first_objective(rows, min_sample=10).get("p_ev_positive")
-                    if n >= 10 else None
-                ),
-            },
-            "action_gate": {
-                "actionable": gate.get("actionable", False),
-                "data_quality": gate.get("data_quality"),
-                "oos_prediction": gate.get("oos_prediction"),
-                "profitability": gate.get("profitability"),
-                "stability": gate.get("stability"),
-                "risk": gate.get("risk"),
-                "execution": gate.get("execution"),
-            },
-            "lifecycle": recs.get("_lifecycle_state", "UNKNOWN"),
-            "config_version": ai.get("config_version"),
-            "dedup_stats": snapshot_dedup_claim_stats(),
-            "dead_letters": dead_letter_queue.count(),
-            "redis_degraded": self.sdb.degraded,
-        }
 
     async def _deliver_report(self, pairs: List[str], telegram_queue: Any, logger_run: logging.Logger) -> bool:
         """Override: route through generate_report() (Profit Action Plan)
