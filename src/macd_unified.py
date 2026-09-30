@@ -1038,20 +1038,63 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             _regime_source = cfg.MACRO_REFERENCE_PAIR
             _regime_pd = parsed_cache.get(_regime_source, (None, None, None))[0]
             if _regime_pd is not None and len(_regime_pd.ts) > 50:
+
                 import threshold_engine as _te
-                _fake_rows = [
-                    {"ts": int(_regime_pd.ts[i]), "adx_val": None}
-                    for i in range(len(_regime_pd.ts))
-                ]
-                # Compute ADX inline (lightweight, no full gate needed)
-                from indicators import calculate_adx_inline
-                _adx_arr = calculate_adx_inline(
-                    _regime_pd.high, _regime_pd.low, _regime_pd.close,
-                    getattr(cfg, "ADX_DI_LENGTH", 14),
-                )
-                for i, r in enumerate(_fake_rows):
-                    if i < len(_adx_arr) and not np.isnan(_adx_arr[i]):
-                        r["adx_val"] = float(_adx_arr[i])
+                _fake_rows: List[Dict[str, Any]] = []
+                for _idx in range(len(_regime_pd.ts)):
+                    _fake_rows.append({"ts": int(_regime_pd.ts[_idx]), "adx_val": None})
+
+                # Compute ADX inline using Wilder's smoothing (no
+                # external dependency — the indicators module does not
+                # expose a standalone ADX-array helper).
+                _adx_period: int = getattr(cfg, "ADX_DI_LENGTH", 14)
+                _h = _regime_pd.high
+                _l = _regime_pd.low
+                _c = _regime_pd.close
+                _n = len(_c)
+                _adx_arr = np.full(_n, np.nan)
+                if _n > _adx_period * 2:
+                    _tr = np.zeros(_n)
+                    _plus_dm = np.zeros(_n)
+                    _minus_dm = np.zeros(_n)
+                    for _i in range(1, _n):
+                        _hl = _h[_i] - _l[_i]
+                        _hc = abs(_h[_i] - _c[_i - 1])
+                        _lc = abs(_l[_i] - _c[_i - 1])
+                        _tr[_i] = max(_hl, _hc, _lc)
+                        _up = _h[_i] - _h[_i - 1]
+                        _dn = _l[_i - 1] - _l[_i]
+                        _plus_dm[_i] = _up if (_up > _dn and _up > 0) else 0.0
+                        _minus_dm[_i] = _dn if (_dn > _up and _dn > 0) else 0.0
+                    # Wilder smoothing
+                    _atr = np.zeros(_n)
+                    _pdi_s = np.zeros(_n)
+                    _mdi_s = np.zeros(_n)
+                    _atr[_adx_period] = np.sum(_tr[1:_adx_period + 1])
+                    _pdi_s[_adx_period] = np.sum(_plus_dm[1:_adx_period + 1])
+                    _mdi_s[_adx_period] = np.sum(_minus_dm[1:_adx_period + 1])
+                    for _i in range(_adx_period + 1, _n):
+                        _atr[_i] = _atr[_i - 1] - (_atr[_i - 1] / _adx_period) + _tr[_i]
+                        _pdi_s[_i] = _pdi_s[_i - 1] - (_pdi_s[_i - 1] / _adx_period) + _plus_dm[_i]
+                        _mdi_s[_i] = _mdi_s[_i - 1] - (_mdi_s[_i - 1] / _adx_period) + _minus_dm[_i]
+                    _dx = np.zeros(_n)
+                    for _i in range(_adx_period, _n):
+                        if _atr[_i] > 0:
+                            _p = 100.0 * _pdi_s[_i] / _atr[_i]
+                            _m = 100.0 * _mdi_s[_i] / _atr[_i]
+                            _s = _p + _m
+                            _dx[_i] = 100.0 * abs(_p - _m) / _s if _s > 0 else 0.0
+                    # Final ADX = smoothed DX
+                    _adx_start = _adx_period * 2
+                    if _n > _adx_start:
+                        _adx_arr[_adx_start] = np.mean(_dx[_adx_period:_adx_start + 1])
+                        for _i in range(_adx_start + 1, _n):
+                            _adx_arr[_i] = (
+                                (_adx_arr[_i - 1] * (_adx_period - 1)) + _dx[_i]
+                            ) / _adx_period
+                for _i, _r in enumerate(_fake_rows):
+                    if _i < len(_adx_arr) and not np.isnan(_adx_arr[_i]):
+                        _r["adx_val"] = float(_adx_arr[_i])
                 regime_transition_events = _te.regime_transition_events(
                     _fake_rows,
                     lookback_stable=getattr(cfg, "REGIME_TRANSITION_LOOKBACK_BARS", 4),
@@ -1182,17 +1225,17 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         except Exception as e:
             logger_main.warning(f"Kill switch evaluation failed (fail-open): {e}")
 
-    valid_results = []
-    batched_payloads = []
+    valid_results: List[Tuple[str, Dict[str, Any]]] = []
+    batched_payloads: List[Any] = []
     for r in results:
-        if isinstance(r, Exception):
+        if isinstance(r, BaseException):
             logger_main.warning(f"Evaluation raised exception: {r}")
             continue
         if r is None:
             continue
         # r is now (pair_name, summary_dict, payload_or_none)
         if isinstance(r, tuple) and len(r) >= 2:
-            valid_results.append((r[0], r[1]))
+            valid_results.append((cast(str, r[0]), cast(Dict[str, Any], r[1])))
             if len(r) >= 3 and r[2] is not None:
                 batched_payloads.append(r[2])
 
