@@ -54,6 +54,7 @@ jobs:
     permissions:
       contents: read
       packages: read
+      actions: write
 
     steps:
       # PHASE 1: VALIDATION & SETUP
@@ -234,6 +235,69 @@ jobs:
           done
 
           echo "data_checkout_seconds=$(( $(date +%s) - START ))"
+
+      - name: ♻️ Replay un-pushed outcomes from earlier runs
+        if: inputs.apply_brain_plan != true
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          : > "$RUNNER_TEMP/replayed_ids"
+          IDS=$(gh api "repos/${REPO}/actions/artifacts?per_page=100" \
+            --jq '.artifacts | map(select((.name | startswith("unpushed-outcomes-")) and (.expired | not))) | sort_by(.created_at) | .[].id')
+          if [ -z "$IDS" ]; then
+            echo "No un-pushed outcome artifacts to replay"
+            exit 0
+          fi
+          for ID in $IDS; do
+            rm -rf /tmp/dead-letter && mkdir -p /tmp/dead-letter
+            if ! gh api "repos/${REPO}/actions/artifacts/${ID}/zip" > /tmp/dead-letter.zip; then
+              echo "::warning::Could not download artifact ${ID} — skipping"
+              continue
+            fi
+            unzip -oq /tmp/dead-letter.zip -d /tmp/dead-letter
+            python3 - <<'PY'
+          import glob, os, subprocess
+
+          SRC, DST = "/tmp/dead-letter", "/tmp/data-repo"
+          merged = skipped = 0
+          for kind in ("outcomes", "shadow"):
+              for src in sorted(glob.glob(f"{SRC}/{kind}/*.jsonl")):
+                  rel = f"{kind}/{os.path.basename(src)}"
+                  dst = f"{DST}/{rel}"
+                  in_head = subprocess.run(
+                      ["git", "-C", DST, "ls-tree", "--name-only", "HEAD", "--", rel],
+                      capture_output=True, text=True,
+                  ).stdout.strip()
+                  if not os.path.exists(dst) and in_head:
+                      # Tracked upstream but outside the sparse window: writing it
+                      # here would overwrite the whole day with a partial file.
+                      print(f"::warning::skip {rel}: outside sparse-checkout window")
+                      skipped += 1
+                      continue
+                  have = set()
+                  needs_nl = False
+                  if os.path.exists(dst):
+                      with open(dst, "rb") as fh:
+                          raw = fh.read()
+                      needs_nl = bool(raw) and not raw.endswith(b"\n")
+                      have = {ln.strip() for ln in raw.decode("utf-8").splitlines() if ln.strip()}
+                  with open(src, encoding="utf-8") as fh:
+                      new = [ln.strip() for ln in fh if ln.strip() and ln.strip() not in have]
+                  if not new:
+                      continue
+                  os.makedirs(os.path.dirname(dst), exist_ok=True)
+                  with open(dst, "a", encoding="utf-8") as fh:
+                      if needs_nl:
+                          fh.write("\n")
+                      fh.write("\n".join(new) + "\n")
+                  merged += len(new)
+                  print(f"replayed {len(new)} row(s) into {rel}")
+          print(f"dead-letter replay: merged={merged} skipped_files={skipped}")
+          PY
+            echo "$ID" >> "$RUNNER_TEMP/replayed_ids"
+          done
 
       - name: 🚀 Execute MACD Bot
         if: inputs.apply_brain_plan != true
@@ -492,3 +556,18 @@ jobs:
             /tmp/data-repo/brain_state.json
           retention-days: 7
           if-no-files-found: ignore
+
+      - name: 🧹 Retire replayed dead-letter artifacts
+        if: always() && steps.persist.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          [ -s "$RUNNER_TEMP/replayed_ids" ] || exit 0
+          while read -r ID; do
+            [ -n "$ID" ] || continue
+            gh api -X DELETE "repos/${REPO}/actions/artifacts/${ID}" \
+              && echo "Retired artifact ${ID}" \
+              || echo "::warning::Could not delete artifact ${ID}"
+          done < "$RUNNER_TEMP/replayed_ids"
