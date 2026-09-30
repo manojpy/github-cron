@@ -276,8 +276,6 @@ class RedisKeyPrefix:
     THRESHOLD_HISTORY = "brain_threshold_history:"
     VOTE_COUNT_HISTORY = "brain_vote_counts:"
     LAST_PROCESSED_CANDLE = "last_processed_candle:"  # NEW
-    TELEGRAM_DEADLETTER = "telegram_deadletter:"      # NEW: failed sends
-    DEDUP_KEPT_STATS = "dedup_kept_stats:"            # NEW: kept-claim counters
 
 class RedisStateStore:
     POOL_MAX_AGE_SECONDS = 3600
@@ -1024,56 +1022,6 @@ class RedisStateStore:
         )
         return bool(result)
 
-    # ── Adaptive dedup windows (per pair+alert_key) ───────────────────
-    async def _record_alert_fire_ts(self, pair: str, alert_key: str, ts: int) -> None:
-        """Push this fire timestamp onto a capped list for the pair+alert.
-        Used purely to estimate inter-arrival; never gates a dispatch."""
-        if self.degraded or not self._redis:
-            return
-        key = f"{RedisKeyPrefix.RECENT_ALERT}iv:{pair}:{alert_key}"
-        try:
-            cap = int(getattr(cfg, "ADAPTIVE_DEDUP_HISTORY_MAX", 100))
-            async with self._redis.pipeline() as pipe:
-                pipe.lpush(key, str(int(ts)))
-                pipe.ltrim(key, 0, cap - 1)
-                pipe.expire(key, 30 * 86400)
-                await asyncio.wait_for(_execute_pipeline(pipe), timeout=2.0)
-        except Exception as e:
-            logger.debug(f"Adaptive-dedup ts record failed for {pair}:{alert_key}: {e}")
-
-    async def _adaptive_dedup_window(self, pair: str, alert_key: str) -> Optional[int]:
-        """Estimate a dedup window for this (pair, alert_key) from its own
-        recent inter-arrival times. Returns None when there is not enough
-        history, so the caller can fall back to the static window."""
-        if self.degraded or not self._redis:
-            return None
-        key = f"{RedisKeyPrefix.RECENT_ALERT}iv:{pair}:{alert_key}"
-        try:
-            raw = await self._safe_redis_op(
-                lambda: _rc(self._redis).lrange(key, 0, 63),
-                2.0, f"adaptive_dedup_read:{pair}:{alert_key}",
-            )
-        except Exception:
-            return None
-        if not raw:
-            return None
-        try:
-            ts_sorted = sorted(int(x) for x in raw)
-        except (TypeError, ValueError):
-            return None
-        if len(ts_sorted) < int(getattr(cfg, "ADAPTIVE_DEDUP_SAMPLE", 20)):
-            return None
-        gaps = [b - a for a, b in zip(ts_sorted, ts_sorted[1:]) if b > a]
-        if not gaps:
-            return None
-        gaps.sort()
-        mid = len(gaps) // 2
-        p50 = gaps[mid] if len(gaps) % 2 else (gaps[mid - 1] + gaps[mid]) // 2
-        factor = float(getattr(cfg, "ADAPTIVE_DEDUP_FACTOR", 0.5))
-        lo = int(getattr(cfg, "ADAPTIVE_DEDUP_MIN_SEC", 90))
-        hi = int(getattr(cfg, "ADAPTIVE_DEDUP_MAX_SEC", 3600))
-        return max(lo, min(hi, int(p50 * factor)))
-
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int, window_sec: Optional[int] = None) -> bool:
         if self.degraded:
             return True
@@ -1085,36 +1033,13 @@ class RedisStateStore:
             return False  # fail-closed, consistent with the except-branch policy below
         recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
         effective_window = window_sec if window_sec is not None else cfg.ALERT_DEDUP_WINDOW_SEC
-
-        # ── Adaptive window: per-alert override when we have enough data ──
-        if (
-            window_sec is None
-            and getattr(cfg, "ENABLE_ADAPTIVE_DEDUP", False)
-        ):
-            try:
-                adaptive = await self._adaptive_dedup_window(pair, alert_key)
-            except Exception:
-                adaptive = None
-            if adaptive is not None:
-                effective_window = adaptive
-                if cfg.DEBUG_MODE:
-                    logger.debug(
-                        f"Adaptive dedup: {pair}:{alert_key} window="
-                        f"{effective_window}s (static fallback "
-                        f"{cfg.ALERT_DEDUP_WINDOW_SEC}s)"
-                    )
-
         try:
             result = await asyncio.wait_for(
                 self._redis.set(recent_key, str(ts), nx=True, ex=effective_window),
                 timeout=3.0
             )
             should_send = bool(result)
-            if should_send:
-                # Record this fire to feed the next inter-arrival estimate.
-                if getattr(cfg, "ENABLE_ADAPTIVE_DEDUP", False):
-                    await self._record_alert_fire_ts(pair, alert_key, ts)
-            elif cfg.DEBUG_MODE:
+            if cfg.DEBUG_MODE and not should_send:
                 logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
             return should_send
         except Exception as e:
@@ -1157,102 +1082,6 @@ class RedisStateStore:
             await asyncio.wait_for(_rc(self._redis).delete(recent_key), timeout=1.0)
         except Exception as e:
             logger.warning(f"Failed to release dedup claim for {pair}:{alert_key}: {e}")
-
-    async def record_telegram_failure(
-        self, pair: str, alert_keys: List[str], message_preview: str,
-        reason: str, ts: Optional[int] = None,
-    ) -> None:
-        """Dead-letter one failed Telegram dispatch. Stored capped so a
-        Telegram outage cannot blow Redis memory; the caller is expected
-        to inspect the list via `get_telegram_deadletter()`."""
-        if self.degraded or not self._redis:
-            return
-        ts = int(ts or time.time())
-        key = f"{RedisKeyPrefix.TELEGRAM_DEADLETTER}{ts}:{pair}"
-        payload = json_dumps({
-            "pair": pair,
-            "alert_keys": alert_keys,
-            "reason": reason,
-            "preview": message_preview[:280],
-            "ts": ts,
-        })
-        try:
-            async with self._redis.pipeline() as pipe:
-                pipe.set(key, payload, ex=14 * 86400)
-                pipe.lpush(f"{RedisKeyPrefix.TELEGRAM_DEADLETTER}index", key)
-                pipe.ltrim(f"{RedisKeyPrefix.TELEGRAM_DEADLETTER}index", 0, 499)
-                await asyncio.wait_for(_execute_pipeline(pipe), timeout=2.0)
-        except Exception as e:
-            logger.warning(f"Telegram dead-letter write failed for {pair}: {e}")
-
-    async def get_telegram_deadletter(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """Read the most recent failed Telegram sends. Returns [] on any
-        Redis problem rather than raising — this is diagnostic surface."""
-        if self.degraded or not self._redis:
-            return []
-        try:
-            keys = await self._safe_redis_op(
-                lambda: _rc(self._redis).lrange(
-                    f"{RedisKeyPrefix.TELEGRAM_DEADLETTER}index", 0, max(0, limit - 1),
-                ),
-                2.0, "telegram_deadletter_index",
-            )
-        except Exception:
-            return []
-        if not keys:
-            return []
-        out: List[Dict[str, Any]] = []
-        try:
-            async with self._redis.pipeline() as pipe:
-                for k in keys:
-                    pipe.get(k)
-                values = await asyncio.wait_for(_execute_pipeline(pipe), timeout=3.0)
-        except Exception:
-            return []
-        for k, raw in zip(keys, values):
-            if not raw:
-                continue
-            try:
-                entry = json_loads(raw)
-                entry["_key"] = k
-                out.append(entry)
-            except Exception:
-                continue
-        return out
-
-    async def bump_dedup_kept_stat(self, kind: str, delta: int = 1) -> None:
-        """Increment a counter describing why a dedup claim was KEPT (not
-        released). Keys: 'repaint', 'mark_disagree', 'send_failed'."""
-        if self.degraded or not self._redis:
-            return
-        key = f"{RedisKeyPrefix.DEDUP_KEPT_STATS}{kind}"
-        try:
-            await self._safe_redis_op(
-                lambda: _rc(self._redis).incrby(key, int(delta)),
-                2.0, f"dedup_kept_incr:{kind}",
-            )
-        except Exception:
-            return
-
-    async def get_dedup_kept_stats(self) -> Dict[str, int]:
-        """Snapshot the dedup-kept counters, for the health endpoint."""
-        if self.degraded or not self._redis:
-            return {}
-        kinds = ("repaint", "mark_disagree", "send_failed")
-        out: Dict[str, int] = {k: 0 for k in kinds}
-        try:
-            async with self._redis.pipeline() as pipe:
-                for k in kinds:
-                    pipe.get(f"{RedisKeyPrefix.DEDUP_KEPT_STATS}{k}")
-                values = await asyncio.wait_for(_execute_pipeline(pipe), timeout=2.0)
-        except Exception:
-            return out
-        for k, raw in zip(kinds, values):
-            try:
-                out[k] = int(raw) if raw is not None else 0
-            except (TypeError, ValueError):
-                out[k] = 0
-        return out
 
     VOTE_COUNT_HISTORY_MAX = 500
 

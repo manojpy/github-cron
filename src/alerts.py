@@ -338,9 +338,6 @@ async def _record_counterfactual_block(
     # Structured "why rejected" surface (roadmap #26)
     if getattr(cfg, "ENABLE_ALERT_WHY_REJECTED", True) and logger_pair is not None:
         try:
-            # Optional ML-EV shadow carried on the context — present only
-            # when ENABLE_ML_EV_SHADOW is on and the model is loaded.
-            ml_ev_map = (context or {}).get("ml_ev_shadow_by_alert") or {}
             for title, _extra, alert_key in alerts_to_send:
                 detail_bits = [f"reason={block_reason}"]
                 if effective_score is not None and effective_required is not None:
@@ -351,23 +348,6 @@ async def _record_counterfactual_block(
                     sc, tot, _ = confluence_scores[alert_key]
                     if sc is not None and tot is not None:
                         detail_bits.append(f"conf={sc:.1f}/{tot:.1f}")
-                # Evidence / drift / ML-EV appended when available, so the
-                # Telegram side has enough to render a real rejection story
-                # without another Redis read at send time.
-                if gr is not None:
-                    if gr.adx_val is not None:
-                        detail_bits.append(f"adx={gr.adx_val:.1f}")
-                    if gr.atr_pctl is not None:
-                        detail_bits.append(f"atr_pctl={gr.atr_pctl:.2f}")
-                ml_ev = ml_ev_map.get(alert_key)
-                if ml_ev:
-                    net_ev = ml_ev.get("net_ev_r")
-                    if net_ev is not None:
-                        detail_bits.append(f"ml_ev={net_ev:+.3f}R")
-                    if ml_ev.get("would_block") is not None:
-                        detail_bits.append(
-                            f"ml_would_block={'yes' if ml_ev['would_block'] else 'no'}"
-                        )
                 logger_pair.info(
                     f"🧠 BRAIN FILTER | {pair_name} {alert_key} | "
                     f"Signal gates: PASS | Action: BLOCKED | "
@@ -2666,8 +2646,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         f"alert suppressed, dedup key KEPT to prevent duplicates"
                     )
                     DEDUP_STATS["kept_repaint"] += 1
-                    await sdb.bump_dedup_kept_stat("repaint")
                     await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
+
                     return pair_name, {
                         "state": "SUPPRESSED_REPAINT_CONFIRMED",
                         "ts": int(time.time()),
@@ -2871,7 +2851,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"dedup key KEPT to prevent duplicates"
                         )
                         DEDUP_STATS["kept_mark_disagree"] += 1
-                        await sdb.bump_dedup_kept_stat("mark_disagree")
                         await _refund_alert_budget(len(alerts_to_send))
                         budget_refunded = True
                         confirmation_blocked = True   # NEW
@@ -2911,20 +2890,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"processed — will retry next run"
                         )
                     else:
-                        # ── Dead-letter the failed send so the failure is
-                        # visible in an ops query, not just in the log.
-                        try:
-                            preview = msg[:280]
-                        except Exception:
-                            preview = ""
-                        await sdb.record_telegram_failure(
-                            pair_name,
-                            [ak for _, _, ak in alerts_to_send],
-                            preview,
-                            reason="telegram_send_false",
-                            ts=ts_curr,
-                        )
-                        await sdb.bump_dedup_kept_stat("send_failed")
                         await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
                         logger_pair.error(
                             f"Alert send failed | {pair_name} | "
