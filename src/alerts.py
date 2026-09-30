@@ -1042,7 +1042,16 @@ def validate_alert_definitions() -> None:
         if def_.key not in BUY_ALERT_KEYS and def_.key not in SELL_ALERT_KEYS:
             errors.append(f"Alert key {def_.key} missing from BUY_ALERT_KEYS/SELL_ALERT_KEYS")
 
+    _defined = {d.key for d in ALERT_DEFINITIONS}
+    _stale = (BUY_ALERT_KEYS | SELL_ALERT_KEYS) - _defined
+    if _stale:
+        errors.append(f"BUY/SELL_ALERT_KEYS contain undefined keys: {sorted(_stale)}")
+    _both = BUY_ALERT_KEYS & SELL_ALERT_KEYS
+    if _both:
+        errors.append(f"Keys in both BUY and SELL sets: {sorted(_both)}")
+
     # ── FIX: cross-check that every alert key resolves to a config path
+
     unmapped = [
         d.key for d in ALERT_DEFINITIONS
         if resolve_alert_config_path(d.key) is None

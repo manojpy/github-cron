@@ -322,6 +322,8 @@ class RedisStateStore:
         self._last_connect_error: Optional[Exception] = None
         self._last_recovery_attempt_ts: float = 0.0
         self._recovery_lock = asyncio.Lock()
+        self.recovery_attempts: int = 0
+        self.recovery_successes: int = 0
 
         if cfg.DEBUG_MODE and logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -364,7 +366,7 @@ class RedisStateStore:
         except Exception as reconnect_exc:
             logger.critical(f"Redis reconnect attempt itself failed: {reconnect_exc} — staying degraded")
 
-    async def maybe_recover_from_degraded(self, cooldown_sec: float = 30.0) -> bool:
+    async def maybe_recover_from_degraded(self, cooldown_sec: Optional[float] = None) -> bool:
         """Mid-run health probe. _record_redis_failure only reconnects once,
         at the moment of the failure — if that single attempt doesn't land,
         the store stays degraded (dedup, state persistence, dynamic
@@ -379,6 +381,8 @@ class RedisStateStore:
             return True
         if self._quota_exhausted:
             return False  # reconnecting can't fix a quota/OOM condition
+        if cooldown_sec is None:
+            cooldown_sec = float(cfg.REDIS_RECOVERY_COOLDOWN_SEC)
         async with self._recovery_lock:
             if not self.degraded:
                 return True
@@ -386,12 +390,14 @@ class RedisStateStore:
             if now - self._last_recovery_attempt_ts < cooldown_sec:
                 return False
             self._last_recovery_attempt_ts = now
+            self.recovery_attempts += 1
             try:
                 reconnected = await self._attempt_connect(timeout=3.0)
             except Exception as exc:
                 logger.debug(f"Mid-run Redis recovery probe failed: {exc}")
                 return False
             if reconnected:
+                self.recovery_successes += 1
                 logger.info("♻️ Redis recovered mid-run — degraded mode cleared")
             return reconnected
 

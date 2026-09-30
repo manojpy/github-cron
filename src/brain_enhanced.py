@@ -71,6 +71,7 @@ def _report_section_failed(failed: List[str], name: str, exc: Exception) -> None
 _RULE = "━" * 30
 PLAN_HISTORY_KEY = "brain_plan_history"
 PLAN_HISTORY_MAX = 100
+CHALLENGER_STREAK_KEY = "challenger_promo_streak"
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 _LADDER = ["⚪", "🟡", "🟠", "🔵", "🟢"]          # Observation → Validated
@@ -2812,17 +2813,61 @@ class BrainEngineV2(BaseBrainEngine):
         base_ev = meta.get("champion_net_ev")
 
         if not force:
+            stored_at = int(blob.get("stored_at") or 0)
+            min_passes = int(getattr(cfg, "CHALLENGER_MIN_CONSECUTIVE_PASSES", 3))
+            min_gap = int(getattr(cfg, "CHALLENGER_STREAK_MIN_GAP_SEC", 3600))
+            now_ts = int(time.time())
+
+            streak_state: Dict[str, Any] = {}
+            try:
+                raw_streak = await self.sdb.get_metadata(CHALLENGER_STREAK_KEY)
+                parsed = json_loads(raw_streak) if raw_streak else {}
+                if isinstance(parsed, dict):
+                    streak_state = parsed
+            except Exception as e:
+                logging.getLogger("macd_bot").debug(
+                    f"Challenger streak read failed (treating as 0): {e}"
+                )
+            # A different challenger (new stored_at) never inherits a streak.
+            if int(streak_state.get("stored_at") or 0) != stored_at:
+                streak_state = {"stored_at": stored_at, "streak": 0, "last_ts": 0}
+            streak = int(streak_state.get("streak") or 0)
+
+            fail: Optional[str] = None
             if n_oos < min_n:
-                return {"promoted": False, "reason": f"n_oos={n_oos}<{min_n}"}
-            if ch_ev is None or base_ev is None:
-                return {"promoted": False, "reason": "missing_ev"}
-            if float(ch_ev) < float(base_ev) + min_lift:
+                fail = f"n_oos={n_oos}<{min_n}"
+            elif ch_ev is None or base_ev is None:
+                fail = "missing_ev"
+            elif float(ch_ev) <= 0.0:
+                fail = f"net_ev={float(ch_ev):.4f}<=0"
+            elif float(ch_ev) < float(base_ev) + min_lift:
+                fail = f"ev_lift={float(ch_ev)-float(base_ev):.4f}<{min_lift}"
+
+            if fail is not None:
+                if streak > 0:
+                    await self.sdb.set_metadata(
+                        CHALLENGER_STREAK_KEY,
+                        json_dumps({"stored_at": stored_at, "streak": 0, "last_ts": now_ts}),
+                        ttl=30 * 86400,
+                    )
+                return {"promoted": False, "reason": fail, "streak_reset": streak > 0}
+
+            # All gates passed this evaluation. Count it at most once per gap.
+            if now_ts - int(streak_state.get("last_ts") or 0) >= min_gap:
+                streak += 1
+                await self.sdb.set_metadata(
+                    CHALLENGER_STREAK_KEY,
+                    json_dumps({"stored_at": stored_at, "streak": streak, "last_ts": now_ts}),
+                    ttl=30 * 86400,
+                )
+            if streak < min_passes:
                 return {
                     "promoted": False,
-                    "reason": f"ev_lift={float(ch_ev)-float(base_ev):.4f}<{min_lift}",
+                    "reason": f"streak={streak}<{min_passes}",
+                    "streak": streak,
                 }
             if getattr(cfg, "CHALLENGER_SHADOW_ONLY", True) and not force:
-                return {"promoted": False, "reason": "shadow_only_requires_force"}
+                return {"promoted": False, "reason": "shadow_only_requires_force", "streak": streak}
 
         ok = await self.sdb.promote_challenger_to_champion()
         return {"promoted": bool(ok), "reason": "ok" if ok else "redis_failed", "meta": meta}

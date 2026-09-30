@@ -292,6 +292,7 @@ class BotConfig(BaseModel):
     TELEGRAM_BURST_SIZE: int = 5
     REDIS_CONNECTION_RETRIES: int = 3
     REDIS_RETRY_DELAY: float = 2.0
+    REDIS_RECOVERY_COOLDOWN_SEC: float = Field(default=30.0, ge=1.0, le=300.0, description="Minimum seconds between mid-run Redis recovery probes while degraded")
     REDIS_LOCK_EXPIRY: int = Field(default=900, ge=900, description="Redis lock TTL in seconds")
     ALERT_DEDUP_WINDOW_SEC: int = Field(default=120, ge=0, description="Dedup window for repeat alerts")
     ENABLE_ALERT_COALESCING: bool = Field(default=True) 
@@ -553,6 +554,8 @@ class BotConfig(BaseModel):
     BRAIN_SIZE_HINT_LOW: float = Field(default=0.25, ge=0.0, le=1.0)
     BRAIN_SIZE_HINT_BLOCKED: float = Field(default=0.0, ge=0.0, le=1.0)
     ENABLE_QUALITY_HARD_BLOCK: bool = Field(default=False, description="HARD gate: when trade-quality verdict is BLOCKED, suppress Telegram dispatch and record a counterfactual instead of only annotating the message. Keep False until quality labels have been observed in shadow for a full analysis window.")
+    CHALLENGER_MIN_CONSECUTIVE_PASSES: int = Field(default=3, ge=1, le=20, description="Consecutive, separately-spaced Brain evaluations the SAME challenger must pass before auto-promotion. A failed evaluation or a new challenger resets the streak.")
+    CHALLENGER_STREAK_MIN_GAP_SEC: int = Field(default=3600, ge=60, le=86400, description="Minimum seconds between two evaluations that count toward the streak (maybe_promote_challenger runs more than once per Brain run).")
 
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:

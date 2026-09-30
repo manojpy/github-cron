@@ -1578,6 +1578,10 @@ async def run_once() -> Optional[bool]:
                 "memory_mb_end": round(final_memory_mb, 1),
                 "memory_delta_mb": round(memory_delta, 1),
                 "redis_status": redis_status,
+                "redis_recovery": {
+                    "attempts": getattr(sdb, "recovery_attempts", 0),
+                    "successes": getattr(sdb, "recovery_successes", 0),
+                },
                 "redis_mem_pct": redis_mem_pct,
                 "brain_enabled": bool(getattr(cfg, "ENABLE_BRAIN", False)),
                 "daily_cache": getattr(fetcher, "_last_daily_cache_stats", None),
