@@ -1184,6 +1184,76 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     )
     return valid_results, deferred_pairs
 
+async def _write_health_endpoint(
+    sdb: Optional[RedisStateStore],
+    telegram_queue: Optional[TelegramQueue],
+    fetcher: Optional[DataFetcher],
+    correlation_id: str,
+    logger_run: logging.Logger,
+) -> None:
+    """Write a machine-readable health snapshot to a stable path.
+    Deliberately separate from run_summary.json (which is per-run and
+    used by the workflow artifact uploader) — this file is a *current
+    state* document consumed by external monitors / a tiny HTTP shim
+    that tails the file. Never raises."""
+    try:
+        import psutil
+        rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+    except Exception:
+        rss_mb = None
+
+    health: Dict[str, Any] = {
+        "ts": int(time.time()),
+        "correlation_id": correlation_id,
+        "bot_version": __version__,
+        "redis": {
+            "degraded": bool(sdb.degraded) if sdb else True,
+            "recovery_attempts": getattr(sdb, "recovery_attempts", 0) if sdb else 0,
+            "recovery_successes": getattr(sdb, "recovery_successes", 0) if sdb else 0,
+            "quota_exhausted": bool(getattr(sdb, "_quota_exhausted", False)) if sdb else False,
+        },
+        "telegram": {
+            "sent_ok": getattr(telegram_queue, "sent_ok", 0) if telegram_queue else 0,
+            "sent_failed": getattr(telegram_queue, "sent_failed", 0) if telegram_queue else 0,
+        },
+        "process": {
+            "rss_mb": round(rss_mb, 1) if rss_mb is not None else None,
+            "memory_limit_mb": cfg.MEMORY_LIMIT_BYTES / (1024 * 1024),
+        },
+    }
+
+    # Dead-letter + dedup counters are optional and cheap; fail-soft.
+    if sdb and not sdb.degraded:
+        try:
+            health["dedup_kept"] = await sdb.get_dedup_kept_stats()
+        except Exception:
+            health["dedup_kept"] = {}
+        try:
+            dl = await sdb.get_telegram_deadletter(limit=10)
+            health["telegram_deadletter_count"] = len(dl)
+            health["telegram_deadletter_latest"] = (
+                dl[0] if dl else None
+            )
+        except Exception:
+            health["telegram_deadletter_count"] = None
+
+    if fetcher is not None:
+        try:
+            health["fetcher"] = fetcher.get_stats()
+        except Exception:
+            health["fetcher"] = None
+
+    try:
+        path = os.environ.get(
+            "HEALTH_SNAPSHOT_PATH", "/tmp/data-repo/health.json"
+        )
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json_dumps(health))
+        logger_run.debug(f"Health snapshot written → {path}")
+    except Exception as e:
+        logger_run.debug(f"Health snapshot write failed (non-fatal): {e}")
+
 async def run_once() -> Optional[bool]:
     MAX_ALERTS_PER_RUN = cfg.MAX_ALERTS_PER_RUN
     all_results: List[Tuple[str, Dict[str, Any]]] = []
@@ -1605,6 +1675,10 @@ async def run_once() -> Optional[bool]:
         except Exception as e:
             logger_run.debug(f"Could not write structured run summary: {e}")
 
+        # ── Health snapshot for external monitors ──
+        await _write_health_endpoint(
+            sdb, telegram_queue, fetcher, correlation_id, logger_run,
+        )
         start_commands = valkey_usage_start.get("total_commands_processed")
         end_commands = valkey_usage_end.get("total_commands_processed")
         if start_commands is not None and end_commands is not None and end_commands >= start_commands:

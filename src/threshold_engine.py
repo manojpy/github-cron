@@ -2210,7 +2210,7 @@ def is_vote_count_ood(
         "relaxed_mode": relaxed_mode,
     }
 
-# ══════════������══════════════════════════════════════════��══════���══════════
+# ══════════�������══════════════════════════════════════════��══════���══════════
 #  NEW: Block-Bootstrap EV Confidence Intervals  (Recommended.txt §6)
 # ═════════════════════════════════════════════════════════════════��═════
 
@@ -5234,8 +5234,37 @@ def trade_quality_score(
         # Shrink further if evidence is weak
         if result.get("evidence_strength") == "weak":
             hint *= 0.5
+
+        # ── Item #20: never upsize from Brain alone ──
+        # Until the evidence gate is met the Brain is allowed to reduce
+        # size (protective) but never to raise it. Policy is applied
+        # AFTER the shrink above so a HIGH verdict on thin evidence still
+        # ends up small.
+        hint_note = "advisory_only"
+        if getattr(cfg, "BRAIN_SIZE_HINT_NEVER_UPSIZE", True):
+            gate_n = int(getattr(cfg, "BRAIN_SIZE_UPSIZE_MIN_N", 200))
+            gate_met = (
+                n_oos >= gate_n
+                and bool(ev_model_result.get("oos_validated"))
+                and evidence_state in ("ELIGIBLE", "ACTIONABLE")
+            )
+            if not gate_met:
+                cap = float(getattr(cfg, "BRAIN_SIZE_HINT_NO_UPSIZE_CAP", 1.0))
+                if hint > cap:
+                    hint = cap
+                    hint_note = (
+                        f"advisory_only|capped_no_upsize "
+                        f"(n={n_oos}<{gate_n} or no OOS)"
+                    )
+                else:
+                    hint_note = (
+                        "advisory_only|reduce_ok_upsize_blocked "
+                        f"(n={n_oos}<{gate_n} or no OOS)"
+                    )
+            else:
+                hint_note = "advisory_only|upsize_allowed"
         result["size_hint"] = round(max(0.0, min(1.0, hint)), 3)
-        result["size_hint_note"] = "advisory_only"
+        result["size_hint_note"] = hint_note
 
     return result
     

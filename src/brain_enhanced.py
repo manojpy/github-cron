@@ -1492,9 +1492,83 @@ class BrainEngineV2(BaseBrainEngine):
                         e["rolled_back_at"] = int(time.time())
                     await self._record_plan_event(
                         f"repair:{ids[0]}" if ids and ids[0] else "repair:unknown",
-                        "rolled_back",
+                        "ROLLBACK",
                         f"dynamic_weights cleared after hurt repair(s) {ids}",
                     )
+
+                # ── Item #6: extend auto-rollback to config overrides ──
+                # A hurt repair whose category is a config override (e.g.
+                # threshold_too_low) should revert the field to its prior
+                # value. Snapshot lives under brain_config_version_snapshots.
+                config_categories = {
+                    "threshold_too_low",
+                    "config_regression_pinpoint",
+                    "config_regression",
+                }
+                hurt_config_repairs = [
+                    e for e in fresh
+                    if e.get("verdict") == "hurt"
+                    and e.get("category") in config_categories
+                ]
+                if hurt_config_repairs:
+                    current_override = await self.sdb.get_config_override()
+                    reverted: List[str] = []
+                    for e in hurt_config_repairs:
+                        field = e.get("config_field")
+                        prior = e.get("config_current")
+                        if not field or prior is None:
+                            continue
+                        if field not in CONFIG_OVERRIDE_ALLOWED_FIELDS:
+                            continue
+                        # Only revert if the live value still matches what
+                        # we applied — never stomp an operator's change.
+                        live = getattr(cfg, field, None)
+                        if live is None or current_override.get(field) != live:
+                            logger.info(
+                                f"Auto-rollback skipped for {field}: live value "
+                                f"changed since the repair (operator edit?)"
+                            )
+                            continue
+                        ok = await self.sdb.write_config_override(field, prior)
+                        if ok:
+                            reverted.append(f"{field}={prior}")
+                            e["auto_rolled_back"] = True
+                            e["rolled_back_at"] = int(time.time())
+                    if reverted:
+                        logger.warning(
+                            f"↩️ Auto-rollback: reverted {len(reverted)} config "
+                            f"override(s): {reverted} (restart required to apply)"
+                        )
+                        await self._record_plan_event(
+                            f"config_revert:{reverted[0].split('=')[0]}",
+                            "ROLLBACK",
+                            f"config reverted: {reverted}",
+                        )
+
+                # ── Item #6: extend auto-rollback to alert-key disables ──
+                # A hurt disable means: we turned it off, and outcomes got
+                # worse, i.e. the alert was actually contributing. Re-enable.
+                hurt_disables = [
+                    e for e in fresh
+                    if e.get("verdict") == "hurt"
+                    and e.get("category") == "disable_alert"
+                ]
+                for e in hurt_disables:
+                    ak = e.get("alert") or e.get("alert_key")
+                    if not ak:
+                        continue
+                    ok = await self.sdb.set_alert_key_disabled(ak, False)
+                    if ok:
+                        logger.warning(
+                            f"↩️ Auto-rollback: re-enabled alert '{ak}' — "
+                            f"disabling it HURT outcomes"
+                        )
+                        e["auto_rolled_back"] = True
+                        e["rolled_back_at"] = int(time.time())
+                        await self._record_plan_event(
+                            f"reenable:{ak}", "ROLLBACK",
+                            f"auto-re-enabled {ak} after hurt disable",
+                        )
 
             # ── Champion/challenger: periodic promotion check. force=False
             # always, so this stays a no-op reporting "shadow_only_requires_force"
@@ -2541,18 +2615,60 @@ class BrainEngineV2(BaseBrainEngine):
     async def _record_plan_event(
         self, plan_id: Optional[str], status: str, note: Optional[str] = None,
     ) -> None:
-        """Append one lifecycle event (blocked/pending/superseded/applied/
-        rolled_back) to the capped Brain plan audit trail. Best-effort —
-        never raises into the report/apply path."""
+        """Append one lifecycle event (BLOCKED/MONITOR/SHADOW/APPROVED/
+        APPLIED/ROLLBACK) to the capped Brain plan audit trail. Best-effort
+        — never raises into the report/apply path.
+
+        Item #18: the status is normalized against LifecycleState so that
+        old string aliases ('pending'/'superseded'/'rolled_back') and new
+        canonical states can coexist in one history without breaking the
+        legality check below."""
         if not plan_id:
             return
         try:
+            from bot_config import LifecycleState
+            # Normalize legacy aliases to canonical states.
+            _ALIAS = {
+                "pending": LifecycleState.APPROVED,
+                "blocked": LifecycleState.BLOCKED,
+                "superseded": LifecycleState.BLOCKED,
+                "rolled_back": LifecycleState.ROLLBACK,
+                "applied": LifecycleState.APPLIED,
+                "shadow": LifecycleState.SHADOW,
+                "monitor": LifecycleState.MONITOR,
+            }
+            canonical = _ALIAS.get(str(status).lower(), status)
+            if canonical not in LifecycleState.ALL:
+                # Unknown status — accept it but flag it so it's visible.
+                canonical = str(status)
+
             raw = await self.sdb.get_metadata(PLAN_HISTORY_KEY)
             hist = json_loads(raw) if raw else []
             if not isinstance(hist, list):
                 hist = []
+
+            # Legality check: warn (don't reject) if a transition is illegal.
+            # A rejection here would silently lose the event, which is worse
+            # than an illegal transition showing up in the audit trail.
+            prev_status: Optional[str] = None
+            for entry in reversed(hist):
+                if isinstance(entry, dict) and entry.get("plan_id") == plan_id:
+                    prev_status = entry.get("status")
+                    break
+            if (
+                prev_status
+                and canonical in LifecycleState.ALL
+                and prev_status in LifecycleState.ALL
+                and not LifecycleState.is_legal(prev_status, canonical)
+            ):
+                logging.getLogger("macd_bot").warning(
+                    f"Plan {plan_id}: illegal lifecycle transition "
+                    f"{prev_status} -> {canonical} (recorded anyway)"
+                )
+
             hist.append({
-                "plan_id": plan_id, "status": status,
+                "plan_id": plan_id, "status": canonical,
+                "prev_status": prev_status,
                 "ts": int(time.time()), "note": note,
             })
             await self.sdb.set_metadata(

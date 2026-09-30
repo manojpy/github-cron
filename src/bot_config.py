@@ -164,6 +164,37 @@ class Constants:
     MACRO_MULT_FULL = 1.30
     MACRO_RS_EASE_FACTOR = 0.75
 
+class LifecycleState:
+    """First-class outcome states for anything the Brain proposes.
+
+    These are the states an action-gate outcome can occupy end-to-end.
+    They are exposed as plain string constants (not an Enum) because they
+    are written into Redis metadata and Telegram messages, and callers in
+    both places expect JSON-serializable primitives.
+    """
+    BLOCKED = "BLOCKED"          # gate did not pass, no action taken
+    MONITOR = "MONITOR"          # under observation, no change proposed
+    SHADOW = "SHADOW"            # computed + logged, never applied live
+    APPROVED = "APPROVED"        # gate passed, pending operator apply
+    APPLIED = "APPLIED"          # written to live config/weights/flags
+    ROLLBACK = "ROLLBACK"        # applied change was reverted by auto/operator
+
+    ALL = (BLOCKED, MONITOR, SHADOW, APPROVED, APPLIED, ROLLBACK)
+
+    _LEGAL_TRANSITIONS = {
+        BLOCKED: {BLOCKED, MONITOR, SHADOW, APPROVED},
+        MONITOR: {MONITOR, SHADOW, APPROVED, BLOCKED},
+        SHADOW:  {SHADOW, APPROVED, BLOCKED, MONITOR},
+        APPROVED: {APPROVED, APPLIED, BLOCKED, ROLLBACK},
+        APPLIED: {APPLIED, ROLLBACK},
+        ROLLBACK: {ROLLBACK, SHADOW, MONITOR, BLOCKED},
+    }
+
+    @classmethod
+    def is_legal(cls, before: str, after: str) -> bool:
+        return after in cls._LEGAL_TRANSITIONS.get(before, {after})
+
+
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
 
@@ -297,6 +328,12 @@ class BotConfig(BaseModel):
     ALERT_DEDUP_WINDOW_SEC: int = Field(default=120, ge=0, description="Dedup window for repeat alerts")
     ENABLE_ALERT_COALESCING: bool = Field(default=True) 
     COALESCE_DEDUP_WINDOW_SEC: int = Field(default=1800, ge=0)
+    ENABLE_ADAPTIVE_DEDUP: bool = Field(default=False, description="If True, ALERT_DEDUP_WINDOW_SEC is replaced per-alert by a window derived from that (pair, alert_key)'s own historical fire spacing.")
+    ADAPTIVE_DEDUP_FACTOR: float = Field(default=0.5, ge=0.05, le=1.0, description="Fraction of the observed inter-arrival p50 used as the dedup window. 0.5 means we allow re-fire at half the typical cadence.")
+    ADAPTIVE_DEDUP_MIN_SEC: int = Field(default=90, ge=0)
+    ADAPTIVE_DEDUP_MAX_SEC: int = Field(default=3600, ge=60)
+    ADAPTIVE_DEDUP_SAMPLE: int = Field(default=20, ge=5, le=500, description="Min outcomes on which to estimate inter-arrival before the adaptive window kicks in. Below this, the static ALERT_DEDUP_WINDOW_SEC is used.")
+    ADAPTIVE_DEDUP_HISTORY_MAX: int = Field(default=100, ge=10, le=1000, description="Cap on stored inter-arrival gaps per (pair, alert_key).")
     ENABLE_CONFLUENCE_GATE: bool = Field(default=False) 
     CONFLUENCE_MIN_PCT: float = Field(default=60.0, ge=1.0, le=100.0, description="Min percentage of the achievable confluence total required to pass. Denominator = sum of weights of enabled, non-abstaining votes this cycle, so the threshold auto-scales when votes are enabled/disabled — no manual retuning needed")
     CONFLUENCE_MIN_ABS_SCORE: float = Field(default=18.0, ge=0.0, le=50.0, description="Absolute weighted-score floor required to pass the confluence gate, applied alongside CONFLUENCE_MIN_PCT. The stricter of the two (percentage-of-total vs this fixed floor) wins, so a low-vote-count cycle can't clear the gate on percentage alone")
@@ -555,6 +592,9 @@ class BotConfig(BaseModel):
     BRAIN_SIZE_HINT_MEDIUM: float = Field(default=0.5, ge=0.0, le=1.0)
     BRAIN_SIZE_HINT_LOW: float = Field(default=0.25, ge=0.0, le=1.0)
     BRAIN_SIZE_HINT_BLOCKED: float = Field(default=0.0, ge=0.0, le=1.0)
+    BRAIN_SIZE_HINT_NEVER_UPSIZE: bool = Field(default=True, description="If True, a size_hint above BRAIN_SIZE_HINT_NO_UPSIZE_CAP is clamped until the evidence gate is met.",)
+    BRAIN_SIZE_UPSIZE_MIN_N: int = Field(default=200, ge=50, le=10000, description="Min OOS sample before the Brain may recommend upsizing.",)
+    BRAIN_SIZE_HINT_NO_UPSIZE_CAP: float = Field(default=1.0, ge=0.0, le=1.0, description="Hard ceiling on size_hint while BRAIN_SIZE_HINT_NEVER_UPSIZE is on and the evidence gate has not been met.",)
     ENABLE_QUALITY_HARD_BLOCK: bool = Field(default=False, description="HARD gate: when trade-quality verdict is BLOCKED, suppress Telegram dispatch and record a counterfactual instead of only annotating the message. Keep False until quality labels have been observed in shadow for a full analysis window.")
     CHALLENGER_MIN_CONSECUTIVE_PASSES: int = Field(default=3, ge=1, le=20, description="Consecutive, separately-spaced Brain evaluations the SAME challenger must pass before auto-promotion. A failed evaluation or a new challenger resets the streak.")
     CHALLENGER_STREAK_MIN_GAP_SEC: int = Field(default=3600, ge=60, le=86400, description="Minimum seconds between two evaluations that count toward the streak (maybe_promote_challenger runs more than once per Brain run).")
