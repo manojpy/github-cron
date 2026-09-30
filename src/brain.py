@@ -283,8 +283,8 @@ class BrainEngine:
 
         1. If a curve blob already exists and we have only a small number of
            newly resolved rows, update buckets incrementally.
-        2. Otherwise fall back to a full rebuild from Redis outcome streams
-           (same as before). Full Brain reports still rebuild from the archive.
+        2. Otherwise fall back to a full rebuild from Redis outcome streams.
+           Full Brain reports still rebuild from the archive.
         """
         if not getattr(cfg, "ENABLE_CALIBRATION_GATE", False):
             return
@@ -297,16 +297,15 @@ class BrainEngine:
             return
 
         try:
-            real_rows, shadow_rows = await self._get_rows(
-                sample_size=getattr(cfg, "CALIBRATION_REFRESH_SAMPLE", 500),
-            )
+            # _get_rows() takes no kwargs; stream size comes from
+            # BRAIN_REPORT_STREAM_SAMPLE / BRAIN_LONG_WINDOW_STREAM_SAMPLE inside it.
+            real_rows, shadow_rows = await self._get_rows()
             n_real = len(real_rows)
             n_shadow = len(shadow_rows)
             if n_real == 0 and n_shadow == 0:
                 logger_run.debug("Calibration refresh: no new rows")
                 return
 
-            # Try incremental path first
             existing_raw = await self.sdb._safe_redis_op(
                 lambda: _rc(self.sdb._redis).get(CALIBRATION_CURVES_KEY),
                 2.0, "calibration_load_for_incremental",
@@ -321,6 +320,7 @@ class BrainEngine:
             use_incremental = (
                 bool(existing.get("curves"))
                 and n_real <= getattr(cfg, "CALIBRATION_INCREMENTAL_MAX_ROWS", 80)
+                and hasattr(engine, "update_calibration_curves_incremental")
             )
 
             if use_incremental:
@@ -358,24 +358,6 @@ class BrainEngine:
             if ok:
                 logger_run.info(
                     f"✅ Calibration curves refreshed ({source}) & persisted "
-                    f"({n_keys} alert_key(s), mean-per-alert ECE={ece})"
-                )
-            else:
-                logger_run.error(
-                    f"❌ Calibration curves built but NOT persisted "
-                    f"({n_keys} alert_key(s), ECE={ece}) — "
-                    f"previous curve (if any) remains live"
-                )
-        except Exception as e:
-            logger_run.warning(
-                f"Calibration refresh failed "
-                f"(gate continues on previous curve if present): {e}"
-            )
-            n_keys = len(calib["curves"])
-            ece = calib.get("ece_mean")
-            if ok:
-                logger_run.info(
-                    f"✅ Calibration curves refreshed & persisted "
                     f"({n_keys} alert_key(s), mean-per-alert ECE={ece})"
                 )
             else:
@@ -701,7 +683,7 @@ class BrainEngine:
         except Exception:
             return False
 
-    # ── Stream reading helpers ───────────────────────────────────�����─────────
+    # ── Stream reading helpers ────────���──────────────────────────�����─────────
 
     async def _read_stream(self, stream_key: str, count: int) -> List[Dict[str, str]]:
         """Read the most recent `count` entries from an outcome stream."""
