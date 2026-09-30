@@ -63,11 +63,11 @@ def test_alert_pending_resolve_jsonl_brain_quality(tmp_path, monkeypatch):
     assert "verdict" in tq
 
     calib = engine.build_calibration_curves([row], bucket_pct=20.0, min_sample=1)
-    assert "curves" in calib
+    assert "ppo_cross_buy" in calib["curves"]
+    assert calib["curves"]["ppo_cross_buy"]["n"] == 1
 
-    # Only if actionable_condition_ablation was added to threshold_engine
-    if hasattr(engine, "actionable_condition_ablation"):
-        ablation = engine.actionable_condition_ablation(
-            [row], min_sample=1, n_permutations=3,
-        )
-        assert isinstance(ablation, list)
+    # Online update must ADD to the curve built above, never replace it.
+    folded = engine.fold_outcomes_into_calibration(calib, [row], min_sample=1)
+    assert folded == 1
+    assert calib["curves"]["ppo_cross_buy"]["n"] == 2
+    assert calib["curves"]["ppo_cross_buy"]["buckets"][0]["observed"] == 1.0
