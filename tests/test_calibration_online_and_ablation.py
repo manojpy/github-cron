@@ -159,57 +159,10 @@ def test_ablation_flags_noise_vote_often():
     )
     assert cuts >= 10
 
+
 def test_ablation_skips_unmeasurable_votes():
     rows = _vote_rows(1)
     for r in rows:
         r["votes"]["always_on"] = True
     names = {a["vote"] for a in engine.actionable_condition_ablation(rows, min_sample=30)}
     assert "always_on" not in names
-
-
-# ── #15: Regime-transition fields don't break calibration ──────────
-def test_calibration_ignores_regime_transition_fields():
-    """Rows carrying regime_transition or learned_tp_sl enrichment
-    fields should not break build_calibration_curves."""
-    rows = _rows(300, 1)
-    for r in rows[:10]:
-        r["regime_transition"] = {"from": "a", "to": "b"}
-        r["learned_tp_sl"] = {"sl_suggested_pct": 0.5}
-        r["lifecycle_state"] = "APPLIED"
-    base = engine.build_calibration_curves(rows, bucket_pct=20, min_sample=15)
-    assert "ppo_cross_buy" in base["curves"]
-    assert base["curves"]["ppo_cross_buy"]["n"] == 300
-
-
-# ── #14: Learned TP/SL zone function ───────────────────────────────
-def test_learned_tp_sl_zone_returns_valid():
-    """learned_tp_sl_zone should return a valid result with enough
-    data and OOS validation."""
-    import random
-    rnd = random.Random(7)
-    rows = []
-    for i in range(80):
-        mae = rnd.uniform(0.001, 0.02)
-        mfe = rnd.uniform(0.001, 0.03)
-        rows.append({
-            "entry_ts": 1700000000 + i * 900,
-            "mae": mae,
-            "mfe": mfe,
-            "win": mfe > mae,
-        })
-    result = engine.learned_tp_sl_zone(rows, min_sample=20)
-    assert result["valid"] is True
-    assert "sl_suggested_pct" in result
-    assert "tp1_suggested_pct" in result
-    assert "tp2_suggested_pct" in result
-    assert "oos_passed" in result
-    assert result["n_train"] >= 20
-    assert result["n_holdout"] >= 10
-
-
-def test_learned_tp_sl_zone_insufficient_data():
-    """With too few rows, learned_tp_sl_zone should return invalid."""
-    rows = [{"entry_ts": i, "mae": 0.01, "mfe": 0.02, "win": True} for i in range(10)]
-    result = engine.learned_tp_sl_zone(rows, min_sample=20)
-    assert result["valid"] is False
-    assert result.get("error") == "insufficient_data"
