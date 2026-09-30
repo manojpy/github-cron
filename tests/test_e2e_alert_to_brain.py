@@ -5,9 +5,6 @@ import json
 import time
 from pathlib import Path
 
-import pytest
-
-
 def test_alert_pending_resolve_jsonl_brain_quality(tmp_path, monkeypatch):
     """Smoke: resolved outcome → JSONL → trade_quality / calibration / ablation."""
     from outcome_storage import append_outcome_batch, OUTCOME_SCHEMA_VERSION
