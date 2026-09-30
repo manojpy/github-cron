@@ -272,6 +272,87 @@ def test_generate_report_falls_back_to_base_report(monkeypatch):
     assert asyncio.run(eng.generate_report([], q, logging.getLogger("t"))) is True
     assert called == [True] and sent == []
 
-
 def test_build_profit_action_plan_is_gone():
     assert not hasattr(be, "build_profit_action_plan")
+
+
+# ── #18: Lifecycle state in data quality header ────────────────────
+def test_lifecycle_state_in_data_quality_header():
+    """The audit layer's lifecycle state should appear in the data
+    quality header lines."""
+    from brain_audit import LifecycleState
+    a = get_audit()
+    a.begin_cycle()
+    rows = _rows(_SPEC)
+    a.set_history_coverage(rows, requested_days=180)
+    a.set_lifecycle_state(LifecycleState.APPROVED, "action gate passed")
+    header = a.build_data_quality_header()
+    text = "\n".join(header)
+    assert "APPROVED" in text
+    assert "Lifecycle" in text
+
+
+def test_lifecycle_transitions_recorded():
+    """Transitioning lifecycle states should be tracked."""
+    from brain_audit import LifecycleState
+    a = get_audit()
+    a.begin_cycle()
+    a.set_lifecycle_state(LifecycleState.MONITOR, "start")
+    a.set_lifecycle_state(LifecycleState.SHADOW, "data collected")
+    a.set_lifecycle_state(LifecycleState.APPROVED, "gate passed")
+    assert a.lifecycle_state == LifecycleState.APPROVED
+    assert len(a._lifecycle_transitions) == 3
+
+
+# ── #6: Auto-rollback events in report ─────────────────────────────
+def test_rollback_events_in_data_quality_header():
+    """Recorded rollback events should appear in the data quality
+    header."""
+    from brain_audit import LifecycleState
+    a = get_audit()
+    a.begin_cycle()
+    rows = _rows(_SPEC)
+    a.set_history_coverage(rows, requested_days=180)
+    a.record_rollback_event(
+        plan_id="PLAN-001",
+        reason="post-apply WR dropped",
+        pre_metrics={"wr": 0.60, "ev": 0.5},
+        post_metrics={"wr": 0.45, "ev": -0.2},
+    )
+    header = a.build_data_quality_header()
+    text = "\n".join(header)
+    assert "ROLLBACK" in text
+    assert "PLAN-001" in text
+    assert a.lifecycle_state == LifecycleState.ROLLBACK
+
+
+# ── #15/#14: New data doesn't crash report ─────────────────────────
+def test_report_with_regime_and_tpsl_context():
+    """Report generation should not crash when rows carry regime
+    transition tags or learned TP/SL data."""
+    rows = _rows(_SPEC)
+    # Inject enrichment fields into a few rows
+    for r in rows[:3]:
+        r["regime_transition"] = {"from": "ranging", "to": "trending"}
+        r["learned_tp_sl"] = {"sl_suggested_pct": 0.5, "oos_passed": True}
+        r["lifecycle_state"] = "APPLIED"
+    msgs = _report(rows)
+    assert msgs  # should not crash
+    assert len(msgs) >= 1
+
+
+# ── Audit to_dict includes new fields ──────────────────────────────
+def test_audit_to_dict_includes_lifecycle_and_rollbacks():
+    from brain_audit import LifecycleState
+    a = get_audit()
+    a.begin_cycle()
+    rows = _rows(_SPEC)
+    a.set_history_coverage(rows, requested_days=180)
+    a.set_lifecycle_state(LifecycleState.APPLIED, "plan applied")
+    a.record_rollback_event("PLAN-002", "hurt", {}, {})
+    d = a.to_dict()
+    assert d["lifecycle_state"] == "ROLLBACK"  # rollback overrides
+    assert len(d["rollback_events"]) == 1
+    assert len(d["lifecycle_transitions"]) >= 2
+
+
