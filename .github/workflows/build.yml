@@ -128,6 +128,13 @@ jobs:
         
               if is_using_aot():
                   print('✅ AOT Binary: LOADED & ACTIVE')
+                  import numeric_selftest
+                  ok, failures = numeric_selftest.run_self_test()
+                  for msg in failures:
+                      print(f'❌ SELFTEST FAIL: {msg}')
+                  if not ok:
+                      sys.exit(1)
+                  print('✅ Numeric self-test passed on AOT backend')
                   sys.exit(0)
               else:
                   reason = get_fallback_reason() or 'Unknown'
