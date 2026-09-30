@@ -2422,7 +2422,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                         else ""
                                     )
                                     alert_extra = (
-                                        f"{alert_extra} | Why: "
+                                        f"{alert_extra} | Votes: "
                                         + ", ".join(shown)
                                         + more
                                     )
