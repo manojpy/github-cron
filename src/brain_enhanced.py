@@ -2236,6 +2236,19 @@ class BrainEngineV2(BaseBrainEngine):
                         f"{a['vote']}(imp={a['importance']:+.3f}→×{a['suggested_weight_factor']})"
                         for a in noise_votes[:5]
                     ]
+                    adj_payload = []
+                    for a in noise_votes[:5]:
+                        vote = a["vote"]
+                        current_w = CONFLUENCE_WEIGHTS.get(vote)
+                        if current_w is None or current_w <= 0:
+                            continue
+                        adj_payload.append({
+                            "vote": vote,
+                            "current": current_w,
+                            "suggested": round(current_w * a["suggested_weight_factor"], 2),
+                            "category": "condition_ablation",
+                            "reason": a["reason"],
+                        })
                     recommendations.append({
                         "type": "condition_ablation",
                         "severity": "medium",
@@ -2244,26 +2257,13 @@ class BrainEngineV2(BaseBrainEngine):
                             + ", ".join(parts)
                         ),
                         "ablation": noise_votes[:5],
+                        "weight_adjustments": adj_payload,  # picked up by _store_pending_plan
                     })
-                    # Convert noise votes into plan weight_adjustments
-                    # (same shape root-cause already uses)
-                    weight_adjustments = recs.setdefault("weight_adjustments", [])
-                    for a in noise_votes[:5]:
-                        vote = a["vote"]
-                        current_w = CONFLUENCE_WEIGHTS.get(vote)
-                        if current_w is None or current_w <= 0:
-                            continue
-                        weight_adjustments.append({
-                            "vote": vote,
-                            "current": current_w,
-                            "suggested": round(current_w * a["suggested_weight_factor"], 2),
-                            "category": "condition_ablation",
-                            "reason": a["reason"],
-                        })
             except Exception as e:
                 logging.getLogger("macd_bot").debug(
                     f"Actionable ablation failed (non-fatal): {e}"
                 )
+
         _phase_mark("permutation_importance")
 
 # ── Benjamini-Hochberg FDR correction ────────────────────────
@@ -2607,17 +2607,31 @@ class BrainEngineV2(BaseBrainEngine):
                         reinstate_alerts.append(ak)
 
                 elif rec_type == "repair_shop" and rec.get("category") == "root_cause":
-                    # FIX (Issue 4): Root-cause weight adjustments must also pass 
-                    # the global action gate, exactly like disable/reinstate alerts.
                     if not action_gate_passed:
                         continue
-                        
-                    # Wiring #1: turn the root-cause segment into an
-                    # actionable weight reduction instead of leaving it prose.
                     adj = self._root_cause_to_weight_adjustment(rec)
                     if adj:
                         weight_adjustments.append(adj)
-            
+
+                elif rec_type == "condition_ablation":
+                    # Roadmap #10 — votes that add almost no information.
+                    # Same gate rule as root-cause weight cuts.
+                    if not action_gate_passed:
+                        continue
+                    for adj in rec.get("weight_adjustments") or []:
+                        if not isinstance(adj, dict):
+                            continue
+                        vote = adj.get("vote")
+                        if not vote:
+                            continue
+                        weight_adjustments.append({
+                            "vote": vote,
+                            "current": adj.get("current"),
+                            "suggested": adj.get("suggested"),
+                            "category": adj.get("category") or "condition_ablation",
+                            "reason": adj.get("reason") or rec.get("message", ""),
+                        })
+
                 elif rec_type == "repair_shop" and rec.get("category") == "threshold_too_low":
                     if not action_gate_passed:
                         continue
@@ -2733,7 +2747,7 @@ class BrainEngineV2(BaseBrainEngine):
                     param_diffs.append({
                         "field": f"weight:{w.get('vote')}",
                         "old": w.get("current") or w.get("old"),
-                        "new": w.get("new") or w.get("proposed"),
+                        "new": w.get("suggested") or w.get("new") or w.get("proposed"),
                         "reason": w.get("category") or "weight_adjustment",
                     })
                 for ak in disable_alerts:
