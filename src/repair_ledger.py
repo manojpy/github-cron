@@ -143,6 +143,10 @@ async def record_repair_issued(sdb, rec: Dict[str, Any],
         "applied_at": None,
         "verdict": None,
         "delta_observed": None,
+        # ── #18: Lifecycle state ──
+        "lifecycle_state": "MONITOR",
+        "rolled_back_at": None,
+        "auto_rolled_back": False,
     }
     entries = await _load_ledger(sdb)
     # If this repair was already issued in the same 15m bucket, refresh it
@@ -167,6 +171,7 @@ async def mark_plan_applied(sdb, plan_ts: int) -> int:
             continue
         if abs(e["issued_at"] - plan_ts) <= APPLY_WINDOW_SEC:
             e["applied_at"] = now
+            e["lifecycle_state"] = "APPLIED"
             n += 1
     if n:
         await _save_ledger(sdb, entries)
@@ -264,6 +269,13 @@ async def evaluate_pending_repairs(sdb, current_rows: List[dict],
             "wilson_lo": round(lo, 4),
             "wilson_hi": round(hi, 4),
         }
+        if verdict == "hurt":
+            e["auto_rolled_back"] = True
+            e["rolled_back_at"] = now
+            e["lifecycle_state"] = "ROLLBACK"
+        elif verdict == "helped":
+            e["lifecycle_state"] = "APPLIED"
+
         fresh_verdicts.append(e)
         changed = True
     if changed:
@@ -309,3 +321,46 @@ async def load_ledger_entries(sdb) -> List[dict]:
     Kept separate from repair_success_rates() because the model needs the
     per-entry snapshot_before + verdict, not just the aggregated rates."""
     return await _load_ledger(sdb)
+
+async def get_config_rollback_targets(sdb) -> List[Dict[str, Any]]:
+    """#6 — Return ledger entries whose verdict is 'hurt' AND whose scope
+    targets a config_version or threshold change. The caller
+    (brain_enhanced.py) uses these to auto-revert the specific
+    config override fields.
+
+    Returns::
+
+        [
+            {
+                "id": str,
+                "category": str,
+                "scope": dict,
+                "config_field": str | None,
+                "pre_apply_value": Any | None,
+                "delta_observed": dict,
+            },
+            ...
+        ]
+    """
+    entries = await _load_ledger(sdb)
+    targets: List[Dict[str, Any]] = []
+    for e in entries:
+        if e.get("verdict") != "hurt":
+            continue
+        scope = e.get("scope") or {}
+        kind = scope.get("kind")
+        # Only config-related scopes are revertible
+        if kind not in ("config_version", "score_band", "global"):
+            continue
+        # Extract the config field if the repair carried one
+        config_field = e.get("param") or e.get("config_field")
+        pre_val = (e.get("snapshot_before") or {}).get("config_value")
+        targets.append({
+            "id": e.get("id"),
+            "category": e.get("category"),
+            "scope": scope,
+            "config_field": config_field,
+            "pre_apply_value": pre_val,
+            "delta_observed": e.get("delta_observed"),
+        })
+    return targets

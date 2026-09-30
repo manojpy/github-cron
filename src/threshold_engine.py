@@ -1040,6 +1040,71 @@ def regime_transition_analysis(
         result["valid"] = True
     return result
 
+def regime_transition_events(
+    rows: List[Row],
+    lookback_stable: int = 4,
+    min_sample: int = 15,
+) -> List[Dict[str, Any]]:
+    with_adx = [
+        r for r in rows
+        if r.get("adx_val") is not None and r.get("ts") is not None
+    ]
+    if len(with_adx) < min_sample:
+        return []
+
+    with_adx = sorted(with_adx, key=lambda r: int(r["ts"]))
+    adx_vals = sorted(r["adx_val"] for r in with_adx)
+    mid = len(adx_vals) // 2
+    median_adx = (
+        adx_vals[mid] if len(adx_vals) % 2
+        else (adx_vals[mid - 1] + adx_vals[mid]) / 2.0
+    )
+
+    def _reg(r: Row) -> str:
+        return "trending" if r["adx_val"] >= median_adx else "ranging"
+
+    events: List[Dict[str, Any]] = []
+    stable_streak = 1
+    prev_reg = _reg(with_adx[0])
+
+    for i in range(1, len(with_adx)):
+        cur_reg = _reg(with_adx[i])
+        if cur_reg == prev_reg:
+            stable_streak += 1
+        else:
+            if stable_streak >= lookback_stable:
+                events.append({
+                    "ts": int(with_adx[i]["ts"]),
+                    "from": prev_reg,
+                    "to": cur_reg,
+                    "adx_before": with_adx[i - 1]["adx_val"],
+                    "adx_after": with_adx[i]["adx_val"],
+                    "stable_bars_before": stable_streak,
+                })
+            stable_streak = 1
+            prev_reg = cur_reg
+
+    return events
+
+def is_within_transition_window(
+    events: List[Dict[str, Any]],
+    alert_ts: int,
+    window_hours: int = 6,
+) -> Optional[Dict[str, Any]]:
+    """If *alert_ts* falls within *window_hours* after any transition
+    event, return that event; otherwise ``None``.  Used by the live
+    dispatch path to stamp a regime-transition warning on the alert."""
+    if not events:
+        return None
+    window_sec = window_hours * 3600
+    for ev in reversed(events):
+        delta = alert_ts - ev["ts"]
+        if 0 <= delta <= window_sec:
+            return ev
+        if delta < 0:
+            break
+    return None
+
 def strategy_vs_regime_attribution(
     rows: List[Row],
     min_sample: int = 30,
@@ -1151,6 +1216,34 @@ def strategy_vs_regime_attribution(
     else:
         result["attribution"] = "insufficient_current_regime_evidence"
         result["detail"] = "Recent outcomes lack ADX tags for regime attribution."
+
+    # ── #17: explicit three-way classification ──────────────────────
+    # 1. strategy_degradation   — edge is decaying across ALL regimes
+    # 2. regime_underrepresented — current regime has too little history
+    # 3. regime_mix_shift        — regime changed but per-regime edge holds
+    # 4. no_significant_drop     — nothing wrong
+    classification = result.get("attribution", "unknown")
+    result["classification"] = classification
+    result["classification_human"] = {
+        "possible_strategy_degradation": (
+            "🔴 STRATEGY DEGRADATION — the edge itself appears to be "
+            "decaying. Consider tightening gates or pausing."
+        ),
+        "regime_mix_shift": (
+            "🟡 REGIME MIX SHIFT — the market regime changed, but the "
+            "strategy's per-regime edge still holds. No parameter change "
+            "needed; expect natural recovery when the regime mix normalises."
+        ),
+        "insufficient_current_regime_evidence": (
+            "🟠 UNDERREPRESENTED REGIME — the current market regime has "
+            "too little historical data to judge. Do NOT change thresholds; "
+            "collect more data."
+        ),
+        "no_significant_drop": (
+            "🟢 NO SIGNIFICANT DROP — performance is within normal "
+            "variation for the current regime mix."
+        ),
+    }.get(classification, f"⚪ {classification}")
 
     result["valid"] = True
     result["evidence_state"] = sample_evidence_state(len(rows))
@@ -2138,6 +2231,73 @@ def lookup_mae_mfe_plan(profiles, pair, alert_key, direction):
             return plan
     return None
 
+
+def learned_tp_sl_zone(
+    rows: List[Row],
+    min_sample: int = 20,
+    oos_train_frac: float = 0.67,
+    sl_percentile: float = 70.0,
+    tp1_percentile: float = 60.0,
+    tp2_percentile: float = 85.0,
+    sl_min_pct: float = 0.15,
+    sl_max_pct: float = 3.0,
+) -> Dict[str, Any]:
+  
+    if len(rows) < min_sample * 2:
+        return {"valid": False, "error": "insufficient_data", "n": len(rows)}
+
+    ordered = sorted(rows, key=lambda r: r.get("entry_ts", 0))
+    split = int(len(ordered) * oos_train_frac)
+    train_rows = ordered[:split]
+    holdout_rows = ordered[split:]
+
+    if len(train_rows) < min_sample or len(holdout_rows) < min_sample // 2:
+        return {"valid": False, "error": "insufficient_split"}
+
+    plan = mae_mfe_trade_plan(
+        train_rows,
+        sl_percentile=sl_percentile,
+        tp1_percentile=tp1_percentile,
+        tp2_percentile=tp2_percentile,
+        sl_min_pct=sl_min_pct,
+        sl_max_pct=sl_max_pct,
+    )
+    if plan is None:
+        return {"valid": False, "error": "no_mae_mfe_data"}
+
+    sl_pct = plan["sl_suggested_pct"]
+    tp1_pct = plan["tp1_suggested_pct"]
+    tp2_pct = plan["tp2_suggested_pct"]
+
+    # ── OOS validation ────────────────────────────────────────────────
+    ho_mae = [
+        abs(r["mae"]) * 100.0
+        for r in holdout_rows if r.get("mae") is not None
+    ]
+    ho_mfe = [
+        abs(r["mfe"]) * 100.0
+        for r in holdout_rows if r.get("mfe") is not None
+    ]
+    if not ho_mae or not ho_mfe:
+        return {"valid": False, "error": "holdout_missing_mae_mfe"}
+
+    sl_coverage = sum(1 for m in ho_mae if m <= sl_pct) / len(ho_mae)
+    tp1_reach = sum(1 for m in ho_mfe if m >= tp1_pct) / len(ho_mfe)
+
+    oos_passed = sl_coverage >= 0.50 and tp1_reach >= 0.30
+
+    return {
+        "valid": True,
+        "oos_passed": oos_passed,
+        "sl_suggested_pct": sl_pct,
+        "tp1_suggested_pct": tp1_pct,
+        "tp2_suggested_pct": tp2_pct,
+        "n_train": len(train_rows),
+        "n_holdout": len(holdout_rows),
+        "oos_sl_coverage": round(sl_coverage, 3),
+        "oos_tp1_reach": round(tp1_reach, 3),
+    }
+
 def is_vote_pattern_ood(
     rows: List[Row],
     current_votes: Dict[str, bool],
@@ -2210,7 +2370,7 @@ def is_vote_count_ood(
         "relaxed_mode": relaxed_mode,
     }
 
-# ══════════������══════════════════════════════════════════��══════���══════════
+# ══════════�������══════════════════════════════════════════��══════���══════════
 #  NEW: Block-Bootstrap EV Confidence Intervals  (Recommended.txt §6)
 # ═════════════════════════════════════════════════════════════════��═════
 
@@ -2807,6 +2967,28 @@ def hash_config_state(
         "BRAIN_WEIGHT_OPTIMIZER_MAX_DELTA",
         "BRAIN_WEIGHT_OPTIMIZER_WALK_FORWARD",
         "BRAIN_WEIGHT_OPTIMIZER_MIN_CONFIDENCE",
+        "ENABLE_REGIME_TRANSITION_ANALYSIS",
+        "REGIME_TRANSITION_LOOKBACK_BARS",
+        "REGIME_TRANSITION_POST_WINDOW_HOURS",
+        "ENABLE_STRATEGY_VS_REGIME_ATTRIBUTION",
+        "STRATEGY_VS_REGIME_MIN_SAMPLE",
+        "ENABLE_ALERT_FAMILY_ANALYSIS",
+        "ALERT_FAMILY_MIN_SAMPLE",
+        "ENABLE_ENSEMBLE_DECISION",
+        "ENSEMBLE_WEIGHT_BAYESIAN",
+        "ENSEMBLE_WEIGHT_ML",
+        "ENSEMBLE_WEIGHT_EV",
+        "ENSEMBLE_WEIGHT_RECENT",
+        "ENABLE_EVIDENCE_VERDICT_CAP",
+        "ENABLE_ALERT_WHY_SURVIVED",
+        "ENABLE_ALERT_WHY_REJECTED",
+        "ENABLE_MAE_MFE_TRADE_PLAN",
+        "MAE_MFE_MIN_SAMPLE",
+        "MAE_MFE_SL_PERCENTILE",
+        "MAE_MFE_TP1_PERCENTILE",
+        "MAE_MFE_TP2_PERCENTILE",
+        "MAE_MFE_SL_MIN_PCT",
+        "MAE_MFE_SL_MAX_PCT",
         "BRAIN_STABILITY_MIN_HISTORY",
         "BRAIN_STABILITY_MAX_JUMP",
         "BRAIN_CUSUM_DRIFT_DELTA",

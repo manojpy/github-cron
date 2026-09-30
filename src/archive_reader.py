@@ -76,12 +76,8 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
         is_migrated = False
         if drop_stale_schema and row_schema != CURRENT_SCHEMA_VERSION:
             # ── Migration viability check ──
-            # A stale row is migratable ONLY if it carries the minimum
-            # viable fields. Without win + pct_move + score + total,
-            # it cannot contribute to ANY Brain analysis.
             missing_viable = MINIMUM_VIABLE_FIELDS - set(raw.keys())
             if missing_viable:
-                # Genuinely unusable — discard.
                 return None
             # Migratable: proceed with None-fill for missing enrichment fields.
             is_migrated = True
@@ -202,6 +198,9 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
             "adx_val": float(_adx_val) if _adx_val is not None and _adx_val != "" else None,
             "rejection_reason": _rejection_reason,
             # ── Provenance — lets downstream consumers audit vintage ──
+            "regime_transition": raw.get("regime_transition"), 
+            "learned_tp_sl": raw.get("learned_tp_sl"),
+            "lifecycle_state": raw.get("lifecycle_state"),
             "schema_version": row_schema,
             "migrated": is_migrated,
         }
@@ -339,7 +338,11 @@ def load_archived_outcomes(
         + stats["dropped_duplicate_sid"]
         + stats["lines_malformed"]
     )
+
     if dropped_total > 0 or stats["migrated_forward"] > 0:
+        # Count enrichment-field coverage for observability
+        n_with_regime = sum(1 for r in rows if r.get("regime_transition"))
+        n_with_tpsl = sum(1 for r in rows if r.get("learned_tp_sl"))
         _log.info(
             f"📚 archive_reader ({label}): kept {stats['kept']} rows | "
             f"migrated_forward={stats['migrated_forward']}, "
@@ -348,6 +351,7 @@ def load_archived_outcomes(
             f"unparseable={stats['dropped_unparseable']}, "
             f"out-of-window={stats['dropped_before_window']}, "
             f"dup-sid={stats['dropped_duplicate_sid']}, "
-            f"malformed={stats['lines_malformed']}"
+            f"malformed={stats['lines_malformed']} | "
+            f"regime_tagged={n_with_regime}, tp_sl_tagged={n_with_tpsl}"
         )
     return (rows, stats) if return_stats else rows

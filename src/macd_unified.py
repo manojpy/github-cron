@@ -39,18 +39,15 @@ from state import (
     RedisKeyPrefix, RedisStateStore, RedisLock, _rc,
 )
 
-
 from gates import GateResult, compute_confluence_score, _eval_gate, _resolve_pair_outcomes
-
 import threshold_engine as engine
 
 _ALERT_ONLY_MODE: bool = False   # True → skip Brain analysis in run_once()
 
 from alerts import (
-    TelegramQueue, ALERT_KEYS, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
-    DEDUP_STATS, reset_dedup_stats,
+TelegramQueue, ALERT_KEYS, BUY_ALERT_KEYS, _eval_alerts, _apply_and_dispatch_alerts,
+escape_markdown_v2, DEDUP_STATS, reset_dedup_stats,
 )
-
 _pair_eval_counter = 0
 _CLUSTER_CACHE_MISS = object()
 
@@ -118,6 +115,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     open_positions_run: Optional[List[Dict[str, Any]]] = None,
     kill_switch_active_run: bool = False,
     last_processed_candles_run: Optional[Dict[str, Optional[int]]] = None,
+    regime_events_run: Optional[List[Dict[str, Any]]] = None,
+    learned_tp_sl_profiles_run: Optional[Dict[str, Any]] = None,
 ) -> Optional[Tuple[str, Dict[str, Any], Optional[Any]]]:
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
@@ -272,11 +271,25 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         first = alert_result[0]
         if not isinstance(first, dict):
             return cast(Tuple[str, Dict[str, Any], Optional[Any]], alert_result)
-
         context, conditional_states, raw_alerts = cast(
             Tuple[Dict[str, Any], Dict[str, bool], List[Tuple[str, str, str]]],
             alert_result,
         )
+
+        # ── #15: Inject regime-transition events into context ──
+        if regime_events_run:
+            context["_regime_events"] = regime_events_run
+
+        # ── #14: Inject learned TP/SL profile for this pair+direction ──
+        if learned_tp_sl_profiles_run and raw_alerts:
+            _first_ak = raw_alerts[0][2] if raw_alerts else None
+            _dir = "buy" if _first_ak in BUY_ALERT_KEYS else "sell"
+            _plan = engine.lookup_mae_mfe_plan(
+                learned_tp_sl_profiles_run, pair_name, _first_ak, _dir
+            )
+            if _plan:
+                context["_learned_tp_sl"] = _plan
+
         return await _apply_and_dispatch_alerts(
             gr, context, conditional_states, raw_alerts, sdb, telegram_queue, fetcher, symbol,
             correlation_id, logger_pair, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
@@ -315,24 +328,26 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                 logger_pair.debug(f"Memory probe failed: {e}")
 
 async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time, fetcher,
-                       alerts_sent_ref: Optional[List[int]] = None,
-                       alerts_sent_lock: Optional[asyncio.Lock] = None,
-                       max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN,
-                       oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None,
-                       macro_context: Optional[BtcMacroContext] = None,
-                       cluster_context: Optional[ClusterContext] = None,
-                       bias_context: Optional[BiasContext] = None,
-                       gate_cache: Optional[Dict[str, Any]] = None,
-                       parsed_cache: Optional[Dict[str, Any]] = None,
-                       calibration_curves: Optional[Dict[str, Any]] = None, 
-                       ml_market_state_model: Optional[Dict[str, Any]] = None,
-                       ml_calibration_curve: Optional[Dict[str, Any]] = None,
-                       brain_engine: Optional[Any] = None,
-                       disabled_alert_keys_run: Optional[Set[str]] = None,
-                       pair_thresholds_run: Optional[Dict[str, float]] = None,
-                       open_positions_run: Optional[List[Dict[str, Any]]] = None,
-                       kill_switch_active_run: bool = False,
-                       last_processed_candles_run: Optional[Dict[str, Optional[int]]] = None):
+    alerts_sent_ref: Optional[List[int]] = None,
+    alerts_sent_lock: Optional[asyncio.Lock] = None,
+    max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN,
+    oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None,
+    macro_context: Optional[BtcMacroContext] = None,
+    cluster_context: Optional[ClusterContext] = None,
+    bias_context: Optional[BiasContext] = None,
+    gate_cache: Optional[Dict[str, Any]] = None,
+    parsed_cache: Optional[Dict[str, Any]] = None,
+    calibration_curves: Optional[Dict[str, Any]] = None,
+    ml_market_state_model: Optional[Dict[str, Any]] = None,
+    ml_calibration_curve: Optional[Dict[str, Any]] = None,
+    brain_engine: Optional[Any] = None,
+    disabled_alert_keys_run: Optional[Set[str]] = None,
+    pair_thresholds_run: Optional[Dict[str, float]] = None,
+    open_positions_run: Optional[List[Dict[str, Any]]] = None,
+    kill_switch_active_run: bool = False,
+    last_processed_candles_run: Optional[Dict[str, Optional[int]]] = None,
+    regime_events_run: Optional[List[Dict[str, Any]]] = None,
+    learned_tp_sl_profiles_run: Optional[Dict[str, Any]] = None):
     p_name, symbol, candles = task_data                 
     try:
         pd_15m, pd_5m, data_daily = (parsed_cache or {}).get(p_name, (None, None, None))
@@ -366,6 +381,8 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
             open_positions_run=open_positions_run,
             kill_switch_active_run=kill_switch_active_run,
             last_processed_candles_run=last_processed_candles_run,
+            regime_events_run=regime_events_run,
+            learned_tp_sl_profiles_run=learned_tp_sl_profiles_run,
         )
         return result
     except asyncio.CancelledError:
@@ -1011,6 +1028,60 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             logger_main.warning(f"Bias pre-pass failed, disabling bias header this run: {e}")
             bias_context = None
 
+    # ── #15: Regime-transition events (computed once, shared by all pairs) ──
+    regime_transition_events: List[Dict[str, Any]] = []
+    if getattr(cfg, "ENABLE_REGIME_TRANSITION_ANALYSIS", True):
+        try:
+            # Use the first available pair's 15m data as a proxy for
+            # market-wide regime.  A dedicated BTC-only regime source
+            # would be better but this avoids an extra fetch.
+            _regime_source = cfg.MACRO_REFERENCE_PAIR
+            _regime_pd = parsed_cache.get(_regime_source, (None, None, None))[0]
+            if _regime_pd is not None and len(_regime_pd.ts) > 50:
+                import threshold_engine as _te
+                _fake_rows = [
+                    {"ts": int(_regime_pd.ts[i]), "adx_val": None}
+                    for i in range(len(_regime_pd.ts))
+                ]
+                # Compute ADX inline (lightweight, no full gate needed)
+                from indicators import calculate_adx_inline
+                _adx_arr = calculate_adx_inline(
+                    _regime_pd.high, _regime_pd.low, _regime_pd.close,
+                    getattr(cfg, "ADX_DI_LENGTH", 14),
+                )
+                for i, r in enumerate(_fake_rows):
+                    if i < len(_adx_arr) and not np.isnan(_adx_arr[i]):
+                        r["adx_val"] = float(_adx_arr[i])
+                regime_transition_events = _te.regime_transition_events(
+                    _fake_rows,
+                    lookback_stable=getattr(cfg, "REGIME_TRANSITION_LOOKBACK_BARS", 4),
+                    min_sample=15,
+                )
+                if regime_transition_events:
+                    logger_main.info(
+                        f"🔀 Regime transitions detected: {len(regime_transition_events)} "
+                        f"(latest: {regime_transition_events[-1]['from']}→"
+                        f"{regime_transition_events[-1]['to']})"
+                    )
+        except Exception as e:
+            logger_main.warning(f"Regime transition pre-pass failed (non-fatal): {e}")
+            regime_transition_events = []
+
+    # ── #14: Learned TP/SL profiles (loaded once from Brain's last persist) ──
+    learned_tp_sl_profiles: Dict[str, Any] = {}
+    if getattr(cfg, "ENABLE_MAE_MFE_TRADE_PLAN", True) and state_db and not state_db.degraded:
+        try:
+            _raw_profiles = await state_db.get_metadata("brain_mae_mfe_profiles")
+            if _raw_profiles:
+                learned_tp_sl_profiles = json_loads(_raw_profiles)
+                logger_main.info(
+                    f"📐 Learned TP/SL profiles loaded: "
+                    f"{len(learned_tp_sl_profiles)} bucket(s)"
+                )
+        except Exception as e:
+            logger_main.warning(f"MAE/MFE profile pre-load failed (non-fatal): {e}")
+            learned_tp_sl_profiles = {}
+
     logger_main.debug(f"🧠 Phase 3: Evaluating {len(prepared_tasks)} pairs...")
     eval_start = time.time()
     eval_semaphore = asyncio.Semaphore(cfg.EVAL_CONCURRENCY_LIMIT)  # NEW, e.g. 5
@@ -1055,6 +1126,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 open_positions_run=open_positions_run,
                 kill_switch_active_run=kill_switch_active_run,
                 last_processed_candles_run=last_processed_candles_run,
+                regime_events_run=regime_transition_events,
+                learned_tp_sl_profiles_run=learned_tp_sl_profiles,
             )
     results = await asyncio.gather(
         *[_bounded_eval(t) for t in prepared_tasks],

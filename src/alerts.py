@@ -42,8 +42,7 @@ from fetcher import (
     detect_reversal_candle_pattern,
     detect_reversal_candle_pattern_with_context,
 )
-
-from state import RedisStateStore, TokenBucket, _rc
+from state import RedisStateStore, TokenBucket, _rc, dead_letter_queue
 
 from gates import GateResult, IndicatorCache
 import threshold_engine as engine
@@ -335,7 +334,7 @@ async def _record_counterfactual_block(
         if logger_pair is not None:
             logger_pair.debug(f"Counterfactual shadow write failed ({block_reason}): {e}")
 
-    # Structured "why rejected" surface (roadmap #26)
+    # Structured "why rejected" surface (#26)
     if getattr(cfg, "ENABLE_ALERT_WHY_REJECTED", True) and logger_pair is not None:
         try:
             for title, _extra, alert_key in alerts_to_send:
@@ -345,9 +344,24 @@ async def _record_counterfactual_block(
                         f"score={effective_score:.1f}/{effective_required:.1f}"
                     )
                 if confluence_scores and alert_key in confluence_scores:
-                    sc, tot, _ = confluence_scores[alert_key]
+                    sc, tot, votes = confluence_scores[alert_key]
                     if sc is not None and tot is not None:
                         detail_bits.append(f"conf={sc:.1f}/{tot:.1f}")
+                    if votes:
+                        passed = [k for k, v in votes.items() if v]
+                        failed = [k for k, v in votes.items() if not v]
+                        if passed:
+                            detail_bits.append(f"✓{','.join(passed[:6])}")
+                        if failed:
+                            detail_bits.append(f"✗{','.join(failed[:4])}")
+                if macro_shadow:
+                    detail_bits.append(
+                        f"macro_mult={macro_shadow.get('multiplier', 1.0):.2f}"
+                    )
+                if cluster_penalty is not None:
+                    detail_bits.append(
+                        f"cluster_pen={cluster_penalty:.0%}"
+                    )
                 logger_pair.info(
                     f"🧠 BRAIN FILTER | {pair_name} {alert_key} | "
                     f"Signal gates: PASS | Action: BLOCKED | "
@@ -1020,10 +1034,19 @@ async def dispatch_combined_alerts(
             for dk in p.dedup_keys:
                 await sdb.release_recent_alert(p.pair_name, dk)
             DEDUP_STATS["released"] += 1
+            # ── Dead-letter: record the failed send for operator visibility ──
+            dead_letter_queue.push(
+                pair=p.pair_name,
+                alert_keys=p.alert_keys,
+                ts=p.ts,
+                reason="telegram_send_failed",
+                msg_snippet=p.msg_body[:200] if p.msg_body else "",
+            )
             logger_run.warning(
                 f"Individual send failed for {p.pair_name} — dedup claims "
                 f"({p.dedup_keys}) released so it can retry next run"
             )
+
     return already_sent + fallback_sent
 
 def validate_alert_definitions() -> None:
@@ -1711,6 +1734,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     last_processed: Union[int, None, object] = _SENTINEL_UNSET,
     kill_switch_active_run: Union[bool, object] = _SENTINEL_UNSET,
 ) -> Optional[Tuple[str, Dict[str, Any], Optional[AlertPayload]]]:
+    
     def _confluence_for(alert_key: str) -> Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]:
         if alert_key in BUY_ALERT_KEYS:
             return confluence_score_buy, confluence_total_buy, confluence_votes_buy
@@ -1718,7 +1742,52 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
     pair_name = gr.pair_name
     _, ts_curr, reference_time = gr.i15, gr.ts_curr, gr.reference_time
+
     _disabled_hits = context.pop("brain_disabled_hits", None) or []
+
+    # ── #15: Regime-transition warning stamp ──────────────────────────
+    # The caller (macd_unified) should pass regime_transition_events
+    # in context["_regime_events"] once per run.  Here we check
+    # whether the current alert falls inside a post-transition window.
+    _regime_events = context.get("_regime_events", [])
+    if _regime_events and ts_curr:
+        _trans = engine.is_within_transition_window(
+            _regime_events,
+            ts_curr,
+            window_hours=getattr(cfg, "REGIME_TRANSITION_POST_WINDOW_HOURS", 6),
+        )
+        if _trans:
+            context["_regime_transition_warning"] = (
+                f"{_trans['from']}→{_trans['to']} "
+                f"({_trans['stable_bars_before']} bars stable)"
+            )
+
+    # ── Soft memory budget: skip remaining pairs when RSS is high ──
+    try:
+        import resource
+        rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # On Linux ru_maxrss is in KB; on macOS it's bytes
+        import sys as _sys
+        if _sys.platform == "linux":
+            rss_bytes *= 1024
+        mem_ratio = rss_bytes / max(cfg.MEMORY_LIMIT_BYTES, 1)
+        if mem_ratio >= cfg.MEMORY_SOFT_STOP_RATIO:
+            logger_pair.warning(
+                f"[{pair_name}] Memory at {mem_ratio:.0%} of limit — "
+                f"deferring pair to protect process stability"
+            )
+            return pair_name, {
+                "state": "DEFERRED_MEMORY",
+                "ts": int(time.time()),
+                "summary": {
+                    "alerts": 0,
+                    "future_cloud": "neutral",
+                    "hist_rma": 0.0,
+                    "suppression": f"RSS {mem_ratio:.0%} ≥ soft-stop {cfg.MEMORY_SOFT_STOP_RATIO:.0%}",
+                },
+            }, None
+    except Exception:
+        pass  # resource module unavailable (Windows) — skip the check
 
     if cfg.ENABLE_KILL_SWITCH and sdb and not sdb.degraded and sdb._redis:
         if kill_switch_active_run is _SENTINEL_UNSET:
@@ -2225,7 +2294,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                         )
                                     )
 
-                        # ── Why it survived (interpretability only) ──
+                        # ── Why it survived (#25): Telegram-visible checklist ──
                         if getattr(cfg, "ENABLE_ALERT_WHY_SURVIVED", True):
                             try:
                                 checks = []
@@ -2246,6 +2315,21 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                         f"{alert_extra} | Why: "
                                         + ", ".join(shown)
                                         + more
+                                    )
+                                # ── Append regime-transition warning if applicable ──
+                                if context.get("_regime_transition_warning"):
+                                    alert_extra = (
+                                        f"{alert_extra} | ⚠️ regime transition"
+                                    )
+                                # ── Append learned TP/SL if available ──
+                                _plan = context.get("_learned_tp_sl")
+                                if _plan and _plan.get("oos_passed"):
+                                    alert_extra = (
+                                        f"{alert_extra} | "
+                                        f"SL-{_plan['sl_suggested_pct']:.2f}% "
+                                        f"TP1+{_plan['tp1_suggested_pct']:.2f}% "
+                                        f"TP2+{_plan['tp2_suggested_pct']:.2f}% "
+                                        f"(learned, OOS✓)"
                                     )
                             except Exception as e:
                                 logger_pair.debug(f"Why-survived build failed for {alert_key}: {e}")
@@ -2527,8 +2611,31 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             sell_present = any(ak in SELL_ALERT_KEYS for _, _, ak in alerts_to_send)
             direction = "MIXED" if (buy_present and sell_present) else ("BUY" if buy_present else "SELL")
             coalesced_dedup_key = f"coalesced_{direction}"
+
+            # ── Adaptive coalesce window: widen when the pair has been
+            # firing frequently (short inter-arrival), tighten when quiet.
+            # Uses a simple heuristic: if >3 alerts in the last hour,
+            # double the window; if none in the last 6 hours, halve it.
+            effective_coalesce_sec = cfg.COALESCE_DEDUP_WINDOW_SEC
+            try:
+                recent_count = await sdb.get_recent_alert_count(pair_name, hours=1)
+                if recent_count >= 3:
+                    effective_coalesce_sec = min(
+                        cfg.COALESCE_DEDUP_WINDOW_SEC * 2,
+                        3600,
+                    )
+                elif recent_count == 0:
+                    quiet_count = await sdb.get_recent_alert_count(pair_name, hours=6)
+                    if quiet_count == 0:
+                        effective_coalesce_sec = max(
+                            cfg.COALESCE_DEDUP_WINDOW_SEC // 2,
+                            300,
+                        )
+            except Exception:
+                pass  # fail-open: use the static window
+
             should_send = await sdb.check_recent_alert(
-                pair_name, coalesced_dedup_key, ts_curr, window_sec=cfg.COALESCE_DEDUP_WINDOW_SEC
+                pair_name, coalesced_dedup_key, ts_curr, window_sec=effective_coalesce_sec
             )
             if not should_send:
                 logger_pair.info(
