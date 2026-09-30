@@ -2789,13 +2789,13 @@ class BrainEngineV2(BaseBrainEngine):
                     reinstate_alerts = [item for _, k, item in keep if k == "reinstate"]
             
             # ── #18: Explicit lifecycle state ──────────────────────────────
+            _plan_real_rows = recs.get("_real_rows", []) or []
             if action_gate_passed:
                 lifecycle_state = "APPROVED"
-            elif len(real_rows) >= ACTION_GATE_MIN_ROWS:
+            elif len(_plan_real_rows) >= ACTION_GATE_MIN_ROWS:
                 lifecycle_state = "SHADOW"
             else:
                 lifecycle_state = "MONITOR"
-
             plan_data = {
                 "generated_at": int(time.time()),
                 "_action_gate_passed": action_gate_passed,
