@@ -111,6 +111,6 @@ def test_redis_key_inventory_counts_prefixes_and_no_ttl():
     s = S()
     s._redis = R(["pending:a:1", "pending:b:2", "metadata:x", "dedup:c"])
     inv = asyncio.run(macd_unified._redis_key_inventory(s))
-    assert inv["pending"] == {"keys": 2, "no_ttl": 0}
-    assert inv["metadata"] == {"keys": 1, "no_ttl": 1}
-    assert inv["dedup"]["keys"] == 1
+    assert inv["pending"] == {"keys": 2, "no_ttl": 0, "oldest_ttl_sec": 300}
+    assert inv["metadata"] == {"keys": 1, "no_ttl": 1, "oldest_ttl_sec": -1}
+    assert inv["dedup"] == {"keys": 1, "no_ttl": 0, "oldest_ttl_sec": 300}
