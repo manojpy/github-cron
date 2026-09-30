@@ -512,7 +512,7 @@ def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
     if validated_mode:
         return _sec_verdict(F, cfg)
     prof = _profit_status(net_ev, n)
-    out = [_hdr(1, 'EXECUTIVE SUMMARY — "WHAT DO I NEED TO KNOW?"')]
+    out = [_hdr(2, 'EXECUTIVE SUMMARY — "WHAT DO I NEED TO KNOW?"')]
     out.append(_p(f"OVERALL SYSTEM STATUS\n{_overall(F)}"))
     out.append(_c("\n".join(_kv_table([
         ("Observed profitability", prof),
@@ -563,7 +563,7 @@ def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
 def _sec_verdict(F: Dict[str, Any], cfg) -> List[_Piece]:
     """End-state Section 1, shown only when the action gate passes."""
     g = F["gate"]
-    out = [_hdr(1, "🧠 BRAIN VERDICT")]
+    out = [_hdr(3, "🧠 BRAIN VERDICT")]
     out.append(_c("\n".join(_kv_table([
         ("System health", _recording_status(F).split(' ')[0]),
         ("Profitability", _profit_status(F['net_ev'], F['n']).split(' ')[0]),
@@ -631,7 +631,7 @@ def _cf_verdict(scenario: Dict[str, Any], cfg) -> Tuple[str, str]:
 
 def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
     n, wr = F["n"], F["wr"]
-    out = [_hdr(2, "🚦 WHAT SHOULD I DO NOW?")]
+    out = [_hdr(3, "🚦 WHAT SHOULD I DO NOW?")]
     do_now: List[str] = []
     recon_ok = F["recon"] is not None and F["recon"].status == HealthStatus.OK
     if wr < 0.10 or not recon_ok:
@@ -704,7 +704,7 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
     n, wr, net_ev, days = F["n"], F["wr"], F["net_ev"], F["days"]
     an = F["anatomy"] or {}
     be = 1.0 / (1.0 + an["rr"]) if an.get("rr") else None
-    out = [_hdr(3, '📊 PROFITABILITY — "ARE WE ACTUALLY MAKING MONEY?"')]
+    out = [_hdr(4, '📊 PROFITABILITY — "ARE WE ACTUALLY MAKING MONEY?"')]
     wr_verdict = ("🔴 Very poor" if be and wr < be * 0.5 else "🔴 Below break-even" if be and wr < be
                   else "🟢 At/above break-even" if be else "⚪")
     dd, bud = F["dd"], F["dd_budget"]
@@ -762,7 +762,7 @@ def _alert_table(items: List[Dict[str, Any]], limit: int) -> List[_Piece]:
     return _c_split(_table(rows, "lrrr")) + [_p(_EVIDENCE_LEGEND)]
 
 def _sec_loss(F: Dict[str, Any], cfg) -> List[_Piece]:
-    out = [_hdr(4, '🔎 LOSS DIAGNOSIS — "WHERE ARE WE FALTERING?"')]
+    out = [_hdr(5, '🔎 LOSS DIAGNOSIS — "WHERE ARE WE FALTERING?"')]
     weak = F["weak"]
     if not weak:
         out.append(_p("No alert with at least 10 trades has negative EV in this sample."))
@@ -783,7 +783,7 @@ def _sec_loss(F: Dict[str, Any], cfg) -> List[_Piece]:
     return out
 
 def _sec_positive(F: Dict[str, Any], cfg) -> List[_Piece]:
-    out = [_hdr(5, '🟢 POSITIVE SIGNS — "WHERE ARE WE DOING BETTER?"')]
+    out = [_hdr(6, '🟢 POSITIVE SIGNS — "WHERE ARE WE DOING BETTER?"')]
     good = F["good"]
     if not good:
         out.append(_p("No alert with at least 10 trades has positive EV in this sample yet."))
@@ -800,7 +800,7 @@ def _sec_positive(F: Dict[str, Any], cfg) -> List[_Piece]:
     return out
 
 def _sec_scorecard(F: Dict[str, Any], cfg) -> List[_Piece]:
-    out = [_hdr(6, '🚦 ALERT SCORECARD — "WHAT SHOULD I TRUST?"')]
+    out = [_hdr(7, '🚦 ALERT SCORECARD — "WHAT SHOULD I TRUST?"')]
     validated = [a for a in F["good"] if a["rank"] == 4]
     promising = [a for a in F["good"] if a["rank"] < 4]
 
@@ -824,7 +824,7 @@ def _sec_scorecard(F: Dict[str, Any], cfg) -> List[_Piece]:
     return out
 
 def _sec_sessions(F: Dict[str, Any], cfg) -> List[_Piece]:
-    out = [_hdr(7, "⏰ SESSION / TIME ANALYSIS")]
+    out = [_hdr(8, "⏰ SESSION / TIME ANALYSIS")]
     sess = F["sessions"]                                     # worst-first
     if not sess:
         out.append(_p("No session data yet."))
@@ -903,7 +903,7 @@ def _confidence_breakdown(F: Dict[str, Any], cfg) -> List[Tuple[str, str, str]]:
 
 def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     g = F["gate"]
-    out = [_hdr(8, '🛡️ ACTION GATE — "CAN THE BRAIN SAFELY CHANGE ANYTHING?"')]
+    out = [_hdr(9, '🛡️ ACTION GATE — "CAN THE BRAIN SAFELY CHANGE ANYTHING?"')]
     labels = [("data_quality", "Minimum trades"), ("oos_prediction", "OOS EV"),
               ("profitability", "Net EV confidence"), ("stability", "CUSUM drift"),
               ("risk", "Drawdown budget"), ("execution", "Cost assumptions")]
@@ -929,79 +929,74 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
 
 def _sec_reasoning_chain(F: Dict[str, Any], cfg) -> List[_Piece]:
     """Roadmap #19 — explicit Brain decision narrative."""
-    out = [_hdr(0, '🧠 BRAIN DECISION — "WHY THIS VERDICT?"')]
-    n, wr, net_ev, days = F["n"], F["wr"], F["net_ev"], F["days"]
-    gate = F.get("gate") or {}
-    ai = F.get("ai") or {}
+    out = [_hdr(1, 'BRAIN DECISION — "WHY THIS VERDICT?"')]
+    try:
+        n = int(F.get("n") or 0)
+        wr = float(F.get("wr") or 0.0)
+        net_ev = float(F.get("net_ev") or 0.0)
+        days = F.get("days")
+        gate = F.get("gate") or {}
+        ai = F.get("ai") or {}
+        conf = str(F.get("conf") or "LOW")
 
-    # Market / regime (best-effort from available facts)
-    regime_bits = []
-    if F.get("sessions"):
-        top_sess = F["sessions"][0] if F["sessions"] else None
-        if top_sess:
-            regime_bits.append(f"weakest session={top_sess.get('session', '?')}")
-    market_line = ", ".join(regime_bits) if regime_bits else "regime tags limited in this window"
+        market_line = "regime tags limited in this window"
+        sessions = F.get("sessions") or []
+        if sessions and isinstance(sessions[0], dict):
+            market_line = f"weakest session={sessions[0].get('session', '?')}"
 
-    # Historical
-    hist_line = (
-        f"n={n} trades over {_fmt_days(days)} | "
-        f"WR={wr:.0%} | Net EV/trade={net_ev:+.2f}%"
-    )
+        hist_line = (
+            f"n={n} trades over {_fmt_days(days)} | "
+            f"WR={wr:.0%} | Net EV/trade={net_ev:+.2f}%"
+        )
 
-    # Recent (from ai_metrics if present)
-    recent_wr = ai.get("recent_wr")
-    recent_n = ai.get("recent_n")
-    if recent_wr is not None and recent_n:
-        recent_line = f"Recent WR={recent_wr:.0%} (n={recent_n})"
-    else:
-        recent_line = "recent window not separately scored this report"
+        recent_wr, recent_n = ai.get("recent_wr"), ai.get("recent_n")
+        if recent_wr is not None and recent_n:
+            recent_line = f"Recent WR={float(recent_wr):.0%} (n={recent_n})"
+        else:
+            recent_line = "recent window not separately scored this report"
 
-    # Calibration
-    ece = ai.get("calibration_ece_mean")
-    calib_line = (
-        f"mean-per-alert ECE={ece:.3f}" if ece is not None else "no calibration curve yet"
-    )
-    if ece is not None:
-        calib_line += " — GOOD" if ece < 0.08 else " — WATCH" if ece < 0.15 else " — POOR"
+        ece = ai.get("calibration_ece_mean")
+        if ece is None:
+            calib_line = "no calibration curve yet"
+        else:
+            ece_f = float(ece)
+            tag = "GOOD" if ece_f < 0.08 else "WATCH" if ece_f < 0.15 else "POOR"
+            calib_line = f"mean-per-alert ECE={ece_f:.3f} — {tag}"
 
-    # OOS / gate
-    oos_ok = bool(gate.get("oos_prediction"))
-    oos_line = "PASS" if oos_ok else "FAIL / unavailable"
+        oos_line = "PASS" if gate.get("oos_prediction") else "FAIL / unavailable"
+        drift_line = "NONE detected" if gate.get("stability") else "CUSUM drift active"
 
-    # Drift
-    stability_ok = bool(gate.get("stability"))
-    drift_line = "NONE detected" if stability_ok else "CUSUM drift active"
+        if F.get("gate_ok") and net_ev > 0 and conf in ("MODERATE", "HIGH"):
+            decision = "APPROVED — evidence supports limited parameter change (still via shadow/plan)"
+        elif F.get("gate_ok"):
+            decision = "MONITOR — gate open but edge not strong enough to change live rules"
+        elif n < int(getattr(cfg, "ACTION_GATE_MIN_ROWS", 100)):
+            decision = "BLOCKED — insufficient sample for any live change"
+        elif not gate.get("stability"):
+            decision = "BLOCKED — drift detected; freeze parameter changes"
+        else:
+            decision = "BLOCKED — action gate not satisfied (see ACTION GATE)"
 
-    # Final decision language
-    if F["gate_ok"] and net_ev > 0 and F["conf"] in ("MODERATE", "HIGH"):
-        decision = "APPROVED — evidence supports limited parameter change (still via shadow/plan)"
-    elif F["gate_ok"]:
-        decision = "MONITOR — gate open but edge not strong enough to change live rules"
-    elif n < getattr(cfg, "ACTION_GATE_MIN_ROWS", 100):
-        decision = "BLOCKED — insufficient sample for any live change"
-    elif not stability_ok:
-        decision = "BLOCKED — drift detected; freeze parameter changes"
-    else:
-        decision = "BLOCKED — action gate not satisfied (see § ACTION GATE)"
-
-    lines = [
-        f"Market:     {market_line}",
-        f"Historical: {hist_line}",
-        f"Recent:     {recent_line}",
-        f"Calibration:{calib_line}",
-        f"OOS:        {oos_line}",
-        f"Drift:      {drift_line}",
-        f"Decision:   {decision}",
-    ]
-    out.append(_c("\n".join(lines)))
-    out.append(_p(
-        "Hard signal rules are unchanged. This block only states the Brain's "
-        "quality assessment and whether any plan is allowed to proceed."
-    ))
+        lines = [
+            f"Market:      {market_line}",
+            f"Historical:  {hist_line}",
+            f"Recent:      {recent_line}",
+            f"Calibration: {calib_line}",
+            f"OOS:         {oos_line}",
+            f"Drift:       {drift_line}",
+            f"Decision:    {decision}",
+        ]
+        out.append(_c("\n".join(lines)))
+        out.append(_p(
+            "Hard signal rules are unchanged. This block only states the Brain's "
+            "quality assessment and whether any plan is allowed to proceed."
+        ))
+    except Exception as e:
+        out.append(_p(f"Reasoning chain unavailable: {type(e).__name__}"))
     return out
 
 _REPORT_SECTIONS = (
-    ("BRAIN DECISION", _sec_reasoning_chain),   # roadmap #19 — first human section
+    ("BRAIN DECISION", _sec_reasoning_chain),
     ("EXECUTIVE SUMMARY", _sec_summary),
     ("WHAT TO DO NOW", _sec_do_now),
     ("PROFITABILITY", _sec_profit),
