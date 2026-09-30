@@ -941,20 +941,23 @@ def _sec_reasoning_chain(F: Dict[str, Any], cfg) -> List[_Piece]:
 
         market_line = "regime tags limited in this window"
         sessions = F.get("sessions") or []
-        if sessions and isinstance(sessions[0], dict):
-            market_line = f"weakest session={sessions[0].get('session', '?')}"
-
+        # session_breakdown() returns (session, wr, n) tuples, worst first.
+        if sessions and isinstance(sessions[0], (tuple, list)) and len(sessions[0]) >= 3:
+            w_name, w_wr, w_n = sessions[0][0], float(sessions[0][1]), int(sessions[0][2])
+            market_line = f"weakest session={w_name} (WR={w_wr:.0%}, n={w_n})"
         hist_line = (
             f"n={n} trades over {_fmt_days(days)} | "
             f"WR={wr:.0%} | Net EV/trade={net_ev:+.2f}%"
         )
 
-        recent_wr, recent_n = ai.get("recent_wr"), ai.get("recent_n")
+        recent_wr, older_wr, recent_n = engine.detect_temporal_drift(F.get("rows") or [])
         if recent_wr is not None and recent_n:
-            recent_line = f"Recent WR={float(recent_wr):.0%} (n={recent_n})"
+            recent_line = (
+                f"Recent WR={float(recent_wr):.0%} (n={recent_n}) "
+                f"vs earlier {float(older_wr):.0%}"
+            )
         else:
             recent_line = "recent window not separately scored this report"
-
         ece = ai.get("calibration_ece_mean")
         if ece is None:
             calib_line = "no calibration curve yet"

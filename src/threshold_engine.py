@@ -2210,7 +2210,7 @@ def is_vote_count_ood(
         "relaxed_mode": relaxed_mode,
     }
 
-# ══════════����══════════════════════════════════════════��══════���══════════
+# ══════════�����══════════════════════════════════════════��══════���══════════
 #  NEW: Block-Bootstrap EV Confidence Intervals  (Recommended.txt §6)
 # ═════════════════════════════════════════════════════════════════��═════
 
@@ -3390,45 +3390,63 @@ def permutation_vote_importance(
     min_sample: int = 30,
     n_permutations: int = 20,
     seed: int = 42,
+    min_side: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """ML-style permutation importance: shuffle each vote's values and
-    measure the WR drop. Votes whose permutation causes the biggest WR
-    drop are the most important. More robust than simple with/without
-    comparison because it preserves the marginal distribution."""
+    """Per-vote information test: how much of the WR gap between rows where
+    the vote fired and rows where it did not survives shuffling the vote?
+
+    importance = |observed WR gap| - mean(|WR gap| after shuffling the vote
+    column). A vote with no information scores ~0; an informative one scores
+    roughly its true gap. A vote needs at least ``min_side`` rows on BOTH
+    sides to be scored; otherwise it is omitted (unmeasurable, not "noise").
+    """
     if len(rows) < min_sample:
         return []
+    side_floor = int(min_side) if min_side is not None else max(10, min_sample // 3)
+
     vote_names: Set[str] = set()
     for r in rows:
         if r.get("votes"):
             vote_names.update(r["votes"].keys())
-    sorted_vote_names: List[str] = sorted(vote_names)
-    if not sorted_vote_names:
+    if not vote_names:
         return []
 
+    wins = [1 if r["win"] else 0 for r in rows]
     rng = random.Random(seed)
-    baseline_wr = sum(r["win"] for r in rows) / len(rows)
     results: List[Dict[str, Any]] = []
 
-    for vn in sorted_vote_names:
-        drops = []
-        for _ in range(n_permutations):
-            shuffled_rows = []
-            vote_vals = [r.get("votes", {}).get(vn) for r in rows]
-            rng.shuffle(vote_vals)
-            for i, r in enumerate(rows):
-                sr = dict(r)
-                if sr.get("votes"):
-                    sr["votes"] = dict(sr["votes"])
-                    sr["votes"][vn] = vote_vals[i]
-                shuffled_rows.append(sr)
-            perm_wr = sum(r["win"] for r in shuffled_rows) / len(shuffled_rows)
-            drops.append(baseline_wr - perm_wr)
-        mean_drop = statistics.fmean(drops)
+    def _gap(mask: List[bool]) -> Optional[float]:
+        n_on = sum(mask)
+        n_off = len(mask) - n_on
+        if n_on < side_floor or n_off < side_floor:
+            return None
+        w_on = sum(w for m, w in zip(mask, wins) if m)
+        w_off = sum(wins) - w_on
+        return w_on / n_on - w_off / n_off
+
+    for vn in sorted(vote_names):
+        mask = [bool((r.get("votes") or {}).get(vn)) for r in rows]
+        observed = _gap(mask)
+        if observed is None:
+            continue
+        null_gaps: List[float] = []
+        shuffled = list(mask)
+        for _ in range(max(1, n_permutations)):
+            rng.shuffle(shuffled)
+            g = _gap(shuffled)
+            if g is not None:
+                null_gaps.append(abs(g))
+        if not null_gaps:
+            continue
+        excess = abs(observed) - statistics.fmean(null_gaps)
+        p_value = (1 + sum(1 for g in null_gaps if g >= abs(observed))) / (1 + len(null_gaps))
         results.append({
             "vote": vn,
-            "importance": round(mean_drop, 4),
-            "std": round(statistics.pstdev(drops), 4) if len(drops) > 1 else 0.0,
-            "direction": "positive" if mean_drop > 0 else "negative",
+            "importance": round(excess, 4),
+            "p_value": round(p_value, 3),
+            "observed_gap": round(observed, 4),
+            "std": round(statistics.pstdev(null_gaps), 4) if len(null_gaps) > 1 else 0.0,
+            "direction": "positive" if observed > 0 else "negative",
         })
 
     results.sort(key=lambda x: -abs(x["importance"]))
@@ -3447,7 +3465,7 @@ def actionable_condition_ablation(
       {
         "vote": str,
         "importance": float,          # mean WR drop when shuffled
-        "direction": "noise"|"edge",
+        "direction": "noise"|"edge"|"weak",
         "action": "reduce_weight"|"keep"|"investigate",
         "suggested_weight_factor": float,  # 0.5 = halve, 1.0 = leave
         "reason": str,
@@ -3464,7 +3482,8 @@ def actionable_condition_ablation(
     for item in raw:
         imp = float(item.get("importance") or 0.0)
         vote = item["vote"]
-        if abs(imp) < noise_threshold:
+        p_val = float(item.get("p_value", 0.0))
+        if imp < noise_threshold:
             out.append({
                 "vote": vote,
                 "importance": imp,
@@ -3476,7 +3495,7 @@ def actionable_condition_ablation(
                     f"condition adds almost no information once others are present"
                 ),
             })
-        elif imp >= edge_threshold:
+        elif imp >= edge_threshold and p_val <= 0.10:
             out.append({
                 "vote": vote,
                 "importance": imp,
@@ -4595,114 +4614,65 @@ def build_calibration_curves(
         "built_at": int(time.time()),
     }
 
-def update_calibration_curves_incremental(
-    existing: Dict[str, Any],
-    new_rows: List[Row],
-    bucket_pct: float = 5.0,
+def fold_outcomes_into_calibration(
+    calib: Dict[str, Any],
+    rows: List[Row],
     min_sample: int = 15,
-) -> Dict[str, Any]:
-    """Merge newly resolved outcomes into an existing calibration blob.
+) -> int:
+    """Online update: fold newly resolved rows into EXISTING curve buckets.
 
-    Strategy (safe + simple):
-      - If an alert_key already has a curve, append its new rows and rebuild
-        ONLY that alert_key's buckets (quantile bins, same math as
-        build_calibration_curves).
-      - If an alert_key is new, build it from the new rows alone when
-        len >= min_sample.
-      - Recompute ece_mean over the updated set of curves.
-      - Never mutates `existing` in place; returns a new dict.
-
-    Full rebuild (build_calibration_curves) remains the source of truth on
-    Brain-report days; this path only keeps the live gate fresher between
-    those reports without re-scanning the whole archive.
+    Mutates ``calib`` in place and returns how many rows were folded. Bucket
+    boundaries are not moved (re-quantiling needs the full rebuild); only
+    n / wins / observed / predicted / Wilson CI / ECE change, so all history
+    already in the curve is kept. ``built_at`` is left untouched so the
+    age-based full rebuild still fires on schedule.
     """
-    if not new_rows:
-        return existing
-
-    curves: Dict[str, Any] = dict((existing or {}).get("curves") or {})
-    by_ak: Dict[str, List[Row]] = defaultdict(list)
-    for r in new_rows:
-        ak = r.get("alert_key")
-        if ak and r.get("conf_pct") is not None:
-            by_ak[str(ak)].append(r)
-
-    target_bins = max(1, round(100.0 / bucket_pct)) if bucket_pct > 0 else 20
-    updated_any = False
-
-    for ak, ak_new in by_ak.items():
-        # Prefer rebuilding from the union of prior bucket samples + new rows
-        # when we still have the raw rows; otherwise fall back to rebuilding
-        # from new rows alone once they clear min_sample.
-        prior_n = int((curves.get(ak) or {}).get("n") or 0)
-        combined_n = prior_n + len(ak_new)
-        if combined_n < min_sample and len(ak_new) < min_sample:
+    curves = calib.get("curves") or {}
+    folded = 0
+    touched: Set[str] = set()
+    for r in rows:
+        curve = curves.get(r.get("alert_key"))
+        buckets = (curve or {}).get("buckets") or []
+        if not buckets or r.get("conf_pct") is None:
             continue
-
-        # Lightweight path: rebuild this alert_key only from the new rows
-        # when they alone are enough; otherwise call the full builder on
-        # just this key's new rows (prior raw rows are not stored in the
-        # persisted curve). Full report rebuild still uses the archive.
-        src = ak_new if len(ak_new) >= min_sample else ak_new
-        if len(src) < min_sample:
+        conf = float(r["conf_pct"])
+        last_idx = len(buckets) - 1
+        chosen = None
+        for idx, bk in enumerate(buckets):
+            if bk["lo"] <= conf < bk["hi"] or (idx == last_idx and conf == bk["hi"]):
+                chosen = bk
+                break
+        if chosen is None:
             continue
+        n = int(chosen["n"])
+        wins = int(chosen["wins"]) if "wins" in chosen else int(round(chosen["observed"] * n))
+        new_n = n + 1
+        new_wins = wins + (1 if r.get("win") else 0)
+        chosen["predicted"] = round((chosen["predicted"] * n + conf / 100.0) / new_n, 4)
+        chosen["n"] = new_n
+        chosen["wins"] = new_wins
+        chosen["observed"] = round(new_wins / new_n, 4)
+        lo, hi, _ = wilson_ci(new_wins, new_n)
+        chosen["wilson_lo"] = round(lo, 4)
+        chosen["wilson_hi"] = round(hi, 4)
+        chosen["trusted"] = new_n >= min_sample
+        curve["n"] = int(curve.get("n") or 0) + 1
+        touched.add(r["alert_key"])
+        folded += 1
 
-        ordered = sorted(src, key=lambda r: float(r["conf_pct"]))
-        n_bins = max(1, min(target_bins, len(ordered) // min_sample))
-        chunk_size = math.ceil(len(ordered) / n_bins)
-        chunks = [ordered[i:i + chunk_size] for i in range(0, len(ordered), chunk_size)]
-        chunks = [c for c in chunks if c]
-        if not chunks:
-            continue
-
-        boundaries = [0.0]
-        for i in range(len(chunks) - 1):
-            prev_max = float(chunks[i][-1]["conf_pct"])
-            next_min = float(chunks[i + 1][0]["conf_pct"])
-            boundaries.append((prev_max + next_min) / 2.0)
-        boundaries.append(100.0)
-
-        buckets = []
-        n_total = len(ordered)
-        for idx, chunk in enumerate(chunks):
-            n_c = len(chunk)
-            wins = sum(1 for r in chunk if r.get("win"))
-            wr = wins / n_c
-            lo, hi, _ = wilson_ci(wins, n_c)
-            pred = statistics.mean(float(r["conf_pct"]) / 100.0 for r in chunk)
-            buckets.append({
-                "lo": round(boundaries[idx], 4),
-                "hi": round(boundaries[idx + 1], 4),
-                "predicted": round(pred, 4),
-                "observed": round(wr, 4),
-                "n": n_c,
-                "trusted": n_c >= min_sample,
-                "wilson_lo": round(lo, 4),
-                "wilson_hi": round(hi, 4),
-            })
-        ece = sum((bk["n"] / n_total) * abs(bk["observed"] - bk["predicted"]) for bk in buckets)
-        curves[ak] = {
-            "buckets": buckets,
-            "ece": round(ece, 4),
-            "n": n_total,
-            "built_at": int(time.time()),
-            "incremental": True,
-        }
-        updated_any = True
-
-    if not updated_any:
-        return existing
-
-    ece_values = [
-        c["ece"] for c in curves.values()
-        if isinstance(c, dict) and c.get("ece") is not None
-    ]
-    return {
-        "curves": curves,
-        "ece_mean": round(statistics.fmean(ece_values), 4) if ece_values else None,
-        "ece_mean_label": "mean_per_alert_ece",
-        "updated_at": int(time.time()),
-        "source": "incremental",
-    }
+    for ak in touched:
+        curve = curves[ak]
+        total = sum(bk["n"] for bk in curve["buckets"])
+        if total > 0:
+            curve["ece"] = round(
+                sum((bk["n"] / total) * abs(bk["observed"] - bk["predicted"])
+                    for bk in curve["buckets"]),
+                4,
+            )
+    if touched:
+        ece_values = [c["ece"] for c in curves.values() if c.get("ece") is not None]
+        calib["ece_mean"] = round(statistics.fmean(ece_values), 4) if ece_values else None
+    return folded
 
 def build_ml_calibration_curve(
     predictions: List[float],
@@ -4820,7 +4790,7 @@ def ml_calibration_lookup(
         return None, "thin_bucket_fail_open"
     return chosen["observed"], "ok"
 
-# ══════════════════════════════════════════════════════════════════════
+# ═════���════════════════════════════════════════════════════════════════
 #  PORTFOLIO HEAT — hard exposure caps, independent of confluence math
 # ══════════════════════════════════════════════════════════════════════
 

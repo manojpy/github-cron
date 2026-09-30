@@ -500,6 +500,7 @@ class BotConfig(BaseModel):
     CALIBRATION_MIN_SAMPLE: int = Field(default=15, ge=5, le=200)
     CALIBRATION_INCREMENTAL_MAX_ROWS: int = Field(default=80, ge=10, le=500)     
     CALIBRATION_SLACK: float = Field(default=0.05, ge=0.0, le=0.20) 
+    ENABLE_ONLINE_CALIBRATION: bool = Field(default=True, description="Between full rebuilds, fold newly resolved outcomes into the existing calibration buckets.")
     CALIBRATION_REFRESH_MAX_AGE_HOURS: float = Field(default=2.0, ge=0.5, le=48.0) 
     ENABLE_PORTFOLIO_HEAT_GATE: bool = Field(default=False) 
     MAX_CONCURRENT_POSITIONS: int = Field(default=6, ge=1, le=50)

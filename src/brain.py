@@ -278,13 +278,97 @@ class BrainEngine:
             )
             return False
 
-    async def maybe_refresh_calibration(self, logger_run: logging.Logger) -> None:
-        """Lightweight calibration refresh, independent of the full Brain report.
+    @staticmethod
+    def _next_stream_id(stream_id: str) -> str:
+        """Smallest stream ID strictly greater than ``stream_id``."""
+        ms, _, seq = str(stream_id).partition("-")
+        return f"{int(ms)}-{int(seq or 0) + 1}"
 
-        1. If a curve blob already exists and we have only a small number of
-           newly resolved rows, update buckets incrementally.
-        2. Otherwise fall back to a full rebuild from Redis outcome streams.
-           Full Brain reports still rebuild from the archive.
+    async def _stream_tips(self) -> Dict[str, str]:
+        """Newest entry ID of the real and shadow outcome streams ("0-0" when
+        empty). Returns {} if Redis can't be read, so callers skip stamping."""
+        tips: Dict[str, str] = {}
+        for kind, key in (
+            ("real", RedisKeyPrefix.OUTCOME_LOG_STREAM),
+            ("shadow", RedisKeyPrefix.SHADOW_LOG_STREAM),
+        ):
+            try:
+                entries = await self.sdb._safe_redis_op(
+                    lambda k=key: _rc(self.sdb._redis).xrevrange(k, count=1),
+                    3.0, f"calibration_stream_tip:{kind}",
+                )
+            except Exception:
+                return {}
+            tips[kind] = str(entries[0][0]) if entries else "0-0"
+        return tips
+
+    async def _fold_new_outcomes_into_calibration(
+        self, calib: Dict[str, Any], logger_run: logging.Logger,
+    ) -> None:
+        """Fold outcomes appended to the streams since the last fold/rebuild
+        into the existing buckets, then re-persist.
+
+        Per-stream ID cursors live INSIDE the curve payload, so cursor and
+        counts are written by one SET. If the persist fails the same rows
+        are simply folded again next run (no double counting).
+        """
+        cursors = dict(calib.get("stream_cursors") or {})
+        if "real" not in cursors or "shadow" not in cursors:
+            # Payload predates cursors (e.g. written by a Brain report):
+            # start folding from "now" instead of guessing what is in it.
+            tips = await self._stream_tips()
+            if tips:
+                calib["stream_cursors"] = tips
+                await self._persist_calibration_curves(calib)
+                logger_run.debug("Online calibration: cursors initialised")
+            return
+
+        cap = int(getattr(cfg, "CALIBRATION_INCREMENTAL_MAX_ROWS", 80))
+        min_sample = int(getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15))
+        folded_total = 0
+        advanced = False
+        for kind, key in (
+            ("real", RedisKeyPrefix.OUTCOME_LOG_STREAM),
+            ("shadow", RedisKeyPrefix.SHADOW_LOG_STREAM),
+        ):
+            start = self._next_stream_id(cursors[kind])
+            entries = await self.sdb._safe_redis_op(
+                lambda k=key, s0=start: _rc(self.sdb._redis).xrange(
+                    k, min=s0, max="+", count=cap,
+                ),
+                5.0, f"calibration_fold_read:{kind}",
+            )
+            if not entries:
+                continue
+            rows = self._parse_rows([fields for _id, fields in entries])
+            if kind == "shadow":
+                # Same selection-leakage exclusion as build_calibration_curves.
+                rows = [r for r in rows if r.get("rejection_reason") != "calibration_gate"]
+            folded_total += engine.fold_outcomes_into_calibration(
+                calib, rows, min_sample=min_sample,
+            )
+            cursors[kind] = str(entries[-1][0])
+            advanced = True
+
+        if not advanced:
+            return
+        calib["stream_cursors"] = cursors
+        calib["online_updates"] = int(calib.get("online_updates") or 0) + folded_total
+        calib["online_folded_at"] = int(time.time())
+        ok = await self._persist_calibration_curves(calib)
+        logger_run.info(
+            f"🎯 Online calibration: folded {folded_total} new outcome(s) "
+            f"(persisted={ok}, ECE={calib.get('ece_mean')})"
+        )
+
+    async def maybe_refresh_calibration(self, logger_run: logging.Logger) -> None:
+        """Keep the live calibration curve fresh, independent of the Brain report.
+
+        1. Curve exists and is younger than CALIBRATION_REFRESH_MAX_AGE_HOURS:
+           fold only the outcomes appended since the last run into the
+           existing buckets (no stream scan, history kept).
+        2. Curve missing or older than that: full rebuild from the Redis
+           outcome streams and stamp fresh stream cursors.
         """
         if not getattr(cfg, "ENABLE_CALIBRATION_GATE", False):
             return
@@ -296,68 +380,82 @@ class BrainEngine:
             logger_run.debug("Calibration refresh skipped: Redis unavailable or degraded")
             return
 
+        max_age_hr = float(getattr(cfg, "CALIBRATION_REFRESH_MAX_AGE_HOURS", 2.0))
+
+        # ── Fresh curve: online fold only ──
         try:
-            # _get_rows() takes no kwargs; stream size comes from
-            # BRAIN_REPORT_STREAM_SAMPLE / BRAIN_LONG_WINDOW_STREAM_SAMPLE inside it.
-            real_rows, shadow_rows = await self._get_rows()
-            n_real = len(real_rows)
-            n_shadow = len(shadow_rows)
-            if n_real == 0 and n_shadow == 0:
-                logger_run.debug("Calibration refresh: no new rows")
-                return
-
-            existing_raw = await self.sdb._safe_redis_op(
+            raw = await self.sdb._safe_redis_op(
                 lambda: _rc(self.sdb._redis).get(CALIBRATION_CURVES_KEY),
-                2.0, "calibration_load_for_incremental",
+                2.0, "calibration_age_check",
             )
-            existing: Dict[str, Any] = {}
-            if existing_raw:
-                try:
-                    existing = json_loads(existing_raw)
-                except Exception:
-                    existing = {}
-
-            use_incremental = (
-                bool(existing.get("curves"))
-                and n_real <= getattr(cfg, "CALIBRATION_INCREMENTAL_MAX_ROWS", 80)
-                and hasattr(engine, "update_calibration_curves_incremental")
+            if raw:
+                existing = json_loads(raw)
+                built_at = existing.get("built_at")
+                if existing.get("curves") and built_at is not None:
+                    age_hr = (time.time() - float(built_at)) / 3600.0
+                    if age_hr < max_age_hr:
+                        if getattr(cfg, "ENABLE_ONLINE_CALIBRATION", True):
+                            try:
+                                await self._fold_new_outcomes_into_calibration(
+                                    existing, logger_run,
+                                )
+                            except Exception as fold_exc:
+                                logger_run.warning(
+                                    f"Online calibration fold failed "
+                                    f"(curve unchanged this run): {fold_exc}"
+                                )
+                        else:
+                            logger_run.debug(
+                                f"Calibration curves fresh ({age_hr:.1f}h) — skip refresh"
+                            )
+                        return
+        except Exception as e:
+            logger_run.warning(
+                f"Calibration age check failed (will attempt rebuild): {e}"
             )
 
-            if use_incremental:
-                calib = engine.update_calibration_curves_incremental(
-                    existing,
-                    real_rows,
-                    bucket_pct=getattr(cfg, "CALIBRATION_BUCKET_PCT", 5.0),
-                    min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
-                )
-                source = "incremental"
-            else:
-                calib = engine.build_calibration_curves(
-                    real_rows,
-                    bucket_pct=getattr(cfg, "CALIBRATION_BUCKET_PCT", 5.0),
-                    min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
-                    shadow_rows=shadow_rows,
-                )
-                source = "full"
+        # ── Missing / stale: full rebuild ──
+        try:
+            logger_run.info(
+                f"🎯 Calibration refresh: curves missing or older than "
+                f"{max_age_hr}h — rebuilding..."
+            )
+            # Tips are read BEFORE the rows: a row appended in between is in
+            # the rebuild AND folded once next run (harmless), whereas reading
+            # tips afterwards could silently skip rows.
+            stream_tips = await self._stream_tips()
+            real_rows, shadow_rows = await self._get_rows()
+            n_real, n_shadow = len(real_rows), len(shadow_rows)
+            logger_run.info(
+                f"🎯 Calibration refresh input: {n_real} real, {n_shadow} shadow rows"
+            )
 
+            calib = engine.build_calibration_curves(
+                real_rows,
+                bucket_pct=getattr(cfg, "CALIBRATION_BUCKET_PCT", 5.0),
+                min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
+                shadow_rows=shadow_rows,
+            )
             if not calib.get("curves"):
                 from collections import Counter
                 ak_counts = Counter(r.get("alert_key") for r in real_rows)
-                top = ak_counts.most_common(5)
                 min_s = getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15)
                 logger_run.warning(
                     f"Calibration refresh: no curves built "
                     f"(need ≥{min_s} samples/alert_key). "
-                    f"real={n_real} shadow={n_shadow} | top alert_keys: {top}"
+                    f"real={n_real} shadow={n_shadow} | "
+                    f"top alert_keys: {ak_counts.most_common(5)}"
                 )
                 return
 
+            if stream_tips:
+                calib["stream_cursors"] = stream_tips
             ok = await self._persist_calibration_curves(calib)
             n_keys = len(calib["curves"])
             ece = calib.get("ece_mean")
             if ok:
                 logger_run.info(
-                    f"✅ Calibration curves refreshed ({source}) & persisted "
+                    f"✅ Calibration curves rebuilt & persisted "
                     f"({n_keys} alert_key(s), mean-per-alert ECE={ece})"
                 )
             else:
@@ -371,6 +469,7 @@ class BrainEngine:
                 f"Calibration refresh failed "
                 f"(gate continues on previous curve if present): {e}"
             )
+    
 
     async def _load_calibration_curve(self, alert_key: str) -> Optional[Dict[str, Any]]:
         now = time.time()
