@@ -33,10 +33,12 @@ from indicators import (
     calculate_ichimoku_numpy,
 )
 # ── state / gates / alerts : trim to direct usage ─
+
 from state import (
-    _blanket_reset_pair, _clear_all_redis_states, build_products_map_from_cfg,
+    _blanket_reset_pair, _clear_all_redis_states, _redis_key_inventory, build_products_map_from_cfg,
     RedisKeyPrefix, RedisStateStore, RedisLock, _rc,
 )
+
 
 from gates import GateResult, compute_confluence_score, _eval_gate, _resolve_pair_outcomes
 
@@ -46,7 +48,8 @@ _ALERT_ONLY_MODE: bool = False   # True → skip Brain analysis in run_once()
 
 from alerts import (
     TelegramQueue, ALERT_KEYS, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
-) 
+    DEDUP_STATS, reset_dedup_stats,
+)
 
 _pair_eval_counter = 0
 _CLUSTER_CACHE_MISS = object()
@@ -308,8 +311,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                 memory_limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
                 if current_memory_mb > (memory_limit_mb * 0.8):
                     logger_pair.warning(f"Memory spike: {current_memory_mb:.0f}MB / {memory_limit_mb:.0f}MB")
-            except Exception:
-                pass
+            except Exception as e:
+                logger_pair.debug(f"Memory probe failed: {e}")
 
 async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time, fetcher,
                        alerts_sent_ref: Optional[List[int]] = None,
@@ -1024,8 +1027,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 _lim_mb = cfg.MEMORY_LIMIT_BYTES / (1024 * 1024)
                 if _lim_mb > 0 and (_rss_mb / _lim_mb) >= soft_limit_ratio:
                     memory_soft_stop = True
-            except Exception:
-                pass
+            except Exception as e:
+                logger_main.warning(f"Soft pair budget probe failed (memory guard inactive): {e}")
 
             if memory_soft_stop:
                 deferred_pairs.append(pair_name)
@@ -1322,6 +1325,19 @@ async def run_once() -> Optional[bool]:
             else:
                 logger_run.error("CLEAR_REDIS=true but Redis is unavailable/degraded")
 
+        if os.getenv("REDIS_INVENTORY", "false").lower() == "true":
+            if sdb and not sdb.degraded:
+                try:
+                    inv = await asyncio.wait_for(_redis_key_inventory(sdb), timeout=30.0)
+                    logger_run.info("🗄️ Redis key inventory (prefix: keys / without TTL):")
+                    for prefix, e in sorted(inv.items(), key=lambda kv: -kv[1]["keys"]):
+                        flag = "  ⚠️ no TTL" if e["no_ttl"] else ""
+                        logger_run.info(f"   {prefix}: {e['keys']} / {e['no_ttl']}{flag}")
+                except Exception as e:
+                    logger_run.warning(f"Redis inventory failed: {e}")
+            else:
+                logger_run.error("REDIS_INVENTORY=true but Redis is unavailable/degraded")
+
         if os.getenv("CLEAR_KILL_SWITCH", "false").lower() == "true":
             if sdb and not sdb.degraded:
                 logger_run.warning("🔓 CLEAR_KILL_SWITCH requested — manually clearing kill switch...")
@@ -1486,8 +1502,9 @@ async def run_once() -> Optional[bool]:
             f"🔔 Processing {len(pairs_to_process)} pairs using optimized parallel architecture"
         )
 
-        logger_run.info("Starting evaluation phase...")  
+        logger_run.info("Starting evaluation phase...")      
         alerts_sent_ref = [0] 
+        reset_dedup_stats()
         all_results, deferred_pairs = await process_pairs_with_workers(
             fetcher, products_map, pairs_to_process, sdb, telegram_queue, 
             correlation_id, lock, reference_time,
@@ -1564,6 +1581,11 @@ async def run_once() -> Optional[bool]:
                 "redis_mem_pct": redis_mem_pct,
                 "brain_enabled": bool(getattr(cfg, "ENABLE_BRAIN", False)),
                 "daily_cache": getattr(fetcher, "_last_daily_cache_stats", None),
+                "telegram": {
+                    "sent_ok": getattr(telegram_queue, "sent_ok", 0),
+                    "sent_failed": getattr(telegram_queue, "sent_failed", 0),
+                },
+                "dedup": dict(DEDUP_STATS),
                 "timestamp": int(time.time()),
             }
             summary_path = os.environ.get(

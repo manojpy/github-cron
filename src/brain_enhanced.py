@@ -69,6 +69,9 @@ def _report_section_failed(failed: List[str], name: str, exc: Exception) -> None
 # ══════════════════════════════════════════════════════════════════════
 
 _RULE = "━" * 30
+PLAN_HISTORY_KEY = "brain_plan_history"
+PLAN_HISTORY_MAX = 100
+
 _IST = timezone(timedelta(hours=5, minutes=30))
 _LADDER = ["⚪", "🟡", "🟠", "🔵", "🟢"]          # Observation → Validated
 _LADDER_NAMES = ["Observation", "Early evidence", "Meaningful evidence",
@@ -1414,6 +1417,11 @@ class BrainEngineV2(BaseBrainEngine):
                     for e in hurt_weight_repairs:
                         e["auto_rolled_back"] = True
                         e["rolled_back_at"] = int(time.time())
+                    await self._record_plan_event(
+                        f"repair:{ids[0]}" if ids and ids[0] else "repair:unknown",
+                        "rolled_back",
+                        f"dynamic_weights cleared after hurt repair(s) {ids}",
+                    )
 
             # ── Champion/challenger: periodic promotion check. force=False
             # always, so this stays a no-op reporting "shadow_only_requires_force"
@@ -2055,7 +2063,7 @@ class BrainEngineV2(BaseBrainEngine):
 
         _phase_mark("regime_profiles")
 
-        # ── Config Version Regression ────────────────────────────────────
+        # ── Config Version Regression ──────���─────────────────────────────
         version_comparisons = compare_config_versions(
             real_rows, min_sample=self._phase_samples["config_regression"]
         )
@@ -2414,6 +2422,30 @@ class BrainEngineV2(BaseBrainEngine):
         base["_shadow_rows"] = shadow_rows
         return base
 
+    async def _record_plan_event(
+        self, plan_id: Optional[str], status: str, note: Optional[str] = None,
+    ) -> None:
+        """Append one lifecycle event (blocked/pending/superseded/applied/
+        rolled_back) to the capped Brain plan audit trail. Best-effort —
+        never raises into the report/apply path."""
+        if not plan_id:
+            return
+        try:
+            raw = await self.sdb.get_metadata(PLAN_HISTORY_KEY)
+            hist = json_loads(raw) if raw else []
+            if not isinstance(hist, list):
+                hist = []
+            hist.append({
+                "plan_id": plan_id, "status": status,
+                "ts": int(time.time()), "note": note,
+            })
+            await self.sdb.set_metadata(
+                PLAN_HISTORY_KEY, json_dumps(hist[-PLAN_HISTORY_MAX:]),
+                ttl=365 * 86400,
+            )
+        except Exception as e:
+            logging.getLogger("macd_bot").debug(f"Plan history write failed (non-fatal): {e}")
+
     async def _store_pending_plan(self, recs: Dict[str, Any]) -> None:
         """Store the current recommendations for later application."""
         try:
@@ -2628,12 +2660,29 @@ class BrainEngineV2(BaseBrainEngine):
                     f"(patches={len(config_patches)} disable={len(disable_alerts)} "
                     f"reinstate={len(reinstate_alerts)} weights={len(weight_adjustments)})"
                 )
+            if plan_data.get("plan_id"):
+                try:
+                    prev_raw = await self.sdb.get_metadata("brain_pending_plan")
+                    prev = json_loads(prev_raw) if prev_raw else {}
+                    prev_id = prev.get("plan_id") if isinstance(prev, dict) else None
+                    if prev_id and prev_id != plan_data["plan_id"]:
+                        await self._record_plan_event(
+                            prev_id, "superseded", f"replaced by {plan_data['plan_id']}"
+                        )
+                except Exception as e:
+                    logging.getLogger("macd_bot").debug(f"Previous plan lookup failed (non-fatal): {e}")
 
             await self.sdb.set_metadata(
                 "brain_pending_plan",
                 json_dumps(plan_data),
                 ttl=7 * 86400
             )
+            if plan_data.get("plan_id"):
+                await self._record_plan_event(
+                    plan_data["plan_id"],
+                    "pending" if action_gate_passed else "blocked",
+                    "action gate " + ("passed" if action_gate_passed else "did not pass"),
+                )
         except Exception as e:
             logging.getLogger("macd_bot").warning(f"Failed to store pending plan: {e}")
 
@@ -2911,6 +2960,7 @@ class BrainEngineV2(BaseBrainEngine):
                     + trailer
                 )
                 await telegram_queue.send(escape_markdown_v2(msg))
+                await self._record_plan_event(plan.get("plan_id"), "applied", "; ".join(applied)[:200])
                 # Clear the pending plan
                 await self.sdb.set_metadata("brain_pending_plan", "{}", ttl=60)
                 return True

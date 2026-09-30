@@ -72,6 +72,40 @@ async def _blanket_reset_pair(sdb: RedisStateStore, pair_name: str, logger_pair:
         )
     return len(resets)
 
+async def _redis_key_inventory(
+    sdb: "RedisStateStore", max_keys: int = 20000,
+) -> Dict[str, Dict[str, int]]:
+    """Read-only Redis audit: key count and no-TTL key count per prefix
+    (the text before the first ':'). Bounded by max_keys so it cannot
+    run away on a large keyspace."""
+    inventory: Dict[str, Dict[str, int]] = {}
+    batch: List[str] = []
+
+    async def _flush() -> None:
+        if not batch:
+            return
+        pipe = sdb._redis.pipeline()
+        for key in batch:
+            pipe.ttl(key)
+        ttls = await pipe.execute()
+        for key, ttl in zip(batch, ttls):
+            entry = inventory.setdefault(str(key).split(":", 1)[0], {"keys": 0, "no_ttl": 0})
+            entry["keys"] += 1
+            if ttl == -1:
+                entry["no_ttl"] += 1
+        batch.clear()
+
+    scanned = 0
+    async for key in sdb._redis.scan_iter(match="*", count=500):
+        batch.append(key)
+        scanned += 1
+        if len(batch) >= 500:
+            await _flush()
+        if scanned >= max_keys:
+            break
+    await _flush()
+    return inventory
+
 async def _clear_all_redis_states(
     sdb: RedisStateStore,
     pairs: List[str],

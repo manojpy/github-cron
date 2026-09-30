@@ -541,6 +541,7 @@ class BotConfig(BaseModel):
     ENABLE_ML_EV_GATE: bool = Field(default=False, description="HARD gate: block dispatch when per-trade calibrated EV < ML_EV_MIN_THRESHOLD. Keep False until shadow mode has been observed for a full analysis window.")
     BRAIN_AUTO_ROLLBACK_HURT: bool = Field(default=True) 
     ENABLE_ALERT_WHY_SURVIVED: bool = Field(default=True) 
+    ENABLE_EVIDENCE_VERDICT_CAP: bool = Field(default=True, description="If True, a trade-quality verdict is capped by sample evidence: INSUFFICIENT evidence → LOW, SHADOW evidence → at most MEDIUM. Advisory label only — never changes signal gates.") 
     MEMORY_SOFT_STOP_RATIO: float = Field(default=0.80, ge=0.5, le=0.95) 
     ENABLE_CHAMPION_CHALLENGER: bool = Field(default=False, description="If True, weight-optimizer / root-cause weight changes are stored as challenger weights in Redis instead of going live. Periodic promotion is checked at the end of each Brain report via maybe_promote_challenger().")
     CHALLENGER_MIN_OOS_SAMPLE: int = Field(default=80, ge=20, le=5000, description="Minimum OOS sample size required before challenger can promote to champion.")

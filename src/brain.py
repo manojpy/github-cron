@@ -2078,6 +2078,21 @@ class BrainEngine:
                 continue
             ev_obj = engine.ev_first_objective(s["rows"], min_sample=min_sample)
             if ev_obj.get("valid"):
+                ev_obj = dict(ev_obj)
+                _r_wr, _o_wr, _r_n = engine.detect_temporal_drift(s["rows"])
+                if _r_wr is not None:
+                    ev_obj["recent_wr"] = round(_r_wr, 4)
+                    ev_obj["wr_drop_recent"] = round(_o_wr - _r_wr, 4)
+                _train_wf, _hold_wf = engine.walk_forward_split(s["rows"])
+                _oos_ok = False
+                if len(_hold_wf) >= 20:
+                    _ho_obj = engine.ev_first_objective(_hold_wf, min_sample=20)
+                    _oos_ok = bool(
+                        _ho_obj.get("valid")
+                        and _ho_obj["p_ev_positive"] >= getattr(cfg, "BRAIN_EV_GATE_P_THRESHOLD", 0.85)
+                    )
+                ev_obj["oos_validated"] = _oos_ok
+                ev_obj["n_holdout"] = len(_hold_wf)
                 ev_by_alert[alert_key] = ev_obj
 
         mae_mfe_profiles: Dict[str, Any] = {}

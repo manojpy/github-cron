@@ -58,6 +58,11 @@ from threshold_engine import hash_config_state
 # Distinguishes "caller didn't pass this" from "caller passed None on purpose"
 # (None is a legitimate value for e.g. last_processed — no candle seen yet).
 _SENTINEL_UNSET = object()
+DEDUP_STATS: Dict[str, int] = {"released": 0, "kept_repaint": 0, "kept_mark_disagree": 0}
+
+def reset_dedup_stats() -> None:
+    for _k in DEDUP_STATS:
+        DEDUP_STATS[_k] = 0
 
 def escape_markdown_v2(text: str) -> str:
     return CompiledPatterns.ESCAPE_MARKDOWN.sub(r'\\\g<0>', str(text))
@@ -67,18 +72,26 @@ class TelegramQueue:
         self.token = token
         self.chat_id = chat_id
         self.token_bucket = TokenBucket(cfg.TELEGRAM_RATE_LIMIT_PER_MINUTE, cfg.TELEGRAM_BURST_SIZE)
+        self.sent_ok = 0
+        self.sent_failed = 0
 
     async def send(self, message: str, priority: str = "normal") -> bool:
         try:
-            return bool(
+            ok = bool(
                 await asyncio.wait_for(
                     self._send_impl(message),
                     timeout=45.0
                 )
             )
+            if ok:
+                self.sent_ok += 1
+            else:
+                self.sent_failed += 1
+            return ok
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            self.sent_failed += 1
             logger.error(f"Telegram send failed: {e}")
             if cfg.FAIL_ON_TELEGRAM_DOWN:
                 raise
@@ -340,8 +353,8 @@ async def _record_counterfactual_block(
                     f"Signal gates: PASS | Action: BLOCKED | "
                     + " | ".join(detail_bits)
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            logger_pair.debug(f"Why-rejected log failed ({block_reason}): {e}")
 
 def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional[str] = None, score: Optional[float] = None, total: Optional[float] = None) -> str:
     if not title: 
@@ -1006,6 +1019,7 @@ async def dispatch_combined_alerts(
             # re-fire on the next run until the dedup window expires.
             for dk in p.dedup_keys:
                 await sdb.release_recent_alert(p.pair_name, dk)
+            DEDUP_STATS["released"] += 1
             logger_run.warning(
                 f"Individual send failed for {p.pair_name} — dedup claims "
                 f"({p.dedup_keys}) released so it can retry next run"
@@ -2172,8 +2186,18 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 alert_extra = (
                                     f"{alert_extra} | 🎯 Quality: {tq['verdict']} "
                                     f"(P(profit)={tq.get('p_ev_positive', 0):.0%}, "
-                                    f"netEV={tq.get('net_ev', 0):+.2f}%)"
+                                    f"netEV={tq.get('net_ev', 0):+.2f}%, "
+                                    f"evidence={tq.get('evidence_state', '?')}"
+                                    + (
+                                        f", ensemble={tq['ensemble_p']:.0%}"
+                                        if tq.get("ensemble_p") is not None else ""
+                                    )
+                                    + ")"
                                 )
+                                if tq.get("drift_warning"):
+                                    alert_extra = f"{alert_extra} | ⚠️ recent WR drift"
+                                if tq.get("regime_warning"):
+                                    alert_extra = f"{alert_extra} | ⚠️ {tq['regime_warning']}"
                                 if tq.get("size_hint") is not None:
                                     alert_extra = (
                                         f"{alert_extra} | size_hint={tq['size_hint']:.2f}"
@@ -2214,8 +2238,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                         + ", ".join(shown)
                                         + more
                                     )
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger_pair.debug(f"Why-survived build failed for {alert_key}: {e}")
 
                         # ── ML-EV shadow / hard qualification ──
                         if (
@@ -2372,18 +2396,21 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     )
                     if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                         from outcome_storage import append_outcome
-                        append_outcome({
-                            "pair": pair_name,
-                            "alert_key": alert_key,
-                            "direction": direction,
-                            "entry_ts": ts_curr,
-                            "price": close_curr,
-                            "score": alert_score,
-                            "total": alert_total,
-                            "votes": alert_votes,
-                            "context": shadow_context,
-                        }, shadow=True)
-
+                        await asyncio.to_thread(
+                            append_outcome,
+                            {
+                                "pair": pair_name,
+                                "alert_key": alert_key,
+                                "direction": direction,
+                                "entry_ts": ts_curr,
+                                "price": close_curr,
+                                "score": alert_score,
+                                "total": alert_total,
+                                "votes": alert_votes,
+                                "context": shadow_context,
+                            },
+                            True,
+                        )
                 logger_pair.info(
                     f"[{pair_name}] Win-rate filter dropped {alert_key}: {fail_note}"
                 )
@@ -2552,6 +2579,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         async def _release_dedup_claims() -> None:
             """Releases whichever kind of claim was taken in step 4 above."""
+            DEDUP_STATS["released"] += 1
             if coalesced_dedup_key:
                 await sdb.release_recent_alert(pair_name, coalesced_dedup_key)
             else:
@@ -2608,7 +2636,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         f"[{pair_name}] 🔁 Confirmed repaint in send-queue window — "
                         f"alert suppressed, dedup key KEPT to prevent duplicates"
                     )
+                    DEDUP_STATS["kept_repaint"] += 1
                     await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
+
                     return pair_name, {
                         "state": "SUPPRESSED_REPAINT_CONFIRMED",
                         "ts": int(time.time()),
@@ -2635,11 +2665,13 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             "suppression": "Mark price check inconclusive — dedup released, will retry next run",
                         },
                     }, None
+
                 elif mark_agrees is False:
                     logger_pair.warning(
                         f"[{pair_name}] Mark price disagreement confirmed — alert suppressed, "
                         f"dedup key KEPT to prevent duplicates"
                     )
+                    DEDUP_STATS["kept_mark_disagree"] += 1
                     await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
                     return pair_name, {
                         "state": "SUPPRESSED_MARK_DISAGREEMENT",
@@ -2789,6 +2821,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"[{pair_name}] 🔁 Confirmed repaint in send-queue window — "
                             f"alert suppressed, dedup key KEPT to prevent duplicates"
                         )
+                        DEDUP_STATS["kept_repaint"] += 1
                         await _refund_alert_budget(len(alerts_to_send))
                         budget_refunded = True
                         confirmation_blocked = True   # NEW
@@ -2808,6 +2841,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"[{pair_name}] Mark price disagreement confirmed — alert suppressed, "
                             f"dedup key KEPT to prevent duplicates"
                         )
+                        DEDUP_STATS["kept_mark_disagree"] += 1
                         await _refund_alert_budget(len(alerts_to_send))
                         budget_refunded = True
                         confirmation_blocked = True   # NEW

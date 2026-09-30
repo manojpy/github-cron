@@ -2210,7 +2210,7 @@ def is_vote_count_ood(
         "relaxed_mode": relaxed_mode,
     }
 
-# ═════════════════════════════════════════════════════��══════���══════════
+# ══════════��══════════════════════════════════════════��══════���══════════
 #  NEW: Block-Bootstrap EV Confidence Intervals  (Recommended.txt §6)
 # ═════════════════════════════════════════════════════════════════��═════
 
@@ -4790,7 +4790,7 @@ class KillSwitch:
         return result
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════���══════════════════════════════════
 #  FILL RECONCILIATION — assumed vs realized execution cost
 # ═══════════════════════════════════════════════════════════════════���══
 
@@ -5009,6 +5009,20 @@ def trade_quality_score(
     else:
         verdict = "LOW"
 
+    evidence_state = sample_evidence_state(
+        n_oos,
+        oos_validated=bool(ev_model_result.get("oos_validated")),
+        insufficient_n=int(getattr(cfg, "SAMPLE_INSUFFICIENT_N", 15)),
+        shadow_n=int(getattr(cfg, "SAMPLE_SHADOW_N", 50)),
+        eligible_n=int(getattr(cfg, "SAMPLE_ELIGIBLE_N", 100)),
+    )
+    verdict_uncapped = verdict
+    if getattr(cfg, "ENABLE_EVIDENCE_VERDICT_CAP", True):
+        if evidence_state == "INSUFFICIENT":
+            verdict = "LOW"
+        elif evidence_state == "SHADOW" and verdict == "HIGH":
+            verdict = "MEDIUM"
+
     result.update({
         "verdict": verdict,
         "quality_score": round(quality, 3),
@@ -5028,14 +5042,12 @@ def trade_quality_score(
             else "moderate" if n_oos >= 50
             else "weak"
         ),
-        "evidence_state": sample_evidence_state(
-            n_oos,
-            oos_validated=bool(ev_model_result.get("oos_validated")),
-            insufficient_n=int(getattr(cfg, "SAMPLE_INSUFFICIENT_N", 15)),
-            shadow_n=int(getattr(cfg, "SAMPLE_SHADOW_N", 50)),
-            eligible_n=int(getattr(cfg, "SAMPLE_ELIGIBLE_N", 100)),
-        ),
+    "evidence_state": evidence_state,
+        "verdict_uncapped": verdict_uncapped,
+        "oos_validated": bool(ev_model_result.get("oos_validated")),
+        "drift_warning": bool((ev_model_result.get("wr_drop_recent") or 0.0) >= 0.10),
         "regime_compatible": regime_ok,
+
         "alert_family": alert_family_of(str(row.get("alert_key") or "")),
     })
 
