@@ -986,9 +986,18 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                             "tuple" if isinstance(btc_gr, tuple)
                             else type(btc_gr).__name__
                         )
+                        # A tuple here is an early-exit summary from _eval_gate
+                        # (HARD_REJECT / NO_SIGNAL / ...), not a failure. Say
+                        # which, so "no result" can be told apart from a bug.
+                        _src = _cached_btc if isinstance(_cached_btc, tuple) else btc_gr
+                        _why = ""
+                        if isinstance(_src, tuple) and len(_src) == 2 and isinstance(_src[1], dict):
+                            _early = _src[1]
+                            _supp = (_early.get("summary") or {}).get("suppression")
+                            _why = f" | reason: state={_early.get('state')}" + (f", {_supp}" if _supp else "")
                         logger_main.info(
                             f"Macro context: {ref_pair} gate returned no result this run "
-                            f"(cache={_cached_kind}, fresh={_fresh_kind}) — "
+                            f"(cache={_cached_kind}, fresh={_fresh_kind}){_why} — "
                             f"macro shadow gate skipped"
                         )
             except Exception as e:

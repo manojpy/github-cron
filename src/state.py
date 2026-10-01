@@ -14,6 +14,21 @@ from fetcher import compute_backoff
 StreamField = Union[bytes, memoryview, str, int, float]
 BRAIN_KEY_HISTORY_METADATA_KEY = "brain_alert_key_history"
 
+# Standing decisions (applied overrides, auto-disabled alert keys, learned
+# per-pair floors, ...). With the default 7-day metadata TTL these silently
+# lapse -- e.g. an auto-disabled alert re-enables itself after a week of
+# quiet. Keep this set in sync with redis_audit.DURABLE_METADATA (a unit test
+# enforces it).
+DURABLE_METADATA_KEYS = frozenset({
+    "config_override",
+    "brain_disabled_alert_keys",
+    "brain_alert_key_history",
+    "pair_confluence_thresholds",
+    "dynamic_weights",
+    "brain_apply_snapshots",
+})
+DURABLE_METADATA_TTL_SEC = 90 * 86400
+
 if TYPE_CHECKING:
     from fetcher import PriceData
 
@@ -668,13 +683,20 @@ class RedisStateStore:
             f"get_metadata {key}",
             parser=lambda r: r if r else None,
         )
+
     async def set_metadata(self, key: str, value: str, timeout: float = 2.0,
-                             ttl: Optional[int] = None) -> None:
+                         ttl: Optional[int] = None) -> None:
+        if ttl is None:
+            ttl = (
+                DURABLE_METADATA_TTL_SEC
+                if key in DURABLE_METADATA_KEYS
+                else self.metadata_expiry_seconds
+            )
         await self._safe_redis_op(
             lambda: _rc(self._redis).set(
                 f"{self.meta_prefix}{key}",
                 value,
-                ex=ttl if ttl is not None else self.metadata_expiry_seconds
+                ex=ttl
             ),
             timeout,
             f"set_metadata {key}",

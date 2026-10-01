@@ -1890,7 +1890,7 @@ class BrainEngineV2(BaseBrainEngine):
                 })
         _phase_mark("weight_optimizer")
 
-        # ─ Per-alert breakdown ──────────────────────────────────────────
+        # ─ Per-alert breakdown ───────────────────────────────��──────────
         alert_stats = engine.per_alert_breakdown(real_rows, min_sample=min_sample)
         if alert_stats:
             display = alert_stats if len(alert_stats) <= 10 else alert_stats[:5] + alert_stats[-5:]
@@ -3384,7 +3384,22 @@ class BrainEngineV2(BaseBrainEngine):
                         "shadow_only": bool(getattr(cfg, "CHALLENGER_SHADOW_ONLY", True)),
                         "votes": [a.get("vote") for a in weight_adj],
                     }
-                    ok = await self.sdb.set_challenger_weights(weights, meta=meta)
+                    # A challenger carrying measured OOS evidence (written by the
+                    # weight optimizer) must not be replaced by this EV-less
+                    # root-cause one: it would reset stored_at (and so the
+                    # promotion streak) and could never satisfy the n_oos / EV
+                    # gates in maybe_promote_challenger().
+                    _existing = await self.sdb.get_challenger_weights()
+                    _existing_meta = (_existing or {}).get("meta") or {}
+                    if _existing_meta.get("net_ev") is not None:
+                        logger_run.info(
+                            "🧪 Root-cause weights not stored as challenger — an "
+                            "OOS-evidenced challenger is already pending "
+                            f"(source={_existing_meta.get('source')})"
+                        )
+                        ok = False
+                    else:
+                        ok = await self.sdb.set_challenger_weights(weights, meta=meta)
                     if ok:
                         for adj in weight_adj:
                             applied.append(
