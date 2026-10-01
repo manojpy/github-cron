@@ -217,21 +217,14 @@ def _clean_setup_title(title: str) -> str:
 
 def _combined_setup_line(items: List[Tuple[str, str]]) -> str:
     """items = list of (title, extra). Collapse to human setup names."""
-    names = []
-    for title, _extra in items:
-        names.append(_clean_setup_title(title))
+    names = [_clean_setup_title(t) for t, _ in items]
+    
     if len(names) == 1:
         return names[0]
-    # e.g. Strong Reversal BUY, VWAP Cross(+3)  — keep first family + count of others
-    primary = names[0]
-    # Prefer a short secondary family name if present
-    extras = [n for n in names[1:]]
-    if extras:
-        # Count of additional families as (+N) on a short secondary tag if useful
-        # Simple form matching your sample: "Strong Reversal BUY, VWAP Cross(+3)"
-        # You may refine mapping alert_key → short family name later.
-        return f"{primary}, +{len(extras)} more"
-    return primary
+    if len(names) == 2:
+        return f"{names[0]}, {names[1]}"        
+    # 3 or more families: "Strong Reversal BUY, VWAP Cross(+2)"
+    return f"{names[0]}, {names[1]}(+{len(names) - 2})"
 
 def _format_price(price: Any) -> str:
     """Safely format price to 2 decimal places."""
