@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-
 """
-redis_audit.py — Redis key inventory + TTL audit (read-only by default).
+redis_audit.py — read-only Redis key inventory + TTL audit.
 
-By default it only calls SCAN / TYPE / TTL / XLEN / MEMORY USAGE and never
-writes. With --heal-leaks it additionally EXPIRE's keys in ttl_required
-families that currently have no TTL (-1).
+Answers, without touching anything: what is in Redis, how much of it, which
+keys never expire, which keys belong to no known family, and which durable
+Brain decisions only live as long as their TTL.
+
+It only ever calls SCAN / TYPE / TTL / XLEN / MEMORY USAGE. It never writes,
+deletes or expires a key, so it is safe to run against production.
 
 Usage:
     python3 redis_audit.py                    # uses $REDIS_URL, prints a table
     python3 redis_audit.py --json             # machine-readable report
     python3 redis_audit.py --fail-on-findings # exit 1 if any warning/error
-    python3 redis_audit.py --heal-leaks       # EXPIRE no-TTL keys in ttl_required families
-    python3 redis_audit.py --heal-leaks --dry-run
     python3 redis_audit.py --url redis://...  # explicit URL
     python3 redis_audit.py --max-keys 50000   # stop scanning after N keys
 
@@ -72,9 +72,7 @@ DURABLE_METADATA = {
     "brain_apply_snapshots",
 }
 DURABLE_WARN_BELOW_DAYS = 8.0
-# Used only by --heal-leaks. Matches CUSUM / plan-history conventions.
-HEAL_TTL_SECONDS = 30 * 86400
-HEAL_DURABLE_TTL_SECONDS = 365 * 86400
+
 
 def _text(key: Any) -> str:
     return key.decode("utf-8", "replace") if isinstance(key, (bytes, bytearray)) else str(key)
@@ -254,53 +252,6 @@ def collect(
             pass
     return records, streams, truncated
 
-def heal_leaks(
-    client: Any,
-    records: List[Dict[str, Any]],
-    dry_run: bool = False,
-    ttl_seconds: int = HEAL_TTL_SECONDS,
-    durable_ttl_seconds: int = HEAL_DURABLE_TTL_SECONDS,
-) -> Dict[str, Any]:
-    """EXPIRE keys in ttl_required families that currently have no TTL.
-
-    Durable metadata names (DURABLE_METADATA) get durable_ttl_seconds so
-    standing decisions are not shortened to the default 30d heal window.
-    """
-    healed: List[Dict[str, Any]] = []
-    skipped: List[str] = []
-
-    for rec in records:
-        key = rec["key"]
-        ttl = int(rec["ttl"])
-        if ttl != -1:
-            continue
-        name, policy = classify_key(key)
-        if policy != "ttl_required":
-            continue
-
-        expire_for = ttl_seconds
-        if name == "metadata":
-            mn = metadata_name(key)
-            if mn in DURABLE_METADATA:
-                expire_for = durable_ttl_seconds
-
-        entry = {"key": key, "family": name, "ttl_set": expire_for, "dry_run": dry_run}
-        if dry_run:
-            healed.append(entry)
-            continue
-        try:
-            client.expire(key, expire_for)
-            healed.append(entry)
-        except Exception as e:
-            skipped.append(f"{key}: {e}")
-
-    return {
-        "healed": len(healed),
-        "skipped": len(skipped),
-        "dry_run": dry_run,
-        "details": healed,
-        "errors": skipped,
-    }
 
 def _fmt_ttl(sec: Optional[float]) -> str:
     if sec is None:
@@ -354,13 +305,12 @@ def render(report: Dict[str, Any], truncated: bool = False) -> str:
                 lines.append(f"      e.g. {ex}")
     return "\n".join(lines)
 
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default=os.getenv("REDIS_URL"), help="Redis URL (default: $REDIS_URL)")
     ap.add_argument("--json", action="store_true", help="Print the report as JSON")
     ap.add_argument("--fail-on-findings", action="store_true", help="Exit 1 on any warning/error finding")
-    ap.add_argument("--heal-leaks", action="store_true", help="EXPIRE ttl_required keys that currently have no TTL(default off; audit stays read-only)")
-    ap.add_argument("--dry-run", action="store_true", help="With --heal-leaks: print what would be expired without writing")
     ap.add_argument("--max-keys", type=int, default=200_000, help="Stop scanning after N keys")
     ap.add_argument("--scan-count", type=int, default=500)
     ap.add_argument("--sample-bytes", type=int, default=25, help="Keys per family sampled for MEMORY USAGE")
@@ -388,46 +338,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     report = summarize(records, streams)
     report["truncated"] = truncated
-
-    if args.heal_leaks:
-        heal_report = heal_leaks(client, records, dry_run=args.dry_run)
-        report["heal"] = {
-            "healed": heal_report["healed"],
-            "skipped": heal_report["skipped"],
-            "dry_run": heal_report["dry_run"],
-            "errors": heal_report["errors"],
-        }
-        # Re-scan TTLs for a post-heal summary when we actually wrote.
-        if not args.dry_run and heal_report["healed"]:
-            records2, streams2, truncated2 = collect(
-                client, max_keys=args.max_keys, scan_count=args.scan_count,
-                sample_bytes=args.sample_bytes, match=args.match,
-            )
-            report = summarize(records2, streams2)
-            report["truncated"] = truncated2
-            report["heal"] = {
-                "healed": heal_report["healed"],
-                "skipped": heal_report["skipped"],
-                "dry_run": False,
-                "errors": heal_report["errors"],
-            }
-
-    if args.json:
-        print(json.dumps(report, indent=2, sort_keys=True))
-    else:
-        print(render(report, report.get("truncated", False)))
-        if args.heal_leaks:
-            h = report.get("heal", {})
-            mode = "dry-run" if h.get("dry_run") else "applied"
-            print("")
-            print(f"Heal ({mode}): expired {h.get('healed', 0)} key(s), "
-                  f"errors={h.get('skipped', 0)}")
-            for err in h.get("errors") or []:
-                print(f"  ! {err}")
-
+    print(json.dumps(report, indent=2, sort_keys=True) if args.json else render(report, truncated))
     if args.fail_on_findings and any(f["severity"] in ("warning", "error") for f in report["findings"]):
         return 1
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
