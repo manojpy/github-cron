@@ -493,18 +493,3 @@ jobs:
             /tmp/data-repo/brain_state.json
           retention-days: 7
           if-no-files-found: ignore
-
-      - name: 🧹 Retire replayed dead-letter artifacts
-        if: always() && steps.persist.outcome == 'success'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        run: |
-          [ -s "$RUNNER_TEMP/replayed_ids" ] || exit 0
-          while read -r ID; do
-            [ -n "$ID" ] || continue
-            gh api -X DELETE "repos/${REPO}/actions/artifacts/${ID}" \
-              && echo "Retired artifact ${ID}" \
-              || echo "::warning::Could not delete artifact ${ID}"
-          done < "$RUNNER_TEMP/replayed_ids"
