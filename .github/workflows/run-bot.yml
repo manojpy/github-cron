@@ -248,11 +248,11 @@ jobs:
           # Guard: retry the API call and tolerate transient failures
           RESPONSE=""
           for attempt in 1 2 3; do
-            RESPONSE=$(gh api "repos/${REPO}/actions/artifacts?per_page=100" 2>/dev/null) && break
+            RESPONSE=$(timeout 5 gh api "repos/${REPO}/actions/artifacts?per_page=100" 2>/dev/null) && break
             echo "::warning::Artifact list API failed (attempt ${attempt}/3), retrying..."
-            sleep 2
+            sleep 1
           done
-          
+  
           if [ -z "$RESPONSE" ]; then
             echo "::warning::Could not list artifacts after 3 attempts — skipping replay"
             exit 0
