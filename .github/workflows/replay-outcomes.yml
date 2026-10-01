@@ -15,8 +15,9 @@ name: ♻️ Replay Un-pushed Outcomes
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: '*/15 * * * *' 
   workflow_dispatch:
+
 
 # Never let two replays race each other for the same artifacts.
 concurrency:
