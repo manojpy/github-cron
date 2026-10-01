@@ -124,3 +124,147 @@ def test_cli_needs_url(monkeypatch, capsys):
     monkeypatch.delenv("REDIS_URL", raising=False)
     assert ra.main([]) == 2
     assert "REDIS_URL" in capsys.readouterr().err
+
+
+# ── one-off durable-TTL heal ────────────────────────────────────────────────
+
+class _HealRedis:
+    """Fake with writable TTLs. gt=True mimics EXPIRE ... GT (never shortens)."""
+
+    def __init__(self, ttls, supports_gt=True):
+        self.ttls, self.supports_gt, self.expired = dict(ttls), supports_gt, []
+
+    def pipeline(self, transaction=False):
+        return _HealPipe(self)
+
+    def ttl(self, k):
+        return self.ttls.get(k, -2)
+
+    def expire(self, k, seconds, gt=False):
+        if gt and not self.supports_gt:
+            raise RuntimeError("ERR syntax error")
+        cur = self.ttls.get(k, -2)
+        if cur == -2:
+            return False
+        if gt and cur != -1 and seconds <= cur:
+            return False
+        self.ttls[k] = seconds
+        self.expired.append(k)
+        return True
+
+
+class _HealPipe:
+    def __init__(self, c):
+        self.c, self.ops = c, []
+
+    def type(self, k):
+        self.ops.append(("type", k))
+
+    def ttl(self, k):
+        self.ops.append(("ttl", k))
+
+    def execute(self):
+        return [b"string" if op == "type" else self.c.ttl(k) for op, k in self.ops]
+
+
+TARGET = ra.HEAL_TARGET_TTL_SEC
+
+
+def test_heal_set_excludes_long_lived_keys_and_matches_durable():
+    assert ra.HEAL_METADATA <= ra.DURABLE_METADATA
+    assert "dynamic_weights" not in ra.HEAL_METADATA
+    assert "brain_apply_snapshots" not in ra.HEAL_METADATA
+    assert "config_override" in ra.HEAL_METADATA
+
+
+def test_plan_only_raises_short_finite_ttls_on_exact_keys():
+    recs = [
+        _rec("metadata:config_override", 3 * DAY),                 # planned
+        _rec("metadata:brain_disabled_alert_keys", TARGET),        # already at target
+        _rec("metadata:brain_alert_key_history", -1),              # no expiry: leave
+        _rec("metadata:pair_confluence_thresholds", -2),           # absent
+        _rec("metadata:dynamic_weights", 2 * DAY),                 # exempt
+        _rec("metadata:brain_apply_snapshots", 2 * DAY),           # exempt
+        _rec("metadata:config_override:extra", 2 * DAY),           # not the exact key
+        _rec("pair_state:BTCUSD", 2 * DAY),                        # other family
+    ]
+    plan = ra.plan_durable_ttl_heal(recs)
+    assert [p["key"] for p in plan] == ["metadata:config_override"]
+    assert plan[0]["ttl_before"] == 3 * DAY and plan[0]["target"] == TARGET
+
+
+def test_apply_raises_and_verifies_after():
+    r = _HealRedis({"metadata:config_override": 3 * DAY})
+    plan = ra.plan_durable_ttl_heal(ra.collect_heal_candidates(r))
+    out = ra.apply_durable_ttl_heal(r, plan)
+    row = out["keys"][0]
+    assert row["status"] == "raised" and row["ttl_after"] == TARGET
+    assert r.ttls["metadata:config_override"] == TARGET
+
+
+def test_dry_run_writes_nothing():
+    r = _HealRedis({"metadata:config_override": 3 * DAY})
+    plan = ra.plan_durable_ttl_heal(ra.collect_heal_candidates(r))
+    out = ra.apply_durable_ttl_heal(r, plan, dry_run=True)
+    assert out["keys"][0]["status"] == "would_raise" and "ttl_after" not in out["keys"][0]
+    assert r.expired == [] and r.ttls["metadata:config_override"] == 3 * DAY
+
+
+def test_heal_never_shortens_a_concurrent_longer_write():
+    # the bot rewrote the key with a 365d TTL between our read and our EXPIRE
+    r = _HealRedis({"metadata:config_override": 365 * DAY})
+    out = ra.apply_durable_ttl_heal(r, [{"key": "metadata:config_override", "ttl_before": 3 * DAY, "target": TARGET}])
+    assert out["keys"][0]["status"] == "skipped"
+    assert r.ttls["metadata:config_override"] == 365 * DAY
+
+
+def test_heal_fallback_without_gt_still_never_shortens():
+    r = _HealRedis({"metadata:config_override": 365 * DAY, "metadata:brain_alert_key_history": 3 * DAY}, supports_gt=False)
+    plan = [
+        {"key": "metadata:config_override", "ttl_before": 3 * DAY, "target": TARGET},
+        {"key": "metadata:brain_alert_key_history", "ttl_before": 3 * DAY, "target": TARGET},
+    ]
+    out = ra.apply_durable_ttl_heal(r, plan)
+    status = {x["key"]: x["status"] for x in out["keys"]}
+    assert status == {"metadata:config_override": "skipped", "metadata:brain_alert_key_history": "raised"}
+    assert r.ttls["metadata:config_override"] == 365 * DAY
+
+
+def test_render_includes_heal_section_and_empty_case():
+    rep = ra.summarize([_rec("pair_state:X", DAY)])
+    rep["heal"] = {"target_days": 90.0, "dry_run": False, "keys": [
+        {"key": "metadata:config_override", "ttl_before": 3 * DAY, "target": TARGET, "ttl_after": TARGET, "status": "raised"}]}
+    text = ra.render(rep)
+    assert "Durable-TTL heal" in text and "3.0d → 90.0d [raised]" in text
+    rep["heal"] = {"target_days": 90.0, "dry_run": True, "keys": []}
+    assert "nothing to heal" in ra.render(rep) and "DRY RUN" in ra.render(rep)
+
+
+def test_cli_heal_end_to_end(monkeypatch, capsys):
+    import sys, types
+    fake = _HealRedis({"metadata:config_override": 3 * DAY, "metadata:dynamic_weights": 2 * DAY})
+    fake.ping = lambda: True
+    fake.scan_iter = lambda match="*", count=500: iter(list(fake.ttls))
+    fake.type = lambda k: b"string"
+    fake.memory_usage = lambda k: 10
+    fake.xlen = lambda s: 0
+    mod = types.SimpleNamespace(from_url=lambda *a, **k: fake)
+    monkeypatch.setitem(sys.modules, "redis", mod)
+    assert ra.main(["--url", "redis://x", "--heal-durable-ttl"]) == 0
+    out = capsys.readouterr().out
+    assert "metadata:config_override" in out and "[raised]" in out
+    assert fake.ttls["metadata:config_override"] == TARGET
+    assert fake.ttls["metadata:dynamic_weights"] == 2 * DAY      # exempt: untouched
+
+
+def test_cli_without_heal_flag_writes_nothing(monkeypatch):
+    import sys, types
+    fake = _HealRedis({"metadata:config_override": 3 * DAY})
+    fake.ping = lambda: True
+    fake.scan_iter = lambda match="*", count=500: iter(list(fake.ttls))
+    fake.type = lambda k: b"string"
+    fake.memory_usage = lambda k: 10
+    fake.xlen = lambda s: 0
+    monkeypatch.setitem(sys.modules, "redis", types.SimpleNamespace(from_url=lambda *a, **k: fake))
+    assert ra.main(["--url", "redis://x"]) == 0
+    assert fake.expired == [] and fake.ttls["metadata:config_override"] == 3 * DAY
