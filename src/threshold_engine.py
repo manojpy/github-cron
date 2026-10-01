@@ -1653,7 +1653,7 @@ def direction_split(rows: List[Row]) -> Tuple[Optional[float], int, Optional[flo
 
 def classify_strategy_state(
     rows: List[Row],
-    recent_days: int = 14,
+    recent_days: float = 14,
     min_recent: int = 20,
     min_older: int = 40,
     min_regime_n: int = 15,
@@ -1674,7 +1674,7 @@ def classify_strategy_state(
     earn, since it is the costly label). Advisory only; never changes a gate.
     """
     now_ts = int(time.time())
-    cutoff = now_ts - recent_days * 86400
+    cutoff = now_ts - int(recent_days * 86400)
     recent = [r for r in rows if r.get("entry_ts", 0) >= cutoff]
     older = [r for r in rows if 0 < r.get("entry_ts", 0) < cutoff]
     out: Dict[str, Any] = {

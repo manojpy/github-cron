@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import math
 import time
 import unicodedata
 from collections import defaultdict
@@ -71,6 +72,8 @@ def _report_section_failed(failed: List[str], name: str, exc: Exception) -> None
 _RULE = "━" * 30
 PLAN_HISTORY_KEY = "brain_plan_history"
 PLAN_HISTORY_MAX = 100
+APPLY_SNAPSHOT_KEY = "brain_apply_snapshots"
+APPLY_SNAPSHOT_MAX = 20
 CHALLENGER_STREAK_KEY = "challenger_promo_streak"
 
 _IST = timezone(timedelta(hours=5, minutes=30))
@@ -1505,6 +1508,32 @@ class BrainEngineV2(BaseBrainEngine):
                         "rolled_back",
                         f"dynamic_weights cleared after hurt repair(s) {ids}",
                     )
+
+            # ── Objective post-apply harm monitor (roadmap #6) ──
+            _mon = await self.monitor_applied_plans(real_rows, logger)
+            if _mon:
+                ai_metrics["apply_monitor"] = _mon
+                for _ev in _mon:
+                    if _ev["status"] == "rolled_back":
+                        _e = _ev["evidence"]
+                        recommendations.append({
+                            "type": "auto_rollback", "severity": "high",
+                            "message": (
+                                f"↩️ Auto-rolled back plan {_ev['plan_id']}: WR "
+                                f"{_e['wr_pre']:.0%}→{_e['wr_post']:.0%} after apply "
+                                f"(p={_e['p_value']}, n={_e['n_post']}/{_e['n_pre']})."
+                                + (" Config overrides need a restart to take effect."
+                                   if _ev.get("needs_restart") else "")
+                            ),
+                        })
+                    elif _ev["status"] == "rollback_withheld":
+                        recommendations.append({
+                            "type": "auto_rollback", "severity": "low",
+                            "message": (
+                                f"ℹ️ Plan {_ev['plan_id']} shows a post-apply WR drop but "
+                                f"auto-rollback was withheld: {_ev['reason']}."
+                            ),
+                        })
 
             # ── Champion/challenger: periodic promotion check. force=False
             # always, so this stays a no-op reporting "shadow_only_requires_force"
@@ -3041,6 +3070,222 @@ class BrainEngineV2(BaseBrainEngine):
         ok = await self.sdb.promote_challenger_to_champion()
         return {"promoted": bool(ok), "reason": "ok" if ok else "redis_failed", "meta": meta}
 
+    async def _load_apply_snapshots(self) -> List[Dict[str, Any]]:
+        try:
+            raw = await self.sdb.get_metadata(APPLY_SNAPSHOT_KEY)
+            data = json_loads(raw) if raw else []
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    async def _store_apply_snapshots(self, snaps: List[Dict[str, Any]]) -> bool:
+        try:
+            await self.sdb.set_metadata(
+                APPLY_SNAPSHOT_KEY, json_dumps(snaps[-APPLY_SNAPSHOT_MAX:]),
+                ttl=365 * 86400,
+            )
+            return True
+        except Exception as e:
+            logging.getLogger("macd_bot").debug(f"Apply-snapshot write failed (non-fatal): {e}")
+            return False
+
+    async def _save_apply_snapshot(
+        self, plan_id: Optional[str],
+        overrides: Dict[str, Any], disabled: Dict[str, Any],
+        weights: Optional[Dict[str, Any]],
+    ) -> None:
+        """Remember how to undo an applied plan. Best-effort; never raises."""
+        if not (overrides or disabled or weights):
+            return
+        snaps = await self._load_apply_snapshots()
+        snaps.append({
+            "plan_id": plan_id or f"plan-{int(time.time())}",
+            "applied_at": int(time.time()),
+            "status": "active",
+            "overrides": overrides, "disabled": disabled, "weights": weights,
+        })
+        await self._store_apply_snapshots(snaps)
+
+    @staticmethod
+    def _weights_equal(a: Optional[Dict[str, Any]], b: Optional[Dict[str, Any]]) -> bool:
+        if a is None or b is None:
+            return a is None and b is None
+        keys = set(a) | set(b)
+        return all(abs(float(a.get(k, 0.0)) - float(b.get(k, 0.0))) < 1e-9 for k in keys)
+
+    async def _revert_snapshot(self, snap: Dict[str, Any]) -> Dict[str, Any]:
+        """Restore what a plan changed, but ONLY where the live value is still
+        exactly what that plan wrote. If a later plan (or a human) changed it
+        since, leave it alone: reverting would clobber the newer decision."""
+        out: Dict[str, Any] = {"reverted": [], "skipped": [], "failed": []}
+        try:
+            live_ov = await self.sdb.get_config_override()
+            live_dis = await self.sdb.get_disabled_alert_keys()
+            live_w = await self.sdb.get_dynamic_weights()
+        except Exception as e:
+            out["failed"].append(f"state read failed: {e}")
+            return out
+
+        for field, d in (snap.get("overrides") or {}).items():
+            if live_ov.get(field) != d.get("new"):
+                out["skipped"].append(f"{field} (changed since)")
+                continue
+            prev = d.get("prev")
+            ok = (
+                await self.sdb.remove_config_override_field(field) if prev is None
+                else await self.sdb.write_config_override(field, prev)
+            )
+            (out["reverted"] if ok else out["failed"]).append(f"{field}→{prev}")
+
+        for ak, d in (snap.get("disabled") or {}).items():
+            if (ak in live_dis) != bool(d.get("new")):
+                out["skipped"].append(f"{ak} (changed since)")
+                continue
+            ok = await self.sdb.set_alert_key_disabled(ak, bool(d.get("prev")))
+            (out["reverted"] if ok else out["failed"]).append(
+                f"{ak}→{'disabled' if d.get('prev') else 'enabled'}"
+            )
+
+        w = snap.get("weights")
+        if w:
+            if not self._weights_equal(live_w, w.get("new")):
+                out["skipped"].append("dynamic_weights (changed since)")
+            else:
+                prev_w = w.get("prev")
+                ok = (
+                    await self.sdb.clear_dynamic_weights() if prev_w is None
+                    else await self.sdb.set_dynamic_weights(prev_w)
+                )
+                (out["reverted"] if ok else out["failed"]).append("dynamic_weights")
+        return out
+
+    async def monitor_applied_plans(
+        self, rows: List[Dict[str, Any]], logger_run: logging.Logger,
+    ) -> List[Dict[str, Any]]:
+        """Objective post-apply harm check with automatic revert (roadmap #6).
+
+        For each active snapshot older than BRAIN_ROLLBACK_MIN_HOURS, compare
+        outcomes AFTER the apply with an equally long window BEFORE it. Revert
+        only when ALL hold:
+          * >= BRAIN_ROLLBACK_MIN_N outcomes on both sides;
+          * win rate fell by >= BRAIN_ROLLBACK_MIN_WR_DROP, one-sided
+            two-proportion test p <= BRAIN_ROLLBACK_ALPHA;
+          * net EV did not improve;
+          * the drop is not attributable to a regime shift (classify_strategy_state
+            says neither REGIME_SHIFT, REGIME_UNDERREPRESENTED nor
+            DEGRADED_REGIME_UNKNOWN);
+          * fewer than BRAIN_ROLLBACK_MAX_PER_DAY rollbacks in the last 24h.
+        Plans that stay clean for BRAIN_ROLLBACK_MONITOR_DAYS are marked cleared.
+        Returns one event dict per status change. Never raises.
+        """
+        events: List[Dict[str, Any]] = []
+        if not getattr(cfg, "BRAIN_AUTO_ROLLBACK_HURT", True):
+            return events
+        try:
+            snaps = await self._load_apply_snapshots()
+            if not any(s.get("status") == "active" for s in snaps):
+                return events
+            now = int(time.time())
+            min_h = float(cfg.BRAIN_ROLLBACK_MIN_HOURS)
+            monitor_s = float(cfg.BRAIN_ROLLBACK_MONITOR_DAYS) * 86400
+            min_n = int(cfg.BRAIN_ROLLBACK_MIN_N)
+            min_drop = float(cfg.BRAIN_ROLLBACK_MIN_WR_DROP)
+            alpha = float(cfg.BRAIN_ROLLBACK_ALPHA)
+            max_per_day = int(cfg.BRAIN_ROLLBACK_MAX_PER_DAY)
+            rolled_24h = sum(
+                1 for s in snaps
+                if s.get("status") == "rolled_back" and now - int(s.get("rolled_back_at") or 0) < 86400
+            )
+            changed = False
+
+            for snap in snaps:
+                if snap.get("status") != "active":
+                    continue
+                applied_at = int(snap.get("applied_at") or 0)
+                age_s = now - applied_at
+                if age_s < min_h * 3600:
+                    continue
+                post = [r for r in rows if r.get("entry_ts", 0) >= applied_at]
+                pre = [r for r in rows if applied_at - age_s <= r.get("entry_ts", 0) < applied_at]
+                pid = snap.get("plan_id")
+
+                harmed = False
+                evidence: Dict[str, Any] = {"n_post": len(post), "n_pre": len(pre)}
+                if len(post) >= min_n and len(pre) >= min_n:
+                    w_post = sum(1 for r in post if r["win"])
+                    w_pre = sum(1 for r in pre if r["win"])
+                    wr_post, wr_pre = w_post / len(post), w_pre / len(pre)
+                    pooled = (w_post + w_pre) / (len(post) + len(pre))
+                    se = math.sqrt(max(pooled * (1 - pooled), 1e-12) * (1 / len(post) + 1 / len(pre)))
+                    drop = wr_pre - wr_post
+                    p_val = 0.5 * math.erfc((drop / se) / math.sqrt(2)) if se > 0 else 1.0
+                    ev_post = engine.ev_and_kelly_for(post)[0]
+                    ev_pre = engine.ev_and_kelly_for(pre)[0]
+                    evidence.update({
+                        "wr_pre": round(wr_pre, 4), "wr_post": round(wr_post, 4),
+                        "drop": round(drop, 4), "p_value": round(p_val, 4),
+                        "ev_pre": round(ev_pre, 4), "ev_post": round(ev_post, 4),
+                    })
+                    harmed = (
+                        drop >= min_drop and p_val <= alpha and ev_post <= ev_pre
+                    )
+
+                if harmed:
+                    # Regime check aligned to THIS apply point: "recent" = everything
+                    # since the apply, "older" = everything before it.
+                    regime = engine.classify_strategy_state(
+                        rows, recent_days=age_s / 86400.0,
+                        min_recent=min_n, min_older=min_n,
+                    )
+                    evidence["regime_state"] = regime.get("state")
+                    if regime.get("state") in (
+                        "REGIME_SHIFT", "REGIME_UNDERREPRESENTED", "DEGRADED_REGIME_UNKNOWN",
+                    ):
+                        events.append({
+                            "plan_id": pid, "status": "rollback_withheld",
+                            "reason": f"drop attributed to regime ({regime.get('state')})",
+                            "evidence": evidence,
+                        })
+                        continue
+                    if rolled_24h >= max_per_day:
+                        events.append({
+                            "plan_id": pid, "status": "rollback_withheld",
+                            "reason": f"daily rollback cap {max_per_day} reached",
+                            "evidence": evidence,
+                        })
+                        continue
+                    result = await self._revert_snapshot(snap)
+                    snap["status"] = "rolled_back"
+                    snap["rolled_back_at"] = now
+                    snap["rollback_evidence"] = evidence
+                    snap["rollback_result"] = result
+                    rolled_24h += 1
+                    changed = True
+                    note = (
+                        f"WR {evidence['wr_pre']:.0%}→{evidence['wr_post']:.0%} "
+                        f"(p={evidence['p_value']}), reverted={result['reverted']}, "
+                        f"skipped={result['skipped']}, failed={result['failed']}"
+                    )
+                    await self._record_plan_event(pid, "rolled_back", note[:300])
+                    logger_run.warning(f"↩️ Auto-rollback of plan {pid}: {note}")
+                    events.append({
+                        "plan_id": pid, "status": "rolled_back",
+                        "evidence": evidence, "result": result,
+                        "needs_restart": bool(snap.get("overrides")),
+                    })
+                elif age_s >= monitor_s:
+                    snap["status"] = "cleared"
+                    snap["cleared_at"] = now
+                    changed = True
+                    await self._record_plan_event(pid, "monitor_cleared", "no significant post-apply harm")
+                    events.append({"plan_id": pid, "status": "cleared", "evidence": evidence})
+
+            if changed:
+                await self._store_apply_snapshots(snaps)
+        except Exception as e:
+            logger_run.warning(f"Apply-monitor failed (non-fatal): {e}")
+        return events
+
     async def apply_pending_plan(self, telegram_queue, logger_run) -> bool:
         """Apply the last generated action plan. Returns True if any changes were applied."""
         try:
@@ -3058,6 +3303,19 @@ class BrainEngineV2(BaseBrainEngine):
             applied_live = False     # dynamic weights / alert flags — read live
 
             plan_gate_passed = bool(plan.get("_action_gate_passed", False))
+
+            # Rollback snapshot: what each touched setting was BEFORE this plan
+            # and what the plan wrote, so a later harm check can restore it.
+            snap_overrides: Dict[str, Any] = {}
+            snap_disabled: Dict[str, Any] = {}
+            snap_weights: Optional[Dict[str, Any]] = None
+            try:
+                _ov_before = await self.sdb.get_config_override()
+                _dis_before = await self.sdb.get_disabled_alert_keys()
+                _w_before = await self.sdb.get_dynamic_weights()
+            except Exception as e:
+                logger_run.debug(f"Rollback snapshot pre-read failed (non-fatal): {e}")
+                _ov_before, _dis_before, _w_before = {}, set(), None
 
             # Apply config changes
             for patch in plan.get("config_patch", []):
@@ -3077,8 +3335,10 @@ class BrainEngineV2(BaseBrainEngine):
                 field = patch.get("path")
                 value = patch.get("suggested")
                 if field in CONFIG_OVERRIDE_ALLOWED_FIELDS:
+
                     ok = await self.sdb.write_config_override(field, value)
                     if ok:
+                        snap_overrides[field] = {"prev": _ov_before.get(field), "new": value}
                         applied.append(f"✅ {field}: {value}")
                         applied_config = True
                         logger_run.info(f"Applied brain config: {field} = {value}")
@@ -3087,12 +3347,14 @@ class BrainEngineV2(BaseBrainEngine):
                 for ak in plan.get("disable_alerts", []):
                     ok = await self.sdb.set_alert_key_disabled(ak, True)
                     if ok:
+                        snap_disabled[ak] = {"prev": ak in _dis_before, "new": True}
                         applied.append(f"🔴 Disabled: {ak}")
                         applied_live = True
                         logger_run.info(f"Applied brain disable: {ak}")
                 for ak in plan.get("reinstate_alerts", []):
                     ok = await self.sdb.set_alert_key_disabled(ak, False)
                     if ok:
+                        snap_disabled[ak] = {"prev": ak in _dis_before, "new": False}
                         applied.append(f"🟢 Reinstated: {ak}")
                         applied_live = True
                         logger_run.info(f"Applied brain reinstate: {ak}")
@@ -3135,8 +3397,9 @@ class BrainEngineV2(BaseBrainEngine):
                         )
                     # Do NOT set applied_live — live CONFLUENCE_WEIGHTS unchanged
                 else:
-                    # Legacy path: write live dynamic weights (existing behavior)
+                    # Legacy path: write live dynamic weights (existing behavior) 
                     if await self.sdb.set_dynamic_weights(weights):
+                        snap_weights = {"prev": _w_before, "new": dict(weights)}
                         applied_live = True
                         for adj in weight_adj:
                             applied.append(
@@ -3175,6 +3438,9 @@ class BrainEngineV2(BaseBrainEngine):
                 )
                 await telegram_queue.send(escape_markdown_v2(msg))
                 await self._record_plan_event(plan.get("plan_id"), "applied", "; ".join(applied)[:200])
+                await self._save_apply_snapshot(
+                    plan.get("plan_id"), snap_overrides, snap_disabled, snap_weights,
+                )
                 # Clear the pending plan
                 await self.sdb.set_metadata("brain_pending_plan", "{}", ttl=60)
                 return True

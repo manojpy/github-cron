@@ -741,6 +741,21 @@ class RedisStateStore:
             return False
         return True
 
+    async def remove_config_override_field(self, field: str) -> bool:
+        """Delete one field from the live config_override blob (read-modify-write).
+        Used by the Brain auto-rollback to restore a field that had NO override
+        before a plan wrote one. Returns True if the field is absent afterwards."""
+        override = await self._read_raw_config_override()
+        if field not in override:
+            return True
+        override.pop(field, None)
+        try:
+            await self.set_metadata(CONFIG_OVERRIDE_METADATA_KEY, json_dumps(override))
+        except Exception as e:
+            logger.warning(f"Failed to remove config_override field '{field}': {e}")
+            return False
+        return True
+
     async def get_disabled_alert_keys(self) -> Set[str]:
         raw = await self.get_metadata(BRAIN_DISABLED_KEYS_METADATA_KEY)
         if not raw:
