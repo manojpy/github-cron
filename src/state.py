@@ -849,7 +849,11 @@ class RedisStateStore:
         current = await self.get_pair_thresholds()
         current[pair] = value
         try:
-            await self.set_metadata(PAIR_THRESHOLDS_METADATA_KEY, json_dumps(current))
+            await self.set_metadata(
+                PAIR_THRESHOLDS_METADATA_KEY,
+                json_dumps(current),
+                ttl=365 * 86400,
+            )
         except Exception as e:
             logger.warning(f"Failed to update pair threshold for '{pair}': {e}")
             return False
@@ -1245,7 +1249,6 @@ class RedisStateStore:
                 f"Failed to record shadow pending outcome for {pair}:{alert_key}: {e}"
             )
     # ── Vote-count history (OOD gate) ────────────────────────────────────────
-
     async def record_vote_count(self, alert_key: str, votes: Dict[str, bool]) -> None:
         if self.degraded or not self._redis:
             return
@@ -1257,6 +1260,7 @@ class RedisStateStore:
             async with self._redis.pipeline() as pipe:
                 pipe.lpush(key, str(count))
                 pipe.ltrim(key, 0, self.VOTE_COUNT_HISTORY_MAX - 1)
+                pipe.expire(key, 30 * 86400)
                 await self._safe_redis_op(
                     lambda: pipe.execute(),
                     2.0,
@@ -2287,6 +2291,7 @@ class RedisStateStore:
             async with self._redis.pipeline() as pipe:
                 pipe.lpush(key, str(value))
                 pipe.ltrim(key, 0, 9)
+                pipe.expire(key, 30 * 86400)
                 await self._safe_redis_op(
                     lambda: pipe.execute(), 2.0, f"threshold_history_save:{key_suffix or 'global'}",
                 )
