@@ -1,0 +1,204 @@
+name: ♻️ Replay Un-pushed Outcomes
+
+# Recovers outcomes that a bot run resolved but could not push to the data
+# repo (see run-bot.yml's 🛟 Preserve un-pushed outcomes step). Each such
+# failure leaves a `unpushed-outcomes-<run_id>` artifact behind; this
+# workflow merges those rows into the live data repo and retires the artifact.
+#
+# Decoupled from run-bot.yml so the bot's own run time is never spent
+# listing/downloading artifacts or waiting on a slow GitHub API. Runs every
+# 15 min — one bot cycle — so a failed push is normally recovered before the
+# next bot run reads the archive.
+#
+# Safe to run concurrently with run-bot.yml and cleanup-outcomes.yml: all
+# three push through the same rebase-retry loop.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+# Never let two replays race each other for the same artifacts.
+concurrency:
+  group: replay-outcomes
+  cancel-in-progress: false
+
+permissions:
+  actions: write   # list / download / delete artifacts
+  contents: read
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 📋 List candidate artifacts
+        id: list
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          RESPONSE=""
+          ERR_FILE="$RUNNER_TEMP/artifact_list.err"
+          # NOTE: run: blocks execute under `bash -e`. A plain
+          #   RESPONSE=$(gh api …); RC=$?
+          # aborts the shell the moment gh fails. The `if …` form suspends
+          # `-e` for the command substitution so RC is actually captured.
+          for attempt in 1 2 3; do
+            : > "$ERR_FILE"
+            if RESPONSE=$(timeout 20 gh api "repos/${REPO}/actions/artifacts?per_page=100" 2>"$ERR_FILE"); then
+              RC=0
+            else
+              RC=$?
+            fi
+            if [ "$RC" -eq 0 ] && echo "$RESPONSE" | jq -e '.artifacts' >/dev/null 2>&1; then
+              break
+            fi
+            RESPONSE=""
+            TIMEOUT_NOTE=""
+            if [ "$RC" -eq 124 ]; then TIMEOUT_NOTE=", timed out"; fi
+            echo "::warning::Artifact list API failed (attempt ${attempt}/3, exit ${RC}${TIMEOUT_NOTE}): $(head -c 300 "$ERR_FILE" | tr '\n' ' ')"
+            sleep $(( attempt * 3 ))
+          done
+          if [ -z "$RESPONSE" ]; then
+            echo "::warning::Could not list artifacts after 3 attempts — skipping this cycle"
+            echo "has_candidates=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          IDS=$(echo "$RESPONSE" | jq -r '.artifacts | map(select((.name | startswith("unpushed-outcomes-")) and (.expired | not))) | sort_by(.created_at) | .[].id')
+          if [ -z "$IDS" ]; then
+            echo "No un-pushed outcome artifacts to replay"
+            echo "has_candidates=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "$IDS" > "$RUNNER_TEMP/candidate_ids"
+          echo "has_candidates=true" >> "$GITHUB_OUTPUT"
+          echo "Candidates: $(echo "$IDS" | tr '\n' ' ')"
+
+      - name: 📦 Clone data repository
+        if: steps.list.outputs.has_candidates == 'true'
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          # Full clone (not sparse): we may need to write any date's file,
+          # and the number of artifacts per cycle is tiny.
+          git clone --depth=1 \
+            "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" \
+            /tmp/data-repo
+
+      - name: ♻️ Merge artifacts into data repo
+        if: steps.list.outputs.has_candidates == 'true'
+        id: merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          : > "$RUNNER_TEMP/replayed_ids"
+
+          while read -r ID; do
+            [ -n "$ID" ] || continue
+            rm -rf /tmp/dead-letter && mkdir -p /tmp/dead-letter
+            if ! gh api "repos/${REPO}/actions/artifacts/${ID}/zip" > /tmp/dead-letter.zip; then
+              echo "::warning::Could not download artifact ${ID} — skipping"
+              continue
+            fi
+            unzip -oq /tmp/dead-letter.zip -d /tmp/dead-letter
+            python3 - <<'PY'
+          import glob, os
+          SRC, DST = "/tmp/dead-letter", "/tmp/data-repo"
+          merged = 0
+          # NOTE: brain_state.json is deliberately NOT replayed — the Brain
+          # rewrites it in full each report cycle, so an old artifact's copy
+          # could regress the live state if a newer report already landed.
+          # This matches the previous in-run replay behaviour exactly.
+          for kind in ("outcomes", "shadow"):
+              for src in sorted(glob.glob(f"{SRC}/{kind}/*.jsonl")):
+                  rel = f"{kind}/{os.path.basename(src)}"
+                  dst = f"{DST}/{rel}"
+                  have = set()
+                  needs_nl = False
+                  if os.path.exists(dst):
+                      with open(dst, "rb") as fh:
+                          raw = fh.read()
+                      needs_nl = bool(raw) and not raw.endswith(b"\n")
+                      have = {ln.strip() for ln in raw.decode("utf-8").splitlines() if ln.strip()}
+                  with open(src, encoding="utf-8") as fh:
+                      new = [ln.strip() for ln in fh if ln.strip() and ln.strip() not in have]
+                  if not new:
+                      continue
+                  os.makedirs(os.path.dirname(dst), exist_ok=True)
+                  with open(dst, "a", encoding="utf-8") as fh:
+                      if needs_nl:
+                          fh.write("\n")
+                      fh.write("\n".join(new) + "\n")
+                  merged += len(new)
+                  print(f"replayed {len(new)} row(s) into {rel}")
+          print(f"dead-letter replay: merged={merged}")
+          PY
+            echo "$ID" >> "$RUNNER_TEMP/replayed_ids"
+          done < "$RUNNER_TEMP/candidate_ids"
+
+          cd /tmp/data-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f outcomes shadow 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "::warning::Replay produced no data changes to push"
+            exit 0
+          fi
+          git commit -m "chore: replay un-pushed outcomes $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      - name: 📤 Push merged replay
+        if: steps.merge.outcome == 'success'
+        id: push
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd /tmp/data-repo
+          PUSH_URL="https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git"
+          for attempt in 1 2 3 4 5; do
+            if git push "$PUSH_URL" HEAD:main; then
+              echo "✅ Replay pushed (attempt ${attempt})"
+              exit 0
+            fi
+            echo "::warning::Push rejected (attempt ${attempt}/5) — rebasing onto latest main"
+            sleep $(( attempt * 2 + RANDOM % 3 ))
+            if ! git pull --rebase --no-tags "$PUSH_URL" main; then
+              echo "::error::Rebase conflict — aborting; replay NOT pushed"
+              git rebase --abort 2>/dev/null || true
+              exit 1
+            fi
+          done
+          echo "::error::Could not push replay after 5 attempts"
+          exit 1
+
+      - name: 🧹 Retire replayed artifacts
+        if: steps.push.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          [ -s "$RUNNER_TEMP/replayed_ids" ] || exit 0
+          while read -r ID; do
+            [ -n "$ID" ] || continue
+            gh api -X DELETE "repos/${REPO}/actions/artifacts/${ID}" \
+              && echo "Retired artifact ${ID}" \
+              || echo "::warning::Could not delete artifact ${ID}"
+          done < "$RUNNER_TEMP/replayed_ids"
+
+      - name: 📋 Summary
+        if: always()
+        run: |
+          echo "## ♻️ Replay Un-pushed Outcomes" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.list.outputs.has_candidates }}" != "true" ]; then
+            echo "✅ No artifacts to replay this cycle" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.push.outcome }}" = "success" ]; then
+            echo "✅ Replay complete" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "⚠️ Replay did not complete — artifacts left in place for the next cycle" >> "$GITHUB_STEP_SUMMARY"
+          fi
