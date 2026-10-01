@@ -244,8 +244,21 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           : > "$RUNNER_TEMP/replayed_ids"
-          IDS=$(gh api "repos/${REPO}/actions/artifacts?per_page=100" \
-            --jq '.artifacts | map(select((.name | startswith("unpushed-outcomes-")) and (.expired | not))) | sort_by(.created_at) | .[].id')
+          set +e
+          RAW=$(gh api "repos/${REPO}/actions/artifacts?per_page=100" 2>/tmp/gh_art.err)
+          GH_RC=$?
+          set -e
+          if [ $GH_RC -ne 0 ] || [ -z "$RAW" ]; then
+            echo "::warning::Artifact list failed (rc=$GH_RC) — skipping dead-letter replay"
+            cat /tmp/gh_art.err 2>/dev/null || true
+            exit 0
+          fi
+          IDS=$(printf '%s' "$RAW" | jq -r '
+            .artifacts
+            | map(select((.name | startswith("unpushed-outcomes-")) and (.expired | not)))
+            | sort_by(.created_at)
+            | .[].id
+          ' 2>/dev/null || true)
           if [ -z "$IDS" ]; then
             echo "No un-pushed outcome artifacts to replay"
             exit 0
