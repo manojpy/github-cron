@@ -244,8 +244,22 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           : > "$RUNNER_TEMP/replayed_ids"
-          IDS=$(gh api "repos/${REPO}/actions/artifacts?per_page=100" \
-            --jq '.artifacts | map(select((.name | startswith("unpushed-outcomes-")) and (.expired | not))) | sort_by(.created_at) | .[].id')
+          
+          # Guard: retry the API call and tolerate transient failures
+          RESPONSE=""
+          for attempt in 1 2 3; do
+            RESPONSE=$(gh api "repos/${REPO}/actions/artifacts?per_page=100" 2>/dev/null) && break
+            echo "::warning::Artifact list API failed (attempt ${attempt}/3), retrying..."
+            sleep 2
+          done
+          
+          if [ -z "$RESPONSE" ]; then
+            echo "::warning::Could not list artifacts after 3 attempts — skipping replay"
+            exit 0
+          fi
+          
+          IDS=$(echo "$RESPONSE" | jq -r '.artifacts | map(select((.name | startswith("unpushed-outcomes-")) and (.expired | not))) | sort_by(.created_at) | .[].id')
+          
           if [ -z "$IDS" ]; then
             echo "No un-pushed outcome artifacts to replay"
             exit 0
