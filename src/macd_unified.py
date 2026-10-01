@@ -993,8 +993,14 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                         _why = ""
                         if isinstance(_src, tuple) and len(_src) == 2 and isinstance(_src[1], dict):
                             _early = _src[1]
-                            _supp = (_early.get("summary") or {}).get("suppression")
-                            _why = f" | reason: state={_early.get('state')}" + (f", {_supp}" if _supp else "")
+                            # _eval_gate's NO_SIGNAL suppression string can be
+                            # a bare "Gate blocked: " (empty detail). Strip the
+                            # trailing colon/space so the log line does not
+                            # render as "Gate blocked:  — macro…".
+                            _supp = ((_early.get("summary") or {}).get("suppression") or "").rstrip(" :")
+                            _why = f" | reason: state={_early.get('state')}"
+                            if _supp:
+                                _why += f", {_supp}"
                         logger_main.info(
                             f"Macro context: {ref_pair} gate returned no result this run "
                             f"(cache={_cached_kind}, fresh={_fresh_kind}){_why} — "
@@ -1183,13 +1189,12 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             f"⚠️ Memory still high after cleanup: {current_memory_mb:.0f}MB ({usage_pct:.0f}%). "
             f"Possible memory leak?"
         )
-
-    knox_approved = len(valid_results)
-    knox_rejected = len(pairs_to_process) - knox_approved
-    
+    completed = len(valid_results)
+    total = len(pairs_to_process)
+    errored = total - completed - len(deferred_pairs)
     logger_main.info(
-        f"🎯🧠 Knox: {knox_approved} approved, {knox_rejected} rejected "
-        f"({len(pairs_to_process)} total evaluated)"
+        f"🎯🧠 Evaluation: {completed} completed, {errored} errored, "
+        f"{len(deferred_pairs)} deferred ({total} total)"
     )
     return valid_results, deferred_pairs
 
