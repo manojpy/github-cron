@@ -1,23 +1,9 @@
 name: ♻️ Replay Un-pushed Outcomes
 
-# Recovers outcomes that a bot run resolved but could not push to the data
-# repo (see run-bot.yml's 🛟 Preserve un-pushed outcomes step). Each such
-# failure leaves a `unpushed-outcomes-<run_id>` artifact behind; this
-# workflow merges those rows into the live data repo and retires the artifact.
-#
-# Decoupled from run-bot.yml so the bot's own run time is never spent
-# listing/downloading artifacts or waiting on a slow GitHub API. Runs every
-# 15 min — one bot cycle — so a failed push is normally recovered before the
-# next bot run reads the archive.
-#
-# Safe to run concurrently with run-bot.yml and cleanup-outcomes.yml: all
-# three push through the same rebase-retry loop.
-
 on:
   schedule:
-    - cron: '*/15 * * * *' 
+    - cron: "*/15 * * * *"   # check every 15 min (1 expected bot cycles)
   workflow_dispatch:
-
 
 # Never let two replays race each other for the same artifacts.
 concurrency:
