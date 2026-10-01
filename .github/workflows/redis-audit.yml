@@ -18,7 +18,7 @@ on:
       dry_run:
         description: 'With heal_leaks: show keys only, do not EXPIRE'
         required: false
-        default: true
+        default: false
         type: boolean
 
 permissions:

@@ -244,8 +244,31 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           : > "$RUNNER_TEMP/replayed_ids"
-          IDS=$(gh api "repos/${REPO}/actions/artifacts?per_page=100" \
-            --jq '.artifacts | map(select((.name | startswith("unpushed-outcomes-")) and (.expired | not))) | sort_by(.created_at) | .[].id')
+
+          RESP_FILE="$RUNNER_TEMP/artifacts.json"
+          HTTP=$(curl -sS -o "$RESP_FILE" -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPO}/actions/artifacts?per_page=100") || HTTP="000"
+
+          if [ "$HTTP" != "200" ]; then
+            echo "::warning::Artifact list HTTP ${HTTP} — skipping dead-letter replay"
+            head -c 400 "$RESP_FILE" 2>/dev/null || true
+            exit 0
+          fi
+          if [ ! -s "$RESP_FILE" ]; then
+            echo "::warning::Artifact list empty body — skipping dead-letter replay"
+            exit 0
+          fi
+
+          IDS=$(jq -r '
+            (.artifacts // [])
+            | map(select((.name | startswith("unpushed-outcomes-")) and (.expired | not)))
+            | sort_by(.created_at)
+            | .[].id
+          ' "$RESP_FILE" 2>/dev/null || true)
+
           if [ -z "$IDS" ]; then
             echo "No un-pushed outcome artifacts to replay"
             exit 0
