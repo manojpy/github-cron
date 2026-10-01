@@ -6,8 +6,12 @@ Answers, without touching anything: what is in Redis, how much of it, which
 keys never expire, which keys belong to no known family, and which durable
 Brain decisions only live as long as their TTL.
 
-It only ever calls SCAN / TYPE / TTL / XLEN / MEMORY USAGE. It never writes,
-deletes or expires a key, so it is safe to run against production.
+By default it only calls SCAN / TYPE / TTL / XLEN / MEMORY USAGE. It never
+writes, deletes or expires a key, so it is safe to run against production.
+
+The one exception is the opt-in --heal-durable-ttl flag (see below), which
+only ever RAISES the TTL of a few named standing-decision keys. Nothing is
+deleted and no value is changed.
 
 Usage:
     python3 redis_audit.py                    # uses $REDIS_URL, prints a table
@@ -15,6 +19,8 @@ Usage:
     python3 redis_audit.py --fail-on-findings # exit 1 if any warning/error
     python3 redis_audit.py --url redis://...  # explicit URL
     python3 redis_audit.py --max-keys 50000   # stop scanning after N keys
+    python3 redis_audit.py --heal-durable-ttl            # one-off: raise old 7d TTLs to 90d
+    python3 redis_audit.py --heal-durable-ttl --dry-run  # same, but only show what would change
 
 Exit codes: 0 ok, 1 findings (only with --fail-on-findings), 2 cannot connect.
 
@@ -72,6 +78,15 @@ DURABLE_METADATA = {
     "brain_apply_snapshots",
 }
 DURABLE_WARN_BELOW_DAYS = 8.0
+
+# One-off heal for standing decisions that were written under the old 7-day
+# default TTL (state.py now writes them with DURABLE_METADATA_TTL_SEC, but a
+# key only picks that up the next time it is rewritten).
+HEAL_TARGET_TTL_SEC = 90 * 86400
+# dynamic_weights is written with an explicit 30d TTL by design and
+# brain_apply_snapshots with 365d; neither is ever touched by the heal.
+HEAL_EXEMPT = {"dynamic_weights", "brain_apply_snapshots"}
+HEAL_METADATA = DURABLE_METADATA - HEAL_EXEMPT
 
 
 def _text(key: Any) -> str:
@@ -253,6 +268,66 @@ def collect(
     return records, streams, truncated
 
 
+def collect_heal_candidates(client: Any) -> List[Dict[str, Any]]:
+    """Look up the TTL of each healable key directly by name (one pipelined
+    round trip). Unlike the SCAN this cannot be cut short by --max-keys."""
+    keys = [f"metadata:{n}" for n in sorted(HEAL_METADATA)]
+    pipe = client.pipeline(transaction=False)
+    for k in keys:
+        pipe.ttl(k)
+    res = pipe.execute()
+    return [{"key": k, "ttl": int(t)} for k, t in zip(keys, res)]
+
+
+def plan_durable_ttl_heal(
+    records: Iterable[Dict[str, Any]],
+    target_ttl: int = HEAL_TARGET_TTL_SEC,
+) -> List[Dict[str, Any]]:
+    """Pure: which keys would be raised. Only an exact 'metadata:<name>' key
+    from HEAL_METADATA with a finite, positive TTL below target is planned.
+    Absent keys (-2), no-expiry keys (-1) and keys already at/above target are
+    left alone -- the heal can only ever lengthen a lifetime."""
+    plan: List[Dict[str, Any]] = []
+    for rec in records:
+        key, ttl = str(rec["key"]), int(rec["ttl"])
+        if not key.startswith("metadata:") or key[len("metadata:"):] not in HEAL_METADATA:
+            continue
+        if 0 < ttl < target_ttl:
+            plan.append({"key": key, "ttl_before": ttl, "target": target_ttl})
+    return sorted(plan, key=lambda p: p["key"])
+
+
+def _raise_ttl(client: Any, key: str, target: int) -> bool:
+    """EXPIRE ... GT: the server itself refuses to shorten a TTL, so a bot
+    write that lands between our read and this call cannot be undone. Servers
+    without GT (Redis < 7) fall back to re-reading the TTL first."""
+    try:
+        return bool(client.expire(key, target, gt=True))
+    except Exception:
+        ttl = int(client.ttl(key))
+        if 0 < ttl < target:
+            return bool(client.expire(key, target))
+        return False
+
+
+def apply_durable_ttl_heal(
+    client: Any, plan: List[Dict[str, Any]], dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Execute (or, with dry_run, only describe) the plan, then re-read each
+    TTL so the report shows the verified 'after' value."""
+    rows: List[Dict[str, Any]] = []
+    for p in plan:
+        row = dict(p)
+        if dry_run:
+            row["status"] = "would_raise"
+        else:
+            changed = _raise_ttl(client, p["key"], p["target"])
+            row["ttl_after"] = int(client.ttl(p["key"]))
+            row["status"] = "raised" if changed else "skipped"
+        rows.append(row)
+    return {"target_days": HEAL_TARGET_TTL_SEC / 86400.0, "dry_run": dry_run, "keys": rows}
+
+
 def _fmt_ttl(sec: Optional[float]) -> str:
     if sec is None:
         return "-"
@@ -303,6 +378,16 @@ def render(report: Dict[str, Any], truncated: bool = False) -> str:
             lines.append(f"  [{fd['severity'].upper()}] {fd['kind']} {fd['family']} (n={fd['count']}): {fd['detail']}")
             for ex in fd.get("examples", []):
                 lines.append(f"      e.g. {ex}")
+    heal = report.get("heal")
+    if heal is not None:
+        lines.append("")
+        mode = "DRY RUN — nothing written" if heal["dry_run"] else "applied"
+        lines.append(f"Durable-TTL heal → {heal['target_days']:.0f}d ({mode})")
+        if not heal["keys"]:
+            lines.append("  nothing to heal: every durable decision key is absent, exempt, or already at the target")
+        for row in heal["keys"]:
+            after = f" → {_fmt_ttl(row['ttl_after'])}" if "ttl_after" in row else ""
+            lines.append(f"  {row['key']}: {_fmt_ttl(row['ttl_before'])}{after} [{row['status']}]")
     return "\n".join(lines)
 
 
@@ -315,6 +400,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--scan-count", type=int, default=500)
     ap.add_argument("--sample-bytes", type=int, default=25, help="Keys per family sampled for MEMORY USAGE")
     ap.add_argument("--match", default="*", help="SCAN MATCH pattern (default: *)")
+    ap.add_argument("--heal-durable-ttl", action="store_true",
+                    help="One-off, opt-in WRITE: raise standing-decision keys still on the old 7d TTL to 90d "
+                         "(never lowers a TTL, never touches dynamic_weights / brain_apply_snapshots)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="With --heal-durable-ttl: show what would change without writing")
     args = ap.parse_args(argv)
 
     if not args.url:
@@ -338,6 +428,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     report = summarize(records, streams)
     report["truncated"] = truncated
+    if args.heal_durable_ttl:
+        plan = plan_durable_ttl_heal(collect_heal_candidates(client))
+        report["heal"] = apply_durable_ttl_heal(client, plan, dry_run=args.dry_run)
     print(json.dumps(report, indent=2, sort_keys=True) if args.json else render(report, truncated))
     if args.fail_on_findings and any(f["severity"] in ("warning", "error") for f in report["findings"]):
         return 1
