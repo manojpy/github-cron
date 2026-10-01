@@ -1,0 +1,51 @@
+name: 🔎 Redis Key & TTL Audit
+
+# Read-only. Runs src/redis_audit.py (SCAN / TYPE / TTL / XLEN / MEMORY USAGE
+# only) against the REDIS_URL secret and prints the report in the job summary.
+# It never writes, deletes or expires a key, so it is safe to run any time,
+# including while the bot is running.
+on:
+  workflow_dispatch:
+    inputs:
+      fail_on_findings:
+        description: 'Fail the job if the audit reports a warning/error finding'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install redis client
+        run: pip install --quiet redis==5.2.1
+
+      - name: Run audit
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings }}
+        run: |
+          set -o pipefail
+          ARGS=""
+          if [ "$FAIL_ON_FINDINGS" = "true" ]; then ARGS="--fail-on-findings"; fi
+          set +e
+          python3 src/redis_audit.py $ARGS | tee audit.txt
+          RC=${PIPESTATUS[0]}
+          set -e
+          {
+            echo "## 🔎 Redis key & TTL audit"
+            echo '```'
+            cat audit.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $RC
