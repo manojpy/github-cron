@@ -215,6 +215,20 @@ def _clean_setup_title(title: str) -> str:
     cleaned = re.sub(r"^[\W_🟢🔴🔵🟣🌀⬆️⬇️▲▼🌊⚖️🔄☁️]+", "", title).strip()
     return cleaned or title
 
+def _leading_emoji(title: str) -> str:
+    """Take the leading emoji/symbol run from an alert title.
+    e.g. '🟢🔄 Strong Reversal BUY' → '🟢🔄'
+         '🌊🟢 Dynamic Flow Cross BUY' → '🌊🟢'
+         '🔴🌀 Fib Pivot Reversal SELL' → '🔴🌀'
+    Falls back to empty string if none found.
+    """
+    if not title:
+        return ""
+    m = re.match(r"^([\W_🟢🔴🔵🟣🌀⬆️⬇️▲▼🌊⚖️🔄☁️]+)", title.strip())
+    if not m:
+        return ""
+    return m.group(1).strip()
+
 def _combined_setup_line(items: List[Tuple[str, str]]) -> str:
     """items = list of (title, extra). Collapse to human setup names."""
     names = [_clean_setup_title(t) for t, _ in items]
@@ -549,32 +563,35 @@ async def _record_counterfactual_block(
 def build_rich_pair_msg(
     *,
     pair: str,
-    direction: str,                    # "buy" | "sell"
+    direction: str,
     price: Any,
     ts: int,
     score: Optional[float],
     total: Optional[float],
-    setup_line: str,                   # e.g. "Strong Reversal BUY, VWAP Cross(+2)"
+    setup_line: str,
     tq: Optional[Dict[str, Any]],
-    multi_family: bool = False,        # True → leading ☁️
+    multi_family: bool = False,          # still useful for setup line / logging
+    primary_emoji: Optional[str] = None, # ← NEW
     why_text: Optional[str] = None,
     risk_text: Optional[str] = None,
     edge_text: Optional[str] = None,
 ) -> str:
     """Full structured Telegram body (MarkdownV2-escaped) WITHOUT bias/datetime footer."""
     is_buy = direction.lower() == "buy"
-    side_emoji = "🟢" if is_buy else "🔴"
     side_word = "BUY" if is_buy else "SELL"
-    cloud = "☁️" if multi_family else ""
+
+    # Prefer emoji from the primary alert title; fall back to direction circle
+    header_emoji = (primary_emoji or "").strip()
+    if not header_emoji:
+        header_emoji = "🟢" if is_buy else "🔴"
 
     price_str = _format_price(price)
-    score_suffix = _fmt_score(score, total)   # ' - (24.0/29) 83%'
+    score_suffix = _fmt_score(score, total)
 
     action_label, conv_pct, conf_label = _action_from_tq(tq)
 
-    # ── Header ──
-    # ☁️🟢 BTCUSD — BUY | $108,420 - (21.5/29) 74%
-    raw_header = f"{cloud}{side_emoji} {pair} — {side_word} | {price_str}{score_suffix}"
+    # e.g. 🟢🔄 BTCUSD — BUY | $108,420 - (21.5/29) 74%
+    raw_header = f"{header_emoji} {pair} — {side_word} | {price_str}{score_suffix}"
     e_header = escape_markdown_v2(raw_header)
 
     # ── Conviction / action ──
@@ -2899,14 +2916,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             direction = "buy" if is_buy_batch else "sell"
             items = [(t, e) for t, e, _ in alerts_to_send[:25]]
             keys = [k for _, _, k in alerts_to_send[:25]]
-
             primary_key = keys[0]
-            tq = alert_tq_by_key.get(primary_key)
-            setup = _combined_setup_line(items)
-            multi = len(items) > 1
+            primary_title = items[0][0] if items else ""
+            primary_emoji = _leading_emoji(primary_title)
 
-            # Rich body has no datetime/bias footer — dispatcher adds those.
-            # Do NOT rpartition: last line is SL/TP, not a datetime line.
             msg = build_rich_pair_msg(
                 pair=pair_name,
                 direction=direction,
@@ -2914,9 +2927,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 ts=ts_curr,
                 score=confluence_score,
                 total=confluence_total,
-                setup_line=setup,
-                tq=tq,
-                multi_family=multi,
+                setup_line=_combined_setup_line(items),
+                tq=alert_tq_by_key.get(primary_key),
+                multi_family=len(items) > 1,
+                primary_emoji=primary_emoji,          # ← NEW
                 why_text=alert_why_by_key.get(primary_key),
                 risk_text=alert_risk_by_key.get(primary_key),
                 edge_text=alert_edge_by_key.get(primary_key),
@@ -3111,6 +3125,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             primary_key = keys[0]
             multi = len(items) > 1
 
+            primary_title = items[0][0] if items else ""
+            primary_emoji = _leading_emoji(primary_title)
+
             msg = build_rich_pair_msg(
                 pair=pair_name,
                 direction=direction,
@@ -3121,11 +3138,11 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 setup_line=_combined_setup_line(items),
                 tq=alert_tq_by_key.get(primary_key),
                 multi_family=multi,
+                primary_emoji=primary_emoji,
                 why_text=alert_why_by_key.get(primary_key),
                 risk_text=alert_risk_by_key.get(primary_key),
                 edge_text=alert_edge_by_key.get(primary_key),
             )
-
             if cfg.ENABLE_BIAS_HEADER and bias_context is not None:
                 date_str = format_ist_time(ts_curr, '%d-%m-%Y')
                 time_str = format_ist_time(ts_curr, '%H:%M IST')
