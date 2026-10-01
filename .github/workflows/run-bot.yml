@@ -252,16 +252,26 @@ jobs:
           ERR_FILE="$RUNNER_TEMP/artifact_list.err"
           for attempt in 1 2 3; do
             : > "$ERR_FILE"
-            RESPONSE=$(timeout 15 gh api "repos/${REPO}/actions/artifacts?per_page=100" 2>"$ERR_FILE")
-            RC=$?
+            # NOTE: run: blocks execute under `bash -e`. A plain
+            #   RESPONSE=$(timeout ... gh api ...); RC=$?
+            # aborts the shell the moment gh fails, so RC is never read
+            # and the retry loop never actually retries. The `if …` form
+            # suspends `-e` for the command substitution, letting RC be
+            # captured and the loop do its job.
+            if RESPONSE=$(timeout 15 gh api "repos/${REPO}/actions/artifacts?per_page=100" 2>"$ERR_FILE"); then
+              RC=0
+            else
+              RC=$?
+            fi
             if [ "$RC" -eq 0 ] && echo "$RESPONSE" | jq -e '.artifacts' >/dev/null 2>&1; then
               break
             fi
             RESPONSE=""
-            echo "::warning::Artifact list API failed (attempt ${attempt}/3, exit ${RC}$([ "$RC" -eq 124 ] && echo ', timed out')): $(head -c 300 "$ERR_FILE" | tr '\n' ' ')"
+            TIMEOUT_NOTE=""
+            if [ "$RC" -eq 124 ]; then TIMEOUT_NOTE=", timed out"; fi
+            echo "::warning::Artifact list API failed (attempt ${attempt}/3, exit ${RC}${TIMEOUT_NOTE}): $(head -c 300 "$ERR_FILE" | tr '\n' ' ')"
             sleep $(( attempt * 2 ))
           done
-          
           if [ -z "$RESPONSE" ]; then
             echo "::warning::Could not list artifacts after 3 attempts — skipping replay"
             exit 0
