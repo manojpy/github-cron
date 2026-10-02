@@ -23,12 +23,15 @@ Hard rules (applied after the score):
     net EV < 0                                -> AVOID
     quality gate verdict BLOCKED              -> AVOID
     against the market bias AND OI/funding failed -> AVOID
-    no brain data at all: AVOID if counter-trend or technicals < 75%,
-                          otherwise WATCH (no conviction % is invented)
+    no brain data at all (no conviction % is ever invented):
+        blocked, technicals < 75%, or counter-trend with OI/funding failed -> AVOID
+        counter-trend (OI ok) -> WATCH only if technicals >= the unproven bar, else AVOID
+        technicals >= the unproven bar, not counter-trend, OI/funding ok,
+            no opposing signal                 -> TAKE (small size, unproven)
+        anything else                          -> WATCH
     opposing signals on the same pair         -> TAKE is downgraded to WATCH
 """
 from __future__ import annotations
-
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -74,11 +77,12 @@ class PairAdvice:
     plan_line: str
     size_line: str = ""
     notes: List[str] = field(default_factory=list)
+    qualifier: str = ""                # e.g. "small size" for an unproven TAKE
 
     @property
     def label(self) -> str:
-        return VERDICT_LABEL[self.verdict]
-
+        base = VERDICT_LABEL[self.verdict]
+        return f"{base} ({self.qualifier})" if self.qualifier else base
 
 def _clamp(x: float, lo: float = 0.0, hi: float = 100.0) -> float:
     return max(lo, min(hi, x))
@@ -139,6 +143,17 @@ def _support_labels(votes: Optional[Dict[str, bool]], weights: Optional[Dict[str
     names.sort(key=lambda n: (-float(w.get(n, 0.0)), n))
     return [VOTE_LABELS.get(n, n.replace("_", " ")) for n in names[:limit]]
 
+def _support_text(votes: Optional[Dict[str, bool]], weights: Optional[Dict[str, float]],
+                  support: List[str]) -> str:
+    """Informative support wording. When every high-weight check passes say so
+    (the top-3 list was identical for nearly every alert and told nothing)."""
+    if not votes:
+        return ""
+    w = weights or {}
+    core_fail = [n for n, ok in votes.items() if not ok and float(w.get(n, 0.0)) >= 2.0]
+    if w and not core_fail:
+        return " All high-weight checks pass."
+    return f" Supported by {', '.join(support)}." if support else ""
 
 def advise_pair(
     *,
@@ -156,6 +171,8 @@ def advise_pair(
     default_sl_pct: float = 0.5,
     default_rr: float = 2.0,
     vote_weights: Optional[Dict[str, float]] = None,
+    unproven_take_min_pct: Optional[float] = None,   # 0-100; None = feature off
+    unproven_size: float = 0.25,
 ) -> PairAdvice:
     data = [t for t in tqs if isinstance(t, dict) and _num(t.get("net_ev")) is not None]
     blocked = any(isinstance(t, dict) and str(t.get("verdict")) == "BLOCKED" for t in tqs)
@@ -177,12 +194,22 @@ def advise_pair(
     plan_line = _plan_line(plan, default_sl_pct, default_rr)
     support = _support_labels(votes, vote_weights, True, 3)
     weak = _support_labels(votes, vote_weights, False, 2)
-    support_txt = f" Supported by {', '.join(support)}." if support else ""
+    support_txt = _support_text(votes, vote_weights, support)
 
     # ═════════ no brain data at all ═════════
     if not data:
-        if blocked or against or pct is None or pct < 0.75:
+        strong_bar = (unproven_take_min_pct if unproven_take_min_pct is not None else 90.0) / 100.0
+        qualifier = ""
+        if blocked or pct is None or pct < 0.75:
             verdict = AVOID
+        elif against and oi_failed:
+            verdict = AVOID
+        elif against:
+            # counter-trend: only a very strong setup earns a WATCH
+            verdict = WATCH if pct >= strong_bar else AVOID
+        elif (unproven_take_min_pct is not None and pct >= strong_bar
+              and not oi_failed and not conflicting):
+            verdict, qualifier = TAKE, "small size"
         else:
             verdict = WATCH
         if against and oi_failed:
@@ -191,6 +218,10 @@ def advise_pair(
             reason = "it is counter-trend and has no track record yet"
         elif verdict == AVOID:
             reason = "technicals are not strong enough to act on without a track record"
+        elif verdict == TAKE:
+            reason = ""
+        elif oi_failed:
+            reason = "OI/funding disagrees and there is no track record yet"
         else:
             reason = "there is no track record for this setup yet"
         no_data_risks = []
@@ -207,15 +238,25 @@ def advise_pair(
             risk_line = "; ".join(no_data_risks) + "; no reliable profitability evidence."
         elif verdict == WATCH:
             label, risk_line = "Missing", "Reliable profitability evidence."
+        elif verdict == TAKE:
+            label, risk_line = "Risk", "unproven setup, no reliable profitability evidence."
         else:
             label = "Risk"
             risk_line = "weak technicals and no reliable profitability evidence."
+        if verdict == TAKE:
+            why = (f"{tech} with no track record yet, so the technical confluence "
+                   f"is the only evidence; size small.{support_txt}")
+            size_line = f"📐 Size {unproven_size:.2f}× (unproven setup, advisory)"
+        else:
+            why = f"{tech}, but {reason}.{support_txt}"
+            size_line = ""
         return PairAdvice(
             verdict=verdict, conviction=None, confidence="LOW",
             brain_line="🧠 Brain: no track record for this setup yet",
             edge_line="📊 Edge: Insufficient history",
-            why_line=f"💡 Why: {tech}, but {reason}.{support_txt}",
+            why_line=f"💡 Why: {why}",
             risk_label=label, risk_line=risk_line, plan_line=plan_line,
+            size_line=size_line, qualifier=qualifier,
         )
 
     # ═════════ conviction blend ═════════

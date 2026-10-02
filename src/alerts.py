@@ -29,6 +29,7 @@ class AlertPayload:
     record_win_rate: Optional[Callable[[], Awaitable[None]]] = None
     record_win_rate_after_send: Optional[Callable[[], Awaitable[None]]] = None
     mark_candle_processed: bool = False
+    verdict: Optional[str] = None       # "TAKE" / "WATCH" / "AVOID" (None if unavailable)
 
 from alert_advisor import PairAdvice, advise_pair
 from bot_config import (
@@ -225,7 +226,7 @@ def _leading_emoji(title: str) -> str:
     """
     if not title:
         return ""
-    m = re.match(r"^([\W_🟢🔴🔵🟣🌀⬆️⬇️▲▼🌊⚖️🔄☁️]+)", title.strip())
+    m = re.match(r"^([\W_🟢🔴🔵🟣🌀⬆️⬇️▲▼🌊��������️🔄☁️]+)", title.strip())
     if not m:
         return ""
     return m.group(1).strip()
@@ -558,17 +559,24 @@ def build_rich_pair_msg(
         lines.append(advice.size_line)
     return "\n".join(escape_markdown_v2(x) for x in lines)
 
+def _bias_alignment(
+    direction: str, bias_context: Optional[BiasContext], min_edge: float = 0.10,
+) -> str:
+    """'with' / 'against' / 'neutral' relative to the pair-universe bias.
 
-def _bias_alignment(direction: str, bias_context: Optional[BiasContext]) -> str:
-    """'with' / 'against' / 'neutral' relative to the pair-universe bias."""
+    Mirrors the bias header: the dominant bucket (up / down / neutral) decides.
+    If Neutral dominates, or the dominant side leads the opposite side by less
+    than ``min_edge`` (fraction of pairs), the market gives no direction, so the
+    alert is neutral -- never "counter-trend" on a 3-point difference."""
     if bias_context is None:
         return "neutral"
     up, down = float(bias_context.up_pct), float(bias_context.down_pct)
-    if up == down:
+    neutral = getattr(bias_context, "neutral_pct", None)
+    neutral = max(0.0, 1.0 - up - down) if neutral is None else float(neutral)
+    if neutral >= max(up, down) or abs(up - down) < min_edge:
         return "neutral"
     market_up = up > down
     return "with" if (direction == "buy") == market_up else "against"
-
 
 def build_pair_msg_safe(
     *,
@@ -585,14 +593,13 @@ def build_pair_msg_safe(
     required: Optional[float],
     bias_context: Optional[BiasContext],
     logger_pair: logging.Logger,
-) -> str:
-    """Build the rich body for one pair/direction. Never raises: any failure
-    degrades to a plain header + setup line so an alert is never lost to a
-    formatting bug."""
+) -> Tuple[str, Optional[str]]:
+    """Build the rich body for one pair/direction and return (body, verdict).
+    Never raises: any failure degrades to a plain header + setup line (verdict
+    None) so an alert is never lost to a formatting bug."""
     try:
         same = [i for i, k in enumerate(keys) if (k in BUY_ALERT_KEYS) == (direction == "buy")]
         conflicting = len(same) < len(keys)
-
         def _ev(i: int) -> float:
             t = tq_by_key.get(keys[i]) or {}
             v = t.get("net_ev")
@@ -604,25 +611,36 @@ def build_pair_msg_safe(
         advice = advise_pair(
             direction=direction, score=score, total=total, required=required,
             votes=votes, tqs=[tq_by_key.get(k) for k in s_keys],
-            bias=_bias_alignment(direction, bias_context), conflicting=conflicting,
+            bias=_bias_alignment(direction, bias_context, cfg.ALERT_BIAS_MIN_EDGE),
+            conflicting=conflicting,
             take_min=cfg.ALERT_TAKE_MIN_CONVICTION,
             watch_min=cfg.ALERT_WATCH_MIN_CONVICTION,
             shadow_cap=cfg.ALERT_SHADOW_CONVICTION_CAP,
             default_sl_pct=cfg.OUTCOME_MAE_LOSS_PCT, default_rr=cfg.OUTCOME_RR_TARGET,
             vote_weights=CONFLUENCE_WEIGHTS,
+            unproven_take_min_pct=(
+                cfg.ALERT_UNPROVEN_MIN_CONFLUENCE_PCT
+                if cfg.ENABLE_ALERT_UNPROVEN_TAKE else None
+            ),
+            unproven_size=cfg.ALERT_UNPROVEN_SIZE_MULT,
         )
-        return build_rich_pair_msg(
+        body = build_rich_pair_msg(
             pair=pair, direction=direction, price=price, ts=ts, score=score, total=total,
             setup_line=_combined_setup_line(s_items), advice=advice,
             primary_emoji=_leading_emoji(s_items[0][0]),
         )
+        return body, advice.verdict
     except Exception as e:
         logger_pair.warning(f"[{pair}] rich alert format failed, using plain body: {e}")
         side = "BUY" if direction == "buy" else "SELL"
         return escape_markdown_v2(
             f"{pair} — {side} | {_format_price(price)}{_fmt_score(score, total)}\n"
             f"{_combined_setup_line(items)}"
-        )
+        ), None
+
+def build_pair_msg_safe(**kwargs: Any) -> str:
+    """Body-only convenience wrapper around build_pair_msg_and_verdict()."""
+    return build_pair_msg_and_verdict(**kwargs)[0]
 
 def _format_bias_header(bias_context: BiasContext) -> str:
     up_pct = round(bias_context.up_pct * 100)
@@ -1131,6 +1149,18 @@ async def dispatch_combined_alerts(
                 else:
                     _dir_seen[p.direction] = p.pair_name
                 _seen.append(p.pair_name)
+
+    # Crypto majors move together: several same-direction TAKEs on one candle
+    # are one correlated bet, not N independent ones. Flag it on the first.
+    _basket_min = int(getattr(cfg, "ALERT_BASKET_NOTE_MIN", 3))
+    for _d in ("buy", "sell"):
+        _takes = [p for p in ordered if p.direction == _d and p.verdict == "TAKE"]
+        if len(_takes) >= _basket_min:
+            _side = "BUY" if _d == "buy" else "SELL"
+            _takes[0].msg_body += "\n" + escape_markdown_v2(
+                f"🧺 {len(_takes)} {_side} TAKEs this candle move together — "
+                f"size them as ONE basket, not {len(_takes)} full trades"
+            )
 
     # Build atomic blocks so we never split inside a pair
     pair_blocks: List[Tuple[str, AlertPayload]] = []
@@ -2795,7 +2825,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 )
             except NameError:
                 _req_msg = None
-            msg = build_pair_msg_safe(
+            msg, pair_verdict = build_pair_msg_and_verdict(
                 pair=pair_name,
                 direction=direction,
                 price=close_curr,
@@ -2941,6 +2971,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 record_win_rate=deferred_record,      # runs only after Telegram confirms delivery
                 record_win_rate_after_send=None,
                 mark_candle_processed=True,    # dispatcher marks candle after delivery
+                verdict=pair_verdict,
             )
             return pair_name, {
                 "state": "BATCHED",
@@ -3009,7 +3040,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 )
             except NameError:
                 _req_msg = None
-            msg = build_pair_msg_safe(
+            msg, _ = build_pair_msg_and_verdict(
                 pair=pair_name,
                 direction=direction,
                 price=close_curr,
@@ -3217,7 +3248,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
             if rsi_prev <= rsi_ema_prev and rsi_curr > rsi_ema_curr:
                 if rsi_curr >= rsi_adaptive_buy:
-                    reasons.append(f"RSI>EMA5 blocked: RSI={rsi_curr:.2f} ≥ cap {rsi_adaptive_buy:.1f}")
+                    reasons.append(f"RSI>EMA5 blocked: RSI={rsi_curr:.2f} ��� cap {rsi_adaptive_buy:.1f}")
                 elif ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY:
                     reasons.append(f"RSI>EMA5 blocked: PPO={ppo_gate_curr:.2f} ≥ guard {Constants.PPO_RSI_GUARD_BUY}")
                 elif not buy_common:
