@@ -30,6 +30,7 @@ class AlertPayload:
     record_win_rate_after_send: Optional[Callable[[], Awaitable[None]]] = None
     mark_candle_processed: bool = False
 
+from alert_advisor import PairAdvice, advise_pair
 from bot_config import (
     cfg, logger, Constants, CompiledPatterns, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
     shutdown_event, format_ist_time, json_dumps, json_loads, CONFLUENCE_WEIGHTS, BtcMacroContext,
@@ -241,8 +242,15 @@ def _combined_setup_line(items: List[Tuple[str, str]]) -> str:
     return f"{names[0]}, {names[1]}(+{len(names) - 2})"
 
 def _format_price(price: Any) -> str:
-    """Safely format price to 2 decimal places."""
-    return f"${price:,.2f}" if isinstance(price, (int, float)) else "N/A"
+    """Format a price with enough precision to be useful for low-priced pairs
+    (a $0.0462 asset must not be shown as $0.05)."""
+    if not isinstance(price, (int, float)):
+        return "N/A"
+    if price >= 1:
+        return f"${price:,.2f}"
+    if price >= 0.01:
+        return f"${price:,.4f}"
+    return f"${price:,.6f}"
 
 def _fmt_num(n: float) -> str:
     """Format a number with no trailing '.0' when it's a whole number."""
@@ -258,46 +266,6 @@ def _fmt_score(score: Optional[float], total: Optional[float] = None) -> str:
         pct = round((score / total) * 100)
         return f" - ({_fmt_num(score)}/{_fmt_num(total)}) {pct}%"
     return f" - ({_fmt_num(score)})"
-
-def _action_from_tq(tq: Optional[Dict[str, Any]]) -> Tuple[str, str, str]:
-    """
-    Returns (action_emoji_label, conviction_pct_str, confidence_label).
-    action_emoji_label is one of: '✅ TAKE', '⛔ AVOID', '🟡 WATCH'
-    confidence_label is HIGH / MEDIUM / LOW
-    """
-    if not tq or not tq.get("verdict"):
-        return "🟡 WATCH", "—", "LOW"
-
-    verdict = str(tq.get("verdict", "")).upper()
-    p = tq.get("p_ev_positive")
-    ev = tq.get("net_ev")
-    evidence = str(tq.get("evidence_state") or "").upper()
-    strength = str(tq.get("evidence_strength") or "").lower()
-
-    # Conviction % prefers ensemble then p_ev_positive
-    conv_src = tq.get("p_ev_positive_ensemble")
-    if conv_src is None:
-        conv_src = p
-    conv_pct = f"{round(float(conv_src) * 100)}%" if conv_src is not None else "—"
-
-    conf = "HIGH" if verdict == "HIGH" else "MEDIUM" if verdict == "MEDIUM" else "LOW"
-
-    if verdict == "BLOCKED":
-        return "⛔ AVOID", conv_pct, "LOW"
-
-    if evidence in ("INSUFFICIENT",) or strength == "weak" and (p is None or p < 0.60):
-        return "🟡 WATCH", conv_pct, conf
-
-    if verdict == "HIGH" and (ev is None or ev >= 0):
-        return "✅ TAKE", conv_pct, "HIGH"
-    if verdict == "MEDIUM" and (ev is None or ev >= 0):
-        return "✅ TAKE", conv_pct, "MEDIUM"
-
-    # LOW / negative EV
-    if ev is not None and ev < 0:
-        return "⛔ AVOID", conv_pct, conf
-    return "🟡 WATCH", conv_pct, conf
-
 
 DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
@@ -569,94 +537,92 @@ def build_rich_pair_msg(
     score: Optional[float],
     total: Optional[float],
     setup_line: str,
-    tq: Optional[Dict[str, Any]],
-    multi_family: bool = False,          # still useful for setup line / logging
-    primary_emoji: Optional[str] = None, # ← NEW
-    why_text: Optional[str] = None,
-    risk_text: Optional[str] = None,
-    edge_text: Optional[str] = None,
+    advice: PairAdvice,
+    primary_emoji: Optional[str] = None,
 ) -> str:
-    """Full structured Telegram body (MarkdownV2-escaped) WITHOUT bias/datetime footer."""
-    is_buy = direction.lower() == "buy"
-    side_word = "BUY" if is_buy else "SELL"
-
-    # Prefer emoji from the primary alert title; fall back to direction circle
-    header_emoji = (primary_emoji or "").strip()
-    if not header_emoji:
-        header_emoji = "🟢" if is_buy else "🔴"
-
-    price_str = _format_price(price)
-    score_suffix = _fmt_score(score, total)
-
-    action_label, conv_pct, conf_label = _action_from_tq(tq)
-
-    # e.g. 🟢🔄 BTCUSD — BUY | $108,420 - (21.5/29) 74%
-    raw_header = f"{header_emoji} {pair} — {side_word} | {price_str}{score_suffix}"
-    e_header = escape_markdown_v2(raw_header)
-
-    # ── Conviction / action ──
-    raw_action = f"🎯 Conviction {conv_pct}  |  {action_label}"
-    e_action = escape_markdown_v2(raw_action)
-
-    # ── Setup ──
-    e_setup = escape_markdown_v2(setup_line)
-
-    # ── Brain ──
-    p = tq.get("p_ev_positive") if tq else None
-    ev = tq.get("net_ev") if tq else None
-    p_str = f"{round(float(p)*100)}%" if p is not None else "—"
-    ev_str = f"{float(ev):+.2f}%" if ev is not None else "—"
-    brain_raw = f"🧠 Brain: P(profit) {p_str}, EV {ev_str}, {conf_label} confidence"
-    e_brain = escape_markdown_v2(brain_raw)
-
-    # ── Edge ──
-    if not edge_text and tq:
-        strength = tq.get("evidence_strength", "limited")
-        state = tq.get("evidence_state", "")
-        if state == "INSUFFICIENT" or strength == "weak":
-            edge_text = "Insufficient history"
-        else:
-            edge_text = f"Historical + ML, evidence {strength}"
-    edge_raw = f"📊 Edge: {edge_text or 'n/a'}"
-    e_edge = escape_markdown_v2(edge_raw)
-
-    # ── Why ──
-    why_raw = f"💡 Why: {why_text or 'Technical conditions supportive.'}"
-    e_why = escape_markdown_v2(why_raw)
-
-    # ── Risk / Missing ──
-    if action_label.startswith("🟡"):
-        risk_prefix = "⚠️ Missing"
-        risk_body = risk_text or "Reliable profitability evidence."
-    else:
-        risk_prefix = "⚠️ Risk"
-        risk_body = risk_text or "Manage size; watch invalidation."
-    risk_raw = f"{risk_prefix}: {risk_body}"
-    e_risk = escape_markdown_v2(risk_raw)
-
-    # ── SL / TP ──
-    plan = (tq or {}).get("trade_plan") if tq else None
-    if plan:
-        sl_tp_raw = (
-            f"🛡 SL -{plan['sl_suggested_pct']:.2f}% | "
-            f"TP1 +{plan['tp1_suggested_pct']:.2f}% | "
-            f"TP2 +{plan['tp2_suggested_pct']:.2f}%"
-        )
-    else:
-        sl_tp_raw = "🛡 SL — | TP1 — | TP2 —"
-    e_sltp = escape_markdown_v2(sl_tp_raw)
-
+    """Structured Telegram body (MarkdownV2-escaped) WITHOUT bias/datetime footer."""
+    side_word = "BUY" if direction.lower() == "buy" else "SELL"
+    header_emoji = (primary_emoji or "").strip() or ("🟢" if side_word == "BUY" else "🔴")
+    conv = f"{advice.conviction}%" if advice.conviction is not None else "n/a"
     lines = [
-        e_header,
-        e_action,
-        e_setup,
-        e_brain,
-        e_edge,
-        e_why,
-        e_risk,
-        e_sltp,
+        f"{header_emoji} {pair} — {side_word} | {_format_price(price)}{_fmt_score(score, total)}",
+        f"🎯 Conviction {conv} | {advice.label}",
+        setup_line,
+        advice.brain_line,
+        advice.edge_line,
+        advice.why_line,
+        f"⚠️ {advice.risk_label}: {advice.risk_line}",
+        advice.plan_line,
     ]
-    return "\n".join(lines)
+    if advice.size_line:
+        lines.append(advice.size_line)
+    return "\n".join(escape_markdown_v2(x) for x in lines)
+
+
+def _bias_alignment(direction: str, bias_context: Optional[BiasContext]) -> str:
+    """'with' / 'against' / 'neutral' relative to the pair-universe bias."""
+    if bias_context is None:
+        return "neutral"
+    up, down = float(bias_context.up_pct), float(bias_context.down_pct)
+    if up == down:
+        return "neutral"
+    market_up = up > down
+    return "with" if (direction == "buy") == market_up else "against"
+
+
+def build_pair_msg_safe(
+    *,
+    pair: str,
+    direction: str,
+    price: Any,
+    ts: int,
+    score: Optional[float],
+    total: Optional[float],
+    items: List[Tuple[str, str]],
+    keys: List[str],
+    tq_by_key: Dict[str, Optional[Dict[str, Any]]],
+    votes: Optional[Dict[str, bool]],
+    required: Optional[float],
+    bias_context: Optional[BiasContext],
+    logger_pair: logging.Logger,
+) -> str:
+    """Build the rich body for one pair/direction. Never raises: any failure
+    degrades to a plain header + setup line so an alert is never lost to a
+    formatting bug."""
+    try:
+        same = [i for i, k in enumerate(keys) if (k in BUY_ALERT_KEYS) == (direction == "buy")]
+        conflicting = len(same) < len(keys)
+
+        def _ev(i: int) -> float:
+            t = tq_by_key.get(keys[i]) or {}
+            v = t.get("net_ev")
+            return float(v) if isinstance(v, (int, float)) else -999.0
+
+        same.sort(key=lambda i: -_ev(i))          # strongest edge first (stable)
+        s_items = [items[i] for i in same]
+        s_keys = [keys[i] for i in same]
+        advice = advise_pair(
+            direction=direction, score=score, total=total, required=required,
+            votes=votes, tqs=[tq_by_key.get(k) for k in s_keys],
+            bias=_bias_alignment(direction, bias_context), conflicting=conflicting,
+            take_min=cfg.ALERT_TAKE_MIN_CONVICTION,
+            watch_min=cfg.ALERT_WATCH_MIN_CONVICTION,
+            shadow_cap=cfg.ALERT_SHADOW_CONVICTION_CAP,
+            default_sl_pct=cfg.OUTCOME_MAE_LOSS_PCT, default_rr=cfg.OUTCOME_RR_TARGET,
+            vote_weights=CONFLUENCE_WEIGHTS,
+        )
+        return build_rich_pair_msg(
+            pair=pair, direction=direction, price=price, ts=ts, score=score, total=total,
+            setup_line=_combined_setup_line(s_items), advice=advice,
+            primary_emoji=_leading_emoji(s_items[0][0]),
+        )
+    except Exception as e:
+        logger_pair.warning(f"[{pair}] rich alert format failed, using plain body: {e}")
+        side = "BUY" if direction == "buy" else "SELL"
+        return escape_markdown_v2(
+            f"{pair} — {side} | {_format_price(price)}{_fmt_score(score, total)}\n"
+            f"{_combined_setup_line(items)}"
+        )
 
 def _format_bias_header(bias_context: BiasContext) -> str:
     up_pct = round(bias_context.up_pct * 100)
@@ -1103,8 +1069,14 @@ async def dispatch_combined_alerts(
     )
     buys = [p for p in payloads if p.direction == "buy"]
     sells = [p for p in payloads if p.direction == "sell"]
-    buys.sort(key=lambda p: (p.score or 0.0), reverse=True)
-    sells.sort(key=lambda p: (p.score or 0.0), reverse=True)
+    def _conf_pct(p: AlertPayload) -> float:
+        # Totals differ per pair (27 vs 29 ...), so rank by score/total, not raw score
+        if p.score is not None and p.total:
+            return p.score / p.total
+        return p.score or 0.0
+
+    buys.sort(key=_conf_pct, reverse=True)
+    sells.sort(key=_conf_pct, reverse=True)
     ordered = (sells + buys) if dominant_sell else (buys + sells)
 
     # ── Global budget enforcement ──
@@ -1143,6 +1115,22 @@ async def dispatch_combined_alerts(
     datetime_footer = (
         f"📆  {escape_markdown_v2(date_str)}{spacing}⏰ {escape_markdown_v2(time_str)}"
     )
+
+    # Pairs on the same underlying (e.g. PAXGUSD / XAUTUSD) are one trade:
+    # flag every later same-direction member so it is not counted twice.
+    for _grp in (getattr(cfg, "ALERT_CORRELATED_PAIRS", None) or []):
+        _seen: List[str] = []
+        _dir_seen: Dict[str, str] = {}
+        for p in ordered:
+            if p.pair_name in _grp:
+                prev = _dir_seen.get(p.direction)
+                if prev:
+                    p.msg_body += "\n" + escape_markdown_v2(
+                        f"🔗 Same underlying as {prev} — count as one trade"
+                    )
+                else:
+                    _dir_seen[p.direction] = p.pair_name
+                _seen.append(p.pair_name)
 
     # Build atomic blocks so we never split inside a pair
     pair_blocks: List[Tuple[str, AlertPayload]] = []
@@ -2266,9 +2254,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         # Structured Telegram metadata (filled during quality pass; used at send)
         alert_tq_by_key: Dict[str, Optional[Dict[str, Any]]] = {}
-        alert_why_by_key: Dict[str, str] = {}
-        alert_risk_by_key: Dict[str, str] = {}
-        alert_edge_by_key: Dict[str, str] = {}
 
         if alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER:
             alert_keys_to_check = [ak for _, _, ak in alerts_to_send]
@@ -2298,9 +2283,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             )
 
                 alert_score, alert_total, alert_votes = _confluence_for(alert_key)
-                _survive_cal_wr: Optional[float] = None
-                _survive_cal_reason: Optional[str] = None
-
+                
                 # ── Calibration gate (independent of the win-rate filter) ──
                 if (cfg.ENABLE_CALIBRATION_GATE
                         and calibration_curves is not None
@@ -2314,7 +2297,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
                             slack=getattr(cfg, "CALIBRATION_SLACK", 0.05),
                         )
-                        _survive_cal_wr, _survive_cal_reason = cal_wr, _reason
                         if not ok:
                             logger_pair.info(
                                 f"[{pair_name}] calibration gate dropped {alert_key}: "
@@ -2410,18 +2392,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     f"ev_bucket_p={tq.get('p_ev_positive', 0):.3f})"
                                 )
                             if tq["verdict"] == "BLOCKED":
-                                # Keep alert_extra technical-only; store tq for rich body
-                                alert_tq_by_key[alert_key] = tq
-                                alert_why_by_key[alert_key] = (
-                                    f"Blocked by quality gate: {tq.get('reason', 'n/a')}"
-                                )
-                                alert_risk_by_key[alert_key] = (
-                                    "Quality veto; do not take this setup."
-                                )
-                                alert_edge_by_key[alert_key] = (
-                                    f"Evidence {tq.get('evidence_strength', '?')}; "
-                                    f"state {tq.get('evidence_state', '?')}"
-                                )
+                                # tq is already stored in alert_tq_by_key; the pair
+                                # message turns a BLOCKED verdict into AVOID.
                                 if getattr(cfg, "ENABLE_QUALITY_HARD_BLOCK", False):
                                     _qr = (
                                         f"quality_hard_block|"
@@ -2456,98 +2428,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     )
                                     continue
                             else:
-                                # Do NOT append Quality / SL / warnings into alert_extra.
-                                # Persist structured fields for build_rich_pair_msg (Step 6).
-                                alert_tq_by_key[alert_key] = tq
-
-                                strength = tq.get("evidence_strength", "limited")
-                                state = str(tq.get("evidence_state") or "")
-                                if state == "INSUFFICIENT" or strength == "weak":
-                                    alert_edge_by_key[alert_key] = "Insufficient history"
-                                else:
-                                    regime_bit = ""
-                                    if tq.get("regime_warning"):
-                                        regime_bit = f"; {tq['regime_warning']}"
-                                    alert_edge_by_key[alert_key] = (
-                                        f"Historical + ML, evidence {strength}{regime_bit}"
-                                    )
-
-                                risk_bits: List[str] = []
-                                if tq.get("drift_warning"):
-                                    risk_bits.append("recent WR drift")
-                                if tq.get("regime_warning"):
-                                    risk_bits.append(str(tq["regime_warning"]))
-                                plan = tq.get("trade_plan")
-                                if plan and plan.get("tp_first_rate") is not None:
-                                    if float(plan["tp_first_rate"]) < 0.40:
-                                        risk_bits.append(
-                                            f"TP1 historically reached only "
-                                            f"{plan['tp_first_rate']:.0%}"
-                                        )
-                                if not risk_bits:
-                                    risk_bits.append(
-                                        "Manage size; watch setup invalidation."
-                                    )
-                                alert_risk_by_key[alert_key] = "; ".join(risk_bits)
-
-                                # Why is filled in the survival-checklist block below
-                                # (or set a default here if that block is disabled)
-                                if alert_key not in alert_why_by_key:
-                                    alert_why_by_key[alert_key] = (
-                                        "Technical conditions supportive; "
-                                        "see brain/edge for evidence."
-                                    )
-
-                        # ── Why it survived (interpretability only) ──
-                        if getattr(cfg, "ENABLE_ALERT_WHY_SURVIVED", True):
-                            try:
-                                try:
-                                    # Defined only when the confluence gate branch ran.
-                                    _req: Optional[float] = (
-                                        _required_confluence(alert_total)
-                                        if cfg.ENABLE_CONFLUENCE_GATE else None
-                                    )
-                                except NameError:
-                                    _req = None
-                                _chk = build_survival_checklist(
-                                    score=alert_score, total=alert_total, required=_req,
-                                    win_rate=win_rate, win_sample=int(sample or 0),
-                                    cal_wr=_survive_cal_wr, cal_reason=_survive_cal_reason,
-                                    tq=tq,
-                                )
-                                if _chk:
-                                    # Human Why line for rich body (not stuffed into extra)
-                                    alert_why_by_key[alert_key] = _chk
-                            except Exception as e:
-                                logger_pair.debug(f"Survival checklist failed for {alert_key}: {e}")
-                            try:
-                                checks = []
-                                if alert_votes:
-                                    for name, ok in sorted(alert_votes.items()):
-                                        if ok is True:
-                                            checks.append(f"✓ {name}")
-                                        elif ok is False:
-                                            checks.append(f"✗ {name}")
-                                if checks:
-                                    shown = checks[:8]
-                                    more = (
-                                        f" +{len(checks) - 8}"
-                                        if len(checks) > 8
-                                        else ""
-                                    )
-                                    # Optional: fold vote summary into Why, still not into extra
-                                    vote_summary = ", ".join(shown) + more
-                                    prev_why = alert_why_by_key.get(alert_key, "")
-                                    if prev_why:
-                                        alert_why_by_key[alert_key] = (
-                                            f"{prev_why} | Votes: {vote_summary}"
-                                        )
-                                    else:
-                                        alert_why_by_key[alert_key] = (
-                                            f"Votes: {vote_summary}"
-                                        )
-                            except Exception as e:
-                                logger_pair.debug(f"Why-survived build failed for {alert_key}: {e}")
+                                pass
 
                         # ── ML-EV shadow / hard qualification ──
                         if (
@@ -2601,19 +2482,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                             "sl_pct": sl_pct,
                                             "would_block": not qualify,
                                         }
-                                        # Shadow stays in context/logs only — not in Telegram extra
+                                        # Shadow stays in context/logs only — not in Telegram
                                         # (already stored on context["ml_ev_shadow_by_alert"])
-                                        if not qualify:
-                                            # Optional: surface as risk hint for rich body
-                                            prev_risk = alert_risk_by_key.get(alert_key, "")
-                                            hint = (
-                                                f"ML-EV {ev.get('net_ev'):+.3f}R below floor "
-                                                f"(still dispatched)"
-                                            )
-                                            alert_risk_by_key[alert_key] = (
-                                                f"{prev_risk}; {hint}" if prev_risk else hint
-                                            )
-                                
                                     # Hard gate (only when explicitly enabled)
                                     if getattr(cfg, "ENABLE_ML_EV_GATE", False) and not qualify:
                                         logger_pair.info(
@@ -2916,26 +2786,34 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             direction = "buy" if is_buy_batch else "sell"
             items = [(t, e) for t, e, _ in alerts_to_send[:25]]
             keys = [k for _, _, k in alerts_to_send[:25]]
-            primary_key = keys[0]
-            primary_title = items[0][0] if items else ""
-            primary_emoji = _leading_emoji(primary_title)
 
-            msg = build_rich_pair_msg(
+            try:
+                # _required_confluence only exists when the confluence gate ran
+                _req_msg = (
+                    _required_confluence(confluence_total)
+                    if cfg.ENABLE_CONFLUENCE_GATE and confluence_total else None
+                )
+            except NameError:
+                _req_msg = None
+            msg = build_pair_msg_safe(
                 pair=pair_name,
                 direction=direction,
                 price=close_curr,
                 ts=ts_curr,
                 score=confluence_score,
                 total=confluence_total,
-                setup_line=_combined_setup_line(items),
-                tq=alert_tq_by_key.get(primary_key),
-                multi_family=len(items) > 1,
-                primary_emoji=primary_emoji,          # ← NEW
-                why_text=alert_why_by_key.get(primary_key),
-                risk_text=alert_risk_by_key.get(primary_key),
-                edge_text=alert_edge_by_key.get(primary_key),
+                items=items,
+                keys=keys,
+                tq_by_key=alert_tq_by_key,
+                votes=confluence_votes_buy if is_buy_batch else confluence_votes_sell,
+                required=_req_msg,
+                bias_context=bias_context,
+                logger_pair=logger_pair,
             )
             msg_body = msg
+
+
+
 
             # Outcome recording and ACTIVE-state activation are DEFERRED to the
             # dispatcher, which runs them only after Telegram confirms delivery.
@@ -3122,41 +3000,48 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             direction = "buy" if is_buy_batch else "sell"
             items = [(t, e) for t, e, _ in alerts_to_send[:25]]
             keys = [k for _, _, k in alerts_to_send[:25]]
-            primary_key = keys[0]
-            multi = len(items) > 1
 
-            primary_title = items[0][0] if items else ""
-            primary_emoji = _leading_emoji(primary_title)
-
-            msg = build_rich_pair_msg(
+            try:
+                # _required_confluence only exists when the confluence gate ran
+                _req_msg = (
+                    _required_confluence(confluence_total)
+                    if cfg.ENABLE_CONFLUENCE_GATE and confluence_total else None
+                )
+            except NameError:
+                _req_msg = None
+            msg = build_pair_msg_safe(
                 pair=pair_name,
                 direction=direction,
                 price=close_curr,
                 ts=ts_curr,
                 score=confluence_score,
                 total=confluence_total,
-                setup_line=_combined_setup_line(items),
-                tq=alert_tq_by_key.get(primary_key),
-                multi_family=multi,
-                primary_emoji=primary_emoji,
-                why_text=alert_why_by_key.get(primary_key),
-                risk_text=alert_risk_by_key.get(primary_key),
-                edge_text=alert_edge_by_key.get(primary_key),
+                items=items,
+                keys=keys,
+                tq_by_key=alert_tq_by_key,
+                votes=confluence_votes_buy if is_buy_batch else confluence_votes_sell,
+                required=_req_msg,
+                bias_context=bias_context,
+                logger_pair=logger_pair,
+            )
+            # Footer: candle OPEN time (e.g. 16:00 for the 16:00-16:15 candle,
+            # delivered ~16:16). The timestamp is always present; the bias
+            # header is optional.
+            date_str = format_ist_time(ts_curr, '%d-%m-%Y')
+            time_str = format_ist_time(ts_curr, '%H:%M IST')
+            spacing = " " * 24
+            datetime_line = (
+                f"📆  {escape_markdown_v2(date_str)}"
+                f"{spacing}⏰ {escape_markdown_v2(time_str)}"
             )
             if cfg.ENABLE_BIAS_HEADER and bias_context is not None:
-                date_str = format_ist_time(ts_curr, '%d-%m-%Y')
-                time_str = format_ist_time(ts_curr, '%H:%M IST')
-                spacing = " " * 24
-                datetime_line = (
-                    f"📆  {escape_markdown_v2(date_str)}"
-                    f"{spacing}⏰ {escape_markdown_v2(time_str)}"
-                )
                 msg = (
                     f"{msg}\n{DIVIDER}\n"
                     f"{_format_bias_header(bias_context)}\n"
                     f"{datetime_line}"
                 )
-            # else: optional date-only footer if you want time without bias
+            else:
+                msg = f"{msg}\n{DIVIDER}\n{datetime_line}"
 
             try:
                 if not cfg.DRY_RUN_MODE:

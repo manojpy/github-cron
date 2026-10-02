@@ -5253,6 +5253,11 @@ def trade_quality_score(
             median_adx = regime_info.get("median_adx", adx)
             regime = "trending" if adx >= median_adx else "ranging"
             reg_data = regime_info.get("regimes", {}).get(regime, {})
+            if reg_data.get("valid"):
+                # Always expose the regime WR (not only when it is a warning)
+                # so Telegram can show "trending regime WR 64%".
+                result["regime_name"] = regime
+                result["regime_wr"] = round(float(reg_data.get("wr", 0.5)), 4)
             if reg_data.get("valid") and reg_data.get("wr", 0.5) < 0.40:
                 regime_ok = False
                 result["regime_warning"] = (
