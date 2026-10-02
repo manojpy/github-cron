@@ -6,11 +6,10 @@ on:
   workflow_dispatch:
     inputs:
       wipe_all:
-        description: '🚨 Wipe ALL outcomes/ + reports/ data (ignores age/size limits)'
+        description: '🚨 Wipe ALL outcomes/ + shadow/ + reports/ data (ignores age/size limits)'
         required: false
         default: false
         type: boolean
-
 jobs:
   cleanup:
     runs-on: ubuntu-latest
