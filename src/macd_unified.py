@@ -10,7 +10,9 @@ import uuid
 import argparse
 import psutil
 import gc
-from typing import Dict, Any, Optional, Tuple, Set, List, cast 
+
+from typing import Dict, Any, Optional, Tuple, Set, List, Sequence, cast 
+
 from datetime import datetime, timezone
 import numpy as np
 
@@ -48,11 +50,39 @@ _ALERT_ONLY_MODE: bool = False   # True → skip Brain analysis in run_once()
 
 from alerts import (
     TelegramQueue, ALERT_KEYS, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
-    DEDUP_STATS, reset_dedup_stats,
+    DEDUP_STATS, reset_dedup_stats, DLQ_STATS, reset_dlq_stats, replay_telegram_dlq, format_dedup_summary
 )
 
 _pair_eval_counter = 0
 _CLUSTER_CACHE_MISS = object()
+LAST_CANDLE_OK_THIS_RUN: Dict[str, int] = {}
+
+def build_candle_freshness(
+    pairs: Sequence[str], merged: Dict[str, int], this_run: Dict[str, int],
+    now: int, stale_after_sec: int,
+) -> Dict[str, Any]:
+    """Per-pair last-successful-candle block for the structured run summary."""
+    out: Dict[str, Any] = {}
+    stale: List[str] = []
+    for pair in pairs:
+        ts = merged.get(pair)
+        if ts is None:
+            out[pair] = {"ts": None, "ist": None, "age_min": None,
+                         "this_run": False, "status": "NEVER"}
+            stale.append(pair)
+            continue
+        age = max(0, now - int(ts))
+        status = "STALE" if age > stale_after_sec else "OK"
+        if status == "STALE":
+            stale.append(pair)
+        out[pair] = {
+            "ts": int(ts),
+            "ist": format_ist_time(int(ts), "%d-%m-%Y %H:%M IST"),
+            "age_min": round(age / 60, 1),
+            "this_run": pair in this_run,
+            "status": status,
+        }
+    return {"pairs": out, "stale": stale}
 
 def _sync_signal_handler(sig: int, frame: Any) -> None:
     logger.warning(f"Received signal {sig}, initiating async shutdown...")
@@ -231,6 +261,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             ob_reason = gr.ob_gate_reason or "OB gate: zone touched, no reversal confirmed"
             logger_pair.info(f"[{pair_name}] {ob_reason}")
             await _blanket_reset_pair(sdb, pair_name, logger_pair)
+            LAST_CANDLE_OK_THIS_RUN[pair_name] = int(gr.ts_curr)
             return pair_name, {
                 "state": "NO_SIGNAL",
                 "ts": int(time.time()),
@@ -260,6 +291,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         )
         if alert_result is None:
             return None
+
+        # Evaluation of candle gr.ts_curr completed → it is this pair's
+        # "last successful candle" (anything but an invariant violation).
+        _eval_state = (
+            None if isinstance(alert_result[0], dict)
+            else (alert_result[1] or {}).get("state")
+        )
+        if _eval_state != "INVARIANT_VIOLATION":
+            LAST_CANDLE_OK_THIS_RUN[pair_name] = int(gr.ts_curr)
 
         # Reserved: RuntimeError path inside _eval_alerts returns a 2-tuple
         # (pair_name, summary_dict). Surface it as a non-dispatched result.
@@ -1519,6 +1559,12 @@ async def run_once() -> Optional[bool]:
         logger_run.info("Starting evaluation phase...")      
         alerts_sent_ref = [0] 
         reset_dedup_stats()
+        reset_dlq_stats()
+        LAST_CANDLE_OK_THIS_RUN.clear()
+        try:
+            await replay_telegram_dlq(sdb, telegram_queue, logger_run)
+        except Exception as e:
+            logger_run.warning(f"Telegram DLQ replay failed (non-fatal): {e}")
         all_results, deferred_pairs = await process_pairs_with_workers(
             fetcher, products_map, pairs_to_process, sdb, telegram_queue, 
             correlation_id, lock, reference_time,
@@ -1571,6 +1617,12 @@ async def run_once() -> Optional[bool]:
             f"Redis: {redis_status}{redis_mem_field}"
         )
         logger_run.info(summary)
+        _dedup_line = format_dedup_summary(DEDUP_STATS)
+        logger_run.info(f"🔁 {_dedup_line}")
+        if any(DLQ_STATS.values()):
+            logger_run.info(
+                "📮 Telegram DLQ | " + " | ".join(f"{k} {v}" for k, v in DLQ_STATS.items() if v)
+            )
         if deferred_n:
             logger_run.warning(
                 f"⏸️ Deferred pairs this run (memory soft-stop): {deferred_pairs[:20]}"
@@ -1578,7 +1630,21 @@ async def run_once() -> Optional[bool]:
             )
 
         # Structured summary for workflow artifacts / external monitors
+        candle_freshness: Dict[str, Any] = {"pairs": {}, "stale": []}
         try:
+            _merged_candles = (
+                await sdb.merge_last_successful_candles(dict(LAST_CANDLE_OK_THIS_RUN))
+                if (sdb and not sdb.degraded) else dict(LAST_CANDLE_OK_THIS_RUN)
+            )
+            candle_freshness = build_candle_freshness(
+                pairs_to_process, _merged_candles, LAST_CANDLE_OK_THIS_RUN,
+                int(time.time()), int(cfg.LAST_CANDLE_STALE_AFTER_SEC),
+            )
+            if candle_freshness["stale"]:
+                logger_run.warning(
+                    f"🕒 Pairs without a fresh successful candle: "
+                    f"{candle_freshness['stale'][:20]}"
+                )
             structured = {
                 "correlation_id": correlation_id,
                 "duration_sec": round(run_duration, 2),
@@ -1604,6 +1670,13 @@ async def run_once() -> Optional[bool]:
                     "sent_failed": getattr(telegram_queue, "sent_failed", 0),
                 },
                 "dedup": dict(DEDUP_STATS),
+                "dedup_text": _dedup_line,
+                "telegram_dlq": {
+                    **DLQ_STATS,
+                    "pending": (await sdb.dlq_count()) if (sdb and not sdb.degraded) else None,
+                },
+                "last_successful_candle": candle_freshness["pairs"],
+                "stale_candle_pairs": candle_freshness["stale"],
                 "timestamp": int(time.time()),
             }
             summary_path = os.environ.get(
@@ -1643,6 +1716,22 @@ async def run_once() -> Optional[bool]:
                 logger_run.warning(f"Brain report generation failed: {e}")
         elif _ALERT_ONLY_MODE:
             logger_run.info("🧠 Brain analysis skipped (alert-only mode)")
+
+        if getattr(cfg, "ENABLE_RUN_DIAGNOSTIC_TELEGRAM", False):
+            try:
+                _stale = candle_freshness["stale"]
+                if _stale or any(DLQ_STATS.values()) or any(DEDUP_STATS.values()):
+                    _diag = [f"🩺 Run diagnostic | {format_ist_time()}", _dedup_line]
+                    if any(DLQ_STATS.values()):
+                        _diag.append(
+                            "Telegram DLQ: "
+                            + ", ".join(f"{k} {v}" for k, v in DLQ_STATS.items() if v)
+                        )
+                    if _stale:
+                        _diag.append(f"Stale candles: {', '.join(_stale[:10])}")
+                    await telegram_queue.send(escape_markdown_v2("\n".join(_diag)))
+            except Exception as e:
+                logger_run.debug(f"Run diagnostic Telegram failed: {e}")
 
         if alerts_sent_ref[0] > MAX_ALERTS_PER_RUN:
             await telegram_queue.send(escape_markdown_v2(

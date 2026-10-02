@@ -285,6 +285,38 @@ _TARGET_REASONS = frozenset({"target_hit", "target_hit_ever"})
 _STOP_REASONS = frozenset({"stop_hit", "stop_hit_ever", "ambiguous_same_candle"})
 _UNTAGGED_REASONS = frozenset({None, "", "legacy", "unknown"})
 
+def adaptive_dedup_windows(
+    rows: List[Row], *, min_gaps: int = 30, percentile: float = 10.0,
+    lo_sec: int = 120, hi_sec: int = 1800,
+) -> Dict[str, Dict[str, Any]]:
+    """Per-alert-key dedup window from historical same-pair inter-arrival times.
+
+    For every (alert_key, pair) series the gaps between consecutive distinct
+    fires are collected; per alert key the chosen percentile of all gaps is the
+    window, clamped to [lo_sec, hi_sec]. Keys with fewer than `min_gaps` gaps
+    are omitted (caller keeps the fixed window). Pure and deterministic."""
+    series: DefaultDict[Tuple[str, str], List[int]] = defaultdict(list)
+    for r in rows:
+        ak, pair, ts = r.get("alert_key"), r.get("pair"), r.get("entry_ts")
+        if not ak or not pair or not ts:
+            continue
+        series[(str(ak), str(pair))].append(int(ts))
+    gaps_by_key: DefaultDict[str, List[int]] = defaultdict(list)
+    for (ak, _pair), stamps in series.items():
+        ordered = sorted(set(stamps))
+        gaps_by_key[ak].extend(b - a for a, b in zip(ordered, ordered[1:]))
+    out: Dict[str, Dict[str, Any]] = {}
+    for ak, gaps in gaps_by_key.items():
+        if len(gaps) < min_gaps:
+            continue
+        raw = _percentile([float(g) for g in gaps], percentile)
+        out[ak] = {
+            "window_sec": int(min(max(raw, lo_sec), hi_sec)),
+            "raw_sec": int(raw),
+            "n_gaps": len(gaps),
+        }
+    return out
+
 def bracket_exit_pct(row: Row) -> Optional[float]:
     """Gross signed exit, in percent, if the trade was closed by its stop or
     target (+target / -stop); None when neither decided it (timeout at the

@@ -2205,6 +2205,24 @@ class BrainEngine:
                 audit.record_analysis_exception("mae_mfe_trade_plan", e)
                 mae_mfe_profiles = {}
 
+        # ── Adaptive dedup windows: always computed + persisted so they can be
+        # inspected; the live bot only uses them if ENABLE_ADAPTIVE_DEDUP_WINDOWS ──
+        try:
+            _dedup_windows = engine.adaptive_dedup_windows(
+                list(real_rows) + list(shadow_rows or []),
+                min_gaps=int(getattr(cfg, "ADAPTIVE_DEDUP_MIN_GAPS", 30)),
+                percentile=float(getattr(cfg, "ADAPTIVE_DEDUP_PERCENTILE", 10.0)),
+                lo_sec=int(getattr(cfg, "ADAPTIVE_DEDUP_MIN_SEC", 120)),
+                hi_sec=int(getattr(cfg, "ADAPTIVE_DEDUP_MAX_SEC", 1800)),
+            )
+            ai_metrics["adaptive_dedup_windows"] = _dedup_windows
+            if _dedup_windows and not self.sdb.degraded:
+                await self.sdb.set_metadata(
+                    "adaptive_dedup_windows", json_dumps(_dedup_windows), ttl=30 * 86400,
+                )
+        except Exception as e:
+            audit.record_analysis_exception("adaptive_dedup_windows", e)
+
         if ev_by_alert:
             await self._persist_quality_inputs({
                 "ev_by_alert": ev_by_alert,

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import uuid
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, TYPE_CHECKING, Set, Sequence, Awaitable, Union, cast
+import hashlib
 import numpy as np
 import redis.asyncio as redis  # type: ignore[import-untyped]
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError  # type: ignore[import-untyped]
@@ -291,6 +292,7 @@ class RedisKeyPrefix:
     THRESHOLD_HISTORY = "brain_threshold_history:"
     VOTE_COUNT_HISTORY = "brain_vote_counts:"
     LAST_PROCESSED_CANDLE = "last_processed_candle:"  # NEW
+    TELEGRAM_DLQ = "telegram_dlq:"
 
 class RedisStateStore:
     POOL_MAX_AGE_SECONDS = 3600
@@ -1075,6 +1077,56 @@ class RedisStateStore:
         )
         return bool(result)
 
+    LAST_SUCCESSFUL_CANDLES_KEY = "last_successful_candles"
+
+    async def merge_last_successful_candles(self, updates: Dict[str, int]) -> Dict[str, int]:
+        """Merge this run's per-pair 'last successfully evaluated candle' into
+        the persisted map (1 GET + 1 SET per run, never goes backwards) and
+        return the merged map. Falls back to `updates` if Redis is unavailable."""
+        merged: Dict[str, int] = {}
+        if self.degraded or not self._redis:
+            return dict(updates)
+        raw = await self.get_metadata(self.LAST_SUCCESSFUL_CANDLES_KEY)
+        if raw:
+            try:
+                data = json_loads(raw)
+                if isinstance(data, dict):
+                    merged = {str(k): int(v) for k, v in data.items()}
+            except (JSONDecodeError, TypeError, ValueError):
+                merged = {}
+        changed = False
+        for pair, ts in updates.items():
+            if int(ts) > merged.get(pair, 0):
+                merged[pair] = int(ts)
+                changed = True
+        if changed:
+            await self.set_metadata(
+                self.LAST_SUCCESSFUL_CANDLES_KEY, json_dumps(merged), ttl=30 * 86400,
+            )
+        return merged
+
+    async def get_adaptive_dedup_windows(self) -> Dict[str, int]:
+        """alert_key -> window seconds from the Brain's inter-arrival analysis.
+        Empty unless ENABLE_ADAPTIVE_DEDUP_WINDOWS. Read once per run (cached on
+        this per-run instance) and re-clamped to the configured hard bounds."""
+        if not getattr(cfg, "ENABLE_ADAPTIVE_DEDUP_WINDOWS", False):
+            return {}
+        cached = getattr(self, "_adaptive_dedup_cache", None)
+        if cached is not None:
+            return cached
+        out: Dict[str, int] = {}
+        if not self.degraded and self._redis:
+            raw = await self.get_metadata("adaptive_dedup_windows")
+            if raw:
+                try:
+                    lo, hi = int(cfg.ADAPTIVE_DEDUP_MIN_SEC), int(cfg.ADAPTIVE_DEDUP_MAX_SEC)
+                    for ak, v in json_loads(raw).items():
+                        out[str(ak)] = int(min(max(int(v["window_sec"]), lo), hi))
+                except (JSONDecodeError, TypeError, ValueError, KeyError, AttributeError):
+                    out = {}
+        self._adaptive_dedup_cache = out
+        return out
+
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int, window_sec: Optional[int] = None) -> bool:
         if self.degraded:
             return True
@@ -1100,7 +1152,8 @@ class RedisStateStore:
             return False   # fail-closed, not fail-open
 
     async def batch_check_recent_alerts(self, pair: str, alert_keys: List[str], ts: int,
-                                          window_sec: Optional[int] = None) -> Dict[str, bool]:
+                                          window_sec: Optional[int] = None,
+                                          windows: Optional[Dict[str, int]] = None) -> Dict[str, bool]:
         """Claim dedup windows for several alert keys on one pair in ONE Redis
         round-trip (pipeline). Each SET NX EX is still independently atomic —
         this only batches the network round-trip, not the semantics."""
@@ -1119,7 +1172,10 @@ class RedisStateStore:
             async with self._redis.pipeline() as pipe:
                 for alert_key in alert_keys:
                     recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
-                    pipe.set(recent_key, str(ts), nx=True, ex=effective_window)
+                    pipe.set(
+                        recent_key, str(ts), nx=True,
+                        ex=int((windows or {}).get(alert_key, effective_window)),
+                    )
                 results = await asyncio.wait_for(_execute_pipeline(pipe), timeout=3.0)
             return {k: bool(r) for k, r in zip(alert_keys, results)}
         except Exception as e:
@@ -1134,7 +1190,97 @@ class RedisStateStore:
         try:
             await asyncio.wait_for(_rc(self._redis).delete(recent_key), timeout=1.0)
         except Exception as e:
+            
             logger.warning(f"Failed to release dedup claim for {pair}:{alert_key}: {e}")
+
+    # ── Telegram dead-letter queue ───────────────────────────────────────
+    # One Redis key per parked alert: telegram_dlq:{pair}:{candle_ts}:{digest}.
+    # The digest makes a re-park of the identical message idempotent.
+    async def dlq_push(
+        self, pair: str, message: str, ts: int, *,
+        dedup_keys: Optional[List[str]] = None, source: str = "",
+    ) -> bool:
+        """Park a failed-to-send alert. Returns True if it is (now) stored."""
+        if self.degraded or not self._redis:
+            return False
+        digest = hashlib.sha1(message.encode("utf-8")).hexdigest()[:10]
+        key = f"{RedisKeyPrefix.TELEGRAM_DLQ}{pair}:{int(ts)}:{digest}"
+        entry = {
+            "pair": pair, "ts": int(ts), "message": message,
+            "dedup_keys": list(dedup_keys or []), "source": source,
+            "attempts": 0, "queued_at": int(time.time()),
+        }
+        ttl = int(cfg.TELEGRAM_DLQ_MAX_AGE_SEC) * 2
+        result = await self._safe_redis_op(
+            lambda: _rc(self._redis).set(key, json_dumps(entry), nx=True, ex=ttl),
+            2.0, f"dlq_push:{pair}",
+        )
+        if result:
+            return True
+        # NX failed: either the identical entry is already parked (fine) or Redis failed.
+        exists = await self._safe_redis_op(
+            lambda: _rc(self._redis).exists(key), 2.0, f"dlq_exists:{pair}",
+        )
+        return bool(exists)
+
+    async def dlq_list(self, limit: int = 10) -> List[Tuple[str, Dict[str, Any]]]:
+        """Oldest-first parked alerts as (redis_key, entry)."""
+        if self.degraded or not self._redis:
+            return []
+        pattern = f"{RedisKeyPrefix.TELEGRAM_DLQ}*"
+
+        async def _scan() -> List[str]:
+            return [k async for k in _rc(self._redis).scan_iter(match=pattern, count=100)]
+
+        keys = await self._safe_redis_op(_scan, 3.0, "dlq_scan")
+        if not keys:
+            return []
+        raw_values = await self._safe_redis_op(
+            lambda: _rc(self._redis).mget(keys), 3.0, "dlq_mget",
+        )
+        out: List[Tuple[str, Dict[str, Any]]] = []
+        for k, raw in zip(keys, raw_values or []):
+            if not raw:
+                continue
+            try:
+                entry = json_loads(raw)
+            except (JSONDecodeError, TypeError, ValueError):
+                continue
+            if isinstance(entry, dict) and entry.get("message"):
+                out.append((k, entry))
+        out.sort(key=lambda kv: int(kv[1].get("ts") or 0))
+        return out[: max(1, int(limit))]
+
+    async def dlq_count(self) -> int:
+        """Number of parked alerts (0 if Redis is unavailable)."""
+        if self.degraded or not self._redis:
+            return 0
+        pattern = f"{RedisKeyPrefix.TELEGRAM_DLQ}*"
+
+        async def _scan() -> List[str]:
+            return [k async for k in _rc(self._redis).scan_iter(match=pattern, count=100)]
+
+        keys = await self._safe_redis_op(_scan, 3.0, "dlq_count")
+        return len(keys or [])
+
+    async def dlq_set_attempts(self, key: str, entry: Dict[str, Any], attempts: int) -> bool:
+        """Persist an incremented attempt counter (keeps the remaining TTL)."""
+        if self.degraded or not self._redis:
+            return False
+        entry = dict(entry, attempts=int(attempts))
+        result = await self._safe_redis_op(
+            lambda: _rc(self._redis).set(key, json_dumps(entry), xx=True, keepttl=True),
+            2.0, "dlq_set_attempts",
+        )
+        return bool(result)
+
+    async def dlq_delete(self, key: str) -> bool:
+        if self.degraded or not self._redis:
+            return False
+        result = await self._safe_redis_op(
+            lambda: _rc(self._redis).delete(key), 2.0, "dlq_delete",
+        )
+        return bool(result)
 
     VOTE_COUNT_HISTORY_MAX = 500
 

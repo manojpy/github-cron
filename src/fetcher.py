@@ -447,13 +447,48 @@ class DataFetcher:
             "rate_limiter_waits": 0,
             "total_wait_time": 0.0,
             "oi_funding_blocks": 0,
+            "coalesced_requests": 0,
         }
+        # (symbol, resolution, limit, reference_time, expected_open_15) -> Future.
+        # Holds in-flight AND successfully completed fetches for this run only
+        # (a DataFetcher lives for exactly one run_once()).
+        self._candle_futures: Dict[Tuple[Any, ...], "asyncio.Future[Optional[Dict[str, Any]]]"] = {}
+    
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._external_session is not None:
             return self._external_session
         return await SessionManager.get_session()
-  
+
     async def fetch_candles(self, symbol: str, resolution: str, limit: int, reference_time: int, expected_open_15: Optional[int] = None, for_confirmation: bool = False) -> Optional[Dict[str, Any]]:
+        """Fetch candles, sharing one API call between identical requests in a run.
+
+        Confirmation re-fetches (for_confirmation=True) must see fresh data and
+        are never shared. Failed fetches are not remembered, so a later caller
+        retries normally. The returned dict is shared: treat it as read-only."""
+        if for_confirmation or not getattr(cfg, "ENABLE_FETCH_COALESCING", True):
+            return await self._fetch_candles_uncached(
+                symbol, resolution, limit, reference_time, expected_open_15, for_confirmation,
+            )
+        key = (symbol, resolution, int(limit), int(reference_time), expected_open_15)
+        fut = self._candle_futures.get(key)
+        if fut is not None:
+            self.fetch_stats["coalesced_requests"] += 1
+            return await asyncio.shield(fut)
+
+        fut = asyncio.ensure_future(self._fetch_candles_uncached(
+            symbol, resolution, limit, reference_time, expected_open_15, for_confirmation,
+        ))
+        self._candle_futures[key] = fut
+
+        def _forget_if_failed(f: "asyncio.Future[Optional[Dict[str, Any]]]") -> None:
+            if f.cancelled() or f.exception() is not None or not f.result():
+                self._candle_futures.pop(key, None)
+
+        fut.add_done_callback(_forget_if_failed)
+        # shield: a cancelled caller must not cancel the fetch other callers share
+        return await asyncio.shield(fut)
+
+    async def _fetch_candles_uncached(self, symbol: str, resolution: str, limit: int, reference_time: int, expected_open_15: Optional[int] = None, for_confirmation: bool = False) -> Optional[Dict[str, Any]]:
         can_proceed, reason = await self.circuit_breaker.can_attempt()
         if not can_proceed:
             logger.warning(f"Circuit breaker blocked candles {symbol}: {reason}")
@@ -636,6 +671,7 @@ class DataFetcher:
             "candles": self.fetch_stats["candles"].copy(),
             "circuit_breaker_blocks": self.fetch_stats["circuit_breaker_blocks"],
             "oi_funding_blocks": self.fetch_stats["oi_funding_blocks"],
+            "coalesced_requests": self.fetch_stats.get("coalesced_requests", 0),
             "rate_limiter": self.rate_limiter.get_stats(),
         }     
         total_products = stats["products"]["success"] + stats["products"]["failed"]

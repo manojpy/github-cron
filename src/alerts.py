@@ -60,11 +60,44 @@ from threshold_engine import hash_config_state
 # Distinguishes "caller didn't pass this" from "caller passed None on purpose"
 # (None is a legitimate value for e.g. last_processed — no candle seen yet).
 _SENTINEL_UNSET = object()
-DEDUP_STATS: Dict[str, int] = {"released": 0, "kept_repaint": 0, "kept_mark_disagree": 0}
+
+DEDUP_STATS: Dict[str, int] = {
+    "claims_taken": 0,           # dedup claims successfully taken this run
+    "released": 0,               # claims released so the alert can retry next run
+    "kept_repaint": 0,           # claim KEPT: candle repainted before send
+    "kept_mark_disagree": 0,     # claim KEPT: mark price disagreed with candle
+    "duplicate_suppressed": 0,   # per-alert-key duplicate inside its window
+    "coalesced_suppressed": 0,   # pair+direction bundle already sent inside window
+}
+
+def format_dedup_summary(stats: Optional[Dict[str, int]] = None) -> str:
+    """One compact, human-readable line describing the dedup claim lifecycle."""
+    s = DEDUP_STATS if stats is None else stats
+    retained = s.get("kept_repaint", 0) + s.get("kept_mark_disagree", 0)
+    return (
+        f"Dedup | claims taken {s.get('claims_taken', 0)} | "
+        f"released (retry next run) {s.get('released', 0)} | "
+        f"retained {retained} (repaint {s.get('kept_repaint', 0)}, "
+        f"mark-disagree {s.get('kept_mark_disagree', 0)}) | "
+        f"suppressed: duplicate {s.get('duplicate_suppressed', 0)}, "
+        f"coalesced {s.get('coalesced_suppressed', 0)}"
+    )
 
 def reset_dedup_stats() -> None:
     for _k in DEDUP_STATS:
         DEDUP_STATS[_k] = 0
+
+# Telegram dead-letter queue counters (per run). "pending" is filled in at
+# summary time from Redis.
+DLQ_STATS: Dict[str, int] = {
+    "queued": 0, "queue_failed": 0,
+    "replayed_ok": 0, "replayed_failed": 0,
+    "expired": 0, "abandoned": 0,
+}
+
+def reset_dlq_stats() -> None:
+    for _k in DLQ_STATS:
+        DLQ_STATS[_k] = 0
 
 def escape_markdown_v2(text: str) -> str:
     return CompiledPatterns.ESCAPE_MARKDOWN.sub(r'\\\g<0>', str(text))
@@ -226,7 +259,7 @@ def _leading_emoji(title: str) -> str:
     """
     if not title:
         return ""
-    m = re.match(r"^([\W_🟢🔴🔵🟣🌀⬆️⬇️▲▼🌊���������️🔄☁️]+)", title.strip())
+    m = re.match(r"^([\W_🟢🔴🔵🟣🌀⬆️⬇️▲▼🌊����������️🔄☁️]+)", title.strip())
     if not m:
         return ""
     return m.group(1).strip()
@@ -1064,6 +1097,83 @@ async def _run_post_send_hooks(p: AlertPayload, sdb: RedisStateStore,
         except Exception as e:
             logger_run.error(f"[{p.pair_name}] Failed to mark candle processed: {e}")
 
+async def coalesce_window_for(sdb: RedisStateStore, alert_keys: List[str]) -> int:
+    """Coalesce window for a pair+direction bundle. Fixed unless adaptive windows
+    are enabled, in which case it can only be LENGTHENED (never below the
+    configured COALESCE_DEDUP_WINDOW_SEC) up to ADAPTIVE_DEDUP_MAX_SEC."""
+    base = int(cfg.COALESCE_DEDUP_WINDOW_SEC)
+    windows = await sdb.get_adaptive_dedup_windows()
+    if not windows:
+        return base
+    adaptive = max((windows.get(k, 0) for k in alert_keys), default=0)
+    return max(base, min(adaptive, int(cfg.ADAPTIVE_DEDUP_MAX_SEC)))
+
+async def queue_failed_alert(
+    sdb: RedisStateStore, pair_name: str, message: str, ts: int,
+    dedup_keys: List[str], source: str, log: logging.Logger,
+) -> bool:
+    """Park an alert whose Telegram send failed so the next run re-sends it.
+    Returns True when the alert is safely stored in the dead-letter queue."""
+    if not getattr(cfg, "ENABLE_TELEGRAM_DLQ", True) or cfg.DRY_RUN_MODE:
+        return False
+    try:
+        ok = await sdb.dlq_push(pair_name, message, ts, dedup_keys=dedup_keys, source=source)
+    except Exception as e:
+        log.error(f"[{pair_name}] Telegram DLQ push raised: {e}")
+        ok = False
+    if ok:
+        DLQ_STATS["queued"] += 1
+        log.warning(f"[{pair_name}] Telegram send failed — alert parked in DLQ for retry ({source})")
+    else:
+        DLQ_STATS["queue_failed"] += 1
+        log.error(f"[{pair_name}] Telegram send failed AND DLQ push failed — alert lost ({source})")
+    return ok
+
+async def replay_telegram_dlq(
+    sdb: Optional[RedisStateStore], telegram_queue: TelegramQueue, log: logging.Logger,
+) -> None:
+    """Re-send parked alerts. Stale entries are dropped and abandoned entries
+    (too many failed attempts) are dropped; both release their dedup claims so
+    nothing stays suppressed. Stops at the first failed send (Telegram down)."""
+    if not getattr(cfg, "ENABLE_TELEGRAM_DLQ", True) or cfg.DRY_RUN_MODE:
+        return
+    if sdb is None or sdb.degraded:
+        return
+    entries = await sdb.dlq_list(limit=int(cfg.TELEGRAM_DLQ_MAX_ITEMS_PER_RUN))
+    if not entries:
+        return
+    now = int(time.time())
+    max_age = int(cfg.TELEGRAM_DLQ_MAX_AGE_SEC)
+    max_attempts = int(cfg.TELEGRAM_DLQ_MAX_ATTEMPTS)
+    prefix = escape_markdown_v2("⏳ Delayed alert — first send failed\n")
+    for key, entry in entries:
+        pair = str(entry.get("pair", ""))
+        claims = [str(k) for k in (entry.get("dedup_keys") or [])]
+        attempts = int(entry.get("attempts") or 0)
+        age = now - int(entry.get("ts") or 0)
+        if age > max_age:
+            for dk in claims:
+                await sdb.release_recent_alert(pair, dk)
+            await sdb.dlq_delete(key)
+            DLQ_STATS["expired"] += 1
+            log.warning(f"[{pair}] DLQ alert expired (candle {age}s old) — dropped")
+            continue
+        if await telegram_queue.send(prefix + str(entry["message"])):
+            await sdb.dlq_delete(key)
+            DLQ_STATS["replayed_ok"] += 1
+            log.info(f"[{pair}] DLQ alert delivered on retry (attempt {attempts + 1})")
+            continue
+        DLQ_STATS["replayed_failed"] += 1
+        if attempts + 1 >= max_attempts:
+            for dk in claims:
+                await sdb.release_recent_alert(pair, dk)
+            await sdb.dlq_delete(key)
+            DLQ_STATS["abandoned"] += 1
+            log.error(f"[{pair}] DLQ alert abandoned after {attempts + 1} failed attempts")
+        else:
+            await sdb.dlq_set_attempts(key, entry, attempts + 1)
+        break
+
 async def dispatch_combined_alerts(
     payloads: List[AlertPayload],
     telegram_queue: TelegramQueue,
@@ -1252,15 +1362,22 @@ async def dispatch_combined_alerts(
             await _run_post_send_hooks(p, sdb, logger_run)
             fallback_sent += p.budget_count
         else:
-            # Send failed. Keep the dedup claims so the alert cannot
-            # re-fire on the next run until the dedup window expires.
-            for dk in p.dedup_keys:
-                await sdb.release_recent_alert(p.pair_name, dk)
-            DEDUP_STATS["released"] += 1
-            logger_run.warning(
-                f"Individual send failed for {p.pair_name} — dedup claims "
-                f"({p.dedup_keys}) released so it can retry next run"
-            )
+            # Send failed. Park the message in the Telegram DLQ: the DLQ now
+            # owns delivery, so keep the dedup claims and mark the candle
+            # processed (no duplicate re-fire). If it cannot be parked, release
+            # the claims so the alert can retry normally.
+            if await queue_failed_alert(
+                sdb, p.pair_name, full_msg, p.ts, p.dedup_keys, "combined_fallback", logger_run,
+            ):
+                await sdb.set_last_processed_candle_ts(p.pair_name, p.ts)
+            else:
+                for dk in p.dedup_keys:
+                    await sdb.release_recent_alert(p.pair_name, dk)
+                DEDUP_STATS["released"] += 1
+                logger_run.warning(
+                    f"Individual send failed for {p.pair_name} — dedup claims "
+                    f"({p.dedup_keys}) released so it can retry next run"
+                )
     return already_sent + fallback_sent
 
 def validate_alert_definitions() -> None:
@@ -2739,8 +2856,15 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             direction = "MIXED" if (buy_present and sell_present) else ("BUY" if buy_present else "SELL")
             coalesced_dedup_key = f"coalesced_{direction}"
             should_send = await sdb.check_recent_alert(
-                pair_name, coalesced_dedup_key, ts_curr, window_sec=cfg.COALESCE_DEDUP_WINDOW_SEC
+                pair_name, coalesced_dedup_key, ts_curr,
+                window_sec=await coalesce_window_for(
+                    sdb, [ak for _, _, ak in alerts_to_send]
+                ),
             )
+            if should_send:
+                DEDUP_STATS["claims_taken"] += 1
+            else:
+                DEDUP_STATS["coalesced_suppressed"] += 1
             if not should_send:
                 logger_pair.info(
                     f"[{pair_name}] Coalesced {direction} dedup — "
@@ -2788,13 +2912,18 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         elif alerts_to_send:
             keys_to_check = [alert_key for _, _, alert_key in alerts_to_send]
-            claim_results = await sdb.batch_check_recent_alerts(pair_name, keys_to_check, ts_curr)
+            claim_results = await sdb.batch_check_recent_alerts(
+                pair_name, keys_to_check, ts_curr,
+                windows=await sdb.get_adaptive_dedup_windows(),
+            )
             deduped_alerts = []
             for alert_title, alert_extra, alert_key in alerts_to_send:
                 if not claim_results.get(alert_key, False):
                     logger_pair.debug(f"Alert {alert_key} skipped (dedup window)")
+                    DEDUP_STATS["duplicate_suppressed"] += 1
                     continue
                 deduped_alerts.append((alert_title, alert_extra, alert_key))
+            DEDUP_STATS["claims_taken"] += len(deduped_alerts)
             alerts_to_send = deduped_alerts
 
         async def _release_dedup_claims() -> None:
@@ -2984,7 +3113,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 }
             }, payload
 
-        # ══════════════════════════════════════════════��════════════════════
+        # ═════════════════════════════════════════════�������════════════════════
         # IMMEDIATE MODE  →  legacy per-pair Telegram send (unchanged logic)
         # ══════════════════════════════════════����═════════════════════════════
         async def _refund_alert_budget(n: int) -> None:
@@ -3157,6 +3286,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"processed — will retry next run"
                         )
                     else:
+                        await queue_failed_alert(
+                            sdb, pair_name, msg, ts_curr,
+                            [coalesced_dedup_key] if coalesced_dedup_key
+                            else [ak for _, _, ak in alerts_to_send],
+                            "single_path", logger_pair,
+                        )
                         await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
                         logger_pair.error(
                             f"Alert send failed | {pair_name} | "
