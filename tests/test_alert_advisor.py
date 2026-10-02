@@ -141,3 +141,64 @@ def test_markdown_v2_special_chars_are_escaped():
         votes=GOOD_VOTES, required=21, bias_context=DOWN, logger_pair=LOG)})
     for ch in "().-+|":
         assert raw.count(ch) == raw.count("\\" + ch), ch
+
+
+# ── bias alignment: follows the dominant bucket and needs a real lead ───────
+
+def _b(up, down, neutral):
+    return NS(up_pct=up, down_pct=down, neutral_pct=neutral)
+
+
+def test_neutral_dominant_bias_is_never_counter_trend():
+    # the AAVE 09:30 case: Neutral 37%, up 30%, down 33%
+    assert A._bias_alignment("buy", _b(0.30, 0.33, 0.37)) == "neutral"
+    assert A._bias_alignment("sell", _b(0.30, 0.33, 0.37)) == "neutral"
+
+
+def test_thin_lead_is_neutral_and_clear_lead_counts():
+    assert A._bias_alignment("buy", _b(0.40, 0.37, 0.23)) == "neutral"      # 3-pt lead
+    assert A._bias_alignment("buy", _b(0.53, 0.17, 0.30)) == "with"
+    assert A._bias_alignment("sell", _b(0.53, 0.17, 0.30)) == "against"
+    assert A._bias_alignment("buy", _b(0.40, 0.37, 0.23), min_edge=0.02) == "with"
+
+
+# ── unproven-but-strong tier ────────────────────────────────────────────────
+
+CLEAN = {"base_trend": True, "dynamic_flow_ribbon": True, "ichimoku_cloud": True,
+         "oi_funding": True, "adx_strength": False}
+
+
+def un(bias="neutral", votes=CLEAN, score=26, total=27, **kw):
+    return advise_pair(direction="buy", score=score, total=total, required=21, votes=votes,
+                       tqs=[None], bias=bias, unproven_take_min_pct=90.0, **kw)
+
+
+def test_strong_unproven_setup_reads_take_small_size_without_fake_conviction():
+    a = un()
+    assert a.verdict == TAKE and a.conviction is None
+    assert a.label == "✅ TAKE (small size)"
+    assert "Size 0.25" in a.size_line and "unproven" in a.size_line
+    assert "Risk" == a.risk_label and "weak: trend strength" in a.risk_line
+
+
+def test_unproven_take_needs_every_condition():
+    assert un(score=24, total=27).verdict == WATCH                         # 89% < 90% bar
+    assert un(votes=dict(CLEAN, oi_funding=False)).verdict == WATCH        # OI/funding failed
+    assert un(conflicting=True).verdict == WATCH                           # opposing signal
+    assert un(bias="against", votes=dict(CLEAN, oi_funding=False)).verdict == AVOID
+    assert un(bias="against").verdict == WATCH                             # counter-trend, 96%: watch only
+    assert un(bias="against", score=24, total=27).verdict == AVOID         # counter-trend, 89%
+
+
+def test_unproven_take_is_off_by_default_and_with_flag_none():
+    a = advise_pair(direction="buy", score=26, total=27, required=21, votes=CLEAN,
+                    tqs=[None], bias="with")
+    assert a.verdict == WATCH and a.label == "🟡 WATCH"
+
+
+def test_why_line_says_all_high_weight_checks_pass_instead_of_repeating_top3():
+    w = {"base_trend": 3.0, "ichimoku_cloud": 2.0, "adx_strength": 1.0}
+    a = un(votes={"base_trend": True, "ichimoku_cloud": True, "adx_strength": False}, vote_weights=w)
+    assert "All high-weight checks pass" in a.why_line
+    b = un(votes={"base_trend": True, "ichimoku_cloud": False, "adx_strength": True}, vote_weights=w)
+    assert "Supported by" in b.why_line and "All high-weight" not in b.why_line

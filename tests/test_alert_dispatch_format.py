@@ -35,10 +35,11 @@ class _Sdb:
         return None
 
 
-def _p(pair, direction, score, total):
+def _p(pair, direction, score, total, verdict=None):
     return AlertPayload(pair_name=pair, direction=direction, score=score, total=total,
                         msg_body=f"BODY-{pair}", dedup_keys=["k"], state_changes=[],
-                        budget_count=1, ts=1_790_826_300, alert_keys=["vwap_up"])
+                        budget_count=1, ts=1_790_826_300, alert_keys=["vwap_up"],
+                        verdict=verdict)
 
 
 def _send(payloads, bias):
@@ -81,3 +82,16 @@ def test_opposite_directions_of_a_group_are_not_flagged():
 def test_footer_has_candle_open_time_and_bias():
     text = _send([_p("AAAUSD", "buy", 24, 27)], DOWN)
     assert "⏰" in text and "📆" in text and "Bias" in text
+
+
+def test_basket_note_when_three_same_direction_takes():
+    ps = [_p(n, "buy", 26, 27, "TAKE") for n in ("AAAUSD", "BBBUSD", "CCCUSD")] + [_p("DDDUSD", "buy", 20, 27, "WATCH")]
+    text = _send(ps, UP)
+    assert text.count("size them as ONE basket") == 1 and "3 BUY TAKEs" in text
+
+
+def test_no_basket_note_below_threshold_or_for_watch():
+    two = [_p("AAAUSD", "buy", 26, 27, "TAKE"), _p("BBBUSD", "buy", 25, 27, "TAKE")]
+    assert "basket" not in _send(two, UP)
+    watch = [_p(n, "buy", 26, 27, "WATCH") for n in ("AAAUSD", "BBBUSD", "CCCUSD")]
+    assert "basket" not in _send(watch, UP)
