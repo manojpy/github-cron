@@ -93,6 +93,7 @@ COPY --chown=appuser:appuser src/alert_advisor.py ./
 COPY --chown=appuser:appuser src/confluence_tier_report.py ./
 COPY --chown=appuser:appuser src/threshold_engine.py ./
 COPY --chown=appuser:appuser src/brain.py ./
+COPY --chown=appuser:appuser src/health_server.py ./
 COPY --chown=appuser:appuser src/brain_enhanced.py ./
 COPY --chown=appuser:appuser src/brain_audit.py ./
 COPY --chown=appuser:appuser src/repair_ledger.py ./
