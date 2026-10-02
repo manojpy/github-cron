@@ -226,7 +226,7 @@ def _leading_emoji(title: str) -> str:
     """
     if not title:
         return ""
-    m = re.match(r"^([\W_🟢🔴🔵🟣🌀⬆️⬇️▲▼🌊��������️🔄☁️]+)", title.strip())
+    m = re.match(r"^([\W_🟢🔴🔵🟣🌀⬆️⬇️▲▼🌊���������️🔄☁️]+)", title.strip())
     if not m:
         return ""
     return m.group(1).strip()
@@ -578,7 +578,7 @@ def _bias_alignment(
     market_up = up > down
     return "with" if (direction == "buy") == market_up else "against"
 
-def build_pair_msg_safe(
+def build_pair_msg_and_verdict(
     *,
     pair: str,
     direction: str,
