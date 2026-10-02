@@ -50,7 +50,7 @@ class FakeSDB:
     async def get_dynamic_weights(self):
         return None if self.weights is None else dict(self.weights)
 
-    async def set_dynamic_weights(self, w, ttl=None):
+    async def set_dynamic_weights(self, w, ttl=None, **kw):
         self.weights = dict(w)
         return True
 
