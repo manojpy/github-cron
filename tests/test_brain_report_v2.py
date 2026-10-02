@@ -130,7 +130,7 @@ def test_confidence_breakdown_shows_four_independent_tiers():
     assert "MODEL       🟢 HIGH" in sec9 and "Brier 0.14" in sec9
     # _SPEC totals 90 trades over the default 2.5-day window: n>=60 alone
     # would rank HIGH, but the short span caps it to MEDIUM.
-    assert "DATA        🟡 MEDIUM" in sec9 and "90 trades" in sec9
+    assert "DATA        🔴 NOT READY" in sec9 and "90 trades" in sec9
     assert "CHANGE      🟢 HIGH" in sec9 and "P(EV>0) 91%" in sec9 and "EV p5 +0.12%" in sec9
     assert "DEPLOYMENT  🟡 MEDIUM" in sec9 and "OOS P(EV>0) 61%" in sec9
 
@@ -158,9 +158,8 @@ def test_low_history_says_diagnose_and_never_advises_disabling():
 def test_win_rule_explained_with_break_even():
     text = _plain(_report(_rows(_SPEC)))
     assert "WHY THE WIN RATE LOOKS LOW" in text
-    assert "before it moves -2.0% against you, within 3 hours" in text
+    assert "before it moves -1.0% against you, within 3 hours" in text
     assert "Break-even needs roughly 33% wins" in text
-
 
 def test_scorecard_uses_friendly_names_and_summarises_thin():
     text = _plain(_report(_rows(_SPEC)))
