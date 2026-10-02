@@ -568,6 +568,7 @@ class BotConfig(BaseModel):
     CHALLENGER_MIN_OOS_SAMPLE: int = Field(default=80, ge=20, le=5000, description="Minimum OOS sample size required before challenger can promote to champion.")
     CHALLENGER_MIN_EV_LIFT: float = Field(default=0.02, ge=0.0, le=1.0, description="Minimum net-EV lift (challenger - champion) required for auto-promotion.")
     CHALLENGER_SHADOW_ONLY: bool = Field(default=True, description="If True, maybe_promote_challenger() never auto-applies (returns shadow_only_requires_force). Set False to allow gated auto-promotion when ENABLE_CHAMPION_CHALLENGER is on.")
+    ENFORCE_SINGLE_WEIGHT_PATH: bool = Field(default=True, description="If True, live CONFLUENCE_WEIGHTS (Redis dynamic_weights) can ONLY change through champion/challenger promotion or an auto-rollback restore. Brain plan-apply never writes live weights directly; it stores a challenger instead. Hard signal rules stay fixed.")
     ENABLE_BRAIN_SIZE_HINT: bool = Field(default=False)
     BRAIN_SIZE_HINT_HIGH: float = Field(default=1.0, ge=0.0, le=1.0)
     BRAIN_SIZE_HINT_MEDIUM: float = Field(default=0.5, ge=0.0, le=1.0)

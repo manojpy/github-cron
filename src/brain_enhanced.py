@@ -3200,7 +3200,7 @@ class BrainEngineV2(BaseBrainEngine):
                 prev_w = w.get("prev")
                 ok = (
                     await self.sdb.clear_dynamic_weights() if prev_w is None
-                    else await self.sdb.set_dynamic_weights(prev_w)
+                    else await self.sdb.set_dynamic_weights(prev_w, source="rollback")
                 )
                 (out["reverted"] if ok else out["failed"]).append("dynamic_weights")
         return out
@@ -3420,7 +3420,8 @@ class BrainEngineV2(BaseBrainEngine):
                     if vote in weights and suggested is not None:
                         weights[vote] = suggested
 
-                if getattr(cfg, "ENABLE_CHAMPION_CHALLENGER", False):
+                if (getattr(cfg, "ENABLE_CHAMPION_CHALLENGER", False)
+                        or getattr(cfg, "ENFORCE_SINGLE_WEIGHT_PATH", True)):
                     # Shadow path: store as challenger only — does not affect live gates
                     meta = {
                         "source": "root_cause_weight_adj",
@@ -3430,11 +3431,6 @@ class BrainEngineV2(BaseBrainEngine):
                         "shadow_only": bool(getattr(cfg, "CHALLENGER_SHADOW_ONLY", True)),
                         "votes": [a.get("vote") for a in weight_adj],
                     }
-                    # A challenger carrying measured OOS evidence (written by the
-                    # weight optimizer) must not be replaced by this EV-less
-                    # root-cause one: it would reset stored_at (and so the
-                    # promotion streak) and could never satisfy the n_oos / EV
-                    # gates in maybe_promote_challenger().
                     _existing = await self.sdb.get_challenger_weights()
                     _existing_meta = (_existing or {}).get("meta") or {}
                     if _existing_meta.get("net_ev") is not None:

@@ -896,9 +896,24 @@ class RedisStateStore:
             logger.warning(f"Ignoring malformed dynamic_weights in Redis: {e}")
             return None
 
-    async def set_dynamic_weights(self, weights: Dict[str, float], ttl: int = 30 * 86400) -> bool:
+    # Only these callers may change live weights when ENFORCE_SINGLE_WEIGHT_PATH is on.
+    _WEIGHT_WRITE_SOURCES: ClassVar[frozenset] = frozenset({"promotion", "rollback"})
+
+    async def set_dynamic_weights(
+        self, weights: Dict[str, float], ttl: int = 30 * 86400, *, source: str = "direct",
+    ) -> bool:
         """Persist the Brain's optimized CONFLUENCE_WEIGHTS to Redis.
-        TTL default 30 days — refresh on each Brain report."""
+        TTL default 30 days — refresh on each Brain report.
+
+        With cfg.ENFORCE_SINGLE_WEIGHT_PATH (default True) only source="promotion"
+        (champion/challenger) or source="rollback" (restore) may write; any other
+        caller is refused so there is exactly one controlled weight-change path."""
+        if getattr(cfg, "ENFORCE_SINGLE_WEIGHT_PATH", True) and source not in self._WEIGHT_WRITE_SOURCES:
+            logger.warning(
+                f"Refused direct dynamic_weights write (source={source!r}): live weights "
+                "change only via challenger promotion or rollback"
+            )
+            return False
         if self.degraded or not self._redis:
             return False
         try:
@@ -907,6 +922,10 @@ class RedisStateStore:
         except Exception as e:
             logger.warning(f"Failed to persist dynamic_weights: {e}")
             return False
+
+
+
+
 
     async def clear_dynamic_weights(self) -> bool:
         """Remove stored dynamic weights (revert to static CONFLUENCE_WEIGHTS)."""
@@ -964,13 +983,10 @@ class RedisStateStore:
         blob = await self.get_challenger_weights()
         if not blob or not blob.get("weights"):
             return False
-        ok = await self.set_dynamic_weights(blob["weights"])
+        ok = await self.set_dynamic_weights(blob["weights"], source="promotion")
         if ok:
             await self.clear_challenger_weights()
         return ok
-
-
-
 
     async def batch_get_metadata(self, keys: List[str], timeout: float = 5.0) -> Dict[str, Optional[str]]:
         """Fetch many metadata keys in ONE Redis round-trip (pipeline)."""
