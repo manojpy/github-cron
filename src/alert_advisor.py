@@ -91,10 +91,9 @@ def _num(v: Any) -> Optional[float]:
         return None
     return f if f == f else None          # drop NaN
 
-
-def _mean(vals: Sequence[float]) -> Optional[float]:
-    return sum(vals) / len(vals) if vals else None
-
+def _mean(vals: Sequence[Optional[float]]) -> Optional[float]:
+    clean = [v for v in vals if v is not None]
+    return sum(clean) / len(clean) if clean else None
 
 def _best_evidence(tqs: Sequence[Dict[str, Any]]) -> str:
     rank = {"": 0, "INSUFFICIENT": 0, "SHADOW": 1, "ELIGIBLE": 2, "ACTIONABLE": 3}
@@ -105,8 +104,7 @@ def _best_evidence(tqs: Sequence[Dict[str, Any]]) -> str:
             best = s
     return best
 
-
-def _plan(tqs: Sequence[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+def _plan(tqs: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Trade plan from the family with the most outcome history behind it."""
     best, best_n = None, -1
     for t in tqs:
@@ -122,7 +120,6 @@ def _plan(tqs: Sequence[Dict[str, Any]]) -> Optional[Dict[str, float]]:
             best, best_n = {"sl": sl, "tp1": tp1, "tp2": tp2,
                             "tp_first": _num(p.get("tp_first_rate")), "n": n}, n
     return best
-
 
 def _plan_line(plan: Optional[Dict[str, float]], default_sl: float, rr: float) -> str:
     if plan:
@@ -163,7 +160,7 @@ def advise_pair(
     data = [t for t in tqs if isinstance(t, dict) and _num(t.get("net_ev")) is not None]
     blocked = any(isinstance(t, dict) and str(t.get("verdict")) == "BLOCKED" for t in tqs)
     pct = (score / total) if (score is not None and total) else None
-    oi_failed = bool(votes) and votes.get("oi_funding") is False
+    oi_failed = votes is not None and votes.get("oi_funding") is False
     against = bias == "against"
 
     # ── technical strength wording ──
@@ -196,18 +193,18 @@ def advise_pair(
             reason = "technicals are not strong enough to act on without a track record"
         else:
             reason = "there is no track record for this setup yet"
-        risks = []
+        no_data_risks = []
         if against:
-            risks.append("against the market bias")
+            no_data_risks.append("against the market bias")
         if oi_failed:
-            risks.append("OI/funding check failed")
+            no_data_risks.append("OI/funding check failed")
         if conflicting:
-            risks.append("opposing signal on the same pair")
-        if weak and not risks:
-            risks.append(f"weak: {', '.join(weak)}")
-        if risks:
+            no_data_risks.append("opposing signal on the same pair")
+        if weak and not no_data_risks:
+            no_data_risks.append(f"weak: {', '.join(weak)}")
+        if no_data_risks:
             label = "Risk"
-            risk_line = "; ".join(risks) + "; no reliable profitability evidence."
+            risk_line = "; ".join(no_data_risks) + "; no reliable profitability evidence."
         elif verdict == WATCH:
             label, risk_line = "Missing", "Reliable profitability evidence."
         else:
@@ -233,7 +230,7 @@ def advise_pair(
     tp_first = plan["tp_first"] if plan else None
     tp_n = plan["n"] if plan else 0
 
-    s_ev = _clamp(50.0 + (ev / 0.30) * 50.0)
+    s_ev = _clamp(50.0 + (ev / 0.30) * 50.0) if ev is not None else 50.0
     s_reg = _clamp(reg_wr * 100.0) if reg_wr is not None else 50.0
     s_tp1 = _clamp(tp_first * 100.0) if tp_first is not None else 50.0
     if pct is not None and score is not None and total:
@@ -318,8 +315,10 @@ def advise_pair(
     risk_line = "; ".join(risks[:3]) + "."
 
     size_line = ""
-    sizes = [_num(t.get("size_hint")) for t in data]
-    sizes = [s for s in sizes if s is not None]
+    sizes: List[float] = [
+        s for t in data
+        if (s := _num(t.get("size_hint"))) is not None
+    ]
     if sizes and verdict != AVOID:
         size_line = f"📐 Size {min(sizes):.2f}× (advisory)"
 
