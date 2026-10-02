@@ -175,13 +175,18 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             return None
         gr = cast(GateResult, cached)
     else:
-        gr_result = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time, pair_oi, resolve_outcomes=False)
+        gr_result = await _eval_gate(
+            pair_name, data_15m, data_5m, data_daily, sdb,
+            correlation_id, reference_time, pair_oi,
+            resolve_outcomes=False
+        )
         if gr_result is None:
             return None
         if isinstance(gr_result, tuple):
             pair_n, summary = cast(Tuple[str, Dict[str, Any]], gr_result)
-            return pair_n, summary, None 
+            return pair_n, summary, None
 
+    LAST_CANDLE_OK_THIS_RUN[pair_name] = int(gr.ts_curr)
 
     reversal_eligible = (
         (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE)
@@ -261,7 +266,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             ob_reason = gr.ob_gate_reason or "OB gate: zone touched, no reversal confirmed"
             logger_pair.info(f"[{pair_name}] {ob_reason}")
             await _blanket_reset_pair(sdb, pair_name, logger_pair)
-            LAST_CANDLE_OK_THIS_RUN[pair_name] = int(gr.ts_curr)
             return pair_name, {
                 "state": "NO_SIGNAL",
                 "ts": int(time.time()),
@@ -284,6 +288,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             last_processed = last_processed_candles_run.get(pair_name)
         else:
             last_processed = await sdb.get_last_processed_candle_ts(pair_name)
+        
         alert_result = await _eval_alerts(
             gr, data_5m, data_daily, reference_time, sdb, correlation_id, logger_pair,
             disabled_alert_keys=disabled_alert_keys_run,
@@ -291,15 +296,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         )
         if alert_result is None:
             return None
-
-        # Evaluation of candle gr.ts_curr completed → it is this pair's
-        # "last successful candle" (anything but an invariant violation).
-        _eval_state = (
-            None if isinstance(alert_result[0], dict)
-            else (alert_result[1] or {}).get("state")
-        )
-        if _eval_state != "INVARIANT_VIOLATION":
-            LAST_CANDLE_OK_THIS_RUN[pair_name] = int(gr.ts_curr)
 
         # Reserved: RuntimeError path inside _eval_alerts returns a 2-tuple
         # (pair_name, summary_dict). Surface it as a non-dispatched result.

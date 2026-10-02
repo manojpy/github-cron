@@ -9,7 +9,7 @@ import json
 import logging
 import statistics
 import time
-from collections import defaultdict
+from collections import defaultdict, Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 from alerts import escape_markdown_v2, resolve_alert_config_path
@@ -437,15 +437,39 @@ class BrainEngine:
                 shadow_rows=shadow_rows,
             )
             if not calib.get("curves"):
-                from collections import Counter
                 ak_counts = Counter(r.get("alert_key") for r in real_rows)
                 min_s = getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15)
+
                 logger_run.warning(
                     f"Calibration refresh: no curves built "
                     f"(need ≥{min_s} samples/alert_key). "
                     f"real={n_real} shadow={n_shadow} | "
                     f"top alert_keys: {ak_counts.most_common(5)}"
                 )
+                if stream_tips:
+                    calib["stream_cursors"] = stream_tips
+
+                calib["status"] = "INSUFFICIENT_SAMPLES"
+                calib["reason"] = (
+                    f"No alert_key has at least {min_s} samples"
+                )
+
+                ok = await self._persist_calibration_curves(calib)
+
+                if ok:
+                    logger_run.info(
+                        f"🎯 Calibration gate disabled for this run: "
+                        f"insufficient samples for any alert_key "
+                        f"(minimum={min_s}, real={n_real}, shadow={n_shadow}). "
+                        f"Existing stale calibration was replaced with "
+                        f"an explicit empty calibration payload."
+                    )
+                else:
+                    logger_run.error(
+                        "❌ Could not persist empty calibration payload; "
+                        "previous calibration may remain live."
+                    )
+
                 return
 
             if stream_tips:
