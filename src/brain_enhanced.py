@@ -206,10 +206,15 @@ def _collect_facts(recs: Dict[str, Any], cfg) -> Dict[str, Any]:
         ev_obj = engine.ev_first_objective(rows, min_sample=10) if rows else None
     except Exception:
         ev_obj = None
+    
     F["ev_obj"] = ev_obj if ev_obj and ev_obj.get("valid") else None
     F["p_ev"] = (F["ev_obj"] or {}).get("p_ev_positive")
-    F["dd"] = (F["ev_obj"] or {}).get("max_drawdown_pct")
-    F["dd_budget"] = float(getattr(cfg, "KILL_SWITCH_MAX_DRAWDOWN_PCT", 3.0))
+
+    F["dd"] = F["gate"].get("risk_drawdown_pct")
+    F["dd_budget"] = float(
+        F["gate"].get("risk_budget_pct")
+        or getattr(cfg, "KILL_SWITCH_MAX_DRAWDOWN_PCT", 3.0)
+    )
 
     # Per-alert table (EV only where the sample is big enough to compute one).
     by_alert: Dict[str, list] = defaultdict(list)
@@ -502,7 +507,8 @@ def _active_blockers(F: Dict[str, Any]) -> List[str]:
     if g and g.get("stability") is False:
         out.append("CUSUM drift active")
     if g and g.get("risk") is False:
-        out.append("Drawdown outside current budget")
+        _r = g.get("risk_reason") or "outside current budget"
+        out.append(f"Risk check failed: {_r}")
     if g and g.get("execution") is False:
         out.append("Fee/slippage assumptions missing")
     return out
@@ -711,6 +717,7 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
     wr_verdict = ("🔴 Very poor" if be and wr < be * 0.5 else "🔴 Below break-even" if be and wr < be
                   else "🟢 At/above break-even" if be else "⚪")
     dd, bud = F["dd"], F["dd_budget"]
+    dd_win = F["gate"].get("risk_window_hours", 24)
 
     # Emoji lifted out of VERDICT and placed at column 0; column order is
     # now emoji | metric | result (right-aligned) | verdict text.
@@ -724,7 +731,7 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
          "🟢 Long enough" if (days or 0) >= 30 else "🟡 Short" if (days or 0) >= 14 else "🔴 Too short"),
         ("After costs?", "YES" if F["gate"].get("execution", True) else "NO",
          "🟢 Costs accounted" if F["gate"].get("execution", True) else "🔴 Missing"),
-        ("Drawdown", "n/a" if dd is None else f"{dd:.1f}%",
+        (f"Drawdown ({dd_win}h)", "n/a" if dd is None else f"{dd:.1f}%",
          "⚪ unknown" if dd is None else f"{'🟢 Within' if dd <= bud else '🔴 Over'} {bud:.1f}% budget"),
         ("CUSUM drift", "ACTIVE" if F["gate"].get("stability") is False else "NONE",
          "🔴 Drifting" if F["gate"].get("stability") is False else "🟢 Stable"),
@@ -913,11 +920,18 @@ def _confidence_breakdown(F: Dict[str, Any], cfg) -> List[Tuple[str, str, str]]:
 def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     g = F["gate"]
     out = [_hdr(9, '🛡️ ACTION GATE — "CAN THE BRAIN SAFELY CHANGE ANYTHING?"')]
+    # Risk label shows the WINDOW and measured values so a FAIL is
+    _dd_pct = g.get("risk_drawdown_pct")
+    _dd_win = g.get("risk_window_hours", 24)
+    _dd_bud = g.get("risk_budget_pct", 3.0)
+    if _dd_pct is None:
+        _risk_label = f"Drawdown ({_dd_win}h: n/a)"
+    else:
+        _risk_label = f"Drawdown ({_dd_win}h: {_dd_pct:.1f}% / {_dd_bud:.1f}%)"
+
     labels = [("data_quality", "Minimum trades"), ("oos_prediction", "OOS EV"),
               ("profitability", "Net EV confidence"), ("stability", "CUSUM drift"),
-              ("risk", "Drawdown budget"), ("execution", "Cost assumptions")]
-    # Emoji at column 0, label, then PASS/FAIL — same shape as _kv_table
-    # without needing to wrap because the pairs are built inline here.
+              ("risk", _risk_label), ("execution", "Cost assumptions")]
     rows = [(f"{'🟢' if g.get(k) else '🔴'} {lab}:", "PASS" if g.get(k) else "FAIL")
             for k, lab in labels]
 
@@ -1265,13 +1279,39 @@ class BrainEngineV2(BaseBrainEngine):
                 r.get("type") == "cusum_drift" for r in recommendations
             )
         # ── Risk: realized max drawdown must stay inside the same budget
-        # the live kill switch enforces. ev_obj is already computed above,
-        # so this reuses it instead of a second pass over the rows. ──
-        if ev_obj.get("valid"):
-            dd_budget = getattr(cfg, "KILL_SWITCH_MAX_DRAWDOWN_PCT", 3.0)
-            gate["risk"] = ev_obj["max_drawdown_pct"] <= dd_budget
-        else:
-            gate["risk"] = False
+        dd_budget = getattr(cfg, "KILL_SWITCH_MAX_DRAWDOWN_PCT", 3.0)
+        lookback_h = int(getattr(cfg, "KILL_SWITCH_LOOKBACK_HOURS", 24))
+        try:
+            _ks_for_gate = engine.KillSwitch(
+                max_consecutive_losses=getattr(
+                    cfg, "KILL_SWITCH_MAX_CONSECUTIVE_LOSSES", 6
+                ),
+                max_drawdown_pct=dd_budget,
+                lookback_hours=lookback_h,
+                fee_pct=getattr(cfg, "BRAIN_FEE_PCT", 0.0006),
+                slippage_pct=getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003),
+            ).evaluate(real_rows)
+            gate["risk"] = not _ks_for_gate["tripped"]
+            # Expose the window + observed values so the report can render
+            # "5.2% over 24h vs 3% budget" instead of an opaque PASS/FAIL.
+            gate["risk_window_hours"] = lookback_h
+            gate["risk_drawdown_pct"] = _ks_for_gate["drawdown_pct"]
+            gate["risk_budget_pct"] = dd_budget
+            gate["risk_consecutive_losses"] = _ks_for_gate["consecutive_losses"]
+            gate["risk_reason"] = _ks_for_gate.get("reason")
+        except Exception as _e:
+            # A gate that crashes must not take dispatch down — fail-open,
+            # matching the rest of the risk checks (KillSwitch itself is
+            # called fail-open in macd_unified). Expose the error so a
+            # silent failure is still visible in the report.
+            logging.getLogger("macd_bot").warning(
+                f"Risk gate evaluation failed, failing open: {_e}"
+            )
+            gate["risk"] = True
+            gate["risk_window_hours"] = lookback_h
+            gate["risk_drawdown_pct"] = None
+            gate["risk_budget_pct"] = dd_budget
+            gate["risk_reason"] = f"gate error (fail-open): {_e}"
 
         # ── Execution: cost assumptions must be non-trivial, or every EV
         # figure above is silently optimistic. ──
