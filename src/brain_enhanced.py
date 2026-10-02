@@ -884,7 +884,13 @@ def _confidence_breakdown(F: Dict[str, Any], cfg) -> List[Tuple[str, str, str]]:
         rows.append(("MODEL", tier, f"Brier {brier:.2f}"))
 
     rank = _evidence_rank(F["n"], F["days"])
-    data_tier = "🔴 NOT READY" if rank == 0 else "🟡 MEDIUM" if rank == 1 else "🟢 HIGH"
+    days = F["days"]
+    if rank == 0 or (days is not None and days < 7):
+        data_tier = "🔴 NOT READY"
+    elif rank == 1:
+        data_tier = "🟡 MEDIUM"
+    else:
+        data_tier = "🟢 HIGH"
     rows.append(("DATA", data_tier, f"{F['n']} trades, {_fmt_days(F['days'])}"))
 
     p_thr = getattr(cfg, "BRAIN_EV_GATE_P_THRESHOLD", 0.85)
@@ -1890,7 +1896,7 @@ class BrainEngineV2(BaseBrainEngine):
                 })
         _phase_mark("weight_optimizer")
 
-        # ─ Per-alert breakdown ───────────────────────────────��──────────
+        # ─ Per-alert breakdown ───────────────────────────────���──────────
         alert_stats = engine.per_alert_breakdown(real_rows, min_sample=min_sample)
         if alert_stats:
             display = alert_stats if len(alert_stats) <= 10 else alert_stats[:5] + alert_stats[-5:]

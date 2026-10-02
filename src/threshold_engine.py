@@ -3948,14 +3948,19 @@ def ev_first_objective(
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
     # Max drawdown (cumulative net PnL trough)
+
     ordered_idx = sorted(range(len(rows)), key=lambda i: rows[i].get("entry_ts", 0))
-    cumulative = 0.0
-    peak = 0.0
+    equity = 1.0
+    peak_equity = 1.0
     max_dd = 0.0
     for i in ordered_idx:
-        cumulative += net_pnls[i]
-        peak = max(peak, cumulative)
-        max_dd = max(max_dd, peak - cumulative)
+        equity *= (1.0 + net_pnls[i] / 100.0)
+        if equity > peak_equity:
+            peak_equity = equity
+        dd = (peak_equity - equity) / peak_equity
+        if dd > max_dd:
+            max_dd = dd
+    max_dd *= 100.0
 
     n = len(rows)
     win_count = sum(1 for r in rows if r["win"])
@@ -5032,11 +5037,10 @@ class KillSwitch:
         # Rolling cost-adjusted PnL (same convention as ev_and_kelly_for).
         total_cost = ((self.fee_pct * 2) + (self.slippage_pct * 2)) * 100
         window = [r for r in ordered if r["entry_ts"] >= cutoff]
-        pnl = 0.0
+        equity = 1.0
         for r in window:
-            pnl += row_net_pnl_pct(r, total_cost)
-
-
+            equity *= (1.0 + row_net_pnl_pct(r, total_cost) / 100.0)
+        pnl = (equity - 1.0) * 100.0
         result.update(
             pnl_pct=round(pnl, 4),
             drawdown_pct=round(-pnl, 4) if pnl < 0 else 0.0,
@@ -5056,8 +5060,7 @@ class KillSwitch:
             result["reason"] = " and ".join(reasons)
         return result
 
-
-# ══════════════════════════════════������══════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
 #  FILL RECONCILIATION — assumed vs realized execution cost
 # ═══════════════════════════════════════════════════════════════════���══
 
