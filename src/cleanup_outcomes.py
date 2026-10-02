@@ -172,8 +172,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="Show what would be cleaned without actually deleting")
     ap.add_argument("--wipe-all", action="store_true",
-                    help="DANGER: delete ALL files in outcomes/ and reports/ regardless "
-                         "of age, instead of the normal age/size-based cleanup")
+                    help="DANGER: delete ALL files in outcomes/, shadow/, and reports/ "
+                         "regardless of age, instead of the normal age/size-based cleanup")
 
     args = ap.parse_args()
     data_dir = Path(args.data_dir)
@@ -184,9 +184,9 @@ def main():
 
     if args.wipe_all:
         print("=" * 60)
-        print("  🚨 OUTCOME DATA WIPE — outcomes/ + reports/" + ("  [DRY RUN]" if args.dry_run else ""))
+        print("  🚨 OUTCOME DATA WIPE — outcomes/ + shadow/ + reports/" + ("  [DRY RUN]" if args.dry_run else ""))
         print("=" * 60)
-        removed = wipe_labels(data_dir, ["outcomes", "reports"], dry_run=args.dry_run)
+        removed = wipe_labels(data_dir, ["outcomes", "shadow", "reports"], dry_run=args.dry_run)
         verb = "Would remove" if args.dry_run else "removed"
         print(f"\n✅ Wipe {'preview' if args.dry_run else 'complete'} — {verb} {removed} file(s)")
         return
