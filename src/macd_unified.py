@@ -162,8 +162,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     # entry) still resolve the pair's pending outcomes instead of starving them.
     i15_for_resolve = get_last_closed_index_from_array(data_15m.ts, 15, reference_time, pair_name)
     if i15_for_resolve is not None and i15_for_resolve >= Constants.MIN_CLOSED_CANDLES_15M:
+        LAST_CANDLE_OK_THIS_RUN[pair_name] = int(data_15m.ts[i15_for_resolve])
         await _resolve_pair_outcomes(pair_name, data_15m, i15_for_resolve, sdb, logger_pair)
-
     gr: GateResult
     if cached is not _CLUSTER_CACHE_MISS:
         if isinstance(cached, tuple):
@@ -185,8 +185,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         if isinstance(gr_result, tuple):
             pair_n, summary = cast(Tuple[str, Dict[str, Any]], gr_result)
             return pair_n, summary, None
-
-    LAST_CANDLE_OK_THIS_RUN[pair_name] = int(gr.ts_curr)
 
     reversal_eligible = (
         (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE)
