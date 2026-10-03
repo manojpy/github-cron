@@ -10,7 +10,7 @@ import logging
 import random
 import math
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import os
 from pathlib import Path
 from brain_audit import DataCoverage, HealthStatus, get_audit, reset_audit, ACTION_GATE_MIN_ROWS
@@ -78,6 +78,14 @@ class BrainEngineV2(BrainCore):
         self._phase_samples = _PHASE_MIN_SAMPLES
         self._recs_cache: Optional[Dict[str, Any]] = None
         self._recs_cache_ts: float = 0.0
+        self._repair_success_rates: Dict[str, Dict[str, float]] = {}
+        self._ledger_stats: Dict[str, Any] = {}
+        self._repair_help_preds: Dict[str, float] = {}
+        self._rows_cache: Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]] = None
+        self._recent_rows_cache: Optional[List[Dict[str, Any]]] = None
+        self._layered_rows_cache: Optional[Tuple[
+            List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]
+        ]] = None
 
     @staticmethod
     def _shadow_weight_check(
