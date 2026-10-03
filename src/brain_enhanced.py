@@ -1,1142 +1,83 @@
-#!/usr/bin/env python3
-"""brain_enhanced.py — Prescriptive Brain (Roadmap Phases 1.5-6)"""
+"""brain_enhanced.py — Brain orchestration (BrainEngineV2): prescriptive phases, action plans, apply/rollback lifecycle.
 
+Public entry point: brain_engine.BrainEngine.
+
+Split out of the original module without logic changes; the original
+module remains as a facade re-exporting every name."""
 from __future__ import annotations
 import asyncio
 import logging
 import random
 import math
 import time
-import unicodedata
-from collections import defaultdict
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import os
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
-
-from brain_audit import (
-    DataCoverage, HealthStatus, get_audit, reset_audit,
-    ACTION_GATE_MIN_ROWS,
-)
-
+from brain_audit import DataCoverage, HealthStatus, get_audit, reset_audit, ACTION_GATE_MIN_ROWS
 from archive_reader import load_archived_outcomes
 from bot_config import cfg, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS, json_dumps, json_loads
-
 from state import RedisKeyPrefix, RedisStateStore
-from brain import BrainEngine as BaseBrainEngine, _extract_p_value_for_fdr
+from brain import BrainCore, _extract_p_value_for_fdr
 import threshold_engine as engine
-
 from threshold_engine import (
-    optimize_vote_weights, conditional_performance,
-    interaction_miner, simulate_config_change, regime_profile_optimizer,
-    hash_config_state, learned_actionability, compare_config_versions,
+    optimize_vote_weights,
+    conditional_performance,
+    interaction_miner,
+    simulate_config_change,
+    regime_profile_optimizer,
+    hash_config_state,
+    learned_actionability,
+    compare_config_versions,
 )
 from repair_ledger import (
-    record_repair_issued, mark_plan_applied,
-    evaluate_pending_repairs, repair_success_rates, ledger_stats,
+    record_repair_issued,
+    mark_plan_applied,
+    evaluate_pending_repairs,
+    repair_success_rates,
+    ledger_stats,
     load_ledger_entries,
 )
-
 from alerts import escape_markdown_v2
-
-_PHASE_MIN_SAMPLES = {
-    "weight_optimizer": 100,
-    "parameter_autopsy": 30,
-    "conditional_gating": 15,
-    "vote_interactions": 20,
-    "counterfactual": 10,
-    "regime_profiles": 25,
-    "config_regression": 20,
-}
-
-def _report_section_failed(failed: List[str], name: str, exc: Exception) -> None:
-    """A report section raised. Never let that vanish: record it in the audit
-    layer (logs at WARNING with the exception type) and queue the section
-    name so the report itself says it is unavailable."""
-    try:
-        get_audit().record_analysis_exception(f"report:{name}", exc)
-    except Exception:
-        logging.getLogger("macd_bot").warning(
-            f"Brain report: {name} section failed: {type(exc).__name__}: {exc}"
-        )
-    failed.append(name)
-
-# ══════════════════════════════════════════════════════════════════════
-#  BRAIN REPORT v2 — layered 16-section layout
-#  Sections 01-05 = the "human Brain" (read these first).
-#  Sections 06-16 = the evidence behind it.
-#  Every number comes from data the Brain already computes; nothing is
-#  invented. build_profit_action_plan() is kept as the fallback.
-# ══════════════════════════════════════════════════════════════════════
-
-_RULE = "━" * 30
-PLAN_HISTORY_KEY = "brain_plan_history"
-PLAN_HISTORY_MAX = 100
-APPLY_SNAPSHOT_KEY = "brain_apply_snapshots"
-APPLY_SNAPSHOT_MAX = 20
-CHALLENGER_STREAK_KEY = "challenger_promo_streak"
-
-_IST = timezone(timedelta(hours=5, minutes=30))
-_LADDER = ["⚪", "🟡", "🟠", "🔵", "🟢"]          # Observation → Validated
-_LADDER_NAMES = ["Observation", "Early evidence", "Meaningful evidence",
-                 "Strong evidence", "Validated evidence"]
-_MSG_LIMIT = 3800                                   # rendered chars per Telegram message
-_HUMAN_SECTIONS = 6                                 # sections 1-5 are packed on their own
-
-
-from alert_registry import (alert_family_of as _alert_family, pretty_alert as _pretty_alert)
-
-class _Piece(str):
-    """A rendered Telegram fragment that remembers its plain source text and
-    kind ('p' prose, 'c' code, 'h' section header), so the same report can
-    also be written out as Markdown."""
-    kind: str
-    raw: str
-
-    def __new__(cls, rendered: str, kind: str, raw: str) -> "_Piece":
-        obj = super().__new__(cls, rendered)
-        obj.kind = kind
-        obj.raw = raw
-        return obj
-
-
-def _p(text: str) -> "_Piece":
-    """Prose piece, MarkdownV2-escaped."""
-    return _Piece(escape_markdown_v2(text), "p", text)
-
-
-def _c(text: str) -> "_Piece":
-    """Code-block piece. Inside ``` only ` and \\ need escaping."""
-    return _Piece("```\n" + text.replace("\\", "\\\\").replace("`", "\\`") + "\n```", "c", text)
-
-def _c_split(lines: List[str], limit: int = 3000) -> List[_Piece]:
-    """Fenced blocks of at most `limit` chars, split on line boundaries."""
-    out: List[_Piece] = []          # was: List[str]
-    cur: List[str] = []
-    size = 0
-    for ln in lines:
-        if cur and size + len(ln) + 1 > limit:
-            out.append(_c("\n".join(cur)))
-            cur, size = [], 0
-        cur.append(ln)
-        size += len(ln) + 1
-    if cur:
-        out.append(_c("\n".join(cur)))
-    return out
-
-def _hdr(num: int, title: str) -> "_Piece":
-    return _Piece(escape_markdown_v2(f"{_RULE}\n{num:02d} │ {title}\n{_RULE}"), "h", f"{num:02d} │ {title}")
-
-def _evidence_rank(n: int, days: Optional[float], validated: bool = False) -> int:
-    """0 ⚪ Observation … 4 🟢 Validated. Capped by history span so a short
-    history can never look 'strong' however many trades it holds."""
-    if validated:
-        return 4
-    r = 0 if n < 15 else 1 if n < 30 else 2 if n < 60 else 3
-    if days is not None:
-        r = min(r, 1 if days < 14 else 2 if days < 30 else 3)
-    return r
-
-def _wrap_names(names: List[str], width: int = 34, indent: str = "   ") -> List[str]:
-    """Bullet-free wrapped list: 'A · B · C' broken into short lines."""
-    lines: List[str] = []
-    cur = ""
-    for nm in names:
-        add = nm if not cur else f" · {nm}"
-        if cur and len(cur) + len(add) > width:
-            lines.append(indent + cur)
-            cur = nm
-        else:
-            cur += add
-    if cur:
-        lines.append(indent + cur)
-    return lines
-
-def _collect_facts(recs: Dict[str, Any], cfg) -> Dict[str, Any]:
-    """Everything the sections need, computed once."""
-    audit = get_audit()
-    rows = recs.get("_real_rows", []) or []
-    ai = recs.get("ai_metrics", {}) or {}
-    n = len(rows)
-    wins = sum(1 for r in rows if r["win"])
-    F: Dict[str, Any] = {
-        "audit": audit, "rows": rows, "ai": ai, "n": n,
-        "wr": wins / n if n else 0.0,
-        "net_ev": ai.get("net_ev", 0.0) or 0.0,
-        "gate": ai.get("action_gate", {}) or {},
-        "cfg_patch": recs.get("config_patch", []) or [],
-        "shadow_rows": recs.get("_shadow_rows", []) or [],
-        "archive_stats": recs.get("_archive_stats", {}) or {},
-        "conf": audit.statistical_confidence_label(),
-        "recon": audit.reconciliation_snapshot(),
-        "coverage": audit.history_coverage(),
-    }
-    F["gate_ok"] = bool(F["gate"].get("actionable"))
-    span = audit.history_span()
-    F["days"] = span[0] if span else None
-    F["req_days"] = span[1] if span else int(getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180))
-    F["low_trust"] = F["conf"] in ("VERY LOW", "LOW")
-
-    # Portfolio-level EV object (drawdown, P(EV>0)) — cached by the engine.
-    ev_obj = None
-    try:
-        ev_obj = engine.ev_first_objective(rows, min_sample=10) if rows else None
-    except Exception:
-        ev_obj = None
-    
-    F["ev_obj"] = ev_obj if ev_obj and ev_obj.get("valid") else None
-    F["p_ev"] = (F["ev_obj"] or {}).get("p_ev_positive")
-
-    F["dd"] = F["gate"].get("risk_drawdown_pct")
-    F["dd_budget"] = float(
-        F["gate"].get("risk_budget_pct")
-        or getattr(cfg, "KILL_SWITCH_MAX_DRAWDOWN_PCT", 3.0)
-    )
-
-    # Per-alert table (EV only where the sample is big enough to compute one).
-    by_alert: Dict[str, list] = defaultdict(list)
-    for r in rows:
-        by_alert[r["alert_key"]].append(r)
-    alerts: List[Dict[str, Any]] = []
-    for ak, arows in by_alert.items():
-        cnt = len(arows)
-        awr = sum(1 for r in arows if r["win"]) / cnt
-        ev = None
-        if cnt >= 10:
-            try:
-                e = engine.ev_first_objective(arows, min_sample=10)
-                ev = e if e and e.get("valid") else None
-            except Exception:
-                ev = None
-        net = ev.get("net_ev", 0.0) if ev else None
-        alerts.append({
-            "key": ak, "name": _pretty_alert(ak), "family": _alert_family(ak),
-            "n": cnt, "wr": awr, "ev": net, "p": ev.get("p_ev_positive", 0.0) if ev else None,
-            "damage": (net * cnt) if net is not None else 0.0,
-        })
-    for a in alerts:
-        validated = (
-            F["gate_ok"] and a["ev"] is not None and a["ev"] > 0
-            and (a["p"] or 0) >= 0.85 and a["n"] >= 60 and (F["days"] or 0) >= 30
-        )
-        a["rank"] = _evidence_rank(a["n"], F["days"], validated)
-    F["alerts"] = alerts
-    F["weak"] = sorted([a for a in alerts if a["ev"] is not None and a["ev"] < 0],
-                       key=lambda a: a["damage"])
-    F["good"] = sorted([a for a in alerts if a["ev"] is not None and a["ev"] > 0],
-                       key=lambda a: -a["ev"])
-    F["thin"] = [a for a in alerts if a["ev"] is None]
-
-    # Direction, coin and session splits.
-    try:
-        F["dir"] = engine.direction_split(rows)
-    except Exception:
-        F["dir"] = (None, 0, None, 0)
-    try:
-        F["pairs"] = engine.per_pair_breakdown(rows, min_sample=5)          # worst-first
-    except Exception:
-        F["pairs"] = []
-    try:
-        F["sessions"] = engine.session_breakdown(rows, min_sample=1)        # worst-first
-    except Exception:
-        F["sessions"] = []
-
-    # Entry-bar simulation.
-    F["target_wr"] = getattr(cfg, "MIN_WIN_RATE", 0.55)
-    try:
-        F["rec_thr"] = engine.recommend_threshold(
-            rows, target_winrate=F["target_wr"],
-            min_sample=getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20),
-        )
-    except Exception:
-        F["rec_thr"] = {"valid": False}
-    F["rec_thr_ok"] = bool(
-        F["rec_thr"].get("valid") and F["rec_thr"].get("recommended")
-        and F["rec_thr"]["recommended"] > cfg.CONFLUENCE_MIN_ABS_SCORE
-    )
-    F["thr_tier"] = audit.max_recommendation_tier("threshold_recommendation")
-    F["anatomy_text"], F["anatomy"] = _outcome_anatomy(rows, cfg)
-    F["shadow_on"] = bool(getattr(cfg, "BRAIN_SHADOW_MODE", False))
-    return F
-
-def _outcome_anatomy(rows: List[Dict[str, Any]], cfg) -> Tuple[Optional[str], Dict[str, Any]]:
-    """Plain-English 'how a win is judged' text plus how trades really ended.
-    Uses only fields already on every outcome row (outcome_reason, mfe, mae;
-    stored as fractions, 0.02 = 2%). Returns (text, facts)."""
-    risk = float(getattr(cfg, "OUTCOME_MAE_LOSS_PCT", 0.0) or 0.0)
-    rr = float(getattr(cfg, "OUTCOME_RR_TARGET", 0.0) or 0.0)
-    target = risk * rr
-    hours = float(getattr(cfg, "OUTCOME_LOOKAHEAD_CANDLES", 0) or 0) * 15.0 / 60.0   # 15m candles
-    if not rows or risk <= 0 or target <= 0 or hours <= 0:
-        return None, {}
-    buckets = {"target_hit": "target", "target_hit_ever": "target",
-               "stop_hit": "stop", "stop_hit_ever": "stop",
-               "both_hit": "both", "ambiguous_same_candle": "both", "no_hit": "neither"}
-    counts = {"target": 0, "stop": 0, "both": 0, "neither": 0}
-    for r in rows:
-        reason = r.get("outcome_reason")
-        b = buckets.get(reason) if isinstance(reason, str) else None
-        if b:
-            counts[b] += 1
-    known = sum(counts.values())
-
-    def _med(vals: List[float]) -> Optional[float]:
-        if not vals:
-            return None
-        v = sorted(vals)
-        m = len(v) // 2
-        return v[m] if len(v) % 2 else (v[m - 1] + v[m]) / 2.0
-
-    med_mfe = _med([r["mfe"] * 100.0 for r in rows if r.get("mfe") is not None])
-    med_mae = _med([r["mae"] * 100.0 for r in rows if r.get("mae") is not None])
-    lines = [
-        f"A trade counts as a WIN only if price moves +{target:.1f}% your way "
-        f"before it moves -{risk:.1f}% against you, within {hours:g} hours.",
-        f"Break-even needs roughly {1.0 / (1.0 + rr):.0%} wins (before fees).",
-    ]
-    if known:
-        lines.append(f"How {known} trades actually ended:")
-        lines.append(f"  • {counts['target'] / known:.0%} reached the +{target:.1f}% target")
-        lines.append(f"  • {counts['stop'] / known:.0%} hit the -{risk:.1f}% stop first")
-        lines.append(f"  • {counts['neither'] / known:.0%} did neither in {hours:g}h")
-        if counts["both"]:
-            lines.append(f"  • {counts['both'] / known:.0%} touched both (order unclear)")
-    if med_mfe is not None:
-        lines.append(f"Typical best move for you: {med_mfe:.1f}% (target {target:.1f}%)")
-    if med_mae is not None:
-        lines.append(f"Typical worst move against you: {med_mae:.1f}% (stop {risk:.1f}%)")
-    strict = med_mfe is not None and 0 < med_mfe < 0.5 * target
-    if strict and med_mfe is not None:
-        lines.append(
-            f"⚠️ The target is {target / med_mfe:.0f}x your typical best move, so this rule "
-            f"is hard for ANY 15-minute signal to meet. It lowers every alert's win rate. "
-            f"Compare alerts with each other, not with the {_goal_wr(cfg):.0%} goal."
-        )
-    return "\n".join(lines), {"target": target, "risk": risk, "hours": hours, "rr": rr,
-                              "med_mfe": med_mfe, "med_mae": med_mae, "strict": strict,
-                              "counts": counts, "known": known}
-
-
-def _goal_wr(cfg) -> float:
-    return float(getattr(cfg, "MIN_WIN_RATE", 0.55))
-
-
-# ── status helpers ────────────────────────────────────────────────────
-
-def _profit_status(net_ev: float, n: int) -> str:
-    if n == 0:
-        return "⚪ NO DATA"
-    return "🔴 POOR" if net_ev <= -0.05 else "🟡 FLAT" if net_ev < 0.05 else "🟢 POSITIVE"
-
-def _data_status(F: Dict[str, Any]) -> str:
-    cov_obj = F.get("coverage")
-    cov = getattr(cov_obj, "coverage", None) if cov_obj else None
-    if not isinstance(cov, DataCoverage):
-        return "⚪ UNKNOWN"
-    return {
-        DataCoverage.FULL: "🟢 GOOD",
-        DataCoverage.PARTIAL: "🟡 PARTIAL HISTORY",
-        DataCoverage.SEVERELY_LIMITED: "🟠 LIMITED HISTORY",
-        DataCoverage.CRITICAL: "🔴 INSUFFICIENT HISTORY",
-    }.get(cov, "⚪ UNKNOWN")
-
-def _recording_status(F: Dict[str, Any]) -> str:
-    r = F["recon"]
-    if r is None:
-        return "⚪ UNKNOWN"
-    label = "HEALTHY" if r.status == HealthStatus.OK else r.status.value
-    return f"{r.status.icon} {label}"
-
-
-def _conf_status(conf: str) -> str:
-    return {"VERY LOW": "🔴 LOW", "LOW": "🔴 LOW", "MODERATE": "🟡 MODERATE", "HIGH": "🟢 HIGH"}[conf]
-
-
-def _icon(ok: Optional[bool]) -> str:
-    return "🟢" if ok else "🔴"
-
-
-def _overall(F: Dict[str, Any]) -> str:
-    prof = _profit_status(F["net_ev"], F["n"])
-    rec = _recording_status(F)
-    if prof.startswith("🔴") or rec.startswith("🔴"):
-        return "🔴 NEEDS ATTENTION"
-    others = [prof, _data_status(F), rec, _conf_status(F["conf"])]
-    if any(not o.startswith("🟢") for o in others) or not F["gate_ok"]:
-        return "🟡 MONITOR"
-    return "🟢 HEALTHY"
-
-
-def _fmt_days(d: Optional[float]) -> str:
-    return "n/a" if d is None else f"{d:.1f} days"
-
-def _fmt_span(d: Optional[float]) -> str:
-    """Adjective form: '2.5-day' (for 'the current 2.5-day sample')."""
-    return "very short" if d is None else f"{d:.1f}-day"
-
-
-_WIDE_EMOJI_RANGES = (
-    (0x1F300, 0x1FAFF), (0x2600, 0x27BF), (0x2B00, 0x2BFF), (0x1F000, 0x1F02F),
+import brain_recommend_full as _full_recs
+from brain_report import (
+    APPLY_SNAPSHOT_KEY,
+    APPLY_SNAPSHOT_MAX,
+    CHALLENGER_STREAK_KEY,
+    PLAN_HISTORY_KEY,
+    PLAN_HISTORY_MAX,
+    _PHASE_MIN_SAMPLES,
+    _Piece,
+    build_brain_report_sections,
+    render_report_markdown,
+    render_report_messages,
 )
 
-def _vwidth(s: str) -> int:
-    """Visual width of `s` in monospace columns. Plain str length
-    undercounts emoji and other wide glyphs — they render ~2 columns
-    wide in virtually every renderer that shows this report (Telegram,
-    Gemini, a terminal, Notepad's default monospace font) — so padding
-    computed from len() alone silently drifts by one column per emoji.
-    This is the actual reason earlier alignment attempts looked fine in
-    the source but scattered on screen."""
-    w = 0
-    for ch in s:
-        cp = ord(ch)
-        if unicodedata.east_asian_width(ch) in ("W", "F"):
-            w += 2
-        elif any(lo <= cp <= hi for lo, hi in _WIDE_EMOJI_RANGES):
-            w += 2
-        elif unicodedata.combining(ch):
-            pass
-        else:
-            w += 1
-    return w
+# Backward-compatible alias for the core class (was `from brain import BrainEngine as BaseBrainEngine`).
+BaseBrainEngine = BrainCore
 
-def _ljust(s: str, width: int) -> str:
-    return s + " " * max(0, width - _vwidth(s))
 
-def _rjust(s: str, width: int) -> str:
-    return " " * max(0, width - _vwidth(s)) + s
+class BrainEngineV2(BrainCore):
+    """The Brain's public engine (import it as brain_engine.BrainEngine).
 
-def _table(rows: Sequence[Tuple[str, ...]], aligns: str, gap: int = 2) -> List[str]:
-    """Render `rows` (equal-length tuples of cell text, header included if
-    any) as monospace lines whose columns are all aligned to the widest
-    VISUAL width in that column across every row — so a dot/emoji in row 3
-    can't push row 3's own values out of line with rows 1, 2, 4... `aligns`
-    is one 'l' or 'r' per column. The last column is never padded (no
-    point padding text nothing follows)."""
-    ncol = len(aligns)
-    widths = [max((_vwidth(r[i]) for r in rows), default=0) for i in range(ncol)]
-    out = []
+    Extends BrainCore with prescriptive phases 1.5-6, actionability scoring,
+    plan storage and the apply / monitor / rollback lifecycle.
 
-    for r in rows:
-        cells = []
-        for i, cell in enumerate(r):
-            if i == ncol - 1 and aligns[i] != "r":
-                cells.append(cell)
-            else:
-                cells.append((_ljust if aligns[i] == "l" else _rjust)(cell, widths[i]))
-        out.append((" " * gap).join(cells))
-    return out
-
-def _split_leading_emoji(text: str) -> Tuple[str, str]:
-    """Split off a leading emoji (plus any variation selector / ZWJ
-    continuation) from `text`. Returns (emoji, rest). No leading emoji
-    → ('', text).
-
-    '🟡 FLAT'    → ('🟡', 'FLAT')
-    '⚠️ WARNING'  → ('⚠️', 'WARNING')
-    'FLAT'       → ('',  'FLAT')
-
-    Uses the same ranges _vwidth() uses, so anything _vwidth counts as
-    a wide glyph is treated as an emoji here too — the two stay in sync.
+    Explicit overlap with BrainCore — these four hooks are overridden here and
+    the core versions are reached by name, never through super():
+      _get_rows / _get_layered_window_rows   archive-first, Redis fallback
+                                             (core: Redis only)
+      generate_recommendations               120 s cached wrapper around the
+                                             full pipeline; the core method
+                                             is the baseline phase
+      _deliver_report                        routes to generate_report()
+                                             (core: legacy _generate_and_send)
     """
-    i, n = 0, len(text)
-    while i < n:
-        cp = ord(text[i])
-        if any(lo <= cp <= hi for lo, hi in _WIDE_EMOJI_RANGES) or cp in (0xFE0F, 0x200D):
-            i += 1
-            continue
-        break
-    if i == 0:
-        return "", text
-    return text[:i], text[i:].lstrip()
-
-def _kv_table(pairs: Sequence[Tuple[str, str]]) -> List[str]:
-    """Convenience for the common 'Label: Value' block.
-
-    Emoji in a value is lifted to column 0 so every row reads
-        🟡 Observed profitability:   FLAT
-        🔴 Data quality:             LOW
-    with one aligned value column, instead of the emoji drifting with
-    the value and the labels looking ragged. Rows whose values carry no
-    emoji at all (e.g. 'Current: 18') are left in the plain
-    'Label: Value' form — no phantom emoji column.
-    """
-    rows = []
-    for label, value in pairs:
-        emoji, rest = _split_leading_emoji(value)
-        if emoji:
-            rows.append((f"{emoji} {label}:", rest))
-        else:
-            rows.append((f"{label}:", value))
-    return _table(rows, "ll")
-
-def _active_blockers(F: Dict[str, Any]) -> List[str]:
-    g = F["gate"]
-    out: List[str] = []
-    if F["days"] is not None and F["days"] < 14:
-        out.append(f"Only {F['days']:.1f} days history")
-    if g and g.get("data_quality") is False:
-        out.append("Fewer than 100 trades")
-    if g and g.get("oos_prediction") is False:
-        out.append("OOS validation unavailable")
-    if g and g.get("profitability") is False:
-        out.append("Net EV not confidently positive")
-    if g and g.get("stability") is False:
-        out.append("CUSUM drift active")
-    if g and g.get("risk") is False:
-        _r = g.get("risk_reason") or "outside current budget"
-        out.append(f"Risk check failed: {_r}")
-    if g and g.get("execution") is False:
-        out.append("Fee/slippage assumptions missing")
-    return out
-
-# ── the sections ──────────────────────────────────────────────────────
-
-def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
-    n, wr, net_ev, days = F["n"], F["wr"], F["net_ev"], F["days"]
-    validated_mode = F["gate_ok"] and net_ev > 0 and F["conf"] in ("MODERATE", "HIGH")
-    if validated_mode:
-        return _sec_verdict(F, cfg)
-    prof = _profit_status(net_ev, n)
-    out = [_hdr(2, 'EXECUTIVE SUMMARY — "WHAT DO I NEED TO KNOW?"')]
-    out.append(_p(f"OVERALL SYSTEM STATUS\n{_overall(F)}"))
-    out.append(_c("\n".join(_kv_table([
-        ("Observed profitability", prof),
-        ("Data quality", _data_status(F)),
-        ("Outcome recording", _recording_status(F)),
-        ("Statistical confidence", _conf_status(F['conf'])),
-        ("Brain action gate", '🟢 PASSED' if F['gate_ok'] else '🔴 BLOCKED'),
-    ]))))
-    out.append(_c("\n".join(
-        [f"📊 {n} resolved trades"] + _table([
-            ("📈 Win Rate:", f"{wr:.0%}"),
-            ("💰 Net EV/trade:", f"{net_ev:+.2f}%"),
-            ("📅 History available:", _fmt_days(days)),
-            ("📅 History requested:", f"{F['req_days']} days"),
-        ], "lr")
-    )))
-    losing = net_ev <= -0.05
-    if losing and F["low_trust"]:
-        text = (
-            "The system is currently producing poor results in the available sample.\n\n"
-            f"However, only {_fmt_days(days)} of history are available, so the Brain does NOT yet "
-            "have enough evidence to say whether this is a persistent strategy problem.\n\n"
-            "➡️ Current priority: DIAGNOSE + COLLECT DATA\n"
-            "➡️ Not yet: AGGRESSIVE OPTIMISATION"
-        )
-    elif losing:
-        text = (
-            "The system is producing poor results and the history is long enough for this to be "
-            "taken seriously.\n\n"
-            "➡️ Current priority: FIX THE WEAKEST PARTS (see sections 04 and 12)\n"
-            + ("➡️ The action gate is still blocked: changes need evidence first."
-               if not F["gate_ok"] else "➡️ The action gate is open for validated changes.")
-        )
-    elif F["low_trust"]:
-        text = (
-            "Results look positive so far, but the history is too short to trust them.\n\n"
-            "➡️ Current priority: COLLECT DATA\n➡️ Not yet: INCREASE RISK OR WEIGHTS"
-        )
-    else:
-        text = (
-            "Results are around break-even to positive with usable history.\n\n"
-            "➡️ Current priority: VALIDATE, THEN OPTIMISE CAREFULLY"
-        )
-    out.append(_p("🧠 BRAIN'S SIMPLE INTERPRETATION\n\n" + text))
-    return out
-
-
-def _sec_verdict(F: Dict[str, Any], cfg) -> List[_Piece]:
-    """End-state Section 1, shown only when the action gate passes."""
-    g = F["gate"]
-    out = [_hdr(2, "🧠 BRAIN VERDICT")]
-    out.append(_c("\n".join(_kv_table([
-        ("System health", _recording_status(F).split(' ')[0]),
-        ("Profitability", _profit_status(F['net_ev'], F['n']).split(' ')[0]),
-        ("Evidence quality", _conf_status(F['conf']).split(' ')[0]),
-        ("OOS validation", _icon(g.get('oos_prediction'))),
-        ("Drift", _icon(g.get('stability'))),
-        ("Drawdown", _icon(g.get('risk'))),
-    ]))))
-    validated = [a for a in F["alerts"] if a["rank"] == 4]
-    validated.sort(key=lambda a: -(a["ev"] or 0))
-    edge = [f"• {a['name']}  (EV {a['ev']:+.2f}%, WR {a['wr']:.0%}, n={a['n']})" for a in validated[:3]]
-    good_sess = [s for s in F["sessions"] if s[2] >= 30]
-    good_pair = [p for p in F["pairs"] if p[2] >= 30]
-    if good_sess:
-        s = good_sess[-1]
-        edge.append(f"• Session: {s[0].upper()} ({s[1]:.0%} WR, n={s[2]})")
-    if good_pair:
-        p_ = good_pair[-1]
-        edge.append(f"• Coin: {p_[0]} ({p_[1]:.0%} WR, n={p_[2]})")
-    pev = f"P(EV > 0): {F['p_ev']:.0%}" if F["p_ev"] is not None else "P(EV > 0): n/a"
-    out.append(_p(
-        "🎯 CURRENTLY VALIDATED EDGE\n"
-        + ("\n".join(edge) if edge else "No single alert has reached 'validated' evidence yet.")
-        + f"\n\nEvidence: {F['n']} trades | {_fmt_days(F['days'])} | Net EV {F['net_ev']:+.2f}%\n{pev}"
-    ))
-    weak_ready = [a for a in F["weak"] if a["n"] >= 30]
-    worst = (weak_ready or F["weak"] or [None])[0]
-    if worst:
-        out.append(_p(
-            f"🎯 CURRENT WEAKNESS\n{worst['name']}\n\n"
-            f"Evidence: {worst['n']} trades | EV {worst['ev']:+.2f}% | WR {worst['wr']:.0%}"
-        ))
-    approved = [p for p in F["cfg_patch"] if not p.get("_blocked_by_action_gate")]
-    if approved:
-        first = approved[0]
-        action = f"{first.get('path')}: {first.get('current')} → {first.get('suggested')}"
-    else:
-        action = "No parameter change is supported by the evidence. Keep current settings."
-    out.append(_p(
-        f"🤖 RECOMMENDED ACTION\n{action}\n\n"
-        f"Confidence: {F['conf']}\nAction Gate: APPROVED"
-    ))
-    return out
-
-def _cf_verdict(scenario: Dict[str, Any], cfg) -> Tuple[str, str]:
-    """Shadow status + promotion verdict for one counterfactual scenario.
-
-    Returns (shadow_status, verdict), both short emoji-prefixed strings for
-    display. Promotion requires shadow_validated is True AND the shadow
-    sample clears BRAIN_COUNTERFACTUAL_PROMOTE_MIN_SHADOW — mirrors how
-    _shadow_weight_check already gates weight-change promotion, applied
-    here to threshold/gate candidates.
-    """
-    sv = scenario.get("shadow_validated")
-    shadow_n = scenario.get("shadow_n") or 0
-    min_shadow = getattr(cfg, "BRAIN_COUNTERFACTUAL_PROMOTE_MIN_SHADOW", 15)
-    if sv is None:
-        return "🟡 too thin to validate", "🕒 NOT YET (shadow inconclusive)"
-    if sv is False:
-        return f"🔴 disagrees (n={shadow_n})", "🚫 REJECTED (curve-fit risk)"
-    if shadow_n >= min_shadow:
-        return f"🟢 confirmed (n={shadow_n})", "✅ PROMOTION-ELIGIBLE"
-    return (f"🟢 confirmed (n={shadow_n})",
-            f"🕒 NOT YET (need {min_shadow} shadow, have {shadow_n})")
-
-def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
-    n, wr = F["n"], F["wr"]
-    out = [_hdr(3, "🚦 WHAT SHOULD I DO NOW?")]
-    do_now: List[str] = []
-    recon_ok = F["recon"] is not None and F["recon"].status == HealthStatus.OK
-    if wr < 0.10 or not recon_ok:
-        do_now.append("Verify alert → trade → outcome recording is correct.")
-    if F["coverage"] is None or F["coverage"].coverage != DataCoverage.FULL:
-        do_now.append("Continue collecting clean outcome data.")
-    do_now.append("Keep Shadow Mode enabled." if F["shadow_on"]
-                  else "Turn Shadow Mode ON (BRAIN_SHADOW_MODE=true) so rejected trades can be judged.")
-    if wr < 0.10 and n:
-        do_now.append(f"Investigate the very low {wr:.0%} win rate (see section 03).")
-    if F["gate"].get("stability") is False or F["gate"].get("risk") is False:
-        do_now.append("Monitor active drift/drawdown warnings.")
-    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"• {x}" for x in do_now)))
-
-    watch: List[str] = []
-    seen = set()
-    for a in F["weak"]:
-        if a["family"] not in seen:
-            seen.add(a["family"])
-            watch.append(a["family"])
-        if len(watch) >= 5:
-            break
-    b_wr, b_n, s_wr, s_n = F["dir"]
-    if b_wr is not None and s_wr is not None and b_n >= 5 and s_n >= 5 and abs(b_wr - s_wr) >= 0.15:
-        watch.append("BUY vs SELL imbalance")
-    if len(F["sessions"]) >= 2 and F["sessions"][-1][1] - F["sessions"][0][1] >= 0.05:
-        watch.append(f"{F['sessions'][0][0].title()} vs {F['sessions'][-1][0].title()} session")
-    out.append(_p("🟡 WATCH / INVESTIGATE\n\n" + ("\n".join(f"• {x}" for x in watch) if watch
-                                                 else "• Nothing flagged right now.")))
-
-    if F["gate_ok"] and not F["low_trust"]:
-        approved = [p for p in F["cfg_patch"] if not p.get("_blocked_by_action_gate")]
-        out.append(_p("✅ APPROVED CHANGES\n\n" + (
-            "\n".join(f"• {p.get('path')}: {p.get('current')} → {p.get('suggested')}" for p in approved[:6])
-            if approved else "• No change is supported by the evidence right now.")))
-    else:
-        dont = []
-        if F["low_trust"] or not F["gate_ok"]:
-            dont.append("Do not disable alerts solely from this report.")
-            dont.append("Do not change confluence weights.")
-            dont.append("Do not change adaptive thresholds.")
-
-        if F["rec_thr_ok"]:
-            dont.append("Do not apply the simulated entry-bar change.")
-        if F["low_trust"]:
-            dont.append(f"Do not optimise from the current {_fmt_span(F['days'])} sample.")
-        out.append(_p("🚫 DO NOT CHANGE YET\n\n" + "\n".join(f"• {x}" for x in dont)))
-
-    # ── Candidate vs Control (counterfactual simulator) ──
-    # Only scenarios that actually beat the live config, top 3 — this report
-    # is meant to be scannable, not a full simulation log. Silent when
-    # nothing currently beats control.
-    beats_control = sorted(
-        (s for s in (F["ai"].get("counterfactual_scenarios") or []) if s.get("delta_ev", 0.0) > 0),
-        key=lambda s: s.get("ev", float("-inf")),
-        reverse=True,
-    )[:3]
-    if beats_control:
-        lines = []
-        for s in beats_control:
-            _, verdict = _cf_verdict(s, cfg)
-            lines.append(
-                f"• {s.get('label', '?')}: {F['net_ev']:+.2f}% → {s.get('ev', 0.0):+.2f}% "
-                f"(n={s.get('n', 0)}) — {verdict}"
-            )
-        out.append(_p("🥇 CANDIDATE CONFIGS (beat current live config)\n\n" + "\n".join(lines)))
-    return out
-
-def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
-    n, wr, net_ev, days = F["n"], F["wr"], F["net_ev"], F["days"]
-    an = F["anatomy"] or {}
-    be = 1.0 / (1.0 + an["rr"]) if an.get("rr") else None
-    out = [_hdr(4, '📊 PROFITABILITY — "ARE WE ACTUALLY MAKING MONEY?"')]
-    wr_verdict = ("🔴 Very poor" if be and wr < be * 0.5 else "🔴 Below break-even" if be and wr < be
-                  else "🟢 At/above break-even" if be else "⚪")
-    dd, bud = F["dd"], F["dd_budget"]
-    dd_win = F["gate"].get("risk_window_hours", 24)
-
-    # Emoji lifted out of VERDICT and placed at column 0; column order is
-    # now emoji | metric | result (right-aligned) | verdict text.
-    entries = [
-        ("Trades", str(n),
-         "🟢 Good sample" if n >= 100 else "🟡 Small sample" if n >= 30 else "🔴 Tiny sample"),
-        ("Win Rate", f"{wr:.0%}", wr_verdict),
-        ("Net EV", f"{net_ev:+.2f}%",
-         "🟢 Positive" if net_ev > 0.05 else "🟡 Flat" if net_ev > -0.05 else "🔴 Negative"),
-        ("History", "n/a" if days is None else f"{days:.1f}d",
-         "🟢 Long enough" if (days or 0) >= 30 else "🟡 Short" if (days or 0) >= 14 else "🔴 Too short"),
-        ("After costs?", "YES" if F["gate"].get("execution", True) else "NO",
-         "🟢 Costs accounted" if F["gate"].get("execution", True) else "🔴 Missing"),
-        (f"Drawdown ({dd_win}h)", "n/a" if dd is None else f"{dd:.1f}%",
-         "⚪ unknown" if dd is None else f"{'🟢 Within' if dd <= bud else '🔴 Over'} {bud:.1f}% budget"),
-        ("CUSUM drift", "ACTIVE" if F["gate"].get("stability") is False else "NONE",
-         "🔴 Drifting" if F["gate"].get("stability") is False else "🟢 Stable"),
-    ]
-    rows = [("", "METRIC", "RESULT", "VERDICT")]
-    for metric, value, verdict in entries:
-        emoji, rest = _split_leading_emoji(verdict)
-        rows.append((emoji or "⚪", metric, value, rest))
-    out.extend(_c_split(_table(rows, "llrl")))
-
-    if net_ev < 0:
-        meaning = ("The observed trades are losing money after costs.\n\n"
-                   + ("BUT the Brain does not yet know whether this will persist across different "
-                      "market conditions." if F["low_trust"]
-                      else "The history is long enough that this should be treated as real."))
-    else:
-        meaning = "The observed trades are not losing money after costs in this sample."
-    recon_ok = F["recon"] is not None and F["recon"].status == HealthStatus.OK
-    out.append(_p(f"🧠 What this means:\n\n{meaning}"))
-    out.append(_c("\n".join(_kv_table([
-        ("Confidence in the RESULT", _conf_status(F['conf'])),
-        ("Confidence in the DATA PIPELINE", '🟢 GOOD' if recon_ok else '🟡 CHECK SECTION 14'),
-    ]))))
-    if F["anatomy_text"]:
-        out.append(_p("🎲 WHY THE WIN RATE LOOKS LOW\n\n" + F["anatomy_text"]))
-    return out
-
-
-_EVIDENCE_LEGEND = "Ev = evidence: ⚪ observation · 🟡 early · 🟠 meaningful · 🔵 strong · 🟢 validated"
-
-def _alert_table(items: List[Dict[str, Any]], limit: int) -> List[_Piece]:
-    rows = [("Alert", "EV%", "WR", "N")]
-    for a in items[:limit]:
-        rows.append((
-            f"{_LADDER[a['rank']]} {a['name']}",
-            f"{a['ev']:+.2f}", f"{a['wr']:.0%}", str(a['n']),
-        ))
-    return _c_split(_table(rows, "lrrr")) + [_p(_EVIDENCE_LEGEND)]
-
-def _sec_loss(F: Dict[str, Any], cfg) -> List[_Piece]:
-    out = [_hdr(5, '🔎 LOSS DIAGNOSIS — "WHERE ARE WE FALTERING?"')]
-    weak = F["weak"]
-    if not weak:
-        out.append(_p("No alert with at least 10 trades has negative EV in this sample."))
-        return out
-    out.append(_p("🔴 CURRENTLY WEAK ALERT FAMILIES (worst total loss first)"))
-    out.extend(_alert_table(weak, 8))
-    if len(weak) > 8:
-        out.append(_p(f"…and {len(weak) - 8} more (full list in section 16)."))
-    ready = [a for a in weak if a["n"] >= 30 and a["rank"] >= 2]
-    if ready and not F["low_trust"]:
-        text = ("Alerts with enough evidence to consider disabling: "
-                + ", ".join(a["name"] for a in ready[:5]) + ".\nOthers are still 'investigate' only.")
-    else:
-        text = ("These alerts are currently contributing negative results.\n\n"
-                "However, most have small samples.\n\n"
-                "➡️ They are \"investigate\" candidates.\n➡️ They are NOT yet \"disable\" candidates.")
-    out.append(_p("🧠 INTERPRETATION\n\n" + text))
-    return out
-
-def _sec_positive(F: Dict[str, Any], cfg) -> List[_Piece]:
-    out = [_hdr(6, '🟢 POSITIVE SIGNS — "WHERE ARE WE DOING BETTER?"')]
-    good = F["good"]
-    if not good:
-        out.append(_p("No alert with at least 10 trades has positive EV in this sample yet."))
-        return out
-    out.extend(_alert_table(good, 6))
-    validated = [a for a in good if a["rank"] == 4]
-    out.append(_p(
-        "🧠 INTERPRETATION\n\n"
-        + ("These alerts have produced positive EV in the current sample, but evidence is still weak.\n\n"
-           "➡️ Monitor.\n➡️ Do NOT increase their weight yet." if not validated
-           else "Validated: " + ", ".join(a["name"] for a in validated[:5])
-           + ".\nThe others remain 'monitor'.")
-    ))
-    return out
-
-def _sec_scorecard(F: Dict[str, Any], cfg) -> List[_Piece]:
-    out = [_hdr(7, '🚦 ALERT SCORECARD — "WHAT SHOULD I TRUST?"')]
-    validated = [a for a in F["good"] if a["rank"] == 4]
-    promising = [a for a in F["good"] if a["rank"] < 4]
-
-    def _group(title: str, names: List[str], empty: str = "None currently.") -> None:
-        body = "\n".join(_wrap_names(names)) if names else "   " + empty
-        out.append(_p(f"{title}\n{body}"))
-
-    _group("🟢 VALIDATED / ACTIONABLE", [a["name"] for a in validated])
-    _group("🟡 PROMISING — NEED MORE EVIDENCE", [a["name"] for a in promising])
-    _group("🔴 UNDERPERFORMING — INVESTIGATE", [a["name"] for a in F["weak"]])
-    thin = sorted(F["thin"], key=lambda a: -a["n"])
-    # Names omitted on purpose: 20–30 thin alerts bloat Telegram without aiding decisions.
-    _group(
-        f"⚪ INSUFFICIENT DATA ({len(thin)} alert types, <10 trades)",
-        [],
-        empty=f"{len(thin)} types — see archive report if needed.",
-    )
-    zero = len(F["alerts"]) - len(validated) - len(promising) - len(F["weak"]) - len(thin)
-    if zero > 0:
-        out.append(_p(f"➖ {zero} alert(s) with exactly zero net EV are not listed above."))
-    return out
-
-def _sec_sessions(F: Dict[str, Any], cfg) -> List[_Piece]:
-    out = [_hdr(8, "⏰ SESSION / TIME ANALYSIS")]
-    sess = F["sessions"]                                     # worst-first
-    if not sess:
-        out.append(_p("No session data yet."))
-        return out
-
-    best, worst = sess[-1][0], sess[0][0]
-    rows = [("", "SESSION", "WR", "TRADES", "STATUS")]
-    for name, swr, sn in sorted(sess, key=lambda t: -t[1]):
-        if name == best and len(sess) > 1:
-            emoji, tag = "🟡", "Best observed"
-        elif name == worst and len(sess) > 1:
-            emoji, tag = "🔴", "Weakest observed"
-        else:
-            emoji, tag = "⚪", ""
-        rows.append((emoji, name.upper(), f"{swr:.0%}", str(sn), tag))
-    out.extend(_c_split(_table(rows, "llrrl")))
-    if len(sess) > 1:
-        out.append(_p(f"🧠 Interpretation:\n\n{best.upper()} has performed better in this sample.\n\n"
-                      f"{worst.upper()} has performed worse."))
-    if F["low_trust"]:
-        out.append(_p(f"⚠️ Only {_fmt_days(F['days'])} are available, therefore session effects are "
-                      f"observations rather than confirmed conclusions."))
-    return out
-
-def _confidence_tier(value: Optional[float], high: float, medium: float) -> str:
-    """Map a 0-1 confidence-like score to a HIGH/MEDIUM/NOT READY tier.
-    None (score not computable yet, e.g. insufficient data) reports N/A
-    rather than a false NOT READY — those are different situations."""
-    if value is None:
-        return "⚪ N/A"
-    if value >= high:
-        return "🟢 HIGH"
-    if value >= medium:
-        return "🟡 MEDIUM"
-    return "🔴 NOT READY"
-
-
-def _confidence_breakdown(F: Dict[str, Any], cfg) -> List[Tuple[str, str, str]]:
-    """(axis, tier, detail) for the four independent confidence axes —
-    MODEL (classifier calibration), DATA (sample size), CHANGE (does a
-    candidate beat control with confidence), DEPLOYMENT (survived OOS and
-    currently stable). Kept separate rather than blended into one score:
-    a change can be HIGH-confidence on thin evidence, or well-evidenced but
-    not yet deployment-ready — one number hides exactly that distinction.
-    """
-    gate = F["gate"]
-    rows: List[Tuple[str, str, str]] = []
-
-    brier = F["ai"].get("brier_score")
-    if brier is None:
-        rows.append(("MODEL", "⚪ N/A", "no calibration data yet"))
-    else:
-        tier = "🟢 HIGH" if brier < 0.20 else "🟡 MEDIUM" if brier < 0.25 else "🔴 NOT READY"
-        rows.append(("MODEL", tier, f"Brier {brier:.2f}"))
-
-    rank = _evidence_rank(F["n"], F["days"])
-    days = F["days"]
-    if rank == 0 or (days is not None and days < 7):
-        data_tier = "🔴 NOT READY"
-    elif rank == 1:
-        data_tier = "🟡 MEDIUM"
-    else:
-        data_tier = "🟢 HIGH"
-    rows.append(("DATA", data_tier, f"{F['n']} trades, {_fmt_days(F['days'])}"))
-
-    p_thr = getattr(cfg, "BRAIN_EV_GATE_P_THRESHOLD", 0.85)
-    change_p = gate.get("profit_p_ev_positive")
-    ev_p5 = gate.get("ev_p5")
-    change_tier = _confidence_tier(change_p, high=p_thr, medium=max(0.0, p_thr - 0.15))
-    change_detail = (f"P(EV>0) {change_p:.0%}, EV p5 {ev_p5:+.2f}%"
-                      if change_p is not None and ev_p5 is not None else "insufficient data")
-    rows.append(("CHANGE", change_tier, change_detail))
-
-    oos_p = gate.get("oos_p_ev_positive")
-    deploy_tier = _confidence_tier(oos_p, high=0.70, medium=0.55)
-    deploy_detail = f"OOS P(EV>0) {oos_p:.0%}" if oos_p is not None else "walk-forward not run"
-    if gate.get("stability") is False:
-        deploy_tier = "🔴 NOT READY"
-        deploy_detail += ", active drift"
-    rows.append(("DEPLOYMENT", deploy_tier, deploy_detail))
-    return rows
-
-def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
-    g = F["gate"]
-    out = [_hdr(9, '🛡️ ACTION GATE — "CAN THE BRAIN SAFELY CHANGE ANYTHING?"')]
-    # Risk label shows the WINDOW and measured values so a FAIL is
-    _dd_pct = g.get("risk_drawdown_pct")
-    _dd_win = g.get("risk_window_hours", 24)
-    _dd_bud = g.get("risk_budget_pct", 3.0)
-    if _dd_pct is None:
-        _risk_label = f"Drawdown ({_dd_win}h: n/a)"
-    else:
-        _risk_label = f"Drawdown ({_dd_win}h: {_dd_pct:.1f}% / {_dd_bud:.1f}%)"
-
-    labels = [("data_quality", "Minimum trades"), ("oos_prediction", "OOS EV"),
-              ("profitability", "Net EV confidence"), ("stability", "CUSUM drift"),
-              ("risk", _risk_label), ("execution", "Cost assumptions")]
-    rows = [(f"{'🟢' if g.get(k) else '🔴'} {lab}:", "PASS" if g.get(k) else "FAIL")
-            for k, lab in labels]
-
-    out.extend(_c_split(_table(rows, "ll")))
-    out.append(_p("CONFIDENCE BREAKDOWN\n\n" + "\n".join(
-        f"{axis.ljust(12)}{tier}  ({detail})" for axis, tier, detail in _confidence_breakdown(F, cfg)
-    )))
-    out.append(_p(
-        "OVERALL:\n\n"
-
-        + ("🟢 BRAIN ACTION GATE = PASSED\n\nMeaning:\n\n\"The Brain's evidence is strong enough to "
-           "recommend specific changes to the live strategy.\""
-           if F["gate_ok"] else
-           "🔴 BRAIN ACTION GATE = BLOCKED\n\nMeaning:\n\n\"The Brain may analyse and recommend what "
-           "to investigate, but it is not sufficiently confident to modify the live strategy.\"")
-    ))
-    return out
-
-def _sec_reasoning_chain(F: Dict[str, Any], cfg) -> List[_Piece]:
-    """Roadmap #19 — explicit Brain decision narrative."""
-    out = [_hdr(1, 'BRAIN DECISION — "WHY THIS VERDICT?"')]
-    try:
-        n = int(F.get("n") or 0)
-        wr = float(F.get("wr") or 0.0)
-        net_ev = float(F.get("net_ev") or 0.0)
-        days = F.get("days")
-        gate = F.get("gate") or {}
-        ai = F.get("ai") or {}
-        conf = str(F.get("conf") or "LOW")
-
-        market_line = "regime tags limited in this window"
-        sessions = F.get("sessions") or []
-        # session_breakdown() returns (session, wr, n) tuples, worst first.
-        if sessions and isinstance(sessions[0], (tuple, list)) and len(sessions[0]) >= 3:
-            w_name, w_wr, w_n = sessions[0][0], float(sessions[0][1]), int(sessions[0][2])
-            market_line = f"weakest session={w_name} (WR={w_wr:.0%}, n={w_n})"
-        hist_line = (
-            f"n={n} trades over {_fmt_days(days)} | "
-            f"WR={wr:.0%} | Net EV/trade={net_ev:+.2f}%"
-        )
-
-        recent_wr, older_wr, recent_n = engine.detect_temporal_drift(F.get("rows") or [])
-        if recent_wr is not None and recent_n:
-            recent_line = (
-                f"Recent WR={float(recent_wr):.0%} (n={recent_n}) "
-                f"vs earlier {float(older_wr):.0%}"
-            )
-        else:
-            recent_line = "recent window not separately scored this report"
-        ece = ai.get("calibration_ece_mean")
-        if ece is None:
-            calib_line = "no calibration curve yet"
-        else:
-            ece_f = float(ece)
-            tag = "GOOD" if ece_f < 0.08 else "WATCH" if ece_f < 0.15 else "POOR"
-            calib_line = f"mean-per-alert ECE={ece_f:.3f} — {tag}"
-
-        oos_line = "PASS" if gate.get("oos_prediction") else "FAIL / unavailable"
-        drift_line = "NONE detected" if gate.get("stability") else "CUSUM drift active"
-        _ss = (ai.get("strategy_state") or {}).get("state")
-        _ss_text = {
-            "STRATEGY_DEGRADED": "strategy degraded (drop persists within the same regimes)",
-            "REGIME_UNDERREPRESENTED": "current regime underrepresented in history — not proof of decay",
-            "REGIME_SHIFT": "regime mix shifted to a weaker regime — expected dip",
-            "DEGRADED_REGIME_UNKNOWN": "WR fell; ADX data too thin to attribute",
-            "STABLE": "no significant WR drop",
-        }.get(_ss or "")
-        if _ss_text:
-            drift_line = f"{drift_line} | {_ss_text}"
-
-        if F.get("gate_ok") and net_ev > 0 and conf in ("MODERATE", "HIGH"):
-            decision = "APPROVED — evidence supports limited parameter change (still via shadow/plan)"
-        elif F.get("gate_ok"):
-            decision = "MONITOR — gate open but edge not strong enough to change live rules"
-        elif n < int(getattr(cfg, "ACTION_GATE_MIN_ROWS", 100)):
-            decision = "BLOCKED — insufficient sample for any live change"
-        elif not gate.get("stability"):
-            decision = "BLOCKED — drift detected; freeze parameter changes"
-        else:
-            decision = "BLOCKED — action gate not satisfied (see ACTION GATE)"
-
-        lines = [
-            f"Market:      {market_line}",
-            f"Historical:  {hist_line}",
-            f"Recent:      {recent_line}",
-            f"Calibration: {calib_line}",
-            f"OOS:         {oos_line}",
-            f"Drift:       {drift_line}",
-            f"Decision:    {decision}",
-        ]
-        out.append(_c("\n".join(lines)))
-        out.append(_p(
-            "Hard signal rules are unchanged. This block only states the Brain's "
-            "quality assessment and whether any plan is allowed to proceed."
-        ))
-    except Exception as e:
-        out.append(_p(f"Reasoning chain unavailable: {type(e).__name__}"))
-    return out
-
-_REPORT_SECTIONS = (
-    ("BRAIN DECISION", _sec_reasoning_chain),
-    ("EXECUTIVE SUMMARY", _sec_summary),
-    ("WHAT TO DO NOW", _sec_do_now),
-    ("PROFITABILITY", _sec_profit),
-    ("LOSS DIAGNOSIS", _sec_loss),
-    ("POSITIVE SIGNS", _sec_positive),
-    ("ALERT SCORECARD", _sec_scorecard),
-    ("SESSION ANALYSIS", _sec_sessions),
-    ("ACTION GATE", _sec_gate),
-)
-
-def build_brain_report_sections(recs: Dict[str, Any], cfg) -> Tuple[List[List["_Piece"]], str]:
-    """Compute the 16 report sections once. Returns (sections, stamp); each
-    section is a list of rendered pieces. An individual failing section is
-    replaced by a notice; the call raises only if the shared facts cannot
-    be computed."""
-    F = _collect_facts(recs, cfg)
-    stamp = datetime.now(_IST).strftime("%d %b %Y | %H:%M IST").upper()
-    sections: List[List[_Piece]] = []
-    failed: List[str] = []
-    for i, (name, fn) in enumerate(_REPORT_SECTIONS, 1):
-        try:
-            sections.append(fn(F, cfg))
-        except Exception as e:
-            _report_section_failed(failed, name, e)
-            sections.append([_hdr(i, name), _p("⚠️ This section is unavailable (analysis error — see logs).")])
-    return sections, stamp
-
-def render_report_messages(sections: List[List[_Piece]], stamp: str) -> List[str]:
-    """Pack the sections into Telegram-ready MarkdownV2 messages..."""
-    msgs: List[str] = []
-    
-    # Explicitly type as str to allow f-string reassignments later
-    cur: str = _p(f"{'═' * 30}\n🧠 BRAIN REPORT\n{stamp}\n{'═' * 30}")
-    
-    def _flush() -> None:
-        nonlocal cur
-        if cur:
-            msgs.append(cur)
-            cur = ""
-            
-    for idx, pieces in enumerate(sections, 1):
-        if len(pieces) > 1:                            # never strand a header from its body
-            # Combine header and first body piece.
-            # FIX 1: Use \n\n for proper Telegram paragraph spacing.
-            # FIX 2: Set kind="p" so render_report_markdown() doesn't 
-            # accidentally format the body text as a Markdown heading (##).
-            combined_rendered = f"{pieces[0]}\n\n{pieces[1]}"
-            combined_raw = f"{pieces[0].raw}\n\n{pieces[1].raw}"
-            combined = _Piece(combined_rendered, "p", combined_raw)
-            pieces = [combined] + pieces[2:]
-            
-        # RESTORED: Original optimization to keep small sections intact
-        whole = "\n\n".join(pieces)
-        if cur and len(cur) + len(whole) + 2 > _MSG_LIMIT and len(whole) <= _MSG_LIMIT:
-            _flush()                                   # small section: start a fresh message
-            
-        for piece in pieces:
-            if cur and len(cur) + len(piece) + 2 > _MSG_LIMIT:
-                _flush()
-            cur = f"{cur}\n\n{piece}" if cur else piece
-
-        if idx == _HUMAN_SECTIONS:
-            divider = _p("▼ CONTEXT (sessions · gate) ▼")
-            if cur and len(cur) + len(divider) + 2 > _MSG_LIMIT:
-                _flush()
-            cur = f"{cur}\n\n{divider}" if cur else divider
-            
-    tail = _p(f"{'═' * 30}\nEND OF BRAIN REPORT\n{'═' * 30}")
-    if cur and len(cur) + len(tail) + 2 <= _MSG_LIMIT:
-        cur = f"{cur}\n\n{tail}"
-    else:
-        _flush()
-        cur = tail
-    _flush()
-    return msgs
-
-def _md_prose(raw: str) -> str:
-    """Plain prose -> Markdown: keep line breaks, neutralise * _ ` and \\."""
-    text = raw.replace("\\", "\\\\")
-    for ch in ("*", "_", "`"):
-        text = text.replace(ch, "\\" + ch)
-    paragraphs = [p.replace("\n", "  \n") for p in text.split("\n\n")]
-    return "\n\n".join(paragraphs)
-
-
-def render_report_markdown(sections: List[List[_Piece]], stamp: str) -> str:
-    """The same report as a Markdown document (for the reports/ archive):
-    no Telegram escaping, real headings, tables kept as code blocks."""
-    out: List[str] = [f"# 🧠 Brain Report — {stamp}"]
-    for idx, pieces in enumerate(sections, 1):
-        for piece in pieces:
-            kind = getattr(piece, "kind", "p")
-            raw = getattr(piece, "raw", str(piece))
-            if kind == "h":
-                out.append("## " + raw)
-            elif kind == "c":
-                out.append("```\n" + raw + "\n```")
-            else:
-                out.append(_md_prose(raw))
-        if idx == _HUMAN_SECTIONS:
-            out.append("---\n\n*Context: sessions and action gate.*")
-    out.append("---\n\n*End of Brain report.*")
-    return "\n\n".join(out) + "\n"
-
-
-def build_brain_report(recs: Dict[str, Any], cfg) -> List[str]:
-    """Convenience wrapper: sections -> Telegram messages."""
-    sections, stamp = build_brain_report_sections(recs, cfg)
-    return render_report_messages(sections, stamp)
-
-class BrainEngineV2(BaseBrainEngine):
-    """Drop-in replacement for BrainEngine. Inherits the original and adds
-    prescriptive phases 1.5-6 plus actionability scoring."""
 
     def __init__(self, sdb: RedisStateStore):
-        super().__init__(sdb)
+        BrainCore.__init__(self, sdb)
         self._phase_samples = _PHASE_MIN_SAMPLES
         self._recs_cache: Optional[Dict[str, Any]] = None
         self._recs_cache_ts: float = 0.0
-        self._repair_success_rates: Dict[str, Dict[str, float]] = {}
-        self._ledger_stats: Dict[str, Any] = {}
-        self._repair_help_preds: Dict[str, float] = {}
-        self._rows_cache: Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]] = None
-        self._recent_rows_cache: Optional[List[Dict[str, Any]]] = None
-        self._layered_rows_cache: Optional[Tuple[
-            List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]
-        ]] = None
 
     @staticmethod
     def _shadow_weight_check(
@@ -1346,7 +287,7 @@ class BrainEngineV2(BaseBrainEngine):
             self._layered_rows_cache = result
             return result
 
-        result = await super()._get_layered_window_rows()
+        result = await BrainCore._get_layered_window_rows(self)
         self._layered_rows_cache = result
         return result
 
@@ -1447,1159 +388,7 @@ class BrainEngineV2(BaseBrainEngine):
         # ── Phase timer — one INFO line per phase so a slow report can be
         # diagnosed from the workflow log without a profiler. Overhead is
         # one time.time() call per mark; negligible against the phases. ──
-        _phase_t0 = time.time()
-        def _phase_mark(_label: str) -> None:
-            nonlocal _phase_t0
-            _now = time.time()
-            logger.info(f"⏱️ Brain phase '{_label}': {_now - _phase_t0:.2f}s")
-            _phase_t0 = _now
-
-        # ── 0. Baseline (original brain logic) ───────────────────────────
-        base_recs = await self._generate_baseline_recommendations()
-        logger = logging.getLogger("macd_bot")
-        _phase_mark("baseline")
-        real_rows = base_recs.get("_real_rows", [])
-        shadow_rows = base_recs.get("_shadow_rows", [])
-        # ════════════════════════════════════════���═════════════════════════
-        #  BRAIN AUDIT LAYER — initialize and validate data population
-        # ══════════════════════���════════════════���══════════════════════════  
-        audit = get_audit()  # keep coverage/reconciliation set during baseline
-
-        # History coverage was already set in _generate_baseline_recommendations
-        long_days = getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180)
-        history = audit._history
-
-        # Log coverage warning (structured, replaces the old ad-hoc warning)
-        if history and history.coverage in (DataCoverage.SEVERELY_LIMITED, DataCoverage.CRITICAL):
-            logger.warning(
-                f"⚠️ Brain audit: DATA COVERAGE = {history.coverage.value}. "
-                f"Requested {long_days}d, have {history.actual_days:.1f}d. "
-                f"Multi-window analyses will be suppressed or degraded."
-            )
-        recommendations: List[Dict[str, Any]] = list(base_recs.get("recommendations", []))
-        config_patch: List[Dict[str, Any]] = list(base_recs.get("config_patch", []))
-        ai_metrics: Dict[str, Any] = dict(base_recs.get("ai_metrics", {}))
-
-        min_sample = getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
-        disable_wr = getattr(cfg, "BRAIN_ALERT_DISABLE_THRESHOLD_WR", 0.40)
-        star_wr = getattr(cfg, "BRAIN_STAR_ALERT_WR", 0.70)
-        max_weight_delta = getattr(cfg, "BRAIN_WEIGHT_OPTIMIZER_MAX_DELTA", 2.0)
-        wf_weight_opt = getattr(cfg, "BRAIN_WEIGHT_OPTIMIZER_WALK_FORWARD", True)
-
-        # ── Repair Ledger: close the loop on past repairs ────────────────
-        try:
-            fresh = await evaluate_pending_repairs(
-                self.sdb, real_rows, horizon_hours=48, min_outcomes=30,
-            )
-            if fresh:
-                logger.info(f"📒 Repair ledger: evaluated {len(fresh)} pending repair(s)")
-
-            # ── Auto-rollback: clear dynamic weights if a weight repair hurt ──
-            if getattr(cfg, "BRAIN_AUTO_ROLLBACK_HURT", True) and fresh:
-                weight_categories = {
-                    "weight_optimizer",
-                    "dynamic_weights",
-                    "confluence_weights",
-                    "vote_weights",
-                }
-                hurt_weight_repairs = [
-                    e for e in fresh
-                    if e.get("verdict") == "hurt"
-                    and (
-                        e.get("category") in weight_categories
-                        or e.get("type") in weight_categories
-                        or "weight" in str(e.get("type", "")).lower()
-                        or "weight" in str(e.get("category", "")).lower()
-                    )
-                ]
-                if hurt_weight_repairs:
-                    cleared = await self.sdb.clear_dynamic_weights()
-                    ids = [
-                        e.get("id") or e.get("repair_id")
-                        for e in hurt_weight_repairs
-                    ]
-                    logger.warning(
-                        f"↩️ Auto-rollback: cleared dynamic_weights after "
-                        f"{len(hurt_weight_repairs)} hurt repair(s): {ids} "
-                        f"(cleared={cleared})"
-                    )
-                    for e in hurt_weight_repairs:
-                        e["auto_rolled_back"] = True
-                        e["rolled_back_at"] = int(time.time())
-                    await self._record_plan_event(
-                        f"repair:{ids[0]}" if ids and ids[0] else "repair:unknown",
-                        "rolled_back",
-                        f"dynamic_weights cleared after hurt repair(s) {ids}",
-                    )
-
-            # ── Objective post-apply harm monitor (roadmap #6) ──
-            _mon = await self.monitor_applied_plans(real_rows, logger)
-            if _mon:
-                ai_metrics["apply_monitor"] = _mon
-                for _ev in _mon:
-                    if _ev["status"] == "rolled_back":
-                        _e = _ev["evidence"]
-                        recommendations.append({
-                            "type": "auto_rollback", "severity": "high",
-                            "message": (
-                                f"↩️ Auto-rolled back plan {_ev['plan_id']}: WR "
-                                f"{_e['wr_pre']:.0%}→{_e['wr_post']:.0%} after apply "
-                                f"(p={_e['p_value']}, n={_e['n_post']}/{_e['n_pre']})."
-                                + (" Config overrides need a restart to take effect."
-                                   if _ev.get("needs_restart") else "")
-                            ),
-                        })
-                    elif _ev["status"] == "rollback_withheld":
-                        recommendations.append({
-                            "type": "auto_rollback", "severity": "low",
-                            "message": (
-                                f"ℹ️ Plan {_ev['plan_id']} shows a post-apply WR drop but "
-                                f"auto-rollback was withheld: {_ev['reason']}."
-                            ),
-                        })
-
-            # ── Champion/challenger: periodic promotion check. force=False
-            # always, so this stays a no-op reporting "shadow_only_requires_force"
-            # while CHALLENGER_SHADOW_ONLY is True — promotion still requires
-            # an explicit force=True call elsewhere, this just makes the
-            # gate's decision visible every report cycle instead of the
-            # challenger sitting unchecked in Redis indefinitely. ──
-            if getattr(cfg, "ENABLE_CHAMPION_CHALLENGER", False):
-                try:
-                    promo = await self.maybe_promote_challenger()
-                    if promo.get("promoted"):
-                        logger.warning(
-                            f"🏆 Challenger promoted to champion (live "
-                            f"dynamic_weights): {promo.get('meta')}"
-                        )
-                        ai_metrics["challenger_promotion"] = promo
-                    elif promo.get("reason") != "no_challenger":
-                        logger.info(f"🧪 Challenger not promoted: {promo.get('reason')}")
-                except Exception as e:
-                    logger.warning(f"Challenger promotion check failed: {e}")
-
-            self._repair_success_rates = await repair_success_rates(self.sdb)
-            self._ledger_stats = await ledger_stats(self.sdb)
-            ai_metrics["repair_ledger"] = dict(self._ledger_stats)
-        except Exception as e:
-            audit.record_analysis_exception("repair_ledger", e)
-            self._repair_success_rates = {}
-            self._ledger_stats = {}
-        _phase_mark("repair_ledger")
-
-        # ── ML: contextual repair-effectiveness model ───────────────────
-        # Learns P(repair helps | system state) from resolved ledger entries,
-        # then annotates each new repair with that probability below.
-        try:
-            ledger_entries = await load_ledger_entries(self.sdb)
-            current_state = {
-                "overall_wr": (
-                    sum(1 for r in real_rows if r["win"]) / len(real_rows)
-                ) if real_rows else None,
-                "n": len(real_rows),
-                "net_ev": ai_metrics.get("net_ev"),
-                "brier": ai_metrics.get("brier_score"),
-            }
-            rem = engine.learn_repair_effectiveness(
-                ledger_entries, current_state, min_records=50,
-            )
-            if rem.get("valid"):
-                self._repair_help_preds = rem["p_help_by_category"]
-                ai_metrics["repair_effectiveness_model"] = rem
-        except Exception as e:
-            audit.record_analysis_exception("repair_effectiveness_model", e)
-            self._repair_help_preds = {}
-
-        # ── REPAIR SHOP (runs first — highest priority) ──────────────────
-        drift_alerts = [r for r in recommendations if r.get("type") == "cusum_drift"]
-        repairs = engine.repair_shop_diagnosis(
-            real_rows, drift_alerts,
-            config={
-                "CONFLUENCE_MIN_ABS_SCORE": cfg.CONFLUENCE_MIN_ABS_SCORE,
-                "CONFLUENCE_MIN_PCT": cfg.CONFLUENCE_MIN_PCT,
-            },
-            target_wr=cfg.MIN_WIN_RATE,
-            disable_wr=disable_wr,
-            min_sample=min_sample,
-        )
-        for repair in repairs:
-            wrapped = {
-                "type": "repair_shop",
-                "severity": repair["severity"],
-                "category": repair["category"],
-                "message": (
-                    f"🔧 [{repair['category'].upper()}] {repair['diagnosis']}\n"
-                    f"   → {repair['action']}\n"
-                    f"   Impact: {repair['expected_impact']}"
-                ),
-                # ── FDR: carry the p-value through for the BH pass ──
-                "p_value": repair.get("p_value"),
-                "posterior": repair.get("posterior"),
-                # ── Scope: the subset of trades this repair can affect.
-                "scope": repair.get("scope"), 
-                "version_before": repair.get("version_before"),
-                "version_after": repair.get("version_after"),
-                "delta_wr": repair.get("delta_wr"),
-                # Wiring #4: mechanical config-patch fields, when present.
-                "config_field": repair.get("config_field"),
-                "config_current": repair.get("config_current"),
-                "config_suggested": repair.get("config_suggested"),
-            }
-            # ── ML: annotate with learned P(helps) for this category ──
-            cat = repair.get("category")
-            if cat in self._repair_help_preds:
-                wrapped["p_helps_learned"] = self._repair_help_preds[cat]
-
-            # ── Ledger: record the issue with a pre-repair snapshot.
-            # real_rows lets the ledger compute scope_wr/scope_n so the
-            # verdict later compares like-for-like on the affected subset
-            # rather than the whole book. ──
-            try:
-                snapshot = {
-                    "overall_wr": (sum(1 for r in real_rows if r["win"]) / len(real_rows))
-                                   if real_rows else None,
-                    "n": len(real_rows),
-                    "net_ev": ai_metrics.get("net_ev"),
-                    "brier": ai_metrics.get("brier_score"),
-                }
-                rid = await record_repair_issued(
-                    self.sdb, wrapped, snapshot, real_rows=real_rows,
-                )
-                if rid:
-                    wrapped["_repair_id"] = rid
-            except Exception as e:
-                audit.record_analysis_exception("repair_ledger_write", e)          
-            recommendations.append(wrapped)
-
-        _phase_mark("repair_shop")
-
-        # ── Wiring #3: change-point regression → concrete revert patch ──
-        for repair in repairs:
-            if repair.get("category") != "config_regression_pinpoint":
-                continue
-            if (repair.get("delta_wr") or 0) >= 0:
-                continue  # only regressions warrant a revert
-            version_before = repair.get("version_before")
-            version_after = repair.get("version_after")
-            if not version_before or version_before == version_after:
-                continue
-            prior = await self._lookup_config_version(version_before)
-            if not prior:
-                continue
-            for field in CONFIG_OVERRIDE_ALLOWED_FIELDS:
-                prior_val = prior.get(field)
-                current_val = getattr(cfg, field, None)
-                if prior_val is None or current_val is None:
-                    continue
-                if prior_val == current_val:
-                    continue
-                config_patch.append({
-                    "path": field,
-                    "current": current_val,
-                    "suggested": prior_val,
-                    "reason": (
-                        f"Revert to config version {version_before}: WR fell "
-                        f"{repair.get('delta_wr', 0):+.0%} at the change point."
-                    ),
-                    "_source_category": "config_regression_pinpoint",
-                })
-
-        _phase_mark("wiring_and_config_regression")
-
-        # ── Phase 1.5: Vote Weight Optimizer (FIXED) ─────────────────────
-        _wopt_ok, _wopt_why = audit.can_run("weight_optimizer")
-        if not _wopt_ok:
-            audit.record_analysis(
-                "weight_optimizer", HealthStatus.INSUFFICIENT_DATA,
-                detail=_wopt_why,
-            )
-        if _wopt_ok and len(real_rows) >= self._phase_samples["weight_optimizer"]:
-            wopt = optimize_vote_weights(
-                real_rows, CONFLUENCE_WEIGHTS,
-                min_sample=self._phase_samples["weight_optimizer"],
-                walk_forward=wf_weight_opt,
-                max_weight_delta=max_weight_delta,
-            )
-
-            if wopt.get("valid"):
-                changed = wopt.get("changed_votes", [])
-                wf_status = "✅ WF-validated" if wopt.get("walk_forward_passed") else "⚠️ No WF data"
-                conf_label = wopt.get("confidence_label", "LOW")
-                conf_score = wopt.get("confidence", 0.0)
-
-                # FIX: read the configured floor instead of hardcoding 0.4
-                min_conf = getattr(cfg, "BRAIN_WEIGHT_OPTIMIZER_MIN_CONFIDENCE", 0.4)
-
-                # ── FIX (Priority 4): OOS veto through the SAME effective
-                oos_weight_ok = True
-                oos_weight_note = ""
-                oos_test_ran = False
-                if wopt.get("walk_forward_passed") and len(real_rows) >= 200:
-                    train_rows_wf, holdout_rows_wf = engine.walk_forward_split(real_rows)
-                    if len(holdout_rows_wf) >= 20:
-                        min_pct = getattr(cfg, "CONFLUENCE_MIN_PCT", 60.0)
-                        abs_floor = getattr(cfg, "CONFLUENCE_MIN_ABS_SCORE", 18.0)
-
-                        def _kept_at(rows, weights):
-                            kept = []
-                            for r in rows:
-                                votes = r.get("votes")
-                                if not votes:
-                                    continue
-                                score = sum(w for vn, w in weights.items() if votes.get(vn))
-                                total = sum(w for vn, w in weights.items() if vn in votes)
-                                if total <= 0:
-                                    continue
-                                required = max(abs_floor, total * (min_pct / 100.0))
-                                if score >= required:
-                                    kept.append(r)
-                            return kept
-
-                        cur_kept = _kept_at(holdout_rows_wf, CONFLUENCE_WEIGHTS)
-                        sug_kept = _kept_at(holdout_rows_wf, wopt["suggested_weights"])
-                        if len(cur_kept) >= 10 and len(sug_kept) >= 10:
-                            oos_test_ran = True
-                            cur_ev_oos, _, _ = engine.ev_and_kelly_for(cur_kept)
-                            sug_ev_oos, _, _ = engine.ev_and_kelly_for(sug_kept)
-                            if sug_ev_oos < cur_ev_oos - 0.01:
-                                oos_weight_ok = False
-                                oos_weight_note = (
-                                    f"OOS veto: suggested EV {sug_ev_oos:+.3f}% < "
-                                    f"current {cur_ev_oos:+.3f}%"
-                                )
-                            else:
-                                oos_weight_note = (
-                                    f"OOS pass: suggested EV {sug_ev_oos:+.3f}% vs "
-                                    f"current {cur_ev_oos:+.3f}%"
-                                )
-                        else:
-                            oos_weight_note = (
-                                f"OOS EV test skipped: gate-empty arms "
-                                f"(cur={len(cur_kept)}, sug={len(sug_kept)})"
-                            )
-                    else:
-                        oos_weight_note = (
-                            f"OOS EV test skipped: holdout too thin "
-                            f"({len(holdout_rows_wf)} rows after split)"
-                        )
-
-                # ── Shadow out-of-sample veto ─────────────────────
-                shadow_weight_ok, shadow_weight_note = True, ""
-                if (wopt.get("walk_forward_passed") and conf_score >= min_conf
-                and len(shadow_rows) >= 15 and oos_weight_ok):
-                    shadow_weight_ok, shadow_weight_note = self._shadow_weight_check(
-                        shadow_rows, CONFLUENCE_WEIGHTS,
-                        wopt["suggested_weights"],
-                    )        
-
-                # ── Emit recommendation (NOW oos_weight_note is defined) ──
-                if changed:
-                    change_strs = [f"{k}: {old:.1f}→{new:.1f}" for k, old, new in changed[:6]]
-                    extra = f" (+{len(changed)-6} more)" if len(changed) > 6 else ""
-                    oos_note = f"\n{oos_weight_note}" if oos_weight_note else ""
-                    recommendations.append({
-                        "type": "weight_optimizer",
-                        "severity": "high" if conf_score > 0.6 else "medium",
-                        "message": (
-                            f"🧮 Weight Optimizer (n={wopt['n_samples']}, {wf_status}, "
-                            f"confidence {conf_label} {conf_score:.0%}):\n"
-                            f"   Changes: {', '.join(change_strs)}{extra}\n"
-                            f"   Max delta/cycle: ±{max_weight_delta}"
-                            f"{oos_note}"
-                        ),
-                        "delta_ev": 0.0,
-                        "wilson_lo": max(0.0, 0.5 - conf_score * 0.2),
-                        "wilson_hi": min(1.0, 0.5 + conf_score * 0.2),
-                    })
-
-                oos_test_ran_and_passed = oos_test_ran and oos_weight_ok
-
-                if not changed:
-                    recommendations.append({
-                        "type": "weight_optimizer",
-                        "severity": "low",
-                        "message": f"🧮 Weight Optimizer: no significant changes detected (n={wopt['n_samples']}).",
-                    })
-                elif (wopt.get("walk_forward_passed")
-                    and oos_test_ran_and_passed
-                    and conf_score >= min_conf):
-
-                    # Shadow is now subordinate: if it vetoes but OOS EV strictly improved,
-                    # we still approve but flag the divergence for human review.
-                    if shadow_weight_ok:
-                        shadow_note = f"Shadow✅ {shadow_weight_note}"
-                    else:
-                        shadow_note = f"Shadow⚠️ vetoed ({shadow_weight_note}) but OOS EV strictly improved, so approving."
-
-                    if getattr(cfg, "ENABLE_CHAMPION_CHALLENGER", False):
-                        # Store as challenger only — does not enter pending live plan
-                        meta = {
-                            "source": "weight_optimizer",
-                            "n_oos": int(wopt.get("n_oos") or wopt.get("n_samples") or 0),
-                            "net_ev": wopt.get("net_ev"),
-                            "champion_net_ev": wopt.get("baseline_net_ev"),
-                            "shadow_only": bool(getattr(cfg, "CHALLENGER_SHADOW_ONLY", True)),
-                            "confidence": conf_score,
-                        }
-                        ok = await self.sdb.set_challenger_weights(
-                            wopt["suggested_weights"], meta=meta,
-                        )
-                        recommendations.append({
-                            "type": "weight_optimizer",
-                            "severity": "medium",
-                            "message": (
-                                f"🧪 Challenger weights stored (shadow only), "
-                                f"not applied live. ok={ok}, n={meta['n_oos']}, "
-                                f"conf={conf_score:.0%}. {oos_weight_note}"
-                            ),
-                        })
-                    else:
-                        config_patch.append({
-                            "path": "CONFLUENCE_WEIGHTS",
-                            "current": dict(CONFLUENCE_WEIGHTS),
-                            "suggested": wopt["suggested_weights"],
-                            "reason": (
-                                f"Logistic-regression optimal ({wf_status}, conf={conf_score:.2f}). "
-                                f"{oos_weight_note}. {shadow_note}"
-                            ),
-                        })
-                else:
-                    if not wopt.get("walk_forward_passed"):
-                        reason = "walk-forward FAILED"
-                    elif len(real_rows) < 200:
-                        reason = (
-                            f"deployed-population OOS veto requires ≥200 rows "
-                            f"(have {len(real_rows)}). Weight changes need more "
-                            f"trade history before the Brain will move them."
-                        )
-                    elif not oos_test_ran_and_passed:
-                        reason = (
-                            f"OOS EV test did not pass. {oos_weight_note}"
-                        )
-                    elif conf_score < min_conf:
-                        reason = f"confidence too low ({conf_score:.2f} < {min_conf:.2f})"
-                    else:
-                        reason = "unknown — all gates passed but patch not emitted"
-                    recommendations.append({
-                        "type": "weight_optimizer_blocked",
-                        "severity": "low",
-                        "message": (
-                            f"🛡️ Weight changes BLOCKED: {reason}. "
-                            f"Keeping current weights. "
-                            f"Accumulate more data or reduce max_weight_delta."
-                        ),
-                    })
-                if wopt.get("negative_votes"):
-                    recommendations.append({
-                        "type": "negative_votes",
-                        "severity": "medium",
-                        "message": (
-                            f"⚠️ Harmful votes (negative logistic coefficients): "
-                            f"{', '.join(f'{v}({c:+.3f})' for v, c in wopt['negative_votes'][:4])}. "
-                            f"Consider disabling or reducing their weights."
-                        ),
-                    })
-
-            elif wopt.get("error") == "walk_forward_degraded":
-                recommendations.append({
-                    "type": "weight_optimizer_blocked",
-                    "severity": "medium",
-                    "message": (
-                        f"🛡️ Weight Optimizer REJECTED by walk-forward: "
-                        f"holdout WR {wopt.get('holdout_wr', 0):.0%} < "
-                        f"baseline {wopt.get('baseline_holdout_wr', 0):.0%}. "
-                        f"Current weights are better. No changes applied."
-                    ),
-                })
-        _phase_mark("weight_optimizer")
-
-        # ─ Per-alert breakdown ───────────────────────────────���──────────
-        alert_stats = engine.per_alert_breakdown(real_rows, min_sample=min_sample)
-        if alert_stats:
-            display = alert_stats if len(alert_stats) <= 10 else alert_stats[:5] + alert_stats[-5:]
-            msg_parts = []
-            for idx, (ak, wr, cnt, avg_s) in enumerate(display):
-                if len(alert_stats) > 10 and idx == 5:
-                    msg_parts.append(f"... ({len(alert_stats) - 10} more) ...")
-                flag = " 🔴" if wr < disable_wr else (" 🟢" if wr >= star_wr else "")
-                msg_parts.append(f"{ak}: {wr:.0%} WR (n={cnt}, avg score {avg_s:.1f}){flag}")
-            recommendations.append({
-                "type": "per_alert_breakdown", "severity": "low",
-                "data": alert_stats,
-                "message": "Per-alert breakdown:\n" + "\n".join(msg_parts),
-            })
-
-        _phase_mark("per_alert_breakdown")
-
-        # ── Phase 2: Parameter Autopsy ─────────────────────────────────
-        if real_rows and any("context" in r for r in real_rows):
-            PARAM_ALERT_MAP = {
-                "ppo_adaptive_threshold": ["ppo_adaptive_up", "ppo_adaptive_down"],
-                "rsi_adaptive_buy": ["rsi_ema5_up", "rsi_cross_adaptive_up"],
-                "rsi_adaptive_sell": ["rsi_ema5_down", "rsi_cross_adaptive_down"],
-                "buy_wick_ratio": ["strong_reversal_buy", "hist_rma_buy", "ppohist_buy", "tk_conversion_up", "kijun_cross_up"],
-                "sell_wick_ratio": ["strong_reversal_sell", "hist_rma_sell", "ppohist_sell", "tk_conversion_down", "kijun_cross_down"],
-            }
-            params_higher_worse = {
-                "rsi_adaptive_buy": True,
-                "rsi_adaptive_sell": False,
-                "ppo_adaptive_threshold": True,
-                "buy_wick_ratio": True,
-                "sell_wick_ratio": True,
-            }
-            for param, higher_is_worse in params_higher_worse.items():
-                if len(real_rows) < self._phase_samples["parameter_autopsy"]:
-                    break
-                autopsy = engine.parameter_autopsy(
-                    real_rows, param,
-                    min_sample=self._phase_samples["parameter_autopsy"],
-                    higher_is_worse=higher_is_worse,
-                )
-                if not autopsy.get("valid") or autopsy.get("optimal_cutoff") is None:
-                    continue
-                last_bucket = autopsy["buckets"][-1]
-                if last_bucket["wilson_hi"] < cfg.MIN_WIN_RATE:
-                    affected = PARAM_ALERT_MAP.get(param, [])
-                    alert_hint = f" (affects: {', '.join(affected[:3])})" if affected else ""
-                    recommendations.append({
-                        "type": "parameter_autopsy",
-                        "severity": "high",
-                        "param": param,
-                        "message": (
-                            f"🎚️ {param}{alert_hint}: trades above {autopsy['optimal_cutoff']:.2f} "
-                            f"show {last_bucket['wr']:.0%} WR (n={last_bucket['n']}). "
-                            f"Consider tightening to ≤{autopsy['optimal_cutoff']:.2f}."
-                        ),
-                        "delta_ev": max(0.0, cfg.MIN_WIN_RATE - last_bucket["wr"]),
-                        "wilson_lo": last_bucket["wilson_lo"],
-                        "wilson_hi": last_bucket["wilson_hi"],
-                        # ── FDR: one-sample test against MIN_WIN_RATE ──
-                        "n": last_bucket["n"],
-                        "wr": last_bucket["wr"],
-                    })
-                    config_path = None
-                    if param == "ppo_adaptive_threshold":
-                        config_path = "PPO_ADAPTIVE_VOLATILE" if higher_is_worse else "PPO_ADAPTIVE_CALM"
-                    elif param == "rsi_adaptive_buy":
-                        config_path = "RSI_ADAPTIVE_BUY_VOLATILE"
-                    elif param == "rsi_adaptive_sell":
-                        config_path = "RSI_ADAPTIVE_SELL_VOLATILE"
-                    if config_path and config_path not in {p["path"] for p in config_patch}:
-                        config_patch.append({
-                            "path": config_path,
-                            "current": getattr(cfg, config_path, None),
-                            "suggested": round(autopsy["optimal_cutoff"], 3),
-                            "reason": f"Parameter autopsy: WR drops above {autopsy['optimal_cutoff']:.2f}",
-                        })
-
-        _phase_mark("parameter_autopsy")
-
-        # ── Phase 3: Conditional Alert Gating ────────────────────────────
-        if real_rows and len(real_rows) >= self._phase_samples["conditional_gating"]:
-            ak_counts: Dict[str, int] = defaultdict(int)
-            for r in real_rows:
-                ak_counts[r["alert_key"]] += 1
-            top_aks = sorted(ak_counts, key=lambda k: -ak_counts[k])[:5]
-            conditions = [("adx_val", 25.0), ("rsi_curr", 50.0), ("buy_wick_ratio", 0.3)]
-            for ak in top_aks:
-                for cond_field, cond_thr in conditions:
-                    cp = conditional_performance(real_rows, ak, cond_field, cond_thr,
-                                                 min_sample=self._phase_samples["conditional_gating"])
-                    if cp.get("valid") and cp["recommendation"] != "neutral":
-                        recommendations.append({
-                            "type": "conditional_gating",
-                            "severity": "medium",
-                            "message": (
-                                f"🔀 {ak} under {cond_field}: "
-                                f"{cp['above']['wr']:.0%} when >{cond_thr} vs "
-                                f"{cp['below']['wr']:.0%} when ≤{cond_thr}. "
-                                f"→ {cp['recommendation']}."
-                            ),
-                            "delta_ev": abs(cp["gap"]),
-                            "wilson_lo": min(cp["above"]["wilson_lo"], cp["below"]["wilson_lo"]),
-                            "wilson_hi": max(cp["above"]["wilson_hi"], cp["below"]["wilson_hi"]),
-                            # ── FDR: two-proportion test, above vs below ──
-                            "above_n": cp["above"]["n"],
-                            "above_wr": cp["above"]["wr"],
-                            "below_n": cp["below"]["n"],
-                            "below_wr": cp["below"]["wr"],
-                        })
-
-        _phase_mark("conditional_gating")
-
-        # ── Phase 4: Vote Interaction Miner ──────────────────────────────
-        if len(real_rows) >= self._phase_samples["vote_interactions"]:
-            interactions = interaction_miner(real_rows, min_sample=self._phase_samples["vote_interactions"])
-            for inter in interactions[:5]:
-                v1, v2 = inter["pair"]
-                if inter["type"] == "synergy":
-                    # wr_only_v2 may be absent when the v2-alone arm was too
-                    # thin to clear min_sample — the corrected miner drops
-                    # the key entirely rather than fabricating a 0.0. Format
-                    # the message defensively so a missing key doesn't crash
-                    # the report.
-                    _v2_alone_str = (
-                        f", {v2}={inter['wr_only_v2']:.0%}"
-                        if "wr_only_v2" in inter else ""
-                    )
-                    recommendations.append({
-                        "type": "vote_interaction", "kind": "synergy", "severity": "low",
-                        "message": (
-                            f"🔗 Synergy: {v1}+{v2} = {inter['wr_both']:.0%} WR "
-                            f"(n={inter['n_both']}). Alone: {v1}={inter['wr_only_v1']:.0%}"
-                            f"{_v2_alone_str}."
-                        ),
-                        "delta_ev": abs(inter["delta"]),
-                        # ── FDR: p_value stamped by the miner directly ──
-                        "p_value": inter.get("p_value"),
-                    })
-                else:
-                    poisoner, victim = inter["poisoner"], inter["victim"]
-                    wr_victim_alone = inter["wr_only_v1"] if victim == v1 else inter["wr_only_v2"]
-                    recommendations.append({
-                        "type": "vote_interaction", "kind": "poison", "severity": "medium",
-                        "message": (
-                            f"Poison: {poisoner} kills {victim}. "
-                            f"Together={inter['wr_both']:.0%}, {victim} alone={wr_victim_alone:.0%}."
-                        ),
-                        "delta_ev": abs(inter["delta"]),
-                        # ── FDR: p_value stamped by the miner directly ──
-                        "p_value": inter.get("p_value"),
-                    })
-
-        _phase_mark("vote_interaction_miner")
-
-        # ─ Phase 5: Counterfactual Simulator (shadow-validated) ──────
-        baseline_ev = ai_metrics.get("net_ev") or 0.0
-        min_cf = self._phase_samples["counterfactual"]
-        if real_rows and len(real_rows) >= min_cf:
-            shadow_usable = len(shadow_rows) >= min_cf
-            shadow_baseline_ev = 0.0
-            if shadow_usable:
-                shadow_baseline_ev, _hk, _swr = engine.ev_and_kelly_for(shadow_rows)
-
-            rsi_cap_ok = any(
-                "context" in r and r["context"].get("rsi_adaptive_buy") for r in real_rows
-            )
-            rsi_cap = getattr(cfg, "RSI_ADAPTIVE_BUY_VOLATILE", 70.0) - 3
-            specs: List[Dict[str, Any]] = [
-                {"label": f"Threshold +1 ({cfg.CONFLUENCE_MIN_ABS_SCORE + 1.0})",
-                 "new_threshold": cfg.CONFLUENCE_MIN_ABS_SCORE + 1.0, "new_params": None},
-            ]
-            if rsi_cap_ok:
-                specs.append({"label": "RSI buy cap -3",
-                              "new_threshold": None, "new_params": {"rsi_curr": rsi_cap}})
-                specs.append({"label": "Threshold +1 + RSI cap -3",
-                              "new_threshold": cfg.CONFLUENCE_MIN_ABS_SCORE + 1.0,
-                              "new_params": {"rsi_curr": rsi_cap}})
-
-            scenarios: List[Dict[str, Any]] = []
-            for spec in specs:
-                real_sim = simulate_config_change(
-                    real_rows, baseline_ev,
-                    new_threshold=spec["new_threshold"], new_params=spec["new_params"],
-                )
-                if not real_sim:
-                    continue
-                scenario = {"label": spec["label"], **real_sim}
-                # ── Shadow out-of-sample check: same change, second sample ──
-                if shadow_usable:
-                    shadow_sim = simulate_config_change(
-                        shadow_rows, shadow_baseline_ev,
-                        new_threshold=spec["new_threshold"], new_params=spec["new_params"],
-                    )
-                    if shadow_sim and shadow_sim["n"] >= 5:
-                        scenario["shadow_n"] = shadow_sim["n"]
-                        scenario["shadow_delta_ev"] = shadow_sim["delta_ev"]
-                        scenario["shadow_wr"] = shadow_sim["wr"]
-                        # Agreement test: two samples from the same window
-                        # must point the same way, or the "improvement" is
-                        # one split, one distribution, one luck draw.
-                        scenario["shadow_validated"] = (
-                            (real_sim["delta_ev"] >= 0) == (shadow_sim["delta_ev"] >= 0)
-                        )
-                    else:
-                        scenario["shadow_validated"] = None
-                else:
-                    scenario["shadow_validated"] = None
-                scenarios.append(scenario)
-
-            if scenarios:
-                best = max(scenarios, key=lambda x: x["ev"])
-                sv = best.get("shadow_validated")
-                if sv is True:
-                    shadow_note = (
-                        f"\n   Shadow-confirmed: Δ{best['shadow_delta_ev']:+.3f}% "
-                        f"on {best['shadow_n']} rejected-path samples."
-                    )
-                elif sv is False:
-                    shadow_note = (
-                        f"\n   ⚠️ Shadow DISAGREES: Δ{best['shadow_delta_ev']:+.3f}% "
-                        f"on {best['shadow_n']} samples — treat as curve-fit."
-                    )
-                else:
-                    shadow_note = "\n   Shadow sample too thin to validate."
-                recommendations.append({
-                    "type": "counterfactual",
-                    # "high" now REQUIRES the out-of-sample shadow check to
-                    # agree — real-data-only wins stay medium/low.
-                    "severity": (
-                        "high" if best["delta_ev"] > 0.05 and sv is True
-                        else "medium" if best["delta_ev"] > 0.05 and sv is None
-                        else "low"
-                    ),
-                    "shadow_validated": sv,
-                    "message": (
-                        f"🔮 Best scenario: '{best['label']}' → "
-                        f"EV {best['ev']:+.3f}%/trade (Δ{best['delta_ev']:+.3f}%), "
-                        f"WR {best['wr']:.0%}, n={best['n']}.{shadow_note}"
-                    ),
-                    "delta_ev": best["delta_ev"],
-                })
-                ai_metrics["counterfactual_scenarios"] = scenarios
-
-        _phase_mark("counterfactual")
-
-        # ── Phase 6: Regime Profiles (shadow-validated) ───────────────
-        if len(real_rows) >= self._phase_samples["regime_profiles"]:
-            rpo = regime_profile_optimizer(
-                real_rows, regime_field="adx_val",
-                min_sample=self._phase_samples["regime_profiles"],
-            )
-            rpo_shadow = None
-            if len(shadow_rows) >= self._phase_samples["regime_profiles"]:
-                rpo_shadow = regime_profile_optimizer(
-                    shadow_rows, regime_field="adx_val",
-                    min_sample=self._phase_samples["regime_profiles"],
-                )
-            if rpo.get("valid") and len(rpo.get("regimes", [])) >= 2:
-                lines = []
-                for reg in rpo["regimes"]:
-                    sreg = self._match_shadow_regime(rpo_shadow, reg["range"])
-                    if sreg is not None:
-                        gap = abs(sreg["recommended_threshold"] - reg["recommended_threshold"])
-                        tag = (
-                            f"shadow✅ thr={sreg['recommended_threshold']:.1f}"
-                            if gap <= 3.0 else
-                            f"shadow⚠️ thr diverges {gap:.1f}pts"
-                        ) + f" (n={sreg['n']})"
-                    elif rpo_shadow is None:
-                        tag = "shadow: insufficient data"
-                    else:
-                        tag = "shadow: no overlapping regime"
-                    lines.append(
-                        f"  Regime {reg['regime_id']} (ADX {reg['range'][0]}-{reg['range'][1]}): "
-                        f"thr={reg['recommended_threshold']:.1f}, WR={reg['wr']:.0%} | {tag}"
-                    )
-                recommendations.append({
-                    "type": "dynamic_regime_profile", "severity": "low",
-                    "message": "📊 Regime thresholds:\n" + "\n".join(lines),
-                })
-
-        _phase_mark("regime_profiles")
-
-        # ── Config Version Regression ───────────────────────────────────
-        version_comparisons = compare_config_versions(
-            real_rows, min_sample=self._phase_samples["config_regression"]
-        )
-        for comp in version_comparisons:
-            _comp_shared = {
-                "prev_version": comp["prev_version"],
-                "cur_version": comp["cur_version"],
-                "prev_n": comp["prev_n"],
-                "cur_n": comp["cur_n"],
-                "prev_wr": comp["prev_wr"],
-                "cur_wr": comp["cur_wr"],
-            }
-            if comp["regression"]:
-                rec_entry = {
-                    "type": "config_regression", "severity": "high",
-                    "message": (
-                        f"🚨 Config regression: WR {comp['prev_wr']:.0%}→{comp['cur_wr']:.0%} "
-                        f"({comp['prev_version']}→{comp['cur_version']}). Consider reverting."
-                    ),
-                    "delta_ev": abs(comp["delta_wr"]),
-                }
-                rec_entry.update(_comp_shared)
-                recommendations.append(rec_entry)
-            elif comp["improvement"]:
-                rec_entry = {
-                    "type": "config_improvement", "severity": "low",
-                    "message": (
-                        f"✅ Config improved WR: {comp['prev_wr']:.0%}→{comp['cur_wr']:.0%} "
-                        f"({comp['prev_version']}→{comp['cur_version']})."
-                    ),
-                }
-                rec_entry.update(_comp_shared)
-                recommendations.append(rec_entry)
-
-        ai_metrics["config_comparisons"] = version_comparisons
-
-        _phase_mark("config_version_regression")
-
-        # ── Strategy degradation vs regime (roadmap #17) ─────────────────
-        try:
-            _state = engine.classify_strategy_state(real_rows)
-            ai_metrics["strategy_state"] = _state
-            _st = _state["state"]
-            if _st == "STRATEGY_DEGRADED":
-                recommendations.append({
-                    "type": "strategy_state", "severity": "high",
-                    "message": (
-                        f"🚨 Strategy degraded: WR {_state['older_wr']:.0%}→{_state['recent_wr']:.0%} "
-                        f"and still {_state['mix_adjusted_drop']:.0%} below what the regime mix "
-                        f"predicts. {_state['action']}."
-                    ),
-                })
-            elif _st in ("REGIME_UNDERREPRESENTED", "REGIME_SHIFT", "DEGRADED_REGIME_UNKNOWN"):
-                _label = {
-                    "REGIME_UNDERREPRESENTED": "current regime underrepresented in history",
-                    "REGIME_SHIFT": "regime mix shifted toward a historically weaker regime",
-                    "DEGRADED_REGIME_UNKNOWN": "drop cannot be attributed (thin ADX data)",
-                }[_st]
-                recommendations.append({
-                    "type": "strategy_state", "severity": "low",
-                    "message": (
-                        f"ℹ️ WR {_state['older_wr']:.0%}→{_state['recent_wr']:.0%}: {_label}. "
-                        f"{_state['action']}. Not evidence the strategy broke."
-                    ),
-                })
-        except Exception as e:
-            logging.getLogger("macd_bot").debug(f"Strategy-state classification failed (non-fatal): {e}")
-
-        # ── AI/ML: OOS Permutation Importance (EV-based, walk-forward) ────
-        # FIX: honor cfg.BRAIN_PERMUTATION_IMPORTANCE — previously this
-        # ran whenever sample size was sufficient, regardless of the flag.
-        _perm_enabled = (
-            getattr(cfg, "BRAIN_PERMUTATION_IMPORTANCE", True)
-            and len(real_rows) >= min_sample * 3
-        )
-        _perm_ok, _perm_why = audit.can_run("permutation_importance")
-        if _perm_enabled and not _perm_ok:
-            audit.record_analysis(
-                "permutation_importance", HealthStatus.INSUFFICIENT_DATA,
-                detail=_perm_why,
-            )
-        if _perm_enabled and _perm_ok:
-            _perm_n = 15
-            perm_imp = engine.oos_permutation_importance(
-                real_rows, min_sample=min_sample, n_permutations=_perm_n
-            )
-            if perm_imp:
-                top_positive = [p for p in perm_imp if p["direction"] == "positive"][:3]
-                top_negative = [p for p in perm_imp if p["direction"] == "negative"][:3]
-                parts = []
-                if top_positive:
-                    parts.append("most impactful: " + ", ".join(
-                        f"{p['feature']}({p['importance_ev']:+.4f})" for p in top_positive))
-                if top_negative:
-                    parts.append("harmful: " + ", ".join(
-                        f"{p['feature']}({p['importance_ev']:+.4f})" for p in top_negative))
-
-                # FDR tests the single strongest signal. If the top signal
-                _top = (top_positive + top_negative)[:1]
-                _top_rec = _top[0] if _top else None
-
-                _rec: Dict[str, Any] = {
-                    "type": "permutation_importance", "severity": "low",
-                    "message": f"🤖 OOS permutation importance (net EV) — {'; '.join(parts)}",
-                }
-                if _top_rec is not None:
-                    _rec["top_vote"] = _top_rec["feature"]
-                    _rec["top_importance"] = _top_rec["importance_ev"]
-                    _rec["top_std"] = _top_rec.get("std", 0.0)
-                    _rec["n_permutations"] = _perm_n
-                recommendations.append(_rec)
-
-            # ── Actionable ablation loop (roadmap #10) ─────────────────
-            try:
-                ablation = engine.actionable_condition_ablation(
-                    real_rows,
-                    min_sample=min_sample,
-                    n_permutations=_perm_n,
-                    noise_threshold=getattr(cfg, "ABLATION_NOISE_THRESHOLD", 0.01),
-                    edge_threshold=getattr(cfg, "ABLATION_EDGE_THRESHOLD", 0.03),
-                )
-                noise_votes = [a for a in ablation if a["action"] == "reduce_weight"]
-                if noise_votes:
-                    parts = [
-                        f"{a['vote']}(imp={a['importance']:+.3f}→×{a['suggested_weight_factor']})"
-                        for a in noise_votes[:5]
-                    ]
-                    adj_payload = []
-                    for a in noise_votes[:5]:
-                        vote = a["vote"]
-                        current_w = CONFLUENCE_WEIGHTS.get(vote)
-                        if current_w is None or current_w <= 0:
-                            continue
-                        adj_payload.append({
-                            "vote": vote,
-                            "current": current_w,
-                            "suggested": round(current_w * a["suggested_weight_factor"], 2),
-                            "category": "condition_ablation",
-                            "reason": a["reason"],
-                        })
-                    recommendations.append({
-                        "type": "condition_ablation",
-                        "severity": "medium",
-                        "message": (
-                            "Conditions adding little information (candidate weight cuts): "
-                            + ", ".join(parts)
-                        ),
-                        "ablation": noise_votes[:5],
-                        "weight_adjustments": adj_payload,  # picked up by _store_pending_plan
-                    })
-            except Exception as e:
-                logging.getLogger("macd_bot").debug(
-                    f"Actionable ablation failed (non-fatal): {e}"
-                )
-
-        _phase_mark("permutation_importance")
-
-# ── Benjamini-Hochberg FDR correction ────────────────────────
-        _fdr_t0 = time.time()
-        p_val_indices: List[int] = []
-        p_vals: List[float] = []
-        for idx, r in enumerate(recommendations):
-            p = _extract_p_value_for_fdr(r)
-            if p is not None:
-                p_val_indices.append(idx)
-                p_vals.append(p)  
-        if p_vals:
-            keep_mask = engine.benjamini_hochberg(p_vals, alpha=0.10)
-            n_survived = sum(keep_mask)
-            n_tested = len(p_vals)
-            for fdr_flag, idx in zip(keep_mask, p_val_indices):
-                recommendations[idx]["fdr_passed"] = bool(fdr_flag)
-            for fdr_flag, idx in zip(keep_mask, p_val_indices):
-                if not fdr_flag and recommendations[idx]["severity"] in ("high", "medium"):
-                    recommendations[idx]["severity"] = "low"
-                    recommendations[idx]["message"] = (
-                        f"{recommendations[idx]['message']}\n"
-                        f"[FDR: not significant after BH correction across "
-                        f"{n_tested} tests at α=0.10]"
-                    )
-            if n_tested > 3:
-                recommendations.append({
-                    "type": "fdr_summary",
-                    "severity": "low",
-                    "message": (
-                        f"🔬 FDR (Benjamini-Hochberg, α=0.10): {n_survived}/{n_tested} "
-                        f"statistical claims survived correction across the report. "
-                        f"Surviving claims are marked `fdr_passed=True`; demoted "
-                        f"claims are downgraded to low severity."
-                    ),
-                })
-        logger.info(f"⏱️   └ fdr_block: {time.time() - _fdr_t0:.2f}s")
-
-        # ─ Actionability scoring (blended with empirical repair outcomes) ──
-        _act_t0 = time.time()
-        for rec in recommendations:
-            rec["actionability_score"] = round(
-                learned_actionability(rec, self._repair_success_rates), 3
-            )
-            if rec.get("_repair_id"):
-                cat = rec.get("category") or rec.get("type")
-                if cat:
-                    stats = (self._repair_success_rates or {}).get(cat, {})
-                    if stats.get("n", 0) >= 8:
-                        rec["_empirical_help_rate"] = round(stats["help_rate"], 3)
-
-        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-        recommendations.sort(key=lambda x: (
-            severity_order.get(x.get("severity", ""), 4),
-            -x.get("actionability_score", 0),
-        ))
-    
-        logger.info(f"⏱️   └ actionability_block: {time.time() - _act_t0:.2f}s")
-
-        # ── Config version hash ──────────────��───────────────────────────
-        _hash_t0 = time.time()
-        ai_metrics["config_version"] = hash_config_state(
-            CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
-        )
-        await self._remember_config_version(ai_metrics["config_version"])
-        logger.info(f"⏱️   └ hash_and_remember: {time.time() - _hash_t0:.2f}s")
-
-        # ── Bonus-aware metrics ──���────────────────────────────�����──────────
-        if real_rows:
-            bonus_count = sum(1 for r in real_rows if r.get("bonus_win"))
-            total_wins = sum(1 for r in real_rows if r["win"])
-            rr_vals = [r.get("rr_achieved", 0) for r in real_rows if r.get("rr_achieved", 0) > 0]
-            ai_metrics["bonus_wins"] = bonus_count
-            ai_metrics["bonus_rate_of_wins"] = bonus_count / max(total_wins, 1)
-            ai_metrics["avg_rr_achieved"] = round(sum(rr_vals) / len(rr_vals), 2) if rr_vals else 0.0
-            total_win_weight = sum(r.get("win_weight", 1.0 if r["win"] else 0.0) for r in real_rows)
-            ai_metrics["weighted_wr"] = round(min(total_win_weight / len(real_rows), 1.0), 4) if real_rows else 0.0
-
-        if shadow_rows:
-            ai_metrics["shadow_win_rate"] = round(
-                sum(1 for r in shadow_rows if r["win"]) / len(shadow_rows), 4
-            )
-
-        # ─ Action gate: suppress config patches unless evidence is strong ──      
-        _cusum_read_failed = False
-        _active_drift_keys: List[str] = []
-        _below_floor_drift: List[Tuple[str, int]] = []
-
-        if getattr(cfg, "BRAIN_ACTION_GATE_ENABLED", True):
-            _cusum_min_n = int(getattr(cfg, "BRAIN_CUSUM_MIN_SAMPLE", 30))
-            try:
-                _seen_aks = {r["alert_key"] for r in real_rows}
-                # Detectors were loaded + updated by _check_cusum_drift, so
-                # reuse them; bulk-read (one round-trip) only what is missing.
-                _states: Dict[str, Dict[str, Any]] = {
-                    ak: self._cusum_detectors[ak].to_dict()
-                    for ak in _seen_aks if ak in self._cusum_detectors
-                }
-                _missing = [ak for ak in _seen_aks if ak not in _states]
-                if _missing:
-                    for _ak, (_wm, _st) in ((await self.sdb.load_cusum_bulk(_missing)) or {}).items():
-                        if _st:
-                            _states[_ak] = _st
-                for _ak, _cusum_state in _states.items():
-                    if _cusum_state.get("s_neg", 0.0) <= _cusum_state.get("h", 2.0):
-
-                        continue
-                    _n_seen = int(_cusum_state.get("n", 0))
-                    if _n_seen >= _cusum_min_n:
-                        _active_drift_keys.append(_ak)
-                    else:
-                        _below_floor_drift.append((_ak, _n_seen))
-                if _active_drift_keys:
-                    logger.info(
-                        f"Action gate: {len(_active_drift_keys)} persisted CUSUM "
-                        f"alarm(s) active with n>={_cusum_min_n} — stability layer "
-                        f"forced False "
-                        f"({_active_drift_keys[:5]}{'…' if len(_active_drift_keys) > 5 else ''})"
-                    )
-                if _below_floor_drift:
-                    logger.info(
-                        f"Action gate: {len(_below_floor_drift)} CUSUM alarm(s) "
-                        f"seen but below BRAIN_CUSUM_MIN_SAMPLE={_cusum_min_n} — "
-                        f"not vetoing tuning "
-                        f"({[f'{ak}(n={n})' for ak, n in _below_floor_drift[:5]]}"
-                        f"{'' if len(_below_floor_drift) > 5 else ''})"
-                    )
-
-            except Exception as e:
-                _cusum_read_failed = True
-                audit.record_analysis_exception("cusum_gate_read", e)
-
-        if getattr(cfg, "BRAIN_ACTION_GATE_ENABLED", True):
-            action_gate = self._action_gate_check(
-                real_rows, min_sample=min_sample,
-                recommendations=recommendations,
-                active_drift_keys=_active_drift_keys or None,
-            )
-        else:
-            action_gate = {"actionable": True, "disabled": True}
-        if _cusum_read_failed and not action_gate.get("disabled"):
-            action_gate["stability"] = False
-            action_gate["actionable"] = False
-        ai_metrics["action_gate"] = action_gate
-        if not action_gate.get("actionable", False):
-            # Downgrade all config patches to informational
-            for patch in config_patch:
-                patch["_blocked_by_action_gate"] = True
-                patch["reason"] = (
-                    f"[GATE BLOCKED] {patch.get('reason', '')} "
-                    f"— OOS EV evidence insufficient"
-                )
-            # Only RISK-INCREASING auto-actions (re-enable) need this gate.
-            # A disable is protective and stands on its own per-alert evidence
-            # (upper CI bound below the disable threshold, net EV negative,
-            # minimum sample). Gating it on portfolio-wide EV/drawdown/drift
-            # would stop the Brain from switching off a losing alert exactly
-            # when the system as a whole is doing worst.
-            for rec in recommendations:
-                if rec.get("pending_auto_action") and rec.get("pending_action") != "disable":
-                    rec["pending_auto_action"] = False
-                    rec["message"] += " [BLOCKED by action gate]"
-            logger.info(
-                f"🚫 Action gate BLOCKED config patches and re-enables "
-                f"(protective disables still proceed): {action_gate}"
-            )
-
-        # ── Execute deferred auto-actions. 'disable' always gets here; 'enable'
-        # only survives the block above when the gate passed. ──
-        for rec in recommendations:
-            if not rec.get("pending_auto_action"):
-                continue
-            ak = rec.get("alert")
-            action = rec.get("pending_action")
-            if not ak or not action:
-                continue
-            try:
-                if action == "disable":
-                    ok = await self.sdb.set_alert_key_disabled(ak, True)
-                    if ok:
-                        rec["message"] = rec["message"].replace(
-                            "[Pending action gate]", "[APPLIED]"
-                        )
-                        logger.info(f"🔒 Post-gate auto-disabled: {ak}")
-                elif action == "enable":
-                    ok = await self.sdb.set_alert_key_disabled(ak, False)
-                    if ok:
-                        rec["message"] = rec["message"].replace(
-                            "[Pending action gate]", "[APPLIED]"
-                        )
-                        logger.info(f"🔓 Post-gate auto-re-enabled: {ak}")
-            except Exception as e:
-                logger.warning(f"Post-gate auto-action failed for {ak}: {e}")
-            # Mark as consumed regardless of success
-            rec["pending_auto_action"] = False
-
-        _phase_mark("fdr_and_actionability")
-
-        # ── Attach audit to ai_metrics for persistence ──
-        ai_metrics["brain_audit"] = audit.to_dict()
-        ai_metrics["data_quality_header"] = audit.build_data_quality_header()
-
-        # ── Attach archive stats for the profit action plan ──
-        result = dict(base_recs)
-        result["recommendations"] = recommendations
-        result["recommendation_count"] = len(recommendations)
-        result["config_patch"] = config_patch
-        result["ai_metrics"] = ai_metrics
-        result["_archive_stats"] = audit._archive_stats or {}
-        _phase_mark("audit_attach")
-
-        # ── Champion/challenger promotion check (gated) ─────────────────
-        # Challenger weights accumulate via weight_optimizer / apply_pending_plan
-        # when ENABLE_CHAMPION_CHALLENGER is on. Promotion is intentionally not
-        # automatic while CHALLENGER_SHADOW_ONLY is True (safe-by-default).
-        if getattr(cfg, "ENABLE_CHAMPION_CHALLENGER", False):
-            try:
-                promo = await self.maybe_promote_challenger(force=False)
-                ai_metrics["challenger_promotion"] = promo
-                if promo.get("promoted"):
-                    meta = promo.get("meta") or {}
-                    recommendations.append({
-                        "type": "challenger_promotion",
-                        "severity": "high",
-                        "message": (
-                            "🏆 Challenger promoted to champion "
-                            f"(n_oos={meta.get('n_oos')}, "
-                            f"net_ev={meta.get('net_ev')}, "
-                            f"champion_net_ev={meta.get('champion_net_ev')})."
-                        ),
-                    })
-                    result["recommendations"] = recommendations
-                    result["recommendation_count"] = len(recommendations)
-                    logger.info(
-                        f"🏆 Challenger promoted to champion: {promo}"
-                    )
-                else:
-                    logger.info(
-                        f"🧪 Challenger promotion skipped: {promo.get('reason')}"
-                    )
-            except Exception as e:
-                audit.record_analysis_exception("challenger_promotion", e)
-                logger.warning(f"Challenger promotion check failed: {e}")
-            _phase_mark("challenger_promotion")
-
-        return result
+        return await _full_recs.build_full_recommendations(self)
 
     # ── Baseline wrapper that also exposes raw rows ─────────────────────
 
@@ -2625,7 +414,7 @@ class BrainEngineV2(BaseBrainEngine):
             analysis_rows=real_rows,
         )
         audit.set_shadow_count(len(shadow_rows))
-        base = await super().generate_recommendations()
+        base = await BrainCore.generate_recommendations(self)
         base["_real_rows"] = real_rows
         base["_shadow_rows"] = shadow_rows
         return base
@@ -3543,3 +1332,154 @@ class BrainEngineV2(BaseBrainEngine):
         maybe_generate_report()/send_report_now() and all their guards are
         inherited unchanged from the base class."""
         return await self.generate_report(pairs, telegram_queue, logger_run)
+
+# Names moved to other modules, re-exported for backward compatibility.
+from brain_report import (
+    _report_section_failed,
+    _RULE,
+    _IST,
+    _LADDER,
+    _LADDER_NAMES,
+    _MSG_LIMIT,
+    _HUMAN_SECTIONS,
+    _alert_family,
+    _p,
+    _c,
+    _c_split,
+    _hdr,
+    _evidence_rank,
+    _wrap_names,
+    _collect_facts,
+    _outcome_anatomy,
+    _goal_wr,
+    _profit_status,
+    _data_status,
+    _recording_status,
+    _conf_status,
+    _icon,
+    _overall,
+    _fmt_days,
+    _fmt_span,
+    _WIDE_EMOJI_RANGES,
+    _vwidth,
+    _ljust,
+    _rjust,
+    _table,
+    _split_leading_emoji,
+    _kv_table,
+    _active_blockers,
+    _sec_summary,
+    _sec_verdict,
+    _cf_verdict,
+    _sec_do_now,
+    _sec_profit,
+    _EVIDENCE_LEGEND,
+    _alert_table,
+    _sec_loss,
+    _sec_positive,
+    _sec_scorecard,
+    _sec_sessions,
+    _confidence_tier,
+    _confidence_breakdown,
+    _sec_gate,
+    _sec_reasoning_chain,
+    _REPORT_SECTIONS,
+    _md_prose,
+    build_brain_report,
+)
+
+__all__ = [
+    "DataCoverage",
+    "HealthStatus",
+    "get_audit",
+    "reset_audit",
+    "ACTION_GATE_MIN_ROWS",
+    "load_archived_outcomes",
+    "cfg",
+    "CONFLUENCE_WEIGHTS",
+    "CONFIG_OVERRIDE_ALLOWED_FIELDS",
+    "json_dumps",
+    "json_loads",
+    "RedisKeyPrefix",
+    "RedisStateStore",
+    "BaseBrainEngine",
+    "_extract_p_value_for_fdr",
+    "engine",
+    "optimize_vote_weights",
+    "conditional_performance",
+    "interaction_miner",
+    "simulate_config_change",
+    "regime_profile_optimizer",
+    "hash_config_state",
+    "learned_actionability",
+    "compare_config_versions",
+    "record_repair_issued",
+    "mark_plan_applied",
+    "evaluate_pending_repairs",
+    "repair_success_rates",
+    "ledger_stats",
+    "load_ledger_entries",
+    "escape_markdown_v2",
+    "_PHASE_MIN_SAMPLES",
+    "_report_section_failed",
+    "_RULE",
+    "PLAN_HISTORY_KEY",
+    "PLAN_HISTORY_MAX",
+    "APPLY_SNAPSHOT_KEY",
+    "APPLY_SNAPSHOT_MAX",
+    "CHALLENGER_STREAK_KEY",
+    "_IST",
+    "_LADDER",
+    "_LADDER_NAMES",
+    "_MSG_LIMIT",
+    "_HUMAN_SECTIONS",
+    "_alert_family",
+    "_Piece",
+    "_p",
+    "_c",
+    "_c_split",
+    "_hdr",
+    "_evidence_rank",
+    "_wrap_names",
+    "_collect_facts",
+    "_outcome_anatomy",
+    "_goal_wr",
+    "_profit_status",
+    "_data_status",
+    "_recording_status",
+    "_conf_status",
+    "_icon",
+    "_overall",
+    "_fmt_days",
+    "_fmt_span",
+    "_WIDE_EMOJI_RANGES",
+    "_vwidth",
+    "_ljust",
+    "_rjust",
+    "_table",
+    "_split_leading_emoji",
+    "_kv_table",
+    "_active_blockers",
+    "_sec_summary",
+    "_sec_verdict",
+    "_cf_verdict",
+    "_sec_do_now",
+    "_sec_profit",
+    "_EVIDENCE_LEGEND",
+    "_alert_table",
+    "_sec_loss",
+    "_sec_positive",
+    "_sec_scorecard",
+    "_sec_sessions",
+    "_confidence_tier",
+    "_confidence_breakdown",
+    "_sec_gate",
+    "_sec_reasoning_chain",
+    "_REPORT_SECTIONS",
+    "build_brain_report_sections",
+    "render_report_messages",
+    "_md_prose",
+    "render_report_markdown",
+    "build_brain_report",
+    "BrainEngineV2",
+]
