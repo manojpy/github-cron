@@ -84,6 +84,7 @@ COPY --chown=appuser:appuser src/numeric_selftest.py ./
 
 # Copy business logic modules (change frequently)
 COPY --chown=appuser:appuser src/alert_registry.py ./
+COPY --chown=appuser:appuser src/config_base.py ./
 COPY --chown=appuser:appuser src/bot_config.py ./
 COPY --chown=appuser:appuser src/state.py ./
 COPY --chown=appuser:appuser src/fetcher.py ./
