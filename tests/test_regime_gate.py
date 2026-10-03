@@ -1,5 +1,7 @@
 """Regime-aware live quality gate: sample-gated, OOS-confirmed, restrict-only."""
 import random
+import asyncio
+import brain as brain_mod
 
 import threshold_engine as engine
 
@@ -99,12 +101,6 @@ def test_ev_cache_does_not_collide_for_same_size_same_span_row_sets():
 
 
 # ── End to end through BrainEngine.get_trade_quality ──
-
-import asyncio
-from types import SimpleNamespace
-
-import brain as brain_mod
-
 
 def _engine_with(blob):
     eng = brain_mod.BrainEngine.__new__(brain_mod.BrainEngine)
