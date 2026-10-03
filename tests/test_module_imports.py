@@ -17,6 +17,11 @@ MODULE_NAMES = sorted(
     if p.stem != "__init__"
 )
 
+def test_brain_engine_is_single_public_entry_point():
+    from brain_engine import BrainEngine
+    from brain_enhanced import BrainEngineV2
+
+    assert BrainEngine is BrainEngineV2
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
 def test_module_imports_cleanly(module_name):

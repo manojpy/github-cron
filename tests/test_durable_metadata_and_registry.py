@@ -62,6 +62,39 @@ def test_durable_sets_match_audit():
     assert set(state.DURABLE_METADATA_KEYS) == set(redis_audit.DURABLE_METADATA)
 
 
+def test_alert_registry_is_self_consistent():
+    from alert_registry import (
+        REGISTRY,
+        ALERT_KEYS,
+        BUY_ALERT_KEYS,
+        SELL_ALERT_KEYS,
+        alert_family_of,
+        registry_problems,
+    )
+
+    assert REGISTRY
+    assert not registry_problems()
+
+    assert set(ALERT_KEYS) == set(REGISTRY)
+
+    assert not (BUY_ALERT_KEYS & SELL_ALERT_KEYS)
+
+    for key, spec in REGISTRY.items():
+        assert spec.key == key
+        assert spec.family
+        assert spec.family != "Other"
+        assert spec.direction in {"buy", "sell"}
+        assert spec.config_flag
+        assert alert_family_of(key) == spec.family
+
+def test_unknown_alert_key_does_not_inherit_family():
+    from alert_registry import alert_family_of
+
+    assert alert_family_of("vwap_future") == "Other"
+    assert alert_family_of("ppo_unknown") == "Other"
+    assert alert_family_of("rsi_unknown") == "Other"
+    assert alert_family_of("not_registered") == "Other"
+
 def test_all_alert_keys_have_a_family():
     other = [k for k in ALERT_KEYS if alert_family_of(k) == "Other"]
     assert not other, f"alert keys with no family: {other}"
