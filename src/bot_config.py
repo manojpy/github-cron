@@ -164,8 +164,10 @@ class Constants:
     MACRO_MULT_FULL = 1.30
     MACRO_RS_EASE_FACTOR = 0.75
 
-PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
-PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
+# Pivot levels now live in the alert registry (single source of truth).
+import alert_registry as _alert_registry
+PIVOT_LEVELS_BUY: List[str] = _alert_registry.PIVOT_LEVELS_BUY
+PIVOT_LEVELS_SELL: List[str] = _alert_registry.PIVOT_LEVELS_SELL
 
 @dataclass
 class BtcMacroContext:

@@ -37,6 +37,18 @@ from bot_config import (
     shutdown_event, format_ist_time, json_dumps, json_loads, CONFLUENCE_WEIGHTS, BtcMacroContext,
     ClusterContext, BiasContext, _get_session_from_ts,
 )
+
+from alert_registry import (
+    ALERT_KEYS as _REGISTRY_ALERT_KEYS,
+    BUY_ALERT_KEYS as _REGISTRY_BUY_ALERT_KEYS,
+    SELL_ALERT_KEYS as _REGISTRY_SELL_ALERT_KEYS,
+    ALERT_CONFIG_MAP as _REGISTRY_ALERT_CONFIG_MAP,
+    ALERT_CONFIG_PREFIX_MAP as _REGISTRY_ALERT_CONFIG_PREFIX_MAP,
+    REGISTRY as _ALERT_REGISTRY,
+    registry_problems as _registry_problems,
+    resolve_alert_config_path as _registry_resolve_config_path,
+)
+
 from fetcher import (
     PriceData, DataFetcher, SessionManager, compute_backoff, validate_indicator_values,
     CandleSnapshot, cross_check_15m_against_5m,
@@ -1003,82 +1015,20 @@ ALERT_DEFINITIONS.extend(SELL_PIVOT_DEFS)
 
 ALERT_DEFINITIONS_MAP = {d.key: d for d in ALERT_DEFINITIONS}
 
-ALERT_KEYS: Dict[str, str] = {
-    d.key: f"ALERT:{d.key.upper()}" for d in ALERT_DEFINITIONS
-}
+ALERT_KEYS: Dict[str, str] = dict(_REGISTRY_ALERT_KEYS)
 _AlertKeyRaw = StrEnum("AlertKey", {k.upper(): k for k in ALERT_KEYS})  # type: ignore[misc]
-AlertKey = cast(Any, _AlertKeyRaw) 
+AlertKey = cast(Any, _AlertKeyRaw)
 
 logger.debug("Alert keys initialized: %s mappings", len(ALERT_KEYS))
 
-BUY_ALERT_KEYS: Set[str] = {
-    "ppo_signal_up", "ppo_zero_up", "ppo_adaptive_up",
-    "rsi_ema5_up", "rsi_cross_adaptive_up", "vwap_up", "hist_rma_buy", "ppohist_buy",
-    "cloud_cross_up", "tk_conversion_up", "kijun_cross_up", "equilibrium_cross_up", "ob_reversal_buy", 
-    "strong_reversal_buy", "choch_buy", "dynamic_flow_cross_buy", "fib_reversal_buy",
-}
-
-BUY_ALERT_KEYS.update(f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY)
-
-SELL_ALERT_KEYS: Set[str] = {
-    "ppo_signal_down", "ppo_zero_down", "ppo_adaptive_down",
-    "rsi_ema5_down", "rsi_cross_adaptive_down", "vwap_down", "hist_rma_sell", "ppohist_sell",
-    "cloud_cross_down", "tk_conversion_down", "kijun_cross_down", "equilibrium_cross_down", "ob_reversal_sell",
-    "strong_reversal_sell", "choch_sell", "dynamic_flow_cross_sell", "fib_reversal_sell",
-}
-SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
-
-ALERT_CONFIG_MAP: Dict[str, str] = {
-    "strong_reversal_buy": "ENABLE_STRONG_REVERSAL_ALERT",
-    "strong_reversal_sell": "ENABLE_STRONG_REVERSAL_ALERT",
-    "choch_buy": "ENABLE_CHOCH_ALERT",
-    "choch_sell": "ENABLE_CHOCH_ALERT",
-    "dynamic_flow_cross_buy": "ENABLE_DYNAMIC_FLOW_CROSS_ALERT",
-    "dynamic_flow_cross_sell": "ENABLE_DYNAMIC_FLOW_CROSS_ALERT",
-    "fib_reversal_buy": "ENABLE_FIB_REVERSAL_ALERT",
-    "fib_reversal_sell": "ENABLE_FIB_REVERSAL_ALERT",
-    "ob_reversal_buy": "ENABLE_OB_GATE",
-    "ob_reversal_sell": "ENABLE_OB_GATE",
-    "ppo_signal_up": "ENABLE_PPO_ALERTS",
-    "ppo_signal_down": "ENABLE_PPO_ALERTS",
-    "ppo_zero_up": "ENABLE_PPO_ALERTS",
-    "ppo_zero_down": "ENABLE_PPO_ALERTS",
-    "ppo_adaptive_up": "ENABLE_PPO_ALERTS",
-    "ppo_adaptive_down": "ENABLE_PPO_ALERTS",
-    "rsi_ema5_up": "ENABLE_RSI_ALERTS",
-    "rsi_ema5_down": "ENABLE_RSI_ALERTS",
-    "rsi_cross_adaptive_up": "ENABLE_RSI_ALERTS",
-    "rsi_cross_adaptive_down": "ENABLE_RSI_ALERTS",
-    "ppohist_buy": "ENABLE_PPOHIST_ALERT",
-    "ppohist_sell": "ENABLE_PPOHIST_ALERT",
-    "vwap_up": "ENABLE_VWAP",
-    "vwap_down": "ENABLE_VWAP",
-    "cloud_cross_up": "ENABLE_CLOUD_CROSS_ALERT",
-    "cloud_cross_down": "ENABLE_CLOUD_CROSS_ALERT",
-    "tk_conversion_up": "ENABLE_TK_CONVERSION_CROSS",
-    "tk_conversion_down": "ENABLE_TK_CONVERSION_CROSS",
-    "kijun_cross_up": "ENABLE_KIJUN_CROSS",
-    "kijun_cross_down": "ENABLE_KIJUN_CROSS",
-    "hist_rma_buy": "ENABLE_HIST_RMA",
-    "hist_rma_sell": "ENABLE_HIST_RMA",
-    "equilibrium_cross_up": "ENABLE_EQUILIBRIUM_CROSS",
-    "equilibrium_cross_down": "ENABLE_EQUILIBRIUM_CROSS",
-}
-ALERT_CONFIG_PREFIX_MAP: Dict[str, str] = {
-    "pivot_up_": "ENABLE_PIVOT",
-    "pivot_down_": "ENABLE_PIVOT",
-}
-
+BUY_ALERT_KEYS: Set[str] = set(_REGISTRY_BUY_ALERT_KEYS)
+SELL_ALERT_KEYS: Set[str] = set(_REGISTRY_SELL_ALERT_KEYS)
+ALERT_CONFIG_MAP: Dict[str, str] = dict(_REGISTRY_ALERT_CONFIG_MAP)
+ALERT_CONFIG_PREFIX_MAP: Dict[str, str] = dict(_REGISTRY_ALERT_CONFIG_PREFIX_MAP)
 
 def resolve_alert_config_path(alert_key: str) -> Optional[str]:
     """Resolve alert_key → config enable flag. Single registry used by Brain."""
-    path = ALERT_CONFIG_MAP.get(alert_key)
-    if path:
-        return path
-    for prefix, mapped in ALERT_CONFIG_PREFIX_MAP.items():
-        if alert_key.startswith(prefix):
-            return mapped
-    return None
+    return _registry_resolve_config_path(alert_key)
 
 async def _run_post_send_hooks(p: AlertPayload, sdb: RedisStateStore,
                                logger_run: logging.Logger) -> None:
@@ -1401,10 +1351,27 @@ def validate_alert_definitions() -> None:
             errors.append(f"Alert key {def_.key} missing from BUY_ALERT_KEYS/SELL_ALERT_KEYS")
 
     _defined = {d.key for d in ALERT_DEFINITIONS}
+
     _stale = (BUY_ALERT_KEYS | SELL_ALERT_KEYS) - _defined
     if _stale:
         errors.append(f"BUY/SELL_ALERT_KEYS contain undefined keys: {sorted(_stale)}")
+    # Registry and AlertRule definitions must describe exactly the same set of keys.
+    _registered = set(_ALERT_REGISTRY)
+    if _defined - _registered:
+        errors.append(
+            f"Alert definitions missing from alert_registry: {sorted(_defined - _registered)}"
+        )
+    if _registered - _defined:
+        errors.append(
+            f"alert_registry keys with no AlertRule definition: {sorted(_registered - _defined)}"
+        )
+    errors.extend(f"alert_registry: {p}" for p in _registry_problems())
+    for _k in _registered & _defined:
+        _flag = _ALERT_REGISTRY[_k].config_flag
+        if _flag and not hasattr(cfg, _flag):
+            errors.append(f"alert_registry: {_k} references unknown config flag {_flag}")
     _both = BUY_ALERT_KEYS & SELL_ALERT_KEYS
+
     if _both:
         errors.append(f"Keys in both BUY and SELL sets: {sorted(_both)}")
 

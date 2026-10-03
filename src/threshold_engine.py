@@ -874,34 +874,7 @@ def sample_evidence_state(
         return "ACTIONABLE"
     return "ELIGIBLE"
 
-# Canonical alert-family taxonomy used by family analysis and registry.
-_ALERT_FAMILY_PREFIXES: List[Tuple[str, str]] = [
-    ("pivot_", "Pivot"),
-    ("strong_reversal_", "Reversal"),
-    ("choch_", "Reversal"),
-    ("fib_reversal_", "Reversal"),
-    ("ob_reversal_", "Order-block"),
-    ("vwap_", "VWAP"),
-    ("ppo_signal_", "Trend continuation"),
-    ("ppo_zero_", "Trend continuation"),
-    ("ppo_adaptive_", "Trend continuation"),
-    ("ppohist_", "Trend continuation"),
-    ("hist_rma_", "Trend continuation"),
-    ("rsi_", "Trend continuation"),
-    ("cloud_cross_", "Pattern"),
-    ("tk_conversion_", "Pattern"),
-    ("kijun_cross_", "Pattern"),
-    ("equilibrium_cross_", "Pattern"),
-    ("dynamic_flow_", "Confluence"),
-]
-
-def alert_family_of(alert_key: str) -> str:
-    """Map an alert_key to its learning family. Shared by reports and analysis."""
-    key = str(alert_key or "").lower()
-    for prefix, family in _ALERT_FAMILY_PREFIXES:
-        if key.startswith(prefix):
-            return family
-    return "Other"
+from alert_registry import alert_family_of  # single source of truth
 
 def alert_family_analysis(
     rows: List[Row],

@@ -83,31 +83,9 @@ _LADDER_NAMES = ["Observation", "Early evidence", "Meaningful evidence",
 _MSG_LIMIT = 3800                                   # rendered chars per Telegram message
 _HUMAN_SECTIONS = 6                                 # sections 1-5 are packed on their own
 
-_TOKEN_NAMES = {
-    "choch": "CHoCH", "ppo": "PPO", "vwap": "VWAP", "rsi": "RSI", "tk": "TK",
-    "rma": "RMA", "hist": "Hist", "ppohist": "PPO Hist", "adx": "ADX",
-    "macd": "MACD", "fib": "Fib", "up": "UP", "down": "DOWN", "buy": "BUY",
-    "sell": "SELL", "s1": "S1", "s2": "S2", "s3": "S3", "r1": "R1", "r2": "R2",
-    "r3": "R3", "p": "P", "ob": "OB", "fvg": "FVG", "bos": "BOS", "atr": "ATR",
-    "ema": "EMA", "sma": "SMA", "bb": "BB",
-}
-_DIRECTION_TOKENS = {"buy", "sell", "up", "down", "cross", "s1", "s2", "s3", "r1", "r2", "r3", "p"}
 
+from alert_registry import (alert_family_of as _alert family, pretty_alert as _pretty_alert)
 
-def _pretty_alert(key: str) -> str:
-    """strong_reversal_buy -> 'Strong Reversal BUY'."""
-    toks = [t for t in str(key).split("_") if t and t.lower() != "cross"]
-    return " ".join(_TOKEN_NAMES.get(t.lower(), t.capitalize()) for t in toks) or _pretty_alert(key)
-
-def _alert_family(key: str) -> str:
-    """Canonical family label — delegates to threshold_engine.alert_family_of
-    so reports and hierarchical family analysis share one taxonomy."""
-    try:
-        from threshold_engine import alert_family_of
-        return alert_family_of(key)
-    except Exception:
-        toks = [t for t in str(key).split("_") if t and t.lower() not in _DIRECTION_TOKENS]
-        return " ".join(_TOKEN_NAMES.get(t.lower(), t.capitalize()) for t in toks) or _pretty_alert(key)
 
 class _Piece(str):
     """A rendered Telegram fragment that remembers its plain source text and
@@ -3477,7 +3455,7 @@ class BrainEngineV2(BaseBrainEngine):
                 try:
                     marked = await mark_plan_applied(self.sdb, plan_ts)
                     if marked:
-                        logger_run.info(f"📒 Repair ledger: marked {marked} repair(s) applied")
+                        logger_run.info(f"���� Repair ledger: marked {marked} repair(s) applied")
                 except Exception as e:
                     logger_run.debug(f"Repair ledger apply-mark failed (non-fatal): {e}")
 
