@@ -4,7 +4,7 @@ import logging
 import statistics
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from bot_config import cfg, json_dumps, json_loads, CONFLUENCE_WEIGHTS
 from state import _rc
 import threshold_engine as engine
@@ -603,7 +603,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                         "type": "alert_family_analysis",
                         "severity": "low",
                         "message": (
-                            "👨‍👩‍👧‍👦 Alert-family intelligence:\n"
+                            "👨��👩‍👧‍👦 Alert-family intelligence:\n"
                             + "\n".join(fam_lines[:8])
                             + "\nDiagnostic only — families are learning entities, not live gates."
                         ),
