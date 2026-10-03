@@ -110,26 +110,37 @@ def _best_evidence(tqs: Sequence[Dict[str, Any]]) -> str:
 
 def _plan(tqs: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Trade plan from the family with the most outcome history behind it."""
-    best, best_n = None, -1
+    best, best_n, best_validated = None, -1, False
     for t in tqs:
-        p = t.get("trade_plan")
+        zone = t.get("trade_zone")
+        validated = isinstance(zone, dict)
+        p = zone if validated else t.get("trade_plan")
         if not isinstance(p, dict):
             continue
-        sl, tp1, tp2 = (_num(p.get(k)) for k in
-                        ("sl_suggested_pct", "tp1_suggested_pct", "tp2_suggested_pct"))
+        if validated:
+            sl, tp1, tp2 = (_num(p.get(k)) for k in ("sl_pct", "tp1_pct", "tp2_pct"))
+        else:
+            sl, tp1, tp2 = (_num(p.get(k)) for k in
+                            ("sl_suggested_pct", "tp1_suggested_pct", "tp2_suggested_pct"))
         if sl is None or tp1 is None or tp2 is None or sl <= 0:
             continue
         n = int(_num(p.get("n")) or 0)
-        if n > best_n:
-            best, best_n = {"sl": sl, "tp1": tp1, "tp2": tp2,
-                            "tp_first": _num(p.get("tp_first_rate")), "n": n}, n
+        # A validated zone always beats an unvalidated plan; within a class,
+        # the one with the most history behind it wins.
+        if (validated, n) > (best_validated, best_n):
+            best, best_n, best_validated = {
+                "sl": sl, "tp1": tp1, "tp2": tp2,
+                "tp_first": _num(p.get("tp_first_rate")), "n": n,
+                "validated": validated,
+            }, n, validated
     return best
 
 def _plan_line(plan: Optional[Dict[str, float]], default_sl: float, rr: float) -> str:
     if plan:
         r1, r2 = plan["tp1"] / plan["sl"], plan["tp2"] / plan["sl"]
+        tag = " · validated zone" if plan.get("validated") else ""
         return (f"🛡 SL -{plan['sl']:.2f}% | TP1 +{plan['tp1']:.2f}% ({r1:.1f}R)"
-                f" | TP2 +{plan['tp2']:.2f}% ({r2:.1f}R)")
+                f" | TP2 +{plan['tp2']:.2f}% ({r2:.1f}R){tag}")
     return (f"🛡 SL -{default_sl:.2f}% | TP +{default_sl * rr:.2f}% "
             f"({rr:.1f}R) · default plan, no history")
 

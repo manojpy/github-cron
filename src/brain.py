@@ -782,6 +782,13 @@ class BrainEngine:
             )
             if plan:
                 result["trade_plan"] = plan
+        _zone_mode = str(getattr(cfg, "ZONE_MODE", "live"))
+        if _zone_mode == "live" and result.get("verdict") != "BLOCKED":
+            _zone = engine.zone_lookup(
+                bundle.get("zone_profiles"), pair, alert_key, direction, context.get("adx_val"),
+            )
+            if _zone:
+                result["trade_zone"] = _zone
         return result
 
     # ── Kill switch ──────────────────────────────────────────────────────
@@ -2056,7 +2063,7 @@ class BrainEngine:
 
                 if pair_wf.get("valid") and pair_wf.get("passed") is False:
                     pair_threshold_lines.append(
-                        f"  • {pair}: suggested {suggested:.1f} (was {current:.1f}) — "
+                        f"  ����� {pair}: suggested {suggested:.1f} (was {current:.1f}) — "
                         f"NOT applied, failed walk-forward "
                         f"({pair_wf['holdout_wr']:.0%} holdout WR on n={len(pair_rows)})"
                     )
@@ -2256,7 +2263,80 @@ class BrainEngine:
         except Exception as e:
             audit.record_analysis_exception("adaptive_dedup_windows", e)
 
-        # ── Regime gate: regime-conditioned, sample- and OOS-gated evidence for
+        # ── Validated TP/SL zones: sample-gated, OOS-replayed, streak-promoted.
+        # Only PROMOTED zones are persisted for dispatch; candidates and the
+        # reasons they failed are reported so the gap to promotion is visible. ──
+        zone_blob: Dict[str, Any] = {}
+        if str(getattr(cfg, "ZONE_MODE", "live")) != "off" and real_rows:
+            try:
+                zres = engine.zone_candidates(
+                    real_rows,
+                    min_n=int(getattr(cfg, "ZONE_MIN_N", 60)),
+                    min_holdout=int(getattr(cfg, "ZONE_MIN_HOLDOUT", 20)),
+                    min_delta_pct=float(getattr(cfg, "ZONE_MIN_DELTA_PCT", 0.05)),
+                    min_p_better=float(getattr(cfg, "ZONE_MIN_P_BETTER", 0.80)),
+                    stability_tol=float(getattr(cfg, "ZONE_STABILITY_TOL", 0.35)),
+                    max_deviation=float(getattr(cfg, "ZONE_MAX_DEVIATION", 2.0)),
+                    min_rr=float(getattr(cfg, "ZONE_MIN_RR", 1.0)),
+                    sl_percentile=float(getattr(cfg, "MAE_MFE_SL_PERCENTILE", 70.0)),
+                    tp1_percentile=float(getattr(cfg, "MAE_MFE_TP1_PERCENTILE", 60.0)),
+                    tp2_percentile=float(getattr(cfg, "MAE_MFE_TP2_PERCENTILE", 85.0)),
+                    sl_min_pct=float(getattr(cfg, "MAE_MFE_SL_MIN_PCT", 0.15)),
+                    sl_max_pct=float(getattr(cfg, "MAE_MFE_SL_MAX_PCT", 3.0)),
+                )
+                _prev_streaks: Dict[str, int] = {}
+                if not self.sdb.degraded:
+                    _raw_streaks = await self.sdb.get_metadata("zone_pass_streaks")
+                    if _raw_streaks:
+                        try:
+                            _prev_streaks = {str(k): int(v) for k, v in json_loads(_raw_streaks).items()}
+                        except Exception:
+                            _prev_streaks = {}
+                _promoted, _streaks = engine.zone_promote(
+                    zres["candidates"], _prev_streaks,
+                    int(getattr(cfg, "ZONE_PROMOTE_CONSECUTIVE", 2)),
+                )
+                if not self.sdb.degraded:
+                    await self.sdb.set_metadata(
+                        "zone_pass_streaks", json_dumps(_streaks), ttl=30 * 86400,
+                    )
+                zone_blob = {"median_adx": zres["median_adx"], "zones": _promoted}
+                _cands = zres["candidates"]
+                ai_metrics["zone_profiles"] = {
+                    "n_candidates": len(_cands),
+                    "n_passing": sum(1 for c in _cands.values() if c.get("passed")),
+                    "n_promoted": len(_promoted),
+                    "candidates": _cands,
+                }
+                if _cands:
+                    _top = sorted(
+                        _cands.values(),
+                        key=lambda c: (not c.get("passed"), -(c.get("delta_ev") or -9.0)),
+                    )[:5]
+                    recommendations.append({
+                        "type": "zone_profiles", "severity": "low",
+                        "message": (
+                            f"🎯 TP/SL zones (mode {getattr(cfg, 'ZONE_MODE', 'live')}): "
+                            f"{len(_cands)} candidate(s), {sum(1 for c in _cands.values() if c.get('passed'))} "
+                            f"passing OOS, {len(_promoted)} promoted "
+                            f"(needs {int(getattr(cfg, 'ZONE_PROMOTE_CONSECUTIVE', 2))} consecutive passes):\n"
+                            + "\n".join(
+                                f"  {'PROMOTED' if c['bucket'] in _promoted else ('pass ' + str(_streaks.get(c['bucket'], 0)) if c.get('passed') else 'fail')} "
+                                f"{c['bucket']}: "
+                                + (f"SL {c['sl_pct']:.2f}% TP1 {c['tp1_pct']:.2f}% "
+                                   f"ΔEV {c.get('delta_ev', 0.0):+.2f}% (n={c['n']})"
+                                   if c.get("sl_pct") is not None else "no profile")
+                                + ("" if c.get("passed") else f" [{', '.join(c['reasons'][:2])}]")
+                                for c in _top
+                            )
+                            + "\nZones only change the SL/TP shown in alerts; outcome labels keep the fixed bracket."
+                        ),
+                    })
+            except Exception as e:
+                audit.record_analysis_exception("zone_profiles", e)
+                zone_blob = {}
+
+        # ─ Regime gate: regime-conditioned, sample- and OOS-gated evidence for
         # the dispatch-time quality verdict (restrict-only) ──
         regime_gate_blob: Dict[str, Any] = {}
         if str(getattr(cfg, "REGIME_GATE_MODE", "live")) != "off" and real_rows:
@@ -2303,6 +2383,7 @@ class BrainEngine:
                 "hierarchical_leaves": hca.get("leaves", {}) if hca.get("valid") else {},
                 "hierarchical_median_adx": hca.get("median_adx"),
                 "regime_gate": regime_gate_blob if regime_gate_blob.get("valid") else {},
+                "zone_profiles": zone_blob,
                 "mae_mfe_profiles": mae_mfe_profiles,
                 "ts": int(time.time()),
             })

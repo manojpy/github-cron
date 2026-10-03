@@ -2300,6 +2300,208 @@ def lookup_mae_mfe_plan(profiles, pair, alert_key, direction):
             return plan
     return None
 
+# ═══════════════════════════════════════════════════════════════════════
+#  Validated TP/SL zones (sample-gated, OOS-replayed, streak-promoted)
+# ═══════════════════════════════════════════════════════════════════════
+
+def zone_replay_pnl(
+    row: Row, sl_pct: float, tp_pct: float, total_cost_pct: float,
+) -> Optional[float]:
+    """Net P&L (percent) the trade WOULD have produced with a different
+    stop/target, from its recorded excursions. MAE/MFE are whole-window
+    extremes with no ordering, so when BOTH levels were touched the trade is
+    counted as a STOP (pessimistic: the zone's replayed EV is a lower bound).
+    Neither touched -> exits at the horizon close. None if the row lacks the
+    needed fields."""
+    mae, mfe = row.get("mae"), row.get("mfe")
+    if mae is None or mfe is None:
+        return None
+    cost = row.get("realized_cost_pct")
+    cost = float(cost) if cost is not None else total_cost_pct
+    if abs(float(mae)) * 100.0 >= sl_pct:
+        return -sl_pct - cost
+    if abs(float(mfe)) * 100.0 >= tp_pct:
+        return tp_pct - cost
+    pm = row.get("pct_move")
+    if pm is None:
+        return None
+    gross = float(pm) if row.get("direction") == "buy" else -float(pm)
+    return gross - cost
+
+def _zone_bucket_keys(row: Row, median_adx: Optional[float]) -> List[str]:
+    ak, d, pair = row.get("alert_key"), row.get("direction"), row.get("pair")
+    if not ak or not d or not pair:
+        return []
+    reg = _regime_label(row.get("adx_val"), median_adx)
+    fam = alert_family_of(str(ak))
+    keys = [f"alertdir:{ak}|{d}", f"famdir:{fam}|{d}"]
+    if reg != "unknown":
+        keys += [f"leafreg:{pair}|{ak}|{d}|{reg}", f"alertreg:{ak}|{d}|{reg}", f"famreg:{fam}|{d}|{reg}"]
+    return keys
+
+def _zone_median_adx(rows: List[Row]) -> Optional[float]:
+    vals = sorted(float(r["adx_val"]) for r in rows if r.get("adx_val") is not None)
+    if not vals:
+        return None
+    mid = len(vals) // 2
+    return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+
+def zone_candidates(
+    rows: List[Row],
+    *,
+    min_n: int = 60,
+    min_holdout: int = 20,
+    min_delta_pct: float = 0.05,
+    min_p_better: float = 0.80,
+    stability_tol: float = 0.35,
+    max_deviation: float = 2.0,
+    min_rr: float = 1.0,
+    sl_percentile: float = 70.0,
+    tp1_percentile: float = 60.0,
+    tp2_percentile: float = 85.0,
+    sl_min_pct: float = 0.15,
+    sl_max_pct: float = 3.0,
+    fee_pct: float = 0.0006,
+    slippage_pct: float = 0.0003,
+) -> Dict[str, Any]:
+    """Build and VALIDATE a TP/SL zone per bucket (pair+alert+dir+regime,
+    alert+dir+regime, family+dir+regime, alert+dir, family+dir).
+
+    A candidate PASSES only if all hold:
+      * sample        - n >= min_n rows carrying MAE/MFE;
+      * OOS replay    - zone learned on the chronological TRAIN split, replayed
+                        on the purged/embargoed HOLDOUT (>= min_holdout rows),
+                        beats the fixed bracket on the same trades by
+                        >= min_delta_pct, with paired-difference probability
+                        >= min_p_better;
+      * stability     - SL and TP1 re-learned on the holdout differ from the
+                        train values by <= stability_tol (relative);
+      * safety rails  - SL and TP1 within [1/max_deviation, max_deviation] x the
+                        fixed bracket, and TP1/SL >= min_rr.
+    Pure and deterministic. Returns {"median_adx", "candidates": {key: {...}}}."""
+    usable = [r for r in rows if r.get("mae") is not None and r.get("mfe") is not None]
+    median_adx = _zone_median_adx(usable)
+    total_cost = (fee_pct * 2 + slippage_pct * 2) * 100
+    fixed_sl = float(cfg.OUTCOME_MAE_LOSS_PCT)
+    fixed_tp = fixed_sl * float(cfg.OUTCOME_RR_TARGET)
+
+    buckets: DefaultDict[str, List[Row]] = defaultdict(list)
+    for r in usable:
+        for k in _zone_bucket_keys(r, median_adx):
+            buckets[k].append(r)
+
+    plan_kw = dict(sl_percentile=sl_percentile, tp1_percentile=tp1_percentile,
+                   tp2_percentile=tp2_percentile, sl_min_pct=sl_min_pct, sl_max_pct=sl_max_pct)
+    out: Dict[str, Dict[str, Any]] = {}
+    for key, bucket in sorted(buckets.items()):
+        n = len(bucket)
+        if n < min_n:
+            continue
+        train, hold = walk_forward_split(bucket)
+        cand: Dict[str, Any] = {"bucket": key, "n": n, "n_holdout": len(hold), "passed": False, "reasons": []}
+        out[key] = cand
+        plan = mae_mfe_trade_plan(train, **plan_kw)
+        if not plan or len(hold) < min_holdout:
+            cand["reasons"].append("insufficient_train_or_holdout")
+            continue
+        sl, tp1, tp2 = plan["sl_suggested_pct"], plan["tp1_suggested_pct"], plan["tp2_suggested_pct"]
+        cand.update({"sl_pct": sl, "tp1_pct": tp1, "tp2_pct": tp2, "tp_first_rate": plan.get("tp_first_rate")})
+        # safety rails
+        if sl <= 0 or tp1 <= 0 or tp1 / sl < min_rr:
+            cand["reasons"].append("rr_below_floor")
+        for name, val, ref in (("sl", sl, fixed_sl), ("tp1", tp1, fixed_tp)):
+            if ref > 0 and not (ref / max_deviation <= val <= ref * max_deviation):
+                cand["reasons"].append(f"{name}_outside_deviation_rail")
+        # stability: re-learn on the holdout split
+        hold_plan = mae_mfe_trade_plan(hold, **plan_kw)
+        if not hold_plan:
+            cand["reasons"].append("holdout_plan_unavailable")
+        else:
+            for name, a, b in (("sl", sl, hold_plan["sl_suggested_pct"]),
+                               ("tp1", tp1, hold_plan["tp1_suggested_pct"])):
+                if a > 0 and abs(b - a) / a > stability_tol:
+                    cand["reasons"].append(f"{name}_unstable")
+        # OOS replay vs the fixed bracket, paired per trade
+        diffs: List[float] = []
+        zone_pnls: List[float] = []
+        base_pnls: List[float] = []
+        for r in hold:
+            z = zone_replay_pnl(r, sl, tp1, total_cost)
+            if z is None:
+                continue
+            b = row_net_pnl_pct(r, total_cost)
+            zone_pnls.append(z)
+            base_pnls.append(b)
+            diffs.append(z - b)
+        if len(diffs) < min_holdout:
+            cand["reasons"].append("holdout_replay_too_thin")
+        else:
+            mean_d = statistics.fmean(diffs)
+            sd = statistics.stdev(diffs)
+            if sd <= 0:
+                p_better = 1.0 if mean_d > 0 else 0.5
+            else:
+                p_better = 0.5 * math.erfc(-(mean_d / (sd / math.sqrt(len(diffs)))) / math.sqrt(2.0))
+            cand.update({
+                "zone_ev": round(statistics.fmean(zone_pnls), 4),
+                "fixed_ev": round(statistics.fmean(base_pnls), 4),
+                "delta_ev": round(mean_d, 4),
+                "p_better": round(p_better, 4),
+                "n_replayed": len(diffs),
+            })
+            if mean_d < min_delta_pct:
+                cand["reasons"].append("delta_below_margin")
+            if p_better < min_p_better:
+                cand["reasons"].append("not_significantly_better")
+        cand["passed"] = not cand["reasons"]
+    return {"median_adx": median_adx, "candidates": out}
+
+def zone_promote(
+    candidates: Dict[str, Dict[str, Any]],
+    prev_streaks: Dict[str, int],
+    required_passes: int = 2,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
+    """Streak-based promotion. A passing candidate's streak increments, a
+    failing or vanished one drops out (reset = demotion). A zone is promoted
+    only once its streak reaches `required_passes`. Returns
+    (promoted_zones, new_streaks)."""
+    streaks: Dict[str, int] = {}
+    promoted: Dict[str, Dict[str, Any]] = {}
+    for key, cand in candidates.items():
+        if not cand.get("passed"):
+            continue
+        s = int(prev_streaks.get(key, 0)) + 1
+        streaks[key] = s
+        if s >= required_passes:
+            promoted[key] = dict(cand, streak=s)
+    return promoted, streaks
+
+def zone_lookup(
+    blob: Optional[Dict[str, Any]], pair: str, alert_key: str, direction: str,
+    adx_val: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    """Most specific PROMOTED zone for a prospective alert, else None.
+    Order: pair+alert+dir+regime, alert+dir+regime, family+dir+regime,
+    alert+dir, family+dir."""
+    if not blob or not isinstance(blob, dict):
+        return None
+    zones = blob.get("zones") or {}
+    if not zones:
+        return None
+    reg = _regime_label(adx_val, blob.get("median_adx"))
+    fam = alert_family_of(str(alert_key))
+    keys = []
+    if reg != "unknown":
+        keys += [f"leafreg:{pair}|{alert_key}|{direction}|{reg}",
+                 f"alertreg:{alert_key}|{direction}|{reg}",
+                 f"famreg:{fam}|{direction}|{reg}"]
+    keys += [f"alertdir:{alert_key}|{direction}", f"famdir:{fam}|{direction}"]
+    for k in keys:
+        z = zones.get(k)
+        if z:
+            return dict(z, bucket=k)
+    return None
+
 def is_vote_pattern_ood(
     rows: List[Row],
     current_votes: Dict[str, bool],
@@ -2650,7 +2852,7 @@ def interaction_miner(
                     entry["n_neither"] = n_neither
                 interactions.append(entry)
 
-            # ── v2 poisons v1 ───────────────────────────────────────────
+            # ── v2 poisons v1 ──────────────────────���────────────────────
             # Reference arm is v1-alone (guaranteed valid). Test: does
             # adding v2 drag v1's win rate down?
             poison_v1 = wr_only_v1 - wr_both
