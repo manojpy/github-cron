@@ -8,7 +8,6 @@ import time
 import statistics
 from collections import defaultdict
 from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple
-import alert_registry as _alert_registry
 from alert_registry import alert_family_of
 from threshold_stats import (
     CapRow,

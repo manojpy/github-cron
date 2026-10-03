@@ -80,7 +80,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             # ── EV-gated disable: only disable if EV is ALSO negative ──
             _ev_cache_key = (alert_key, len(s["rows"]))
             if not hasattr(self, "_ev_obj_cache"):
-                self._ev_obj_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
+                self._ev_obj_cache = {}
             if _ev_cache_key in self._ev_obj_cache:
                 ev_obj = self._ev_obj_cache[_ev_cache_key]
             else:
