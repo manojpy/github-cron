@@ -23,7 +23,7 @@ try:
     def json_loads(s: str | bytes) -> Any:
         return orjson.loads(s)
 
-    JSONDecodeError = orjson.JSONDecodeError
+    JSONDecodeError: type[ValueError] = orjson.JSONDecodeError
     JSON_BACKEND = "orjson"
 
 except ImportError:
