@@ -1338,7 +1338,9 @@ class BrainCore:
         perf = next((r for r in recs["recommendations"] if r["type"] == "per_alert_breakdown"), None)
         alert_data = perf.get("data") if perf else None
         if alert_data:
-            from alerts import BUY_ALERT_KEYS, SELL_ALERT_KEYS
+
+            from alert_registry import BUY_ALERT_KEYS, SELL_ALERT_KEYS         
+
             buy_ranked = sorted((t for t in alert_data if t[0] in BUY_ALERT_KEYS), key=lambda t: -t[1])
             sell_ranked = sorted((t for t in alert_data if t[0] in SELL_ALERT_KEYS), key=lambda t: -t[1])
             if buy_ranked or sell_ranked:

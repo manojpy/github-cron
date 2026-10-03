@@ -73,7 +73,7 @@ async def _execute_pipeline(pipe: Any) -> Any:
     return await result
 
 async def _blanket_reset_pair(sdb: RedisStateStore, pair_name: str, logger_pair: logging.Logger) -> int:
-    from alerts import ALERT_KEYS
+    from alert_registry import ALERT_KEYS
     all_keys = list(ALERT_KEYS.values())
     previous_states = await sdb.batch_get_all_alert_states(pair_name, all_keys)
     resets = [

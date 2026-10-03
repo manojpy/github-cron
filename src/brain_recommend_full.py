@@ -30,16 +30,19 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
     # ── Phase timer — one INFO line per phase so a slow report can be
     # diagnosed from the workflow log without a profiler. Overhead is
     # one time.time() call per mark; negligible against the phases. ──
+    logger = logging.getLogger("macd_bot")
     _phase_t0 = time.time()
+
     def _phase_mark(_label: str) -> None:
         nonlocal _phase_t0
         _now = time.time()
-        logger.info(f"⏱️ Brain phase '{_label}': {_now - _phase_t0:.2f}s")
+        logger.info(
+            f"⏱️ Brain phase '{_label}': {_now - _phase_t0:.2f}s"
+        )
         _phase_t0 = _now
 
     # ── 0. Baseline (original brain logic) ───────────────────────────
     base_recs = await self._generate_baseline_recommendations()
-    logger = logging.getLogger("macd_bot")
     _phase_mark("baseline")
     real_rows = base_recs.get("_real_rows", [])
     shadow_rows = base_recs.get("_shadow_rows", [])

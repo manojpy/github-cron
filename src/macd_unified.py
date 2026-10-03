@@ -41,17 +41,18 @@ from state import (
     RedisKeyPrefix, RedisStateStore, RedisLock, _rc,
 )
 
-
 from gates import GateResult, compute_confluence_score, _eval_gate, _resolve_pair_outcomes
-
 import threshold_engine as engine
+from brain_engine import BrainEngine
 
-_ALERT_ONLY_MODE: bool = False   # True → skip Brain analysis in run_once()
+_ALERT_ONLY_MODE: bool = False
 
 from alerts import (
-    TelegramQueue, ALERT_KEYS, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
+    TelegramQueue, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
     DEDUP_STATS, reset_dedup_stats, DLQ_STATS, reset_dlq_stats, replay_telegram_dlq, format_dedup_summary
 )
+
+from alert_registry import ALERT_KEYS
 
 _pair_eval_counter = 0
 _CLUSTER_CACHE_MISS = object()
@@ -767,8 +768,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         try:
             # Refresh first so this run's gate uses a fresh curve when needed.
             # Works on shallow-archive runs (Redis streams only).
-            from brain_enhanced import BrainEngineV2
-            _calib_brain = BrainEngineV2(state_db)
+            _calib_brain = BrainEngine(state_db)
             await _calib_brain.maybe_refresh_calibration(logger_main)
         except Exception as e:
             logger_main.warning(
@@ -858,16 +858,18 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             )
         except Exception as e:
             logger_main.warning(f"ML-EV pre-load failed (fail-open): {e}")
+
             ml_market_state_model = None
             ml_calibration_curve = None
 
     brain_engine_shared: Optional[Any] = None
     if cfg.ENABLE_BRAIN and state_db and not state_db.degraded:
         try:
-            from brain_enhanced import BrainEngineV2
-            brain_engine_shared = BrainEngineV2(state_db)
+            brain_engine_shared = BrainEngine(state_db)
         except Exception as e:
-            logger_main.warning(f"Shared brain engine init failed (fail-open): {e}")
+            logger_main.warning(
+                f"Shared brain engine init failed (fail-open): {e}"
+            )
             brain_engine_shared = None
 
     # ── Disabled-alert-keys, pair-thresholds, open-positions: loaded ONCE
@@ -1390,11 +1392,12 @@ async def run_once() -> Optional[bool]:
             if sdb and not sdb.degraded:
                 logger_run.warning("🔓 CLEAR_KILL_SWITCH requested — manually clearing kill switch...")
                 try:
-                    from brain_enhanced import BrainEngineV2
-                    brain_for_clear = BrainEngineV2(sdb)
+                    brain_for_clear = BrainEngine(sdb)
                     cleared = await brain_for_clear.clear_kill_switch()
                 except Exception as e:
-                    logger_run.error(f"Kill switch clear raised an exception: {e}")
+                    logger_run.error(
+                        f"Kill switch clear raised an exception: {e}"
+                    )
                     cleared = False
 
                 if telegram_queue is None:
@@ -1699,8 +1702,8 @@ async def run_once() -> Optional[bool]:
 
         if cfg.ENABLE_BRAIN and not _ALERT_ONLY_MODE:
             try:
-                from brain_enhanced import BrainEngineV2
-                brain = BrainEngineV2(sdb)
+                brain = BrainEngine(sdb)
+
                 if getattr(cfg, "BRAIN_REPORT_ON_DEMAND", False):
                     logger_run.info("🧠 Brain report on demand requested — forcing report generation...")
                     await brain.send_report_now(pairs_to_process, telegram_queue, logger_run)
@@ -1909,7 +1912,6 @@ if __name__ == "__main__":
 
     if args.apply_brain:
         async def apply_brain_and_exit():
-            from brain_enhanced import BrainEngineV2
             from alerts import TelegramQueue
 
             sdb = RedisStateStore(cfg.REDIS_URL)
@@ -1917,7 +1919,7 @@ if __name__ == "__main__":
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
 
             try:
-                brain = BrainEngineV2(sdb)
+                brain = BrainEngine(sdb)
                 return await brain.apply_pending_plan(telegram_queue, logger_main)
             except Exception as e:
                 logger_main.critical(f"Apply brain failed: {e}")

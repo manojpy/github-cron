@@ -134,7 +134,7 @@ def build_caps_data(rows: List[Row], min_sample: int = 20) -> Tuple[List[float],
     caps_data.reverse()  # back to ascending order
     return candidate_caps, caps_data
 
-_ALERT_FAMILY_PREFIXES: List[Tuple[str, str]] = _alert_registry.FAMILY_PREFIXES
+_ALERT_FAMILY_PREFIXES: List[Tuple[str, str]] = []
 
 def alert_family_analysis(
     rows: List[Row],
