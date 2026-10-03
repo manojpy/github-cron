@@ -17,8 +17,7 @@ from datetime import datetime, timezone
 import numpy as np
 
 from bot_config import (
-    Constants, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
-    TRACE_ID, PAIR_ID, cfg, logger, logger_main,
+    Constants, TRACE_ID, PAIR_ID, cfg, logger, logger_main,
     format_ist_time, MEMORY_CHECK_INTERVAL_PAIRS, validate_runtime_config,
     json_dumps, json_loads, JSON_BACKEND, shutdown_event, __version__, BtcMacroContext,
     ClusterContext, BiasContext,
@@ -51,8 +50,7 @@ from alerts import (
     TelegramQueue, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
     DEDUP_STATS, reset_dedup_stats, DLQ_STATS, reset_dlq_stats, replay_telegram_dlq, format_dedup_summary
 )
-
-from alert_registry import ALERT_KEYS
+from alert_registry import ALERT_KEYS, keys_for
 
 _pair_eval_counter = 0
 _CLUSTER_CACHE_MISS = object()
@@ -1438,11 +1436,8 @@ async def run_once() -> Optional[bool]:
                 all_delete_keys = []
     
                 if cfg.ENABLE_PIVOT:
-                    pivot_alerts = (
-                        [f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY] +
-                        [f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL]
-                    )
-        
+                    pivot_alerts = keys_for(kind="pivot")
+
                     for pair in pairs_to_process:
                         for alert_key in pivot_alerts:
                             redis_key = ALERT_KEYS.get(alert_key)
@@ -1450,7 +1445,7 @@ async def run_once() -> Optional[bool]:
                                 all_delete_keys.append(f"{pair}:{redis_key}")
     
                 if cfg.ENABLE_VWAP:
-                    vwap_alerts = ["vwap_up", "vwap_down"]
+                    vwap_alerts = keys_for(config_flag="ENABLE_VWAP")
                     for pair in pairs_to_process:
                         for alert_key in vwap_alerts:
                             redis_key = ALERT_KEYS.get(alert_key)
