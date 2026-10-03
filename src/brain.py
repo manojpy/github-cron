@@ -9,7 +9,7 @@ import asyncio
 import json
 import logging
 import time
-from collections import defaultdict
+from collections import defaultdict, Counter
 from typing import Any, Dict, List, Optional, Tuple
 from alerts import escape_markdown_v2
 from bot_config import cfg, json_dumps, json_loads, format_ist_time, CONFLUENCE_WEIGHTS

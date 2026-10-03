@@ -10,7 +10,7 @@ import logging
 import random
 import math
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import os
 from pathlib import Path
 from brain_audit import DataCoverage, HealthStatus, get_audit, reset_audit, ACTION_GATE_MIN_ROWS
