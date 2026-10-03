@@ -21,15 +21,24 @@ CapRow = Tuple[float, int, float, float]  # (cap, n, wr, wilson_lower_bound)
 
 # ── Per-report-cycle memo for ev_first_objective ──
 
-_EV_FIRST_CACHE: Dict[Tuple[int, Any, Any, int, float, float], Dict[str, Any]] = {}
+_EV_FIRST_CACHE: Dict[Tuple[int, Any, Any, int, int, float, float], Dict[str, Any]] = {}
 
 def _ev_first_cache_key(
     rows: List[Row], min_sample: int, fee_pct: float, slippage_pct: float,
-) -> Tuple[int, Any, Any, int, float, float]:
+) -> Tuple[int, Any, Any, int, int, float, float]:
     n = len(rows)
     first_ts = rows[0].get("entry_ts", 0) if n else 0
     last_ts = rows[-1].get("entry_ts", 0) if n else 0
-    return (n, first_ts, last_ts, min_sample, fee_pct, slippage_pct)
+    # n + first/last ts alone collide for different row sets that share a size
+    # and time span (e.g. two alert keys firing on the same candles, or regime
+    # segments of one alert), returning another set's cached EV. The content
+    # checksum makes the key specific to the actual rows and their outcomes.
+    content = hash(tuple(
+        (r.get("entry_ts", 0), r.get("pair"), r.get("alert_key"),
+         r.get("direction"), bool(r.get("win")), r.get("outcome_reason"))
+        for r in rows
+    ))
+    return (n, first_ts, last_ts, content, min_sample, fee_pct, slippage_pct)
 
 def clear_ev_first_cache() -> None:
     """Drop all memoised ev_first_objective() results. Call at the top of
@@ -5203,6 +5212,170 @@ def fill_reconciliation(
                 "outcome writer for the measured tier",
     }
 
+def _regime_label(adx_val: Optional[float], median_adx: Optional[float]) -> str:
+    """Same trending/ranging split as regime_breakdown and the hierarchical
+    leaves: ADX at or above the window median is 'trending'."""
+    if adx_val is None or median_adx is None:
+        return "unknown"
+    return "trending" if float(adx_val) >= float(median_adx) else "ranging"
+
+def _holdout_ev_check(rows: List[Row], fee_pct: float = 0.0006, slippage_pct: float = 0.0003) -> Optional[Dict[str, float]]:
+    """Net EV and P(true mean P&L > 0) for a SMALL holdout, without the block
+    bootstrap (which needs >= 60 rows and so can never confirm a 20-59 row
+    holdout). Uses the per-trade net P&L (same bracket model as everywhere
+    else) and a normal approximation on the mean: p = Phi(mean / (sd/sqrt(n))).
+    Deliberately simple and iid; returns None when it cannot be computed."""
+    n = len(rows)
+    if n < 2:
+        return None
+    total_cost = (fee_pct * 2 + slippage_pct * 2) * 100
+    pnls = [row_net_pnl_pct(r, total_cost) for r in rows]
+    mean = statistics.fmean(pnls)
+    sd = statistics.stdev(pnls)
+    if sd <= 0:
+        return {"net_ev": mean, "p_ev_positive": 1.0 if mean > 0 else (0.0 if mean < 0 else 0.5)}
+    z = mean / (sd / math.sqrt(n))
+    return {"net_ev": mean, "p_ev_positive": 0.5 * math.erfc(-z / math.sqrt(2.0))}
+
+def regime_gate_analysis(
+    rows: List[Row],
+    *,
+    min_n_downgrade: int = 50,
+    min_n_block: int = 100,
+    min_holdout: int = 20,
+    downgrade_p: float = 0.35,
+    block_p: float = 0.20,
+    min_gap_pct: float = 0.10,
+    min_sample: int = 15,
+) -> Dict[str, Any]:
+    """Regime-conditioned evidence for the live quality gate.
+
+    For every (alert_key, direction, regime) segment this asks "is this alert
+    bad specifically in THIS regime?":
+      * sample gate   - DOWNGRADE needs n >= min_n_downgrade, BLOCK needs
+                        n >= min_n_block;
+      * regime gap    - segment net EV must be >= min_gap_pct worse than the
+                        same alert+direction over all regimes;
+      * probability   - segment P(net EV > 0) <= downgrade_p (or block_p);
+      * OOS confirm   - BLOCK additionally needs a purged/embargoed
+                        chronological holdout of >= min_holdout rows that is
+                        itself negative with P(net EV > 0) <= block_p.
+    The output can only ever restrict a verdict. Pure and deterministic."""
+    adx_vals = sorted(float(r["adx_val"]) for r in rows if r.get("adx_val") is not None)
+    out: Dict[str, Any] = {"valid": False, "median_adx": None, "segments": {}, "n_evaluated": 0}
+    if len(adx_vals) < 2 * min_sample:
+        out["error"] = "insufficient_adx_tagged_rows"
+        return out
+    mid = len(adx_vals) // 2
+    median_adx = adx_vals[mid] if len(adx_vals) % 2 else (adx_vals[mid - 1] + adx_vals[mid]) / 2.0
+    out["median_adx"] = median_adx
+
+    by_ad: DefaultDict[Tuple[str, str], List[Row]] = defaultdict(list)
+    by_adr: DefaultDict[Tuple[str, str, str], List[Row]] = defaultdict(list)
+    for r in rows:
+        ak, d = r.get("alert_key"), r.get("direction")
+        if not ak or not d:
+            continue
+        reg = _regime_label(r.get("adx_val"), median_adx)
+        if reg == "unknown":
+            continue
+        by_ad[(str(ak), str(d))].append(r)
+        by_adr[(str(ak), str(d), reg)].append(r)
+
+    base_cache: Dict[Tuple[str, str], Optional[float]] = {}
+    for (ak, d, reg), seg in sorted(by_adr.items()):
+        n = len(seg)
+        if n < min_n_downgrade:
+            continue
+        ev = ev_first_objective(seg, min_sample=min_sample)
+        if not ev.get("valid"):
+            continue
+        out["n_evaluated"] += 1
+        if (ak, d) not in base_cache:
+            b = ev_first_objective(by_ad[(ak, d)], min_sample=min_sample)
+            base_cache[(ak, d)] = float(b["net_ev"]) if b.get("valid") else None
+        base_ev = base_cache[(ak, d)]
+        seg_ev = float(ev["net_ev"])
+        p_pos = float(ev["p_ev_positive"])
+        gap = (seg_ev - base_ev) if base_ev is not None else None
+        regime_specific = gap is not None and gap <= -float(min_gap_pct)
+
+        train, hold = walk_forward_split(seg)
+        hold_ev = _holdout_ev_check(hold) if len(hold) >= min_holdout else None
+        hold_negative = bool(
+            hold_ev
+            and float(hold_ev["net_ev"]) < 0.0
+            and float(hold_ev["p_ev_positive"]) <= block_p
+        )
+        action = "NONE"
+        if regime_specific and seg_ev < 0.0:
+            if n >= min_n_block and p_pos <= block_p and hold_negative:
+                action = "BLOCK"
+            elif p_pos <= downgrade_p:
+                action = "DOWNGRADE"
+        out["segments"][f"{ak}|{d}|{reg}"] = {
+            "alert_key": ak, "direction": d, "regime": reg, "n": n,
+            "net_ev": round(seg_ev, 4), "p_ev_positive": round(p_pos, 4),
+            "baseline_net_ev": None if base_ev is None else round(base_ev, 4),
+            "gap_vs_baseline": None if gap is None else round(gap, 4),
+            "n_holdout": len(hold),
+            "holdout_net_ev": None if not hold_ev else round(float(hold_ev["net_ev"]), 4),
+            "holdout_p_ev_positive": None if not hold_ev else round(float(hold_ev["p_ev_positive"]), 4),
+            "oos_confirmed_negative": hold_negative,
+            "action": action,
+        }
+    out["valid"] = True
+    return out
+
+def regime_gate_lookup(
+    blob: Optional[Dict[str, Any]], alert_key: str, direction: str, adx_val: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    """Persisted segment for the CURRENT regime of a prospective alert, or None
+    (unknown ADX, no blob, or no actionable segment)."""
+    if not blob or not isinstance(blob, dict):
+        return None
+    reg = _regime_label(adx_val, blob.get("median_adx"))
+    if reg == "unknown":
+        return None
+    seg = (blob.get("segments") or {}).get(f"{alert_key}|{direction}|{reg}")
+    if not seg or seg.get("action") not in ("BLOCK", "DOWNGRADE"):
+        return None
+    return seg
+
+def apply_regime_gate(result: Dict[str, Any], seg: Optional[Dict[str, Any]], mode: str) -> None:
+    """Apply a regime-gate segment to a trade-quality result IN PLACE.
+
+    Restrict-only: BLOCK -> BLOCKED, DOWNGRADE -> at most LOW. A verdict that is
+    already BLOCKED or LOW is never changed, and nothing is ever raised.
+    mode 'shadow' only annotates; 'off' does nothing."""
+    if not seg or mode == "off":
+        return
+    action = str(seg.get("action"))
+    note = (
+        f"{seg.get('regime')} regime: net EV {float(seg.get('net_ev', 0.0)):+.2f}% "
+        f"vs {float(seg.get('baseline_net_ev') or 0.0):+.2f}% overall "
+        f"(P={float(seg.get('p_ev_positive', 0.0)):.0%}, n={seg.get('n')})"
+    )
+    entry = {"action": action, "note": note, "n": seg.get("n"), "regime": seg.get("regime")}
+    if mode != "live":
+        result["regime_gate_shadow"] = entry
+        return
+    before = result.get("verdict")
+    if before == "BLOCKED":
+        return
+    if action == "BLOCK":
+        result["verdict_before_regime_gate"] = before
+        result["verdict"] = "BLOCKED"
+        result["reason"] = f"regime_gate: {note}"
+        entry["applied"] = True
+    elif action == "DOWNGRADE" and before in ("HIGH", "MEDIUM"):
+        result["verdict_before_regime_gate"] = before
+        result["verdict"] = "LOW"
+        entry["applied"] = True
+    else:
+        entry["applied"] = False
+    result["regime_gate"] = entry
+
 def trade_quality_score(
     row: Row,
     ev_model_result: Dict[str, Any],
@@ -5216,8 +5389,9 @@ def trade_quality_score(
     market_state_p_win: Optional[float] = None,
     use_market_state_live: bool = False,
     ml_calibration_curve: Optional[Dict[str, Any]] = None,
+    regime_gate: Optional[Dict[str, Any]] = None,
+    regime_gate_mode: str = "off",
 ) -> Dict[str, Any]:
-    """Unified quality assessment for a single prospective trade."""
     result: Dict[str, Any] = {
         "pair": row.get("pair"),
         "alert_key": row.get("alert_key"),
@@ -5357,6 +5531,9 @@ def trade_quality_score(
 
         "alert_family": alert_family_of(str(row.get("alert_key") or "")),
     })
+
+    # ── Regime gate (restrict-only; sample + OOS gated upstream) ──
+    apply_regime_gate(result, regime_gate, regime_gate_mode)
 
     # ── Ensemble layer (roadmap #22): blend Bayesian + ML + EV + recent ──
     if getattr(cfg, "ENABLE_ENSEMBLE_DECISION", True):

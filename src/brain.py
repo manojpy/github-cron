@@ -755,9 +755,17 @@ class BrainEngine:
             )
             if market_state_p_win is not None:
                 ml_calibration_curve = await self._load_ml_calibration_curve()
+     
+        _rg_mode = str(getattr(cfg, "REGIME_GATE_MODE", "live"))
+        _rg_seg = (
+            engine.regime_gate_lookup(
+                bundle.get("regime_gate"), alert_key, direction, context.get("adx_val"),
+            ) if _rg_mode != "off" else None
+        )
         try:
             result = engine.trade_quality_score(
                 row, ev_model_result, calibration_curve, bundle.get("regime_info"),
+                regime_gate=_rg_seg, regime_gate_mode=_rg_mode,
                 target_wr=getattr(cfg, "MIN_WIN_RATE", 0.55),
                 calibration_min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
                 calibration_slack=getattr(cfg, "CALIBRATION_SLACK", 0.05),
@@ -1576,8 +1584,9 @@ class BrainEngine:
                     f"Regime split (median ADX {rb['median_adx']:.1f} this window): "
                     f"trending WR {trending['wr']:.0%} (n={trending['n']}, {trending['confidence']}) "
                     f"vs ranging WR {ranging['wr']:.0%} (n={ranging['n']}, {ranging['confidence']}). "
-                    f"Gap {gap:+.1%} — {gap_note}.\n"
-                    f"Diagnostic only — no regime-specific threshold applied yet."
+                    f"Gap {gap:+.1%} — {gap_note}.\n"            
+                    f"Regime-specific action: only through the regime gate "
+                    f"(sample- and OOS-gated, lowers the quality verdict only)."
                 ),
             })
         # ── Layered recent/medium/long-history comparison ──
@@ -2247,12 +2256,53 @@ class BrainEngine:
         except Exception as e:
             audit.record_analysis_exception("adaptive_dedup_windows", e)
 
+        # ── Regime gate: regime-conditioned, sample- and OOS-gated evidence for
+        # the dispatch-time quality verdict (restrict-only) ──
+        regime_gate_blob: Dict[str, Any] = {}
+        if str(getattr(cfg, "REGIME_GATE_MODE", "live")) != "off" and real_rows:
+            try:
+                regime_gate_blob = engine.regime_gate_analysis(
+                    real_rows,
+                    min_n_downgrade=int(getattr(cfg, "REGIME_GATE_MIN_N_DOWNGRADE", 50)),
+                    min_n_block=int(getattr(cfg, "REGIME_GATE_MIN_N_BLOCK", 100)),
+                    min_holdout=int(getattr(cfg, "REGIME_GATE_MIN_HOLDOUT", 20)),
+                    downgrade_p=float(getattr(cfg, "REGIME_GATE_DOWNGRADE_P", 0.35)),
+                    block_p=float(getattr(cfg, "REGIME_GATE_BLOCK_P", 0.20)),
+                    min_gap_pct=float(getattr(cfg, "REGIME_GATE_MIN_GAP_PCT", 0.10)),
+                )
+                ai_metrics["regime_gate"] = regime_gate_blob
+                _acting = [
+                    s for s in regime_gate_blob.get("segments", {}).values()
+                    if s.get("action") in ("BLOCK", "DOWNGRADE")
+                ]
+                if _acting:
+                    _acting.sort(key=lambda s: (s["action"] != "BLOCK", s["net_ev"]))
+                    recommendations.append({
+                        "type": "regime_gate", "severity": "medium",
+                        "message": (
+                            f"🚦 Regime gate: {len(_acting)} alert+direction+regime segment(s) "
+                            f"are weak specifically in that regime (mode "
+                            f"{getattr(cfg, 'REGIME_GATE_MODE', 'live')}):\n"
+                            + "\n".join(
+                                f"  {s['action']} {s['alert_key']} {s['direction']} in {s['regime']}: "
+                                f"netEV {s['net_ev']:+.2f}% vs {(s['baseline_net_ev'] or 0.0):+.2f}% overall "
+                                f"(P={s['p_ev_positive']:.0%}, n={s['n']})"
+                                for s in _acting[:5]
+                            )
+                            + "\nLowers the quality verdict only; hard signal gates are unchanged."
+                        ),
+                    })
+            except Exception as e:
+                audit.record_analysis_exception("regime_gate", e)
+                regime_gate_blob = {}
+
         if ev_by_alert:
             await self._persist_quality_inputs({
                 "ev_by_alert": ev_by_alert,
                 "regime_info": rb,
                 "hierarchical_leaves": hca.get("leaves", {}) if hca.get("valid") else {},
                 "hierarchical_median_adx": hca.get("median_adx"),
+                "regime_gate": regime_gate_blob if regime_gate_blob.get("valid") else {},
                 "mae_mfe_profiles": mae_mfe_profiles,
                 "ts": int(time.time()),
             })

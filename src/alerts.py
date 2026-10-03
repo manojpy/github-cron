@@ -363,6 +363,8 @@ def build_survival_checklist(
             bits.append("⚠ drift")
         if tq.get("regime_warning"):
             bits.append(f"⚠ {tq['regime_warning']}")
+        if (tq.get("regime_gate") or {}).get("applied"):
+            bits.append(f"⚠ regime gate: {tq['regime_gate']['note']}")
     return " · ".join(bits)
 
 def build_brain_filter_message(
@@ -400,6 +402,8 @@ def build_brain_filter_message(
             warn.append("recent WR drift")
         if tq.get("regime_warning"):
             warn.append(str(tq["regime_warning"]))
+        if (tq.get("regime_gate") or {}).get("applied"):
+            warn.append("regime gate: " + str(tq["regime_gate"]["note"]))
         if warn:
             out.append(e("⚠️ " + " · ".join(warn)))
     for ln in lines:
@@ -688,7 +692,7 @@ def _format_bias_header(bias_context: BiasContext) -> str:
     ]
     _, emoji, arrow, label, pct = max(candidates, key=lambda t: t[0])
 
-    # Non-dominant fragments in fixed order: up → down → neutral
+    # Non-dominant fragments in fixed order: up → down �� neutral
     fragments = []
     for lbl, arr, p in (
         ("Uptrend",   "▲", up_pct),
