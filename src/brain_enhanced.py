@@ -84,8 +84,7 @@ _MSG_LIMIT = 3800                                   # rendered chars per Telegra
 _HUMAN_SECTIONS = 6                                 # sections 1-5 are packed on their own
 
 
-from alert_registry import (alert_family_of as _alert family, pretty_alert as _pretty_alert)
-
+from alert_registry import (alert_family_of as _alert_family, pretty_alert as _pretty_alert)
 
 class _Piece(str):
     """A rendered Telegram fragment that remembers its plain source text and
