@@ -102,6 +102,7 @@ COPY --chown=appuser:appuser src/threshold_repair.py ./
 COPY --chown=appuser:appuser src/threshold_engine.py ./
 COPY --chown=appuser:appuser src/brain_helpers.py ./
 COPY --chown=appuser:appuser src/brain_report.py ./
+COPY --chown=appuser:appuser src/plan_replay.py ./
 COPY --chown=appuser:appuser src/brain_recommend_baseline.py ./
 COPY --chown=appuser:appuser src/brain.py ./
 COPY --chown=appuser:appuser src/brain_recommend_full.py ./
