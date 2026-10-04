@@ -1637,6 +1637,13 @@ async def run_once() -> Optional[bool]:
                     f"🕒 Pairs without a fresh successful candle: "
                     f"{candle_freshness['stale'][:20]}"
                 )
+            _plan_state = None
+            try:
+                if sdb and not sdb.degraded:
+                    _ps_raw = await sdb.get_metadata("brain_plan_state")
+                    _plan_state = json_loads(_ps_raw) if _ps_raw else None
+            except Exception as _ps_err:
+                logger_run.debug(f"Could not read brain plan state: {_ps_err}")
             structured = {
                 "correlation_id": correlation_id,
                 "duration_sec": round(run_duration, 2),
@@ -1669,6 +1676,7 @@ async def run_once() -> Optional[bool]:
                 },
                 "last_successful_candle": candle_freshness["pairs"],
                 "stale_candle_pairs": candle_freshness["stale"],
+                "brain_plan_state": _plan_state,
                 "timestamp": int(time.time()),
             }
             summary_path = os.environ.get(

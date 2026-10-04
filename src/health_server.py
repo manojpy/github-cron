@@ -85,6 +85,7 @@ def build_health(
         "dedup": summary.get("dedup"),
         "stale_candle_pairs": stale,
         "last_successful_candle": summary.get("last_successful_candle"),
+        "brain_plan_state": summary.get("brain_plan_state"),
         "outcome_data": outcome_data_status(outcome_dir, now),
     }
     return (503 if problems else 200), body

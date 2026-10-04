@@ -24,6 +24,7 @@ from threshold_stats import (
     per_trade_ev,
     row_net_pnl_pct,
     sample_evidence_state,
+    two_proportion_p_value,
     walk_forward_split,
 )
 from threshold_validation import (
@@ -683,6 +684,92 @@ def apply_regime_gate(result: Dict[str, Any], seg: Optional[Dict[str, Any]], mod
         entry["applied"] = False
     result["regime_gate"] = entry
 
+def apply_ensemble_gate(
+    result: Dict[str, Any], mode: str, min_n: int, max_p: float,
+    n_oos: int, oos_validated: bool,
+) -> None:
+    """Apply the ensemble probability to a trade-quality result IN PLACE.
+
+    Restrict-only: when the gate is eligible (out-of-sample validated and at
+    least min_n trades) and ensemble_p <= max_p, a HIGH verdict drops to MEDIUM
+    and a MEDIUM verdict drops to LOW. LOW/BLOCKED verdicts are never changed
+    and nothing is ever raised. mode 'shadow' only annotates; 'off' does nothing."""
+    if mode == "off":
+        return
+    ens_p = result.get("ensemble_p")
+    before = result.get("verdict")
+    if ens_p is None or before not in ("HIGH", "MEDIUM"):
+        return
+    if not (bool(oos_validated) and int(n_oos) >= int(min_n)):
+        return
+    if float(ens_p) > float(max_p):
+        return
+    target = "MEDIUM" if before == "HIGH" else "LOW"
+    entry = {
+        "ensemble_p": round(float(ens_p), 4), "max_p": float(max_p),
+        "n_oos": int(n_oos), "from": before, "to": target,
+    }
+    if mode != "live":
+        result["ensemble_gate_shadow"] = entry
+        return
+    result["verdict_before_ensemble_gate"] = before
+    result["verdict"] = target
+    entry["applied"] = True
+    result["ensemble_gate"] = entry
+
+def gate_shadow_comparison(rows: List[Row], min_flagged: int = 20) -> Dict[str, Any]:
+    """Did the alerts a gate flagged really do worse than the ones it left alone?
+
+    A row counts as flagged by a gate when its stored context["gate_shadow"]
+    holds that gate's shadow ('would act') entry or a live entry with
+    applied=True. Compared against every other resolved row (win rate, net EV,
+    two-sided p-value). 'ready' needs min_flagged rows on both sides;
+    'looks_justified' means ready, flagged win rate lower and p <= 0.20.
+    Purely diagnostic: never changes a verdict."""
+    out: Dict[str, Any] = {"valid": True, "gates": {}}
+    for gate in ("ensemble", "regime"):
+        flagged: List[Row] = []
+        clean: List[Row] = []
+        for r in rows:
+            ctx = r.get("context")
+            gs = ctx.get("gate_shadow") if isinstance(ctx, dict) else None
+            gs = gs if isinstance(gs, dict) else {}
+            live = gs.get(f"{gate}_gate")
+            if gs.get(f"{gate}_gate_shadow") or (isinstance(live, dict) and live.get("applied")):
+                flagged.append(r)
+            else:
+                clean.append(r)
+        nf, nc = len(flagged), len(clean)
+        wf = sum(1 for r in flagged if r.get("win"))
+        wc = sum(1 for r in clean if r.get("win"))
+        wr_f = (wf / nf) if nf else None
+        wr_c = (wc / nc) if nc else None
+        p = two_proportion_p_value(wf, nf, wc, nc)
+        ev_f = ev_first_objective(flagged, min_sample=min_flagged) if nf else {}
+        ev_c = ev_first_objective(clean, min_sample=min_flagged) if nc else {}
+        ready = nf >= min_flagged and nc >= min_flagged
+        worse = wr_f is not None and wr_c is not None and wr_f < wr_c
+        entry = {
+            "n_flagged": nf, "n_unflagged": nc,
+            "wr_flagged": None if wr_f is None else round(wr_f, 4),
+            "wr_unflagged": None if wr_c is None else round(wr_c, 4),
+            "net_ev_flagged": round(ev_f["net_ev"], 4) if ev_f.get("valid") else None,
+            "net_ev_unflagged": round(ev_c["net_ev"], 4) if ev_c.get("valid") else None,
+            "p_value": round(p, 4),
+            "ready": ready,
+            "looks_justified": bool(ready and worse and p <= 0.20),
+        }
+        if nf:
+            entry["text"] = (
+                f"{gate}: flagged n={nf} WR={wr_f:.0%} vs unflagged n={nc} "
+                f"WR={(wr_c if wr_c is not None else 0.0):.0%} (p={p:.2f}) -> "
+                + ("looks justified" if entry["looks_justified"]
+                   else "not enough evidence yet" if not ready
+                   else "no evidence the gate helps")
+            )
+        out["gates"][gate] = entry
+    return out
+
 def trade_quality_score(
     row: Row,
     ev_model_result: Dict[str, Any],
@@ -831,7 +918,7 @@ def trade_quality_score(
             else "moderate" if n_oos >= 50
             else "weak"
         ),
-    "evidence_state": evidence_state,
+        "evidence_state": evidence_state,
         "verdict_uncapped": verdict_uncapped,
         "oos_validated": bool(ev_model_result.get("oos_validated")),
         "drift_warning": bool((ev_model_result.get("wr_drop_recent") or 0.0) >= 0.10),
@@ -864,8 +951,17 @@ def trade_quality_score(
         if ens.get("valid"):
             result["ensemble_p"] = ens["ensemble_p"]
             result["ensemble_components"] = ens.get("components")
+
             if ens["ensemble_p"] is not None:
                 result["p_ev_positive_ensemble"] = ens["ensemble_p"]
+        apply_ensemble_gate(
+            result,
+            str(getattr(cfg, "ENSEMBLE_GATE_MODE", "shadow")),
+            int(getattr(cfg, "ENSEMBLE_GATE_MIN_N", 100)),
+            float(getattr(cfg, "ENSEMBLE_GATE_MAX_P", 0.40)),
+            int(n_oos),
+            bool(ev_model_result.get("oos_validated")),
+        )
 
     # Advisory size hint only — never used to place orders in this bot
     if getattr(cfg, "ENABLE_BRAIN_SIZE_HINT", False):

@@ -45,6 +45,8 @@ from brain_report import (
     CHALLENGER_STREAK_KEY,
     PLAN_HISTORY_KEY,
     PLAN_HISTORY_MAX,
+    PLAN_STATE_KEY,
+    plan_transition_allowed,
     _PHASE_MIN_SAMPLES,
     _Piece,
     build_brain_report_sections,
@@ -431,8 +433,10 @@ class BrainEngineV2(BrainCore):
         self, plan_id: Optional[str], status: str, note: Optional[str] = None,
     ) -> None:
         """Append one lifecycle event (blocked/pending/superseded/applied/
-        rolled_back) to the capped Brain plan audit trail. Best-effort —
-        never raises into the report/apply path."""
+        rolled_back/monitor_cleared) to the capped Brain plan audit trail and
+        persist it as the current plan state (PLAN_STATE_KEY). Each event records
+        the state it came from; an unexpected transition is flagged and logged
+        but still recorded. Best-effort — never raises into the report/apply path."""
         if not plan_id:
             return
         try:
@@ -440,12 +444,33 @@ class BrainEngineV2(BrainCore):
             hist = json_loads(raw) if raw else []
             if not isinstance(hist, list):
                 hist = []
-            hist.append({
-                "plan_id": plan_id, "status": status,
-                "ts": int(time.time()), "note": note,
-            })
+            prev = next(
+                (h.get("status") for h in reversed(hist)
+                 if isinstance(h, dict) and h.get("plan_id") == plan_id),
+                None,
+            )
+            allowed = plan_transition_allowed(prev, status)
+            now_ts = int(time.time())
+            event: Dict[str, Any] = {
+                "plan_id": plan_id, "status": status, "from": prev,
+                "ts": now_ts, "note": note,
+            }
+            if not allowed:
+                event["unexpected_transition"] = True
+                logging.getLogger("macd_bot").warning(
+                    f"Brain plan {plan_id}: unexpected lifecycle transition {prev!r} -> {status!r}"
+                )
+            hist.append(event)
             await self.sdb.set_metadata(
                 PLAN_HISTORY_KEY, json_dumps(hist[-PLAN_HISTORY_MAX:]),
+                ttl=365 * 86400,
+            )
+            await self.sdb.set_metadata(
+                PLAN_STATE_KEY,
+                json_dumps({
+                    "plan_id": plan_id, "state": status, "from": prev,
+                    "reason": note, "ts": now_ts, "unexpected": not allowed,
+                }),
                 ttl=365 * 86400,
             )
         except Exception as e:
@@ -1433,6 +1458,7 @@ __all__ = [
     "_RULE",
     "PLAN_HISTORY_KEY",
     "PLAN_HISTORY_MAX",
+    "PLAN_STATE_KEY",
     "APPLY_SNAPSHOT_KEY",
     "APPLY_SNAPSHOT_MAX",
     "CHALLENGER_STREAK_KEY",

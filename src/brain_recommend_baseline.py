@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from bot_config import cfg, json_dumps, json_loads, CONFLUENCE_WEIGHTS
 from state import _rc
 import threshold_engine as engine
+from threshold_quality import gate_shadow_comparison
 from brain_audit import get_audit, HealthStatus
 from brain_helpers import KILL_SWITCH_KEY, _resolve_config_path
 
@@ -603,7 +604,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                         "type": "alert_family_analysis",
                         "severity": "low",
                         "message": (
-                            "👨��👩‍👧‍👦 Alert-family intelligence:\n"
+                            "👨����‍👧‍👦 Alert-family intelligence:\n"
                             + "\n".join(fam_lines[:8])
                             + "\nDiagnostic only — families are learning entities, not live gates."
                         ),
@@ -1110,6 +1111,16 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             )
     except Exception as e:
         audit.record_analysis_exception("adaptive_dedup_windows", e)
+
+    # ── Gate shadow audit: did alerts a gate flagged do worse than the rest? ──
+    try:
+        _gate_cmp = gate_shadow_comparison(list(real_rows))
+        ai_metrics["gate_shadow_comparison"] = _gate_cmp
+        for _g in (_gate_cmp.get("gates") or {}).values():
+            if _g.get("text"):
+                logging.getLogger("macd_bot").info(f"🧪 Gate shadow audit | {_g['text']}")
+    except Exception as e:
+        audit.record_analysis_exception("gate_shadow_comparison", e)
 
     # ── Validated TP/SL zones: sample-gated, OOS-replayed, streak-promoted.
     # Only PROMOTED zones are persisted for dispatch; candidates and the

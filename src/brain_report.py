@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 import unicodedata
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from datetime import datetime, timedelta, timezone
 from brain_audit import DataCoverage, HealthStatus, get_audit
 import threshold_engine as engine
@@ -40,6 +40,30 @@ _RULE = "━" * 30
 PLAN_HISTORY_KEY = "brain_plan_history"
 
 PLAN_HISTORY_MAX = 100
+
+# Current lifecycle state of the most recent Brain plan (operator-visible).
+PLAN_STATE_KEY = "brain_plan_state"
+
+PLAN_LIFECYCLE_STATES = (
+    "blocked", "pending", "superseded", "applied", "rolled_back", "monitor_cleared",
+)
+
+# prev state -> states it may move to. None = first event recorded for a plan id
+# (repair:<id> entries start at rolled_back).
+PLAN_LIFECYCLE_TRANSITIONS: Dict[Optional[str], Set[str]] = {
+    None: {"blocked", "pending", "rolled_back"},
+    "blocked": {"superseded", "applied"},
+    "pending": {"applied", "superseded", "blocked"},
+    "applied": {"rolled_back", "monitor_cleared"},
+    "superseded": set(),
+    "rolled_back": set(),
+    "monitor_cleared": set(),
+}
+
+def plan_transition_allowed(prev: Optional[str], new: str) -> bool:
+    """True when prev -> new is a legal Brain plan lifecycle step (repeating the
+    same state is allowed)."""
+    return prev == new or new in PLAN_LIFECYCLE_TRANSITIONS.get(prev, set())
 
 APPLY_SNAPSHOT_KEY = "brain_apply_snapshots"
 
@@ -485,7 +509,7 @@ def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
             "The system is currently producing poor results in the available sample.\n\n"
             f"However, only {_fmt_days(days)} of history are available, so the Brain does NOT yet "
             "have enough evidence to say whether this is a persistent strategy problem.\n\n"
-            "➡️ Current priority: DIAGNOSE + COLLECT DATA\n"
+            "���️ Current priority: DIAGNOSE + COLLECT DATA\n"
             "➡️ Not yet: AGGRESSIVE OPTIMISATION"
         )
     elif losing:

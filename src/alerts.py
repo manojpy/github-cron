@@ -2732,6 +2732,21 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             logger_pair.info(
                 f"[{pair_name}] RECORD ts={ts_curr} keys={recorded}"
             )
+
+            def _gate_shadow_for(alert_key: str) -> Optional[Dict[str, Any]]:
+                """Gate annotations from this alert's trade-quality result (shadow
+                'would act' entries and live 'applied' entries), or None."""
+                _tq = alert_tq_by_key.get(alert_key)
+                if not _tq:
+                    return None
+                _out = {
+                    k: _tq[k]
+                    for k in ("regime_gate_shadow", "ensemble_gate_shadow",
+                              "regime_gate", "ensemble_gate")
+                    if _tq.get(k)
+                }
+                return _out or None
+
             async def _record_one(alert_key: str):
                 s, t, v = _confluence_for(alert_key)
                 trigger_context = {
@@ -2776,6 +2791,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     "ml_ev_shadow": (
                         (context.get("ml_ev_shadow_by_alert") or {}).get(alert_key)
                     ),
+                    "gate_shadow": _gate_shadow_for(alert_key),
                 }
                 # ── NEW: compute effective score after macro/cluster ──
                 eff_score = s
