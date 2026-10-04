@@ -124,14 +124,17 @@ def _plan(tqs: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
                             ("sl_suggested_pct", "tp1_suggested_pct", "tp2_suggested_pct"))
         if sl is None or tp1 is None or tp2 is None or sl <= 0:
             continue
+
         n = int(_num(p.get("n")) or 0)
+        _ntf = _num(p.get("n_tp_first"))
+        tp_n = int(_ntf) if _ntf is not None else n
         # A validated zone always beats an unvalidated plan; within a class,
         # the one with the most history behind it wins.
         if (validated, n) > (best_validated, best_n):
             best, best_n, best_validated = {
                 "sl": sl, "tp1": tp1, "tp2": tp2,
                 "tp_first": _num(p.get("tp_first_rate")), "n": n,
-                "tp_n": int(_num(p.get("n_tp_first")) if p.get("n_tp_first") is not None else n),
+                "tp_n": tp_n,
                 "validated": validated,
             }, n, validated
     return best
