@@ -62,6 +62,7 @@ def mae_mfe_trade_plan(
         "tp1_suggested_pct": round(tp1, 3),
         "tp2_suggested_pct": round(tp2, 3),
         "tp_first_rate": round(tp_first_rate, 3) if tp_first_rate is not None else None,
+        "n_tp_first": len(tp_first_rows),
         "sl_percentile": sl_percentile, "tp1_percentile": tp1_percentile, "tp2_percentile": tp2_percentile,
     }
 
@@ -201,7 +202,7 @@ def zone_candidates(
             cand["reasons"].append("insufficient_train_or_holdout")
             continue
         sl, tp1, tp2 = plan["sl_suggested_pct"], plan["tp1_suggested_pct"], plan["tp2_suggested_pct"]
-        cand.update({"sl_pct": sl, "tp1_pct": tp1, "tp2_pct": tp2, "tp_first_rate": plan.get("tp_first_rate")})
+        cand.update({"sl_pct": sl, "tp1_pct": tp1, "tp2_pct": tp2, "tp_first_rate": plan.get("tp_first_rate"), "n_tp_first": plan.get("n_tp_first")})
         # safety rails
         if sl <= 0 or tp1 <= 0 or tp1 / sl < min_rr:
             cand["reasons"].append("rr_below_floor")

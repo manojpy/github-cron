@@ -1076,7 +1076,7 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
         action_gate = self._action_gate_check(
             real_rows, min_sample=min_sample,
             recommendations=recommendations,
-            active_drift_keys=_active_drift_keys or None,
+            active_drift_keys=None if _cusum_read_failed else _active_drift_keys,
         )
     else:
         action_gate = {"actionable": True, "disabled": True}

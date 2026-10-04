@@ -200,8 +200,10 @@ class BrainEngineV2(BrainCore):
             gate["ev_p5"] = ev_obj["ev_p5"]
 
         # ── Stability: no active CUSUM edge-decay alarm. Prefer the
-        if active_drift_keys:
-            gate["stability"] = False
+        if active_drift_keys is not None:
+            # Authoritative (possibly empty) persisted alarm set: an empty
+            # list means "no alarm at/above the sample floor", NOT "unknown".
+            gate["stability"] = not active_drift_keys
         elif recommendations is not None:
             gate["stability"] = not any(
                 r.get("type") == "cusum_drift" for r in recommendations
@@ -476,6 +478,22 @@ class BrainEngineV2(BrainCore):
         except Exception as e:
             logging.getLogger("macd_bot").debug(f"Plan history write failed (non-fatal): {e}")
 
+    async def _load_plan_lifecycle(self) -> Dict[str, Any]:
+        """Current plan state plus the most recent lifecycle events, for the
+        Brain report. Best-effort: returns {} on any error."""
+        try:
+            raw_state = await self.sdb.get_metadata(PLAN_STATE_KEY)
+            state = json_loads(raw_state) if raw_state else None
+            raw_hist = await self.sdb.get_metadata(PLAN_HISTORY_KEY)
+            hist = json_loads(raw_hist) if raw_hist else []
+            return {
+                "current": state if isinstance(state, dict) else None,
+                "recent": [h for h in hist if isinstance(h, dict)][-5:] if isinstance(hist, list) else [],
+            }
+        except Exception as e:
+            logging.getLogger("macd_bot").debug(f"Plan lifecycle load failed (non-fatal): {e}")
+            return {}
+
     async def _store_pending_plan(self, recs: Dict[str, Any]) -> None:
         """Store the current recommendations for later application."""
         try:
@@ -634,8 +652,9 @@ class BrainEngineV2(BrainCore):
                 "reinstate_alerts": reinstate_alerts,
                 "weight_adjustments": weight_adjustments,
             }
-
-            if getattr(cfg, "ENABLE_BRAIN_PLAN_IDS", True):
+            _plan_empty = not (config_patches or disable_alerts
+                               or reinstate_alerts or weight_adjustments)
+            if getattr(cfg, "ENABLE_BRAIN_PLAN_IDS", True) and not _plan_empty:
                 try:
                     counter_raw = await self.sdb.get_metadata("brain_plan_counter")
                     counter = int(counter_raw or 0) + 1
@@ -704,14 +723,16 @@ class BrainEngineV2(BrainCore):
                     f"(patches={len(config_patches)} disable={len(disable_alerts)} "
                     f"reinstate={len(reinstate_alerts)} weights={len(weight_adjustments)})"
                 )
-            if plan_data.get("plan_id"):
+            if plan_data.get("plan_id") or _plan_empty:
                 try:
                     prev_raw = await self.sdb.get_metadata("brain_pending_plan")
                     prev = json_loads(prev_raw) if prev_raw else {}
                     prev_id = prev.get("plan_id") if isinstance(prev, dict) else None
-                    if prev_id and prev_id != plan_data["plan_id"]:
+                    _new_id = plan_data.get("plan_id")
+                    if prev_id and prev_id != _new_id:
                         await self._record_plan_event(
-                            prev_id, "superseded", f"replaced by {plan_data['plan_id']}"
+                            prev_id, "superseded",
+                            f"replaced by {_new_id}" if _new_id else "replaced by an empty report",
                         )
                 except Exception as e:
                     logging.getLogger("macd_bot").debug(f"Previous plan lookup failed (non-fatal): {e}")
@@ -1334,6 +1355,7 @@ class BrainEngineV2(BrainCore):
             # Build and send the plain-English action plan
             # Layered 16-section report. If building it raises, the outer
             # handler below falls back to the base technical report.
+            recs["_plan_lifecycle"] = await self._load_plan_lifecycle()
             sections, stamp = build_brain_report_sections(recs, cfg)
             plan_messages = render_report_messages(sections, stamp)   # already MarkdownV2-escaped
             self._archive_report(sections, stamp, logger_run)

@@ -41,6 +41,10 @@ PLAN_HISTORY_KEY = "brain_plan_history"
 
 PLAN_HISTORY_MAX = 100
 
+After:
+```python
+PLAN_HISTORY_MAX = 100
+
 # Current lifecycle state of the most recent Brain plan (operator-visible).
 PLAN_STATE_KEY = "brain_plan_state"
 
@@ -169,6 +173,7 @@ def _collect_facts(recs: Dict[str, Any], cfg) -> Dict[str, Any]:
         "conf": audit.statistical_confidence_label(),
         "recon": audit.reconciliation_snapshot(),
         "coverage": audit.history_coverage(),
+        "plan_lifecycle": recs.get("_plan_lifecycle") or {},
     }
     F["gate_ok"] = bool(F["gate"].get("actionable"))
     span = audit.history_span()
@@ -614,7 +619,7 @@ def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
     do_now.append("Keep Shadow Mode enabled." if F["shadow_on"]
                   else "Turn Shadow Mode ON (BRAIN_SHADOW_MODE=true) so rejected trades can be judged.")
     if wr < 0.10 and n:
-        do_now.append(f"Investigate the very low {wr:.0%} win rate (see section 03).")
+        do_now.append(f"Investigate the very low {wr:.0%} win rate (see section 04).")
     if F["gate"].get("stability") is False or F["gate"].get("risk") is False:
         do_now.append("Monitor active drift/drawdown warnings.")
     out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"• {x}" for x in do_now)))
@@ -666,6 +671,8 @@ def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
         lines = []
         for s in beats_control:
             _, verdict = _cf_verdict(s, cfg)
+            if "PROMOTION-ELIGIBLE" in verdict and s.get("ev", 0.0) <= 0:
+                verdict = "🕒 HOLD (still negative EV)"
             lines.append(
                 f"• {s.get('label', '?')}: {F['net_ev']:+.2f}% → {s.get('ev', 0.0):+.2f}% "
                 f"(n={s.get('n', 0)}) — {verdict}"
@@ -849,9 +856,13 @@ def _confidence_breakdown(F: Dict[str, Any], cfg) -> List[Tuple[str, str, str]]:
     if brier is None:
         rows.append(("MODEL", "⚪ N/A", "no calibration data yet"))
     else:
-        tier = "🟢 HIGH" if brier < 0.20 else "🟡 MEDIUM" if brier < 0.25 else "🔴 NOT READY"
-        rows.append(("MODEL", tier, f"Brier {brier:.2f}"))
-
+        _wr = float(F.get("wr") or 0.0)
+        _ref = _wr * (1.0 - _wr)      # Brier of always predicting the base rate
+        if F.get("n") and brier > _ref + 0.005:
+            rows.append(("MODEL", "🔴 NOT READY", f"Brier {brier:.2f} is worse than base rate {_ref:.2f}"))
+        else:
+            tier = "🟢 HIGH" if brier < 0.20 else "🟡 MEDIUM" if brier < 0.25 else "🔴 NOT READY"
+            rows.append(("MODEL", tier, f"Brier {brier:.2f}"))
     rank = _evidence_rank(F["n"], F["days"])
     days = F["days"]
     if rank == 0 or (days is not None and days < 7):
@@ -879,6 +890,50 @@ def _confidence_breakdown(F: Dict[str, Any], cfg) -> List[Tuple[str, str, str]]:
     rows.append(("DEPLOYMENT", deploy_tier, deploy_detail))
     return rows
 
+_PLAN_STATE_LABEL = {
+    "pending": ("🟡", "PENDING — waiting for you to apply"),
+    "blocked": ("🔴", "BLOCKED — action gate not passed"),
+    "applied": ("🟢", "APPLIED — under post-apply monitoring"),
+    "monitor_cleared": ("✅", "CLEARED — monitoring found no harm"),
+    "rolled_back": ("↩️", "ROLLED BACK — change reverted"),
+    "superseded": ("⚪", "SUPERSEDED — replaced by a newer plan"),
+}
+
+def _fmt_plan_ts(ts: Any) -> str:
+    try:
+        return datetime.fromtimestamp(int(ts), _IST).strftime("%d %b %H:%M")
+    except Exception:
+        return "?"
+
+def _plan_lifecycle_text(L: Dict[str, Any]) -> Optional[str]:
+    """Plain-text lifecycle block for the action-gate section: the last recorded
+    plan state with its reason, plus the most recent transitions. None when no
+    plan has been recorded yet."""
+    cur = (L or {}).get("current") or {}
+    state = cur.get("state")
+    if not state:
+        return None
+    icon, label = _PLAN_STATE_LABEL.get(str(state), ("⚪", str(state).upper()))
+    lines = [
+        "PLAN LIFECYCLE (last recorded)",
+        "",
+        f"{icon} {cur.get('plan_id', '?')}: {label}",
+        f"Since {_fmt_plan_ts(cur.get('ts'))} IST",
+    ]
+    if cur.get("reason"):
+        lines.append(f"Reason: {str(cur['reason'])[:160]}")
+    if cur.get("unexpected"):
+        lines.append("⚠️ Unexpected state change — see logs")
+    recent = [e for e in ((L or {}).get("recent") or []) if isinstance(e, dict)][-5:]
+    if recent:
+        lines += ["", "Recent steps (newest first):"]
+        for ev in reversed(recent):
+            lines.append(
+                f"{_fmt_plan_ts(ev.get('ts'))}  {ev.get('plan_id')}  "
+                f"{ev.get('from') or 'new'} → {ev.get('status')}"
+            )
+    return "\n".join(lines)
+
 def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     g = F["gate"]
     out = [_hdr(9, '🛡️ ACTION GATE — "CAN THE BRAIN SAFELY CHANGE ANYTHING?"')]
@@ -894,9 +949,12 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     labels = [("data_quality", "Minimum trades"), ("oos_prediction", "OOS EV"),
               ("profitability", "Net EV confidence"), ("stability", "CUSUM drift"),
               ("risk", _risk_label), ("execution", "Cost assumptions")]
-    rows = [(f"{'🟢' if g.get(k) else '🔴'} {lab}:", "PASS" if g.get(k) else "FAIL")
-            for k, lab in labels]
-
+    rows = []
+    for k, lab in labels:
+        if k == "oos_prediction" and g.get("oos_p_ev_positive") is None and not g.get(k):
+            rows.append((f"⚪ {lab}:", "N/A (not run)"))
+            continue
+        rows.append((f"{'🟢' if g.get(k) else '🔴'} {lab}:", "PASS" if g.get(k) else "FAIL"))
     out.extend(_c_split(_table(rows, "ll")))
     out.append(_p("CONFIDENCE BREAKDOWN\n\n" + "\n".join(
         f"{axis.ljust(12)}{tier}  ({detail})" for axis, tier, detail in _confidence_breakdown(F, cfg)
@@ -910,6 +968,9 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
            "🔴 BRAIN ACTION GATE = BLOCKED\n\nMeaning:\n\n\"The Brain may analyse and recommend what "
            "to investigate, but it is not sufficiently confident to modify the live strategy.\"")
     ))
+    _lifecycle = _plan_lifecycle_text(F.get("plan_lifecycle") or {})
+    if _lifecycle:
+        out.append(_p(_lifecycle))
     return out
 
 def _sec_reasoning_chain(F: Dict[str, Any], cfg) -> List[_Piece]:
@@ -950,8 +1011,13 @@ def _sec_reasoning_chain(F: Dict[str, Any], cfg) -> List[_Piece]:
             ece_f = float(ece)
             tag = "GOOD" if ece_f < 0.08 else "WATCH" if ece_f < 0.15 else "POOR"
             calib_line = f"mean-per-alert ECE={ece_f:.3f} — {tag}"
+        if gate.get("oos_prediction"):
+            oos_line = "PASS"
+        elif gate.get("oos_p_ev_positive") is None:
+            oos_line = "N/A (walk-forward not run)"
+        else:
+            oos_line = "FAIL"
 
-        oos_line = "PASS" if gate.get("oos_prediction") else "FAIL / unavailable"
         drift_line = "NONE detected" if gate.get("stability") else "CUSUM drift active"
         _ss = (ai.get("strategy_state") or {}).get("state")
         _ss_text = {

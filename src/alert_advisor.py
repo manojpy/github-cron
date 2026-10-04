@@ -131,6 +131,7 @@ def _plan(tqs: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
             best, best_n, best_validated = {
                 "sl": sl, "tp1": tp1, "tp2": tp2,
                 "tp_first": _num(p.get("tp_first_rate")), "n": n,
+                "tp_n": int(_num(p.get("n_tp_first")) if p.get("n_tp_first") is not None else n),
                 "validated": validated,
             }, n, validated
     return best
@@ -280,8 +281,7 @@ def advise_pair(
     reg_wr = _mean(reg_vals)
     reg_name = next((str(t.get("regime_name")) for t in data if t.get("regime_name")), "")
     tp_first = plan["tp_first"] if plan else None
-    tp_n = plan["n"] if plan else 0
-
+    tp_n = plan.get("tp_n", plan["n"]) if plan else 0
     s_ev = _clamp(50.0 + (ev / 0.30) * 50.0) if ev is not None else 50.0
     s_reg = _clamp(reg_wr * 100.0) if reg_wr is not None else 50.0
     s_tp1 = _clamp(tp_first * 100.0) if tp_first is not None else 50.0
@@ -319,17 +319,18 @@ def advise_pair(
 
     confidence = _CONFIDENCE.get(state, "LOW")
 
-    # ── lines ──
-    p_txt = f"{round(p_mean * 100)}%" if p_mean is not None else "n/a"
-    brain_line = f"🧠 Brain: P(profit) {p_txt}, EV {ev:+.2f}%, {confidence} confidence"
-
+    if p_mean is None or (state in ("SHADOW", "") and abs(p_mean - 0.5) < 0.05):
+        p_txt = "n/a (thin data)"
+    else:
+        p_txt = f"{round(p_mean * 100)}%"
+    brain_line = f"🧠 Brain: P(EV>0) {p_txt}, EV {ev:+.2f}%, {confidence} confidence"
     ev_label = {"ACTIONABLE": "Strong evidence", "ELIGIBLE": "Moderate evidence",
                 "SHADOW": "Limited evidence (shadow)"}.get(state, "Insufficient history")
     edge_bits = [ev_label]
     if reg_wr is not None:
         edge_bits.append(f"{reg_name + ' ' if reg_name else ''}regime WR {round(reg_wr * 100)}%")
     if tp_first is not None:
-        edge_bits.append(f"TP1 first {round(tp_first * 100)}% (n={tp_n})")
+        edge_bits.append(f"target-before-stop {round(tp_first * 100)}% (n={tp_n})")
     edge_line = "📊 Edge: " + " · ".join(edge_bits)
 
     if verdict == TAKE:
@@ -357,7 +358,7 @@ def advise_pair(
     if reg_wr is not None and reg_wr < 0.45:
         risks.append(f"{reg_name + ' ' if reg_name else ''}regime WR only {round(reg_wr * 100)}%")
     if tp_first is not None and tp_n >= 20 and tp_first < 0.40:
-        risks.append(f"TP1 historically reached only {round(tp_first * 100)}%")
+        risks.append(f"target reached before stop only {round(tp_first * 100)}%")
     if any(t.get("drift_warning") for t in data):
         risks.append("recent win-rate drift")
     if ev is not None and ev < 0:
