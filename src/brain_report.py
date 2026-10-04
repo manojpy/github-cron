@@ -41,10 +41,6 @@ PLAN_HISTORY_KEY = "brain_plan_history"
 
 PLAN_HISTORY_MAX = 100
 
-After:
-```python
-PLAN_HISTORY_MAX = 100
-
 # Current lifecycle state of the most recent Brain plan (operator-visible).
 PLAN_STATE_KEY = "brain_plan_state"
 
