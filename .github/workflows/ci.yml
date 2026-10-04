@@ -46,7 +46,7 @@ jobs:
           python -m mypy --ignore-missing-imports --no-error-summary \
             src/threshold_engine.py src/threshold_stats.py src/threshold_analysis.py \
             src/threshold_validation.py src/threshold_models.py src/threshold_quality.py \
-            src/threshold_repair.py src/archive_reader.py \
+            src/threshold_repair.py src/archive_reader.py src/plan_replay.py \
             src/brain.py src/brain_enhanced.py src/brain_engine.py src/repair_ledger.py || true
 
   unit-tests:
