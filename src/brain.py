@@ -11,9 +11,14 @@ import logging
 import time
 from collections import defaultdict, Counter
 from typing import Any, Dict, List, Optional, Tuple
+
+
+**AFTER**
+```python
 from alerts import escape_markdown_v2
 from bot_config import cfg, json_dumps, json_loads, format_ist_time, CONFLUENCE_WEIGHTS
 from state import RedisKeyPrefix, RedisStateStore, _rc
+from plan_replay import coerce_path_fields
 import threshold_engine as engine
 from threshold_engine import CUSUMDetector, StabilityGate
 from brain_audit import get_audit, HealthStatus
@@ -29,7 +34,6 @@ from brain_helpers import (
     _resolve_config_path,
     _to_opt_float,
 )
-
 class BrainCore:
     """Brain core — the persistence + verdict half of the engine.
 
@@ -814,6 +818,7 @@ class BrainCore:
                     "fees_paid_pct": _to_opt_float(f, "fees_paid_pct"),
                     "net_pnl_pct": _to_opt_float(f, "net_pnl_pct"),
                     "realized_cost_pct": _to_opt_float(f, "realized_cost_pct"),
+                    **coerce_path_fields(f),
                     "adx_val": _to_opt_float(f, "adx_val"), 
                     "effective_score": _to_opt_float(f, "effective_score"),
                     "effective_required": _to_opt_float(f, "effective_required"),

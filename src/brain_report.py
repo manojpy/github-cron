@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from datetime import datetime, timedelta, timezone
 from brain_audit import DataCoverage, HealthStatus, get_audit
 import threshold_engine as engine
+from plan_replay import build_plan_lab
 from alerts import escape_markdown_v2
 from alert_registry import alert_family_of as _registry_family_of, pretty_alert as _pretty_alert
 
@@ -256,6 +257,18 @@ def _collect_facts(recs: Dict[str, Any], cfg) -> Dict[str, Any]:
     )
     F["thr_tier"] = audit.max_recommendation_tier("threshold_recommendation")
     F["anatomy_text"], F["anatomy"] = _outcome_anatomy(rows, cfg)
+    try:
+        _fee = float(getattr(cfg, "BRAIN_FEE_PCT", 0.0006))
+        _slip = float(getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003))
+        _sl = float(getattr(cfg, "OUTCOME_MAE_LOSS_PCT", 1.0))
+        F["plan_text"], F["plan_lab"] = build_plan_lab(
+            rows, sl_pct=_sl, tp_pct=_sl * float(getattr(cfg, "OUTCOME_RR_TARGET", 2.0)),
+            horizon=int(getattr(cfg, "OUTCOME_LOOKAHEAD_CANDLES", 12)),
+            cost_pct=(_fee * 2 + _slip * 2) * 100.0, name_fn=_pretty_alert,
+        )
+    except Exception as e:
+        logging.getLogger("macd_bot").warning(f"Brain report: trade-plan lab failed: {type(e).__name__}: {e}")
+        F["plan_text"], F["plan_lab"] = None, {}
     F["shadow_on"] = bool(getattr(cfg, "BRAIN_SHADOW_MODE", False))
     return F
 
@@ -724,6 +737,8 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
     ]))))
     if F["anatomy_text"]:
         out.append(_p("🎲 WHY THE WIN RATE LOOKS LOW\n\n" + F["anatomy_text"]))
+    if F.get("plan_text"):
+        out.append(_p("🧪 TRADE-PLAN LAB — \"WOULD A DIFFERENT TARGET/STOP HAVE WORKED?\"\n\n" + F["plan_text"]))
     return out
 
 _EVIDENCE_LEGEND = "Ev = evidence: ⚪ observation · 🟡 early · 🟠 meaningful · 🔵 strong · 🟢 validated"

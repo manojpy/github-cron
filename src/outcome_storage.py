@@ -61,6 +61,8 @@ NULLABLE_MIGRATION_FIELDS = frozenset({
     "adx_val", "effective_score", "effective_required",
     "macro_multiplier", "cluster_penalty", "gate_passed",
     "votes", "context", "session",
+    "outcome_class", "tp_candle", "sl_candle", "mfe_candle", "mae_candle",
+    "net_pnl_hold_pct", "plan_sl_pct", "plan_tp_pct", "plan_horizon", "path",
 })
 
 _OUTCOME_DIR = getattr(cfg, "OUTCOME_DATA_DIR", "outcome-data")

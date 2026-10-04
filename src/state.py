@@ -6,9 +6,11 @@ import uuid
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, TYPE_CHECKING, Set, Sequence, Awaitable, Union, cast
 import hashlib
 import numpy as np
+
 import redis.asyncio as redis  # type: ignore[import-untyped]
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError  # type: ignore[import-untyped]
 
+from plan_replay import outcome_path_fields
 from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError, CONFIG_OVERRIDE_ALLOWED_FIELDS, CONFIG_OVERRIDE_METADATA_KEY, BRAIN_DISABLED_KEYS_METADATA_KEY, PAIR_THRESHOLDS_METADATA_KEY, _get_session_from_ts
 from fetcher import compute_backoff
 
@@ -1565,6 +1567,27 @@ class RedisStateStore:
                 mae = max(0.0, (float(np.max(path_high)) - anchor_price) / anchor_price)
                 mfe = max(0.0, (anchor_price - float(np.min(path_low))) / anchor_price)
 
+        # ── PATH: candle-by-candle excursions in the TRADE's direction, in % of
+        # fill price. Lets the Brain replay any other stop/target/horizon on this
+        # exact trade later (see plan_replay.py). Index 0 = fill candle. ──
+        path_fav = path_adv = path_close = None
+        mfe_candle = mae_candle = None
+        if len(path_low) and len(path_high):
+            path_close_raw = data_15m.close[path_start:path_end]
+            if is_buy:
+                _fav = (path_high - anchor_price) / anchor_price * 100.0
+                _adv = (anchor_price - path_low) / anchor_price * 100.0
+                _cls = (path_close_raw - anchor_price) / anchor_price * 100.0
+            else:
+                _fav = (anchor_price - path_low) / anchor_price * 100.0
+                _adv = (path_high - anchor_price) / anchor_price * 100.0
+                _cls = (anchor_price - path_close_raw) / anchor_price * 100.0
+            path_fav = [round(float(x), 4) for x in _fav]
+            path_adv = [round(float(x), 4) for x in _adv]
+            path_close = [round(float(x), 4) for x in _cls]
+            mfe_candle = int(np.argmax(_fav))
+            mae_candle = int(np.argmax(_adv))
+
         # ── METRIC 2: mfe_win (TP hit at 1:2 R:R) ──
         mfe_win = mfe is not None and mfe >= target_pct
 
@@ -1579,16 +1602,16 @@ class RedisStateStore:
 
         # ── BONUS: tp_first ordering (candle-by-candle, anchored to fill_price) ──
         tp_first: Optional[bool] = None
+        tp_hit_idx: Optional[int] = None
+        sl_hit_idx: Optional[int] = None
         ambiguous_same_candle = False          # ← initialized BEFORE the loop
         if len(path_low) and len(path_high):
             tp_level = anchor_price * (1 + target_pct) if is_buy else anchor_price * (1 - target_pct)
             sl_level = anchor_price * (1 - risk_pct) if is_buy else anchor_price * (1 + risk_pct)
 
-            tp_hit_idx = None
-            sl_hit_idx = None
-
             for candle_offset in range(len(path_low)):
                 idx = path_start + candle_offset
+
                 candle_low = float(data_15m.low[idx])
                 candle_high = float(data_15m.high[idx])
 
@@ -1650,14 +1673,34 @@ class RedisStateStore:
                 entry_slip_pct = (fill_p - sig_p) / sig_p * 100
             else:
                 entry_slip_pct = (sig_p - fill_p) / sig_p * 100
+
+
+
+
             realized_cost = (fee_pct * 2) * 100 + abs(entry_slip_pct) * 2
         else:
             realized_cost = base_cost_pct
 
         if is_buy:
-            net_pnl_pct = pct_move - realized_cost
+            net_pnl_hold_pct = pct_move - realized_cost
         else:
-            net_pnl_pct = -pct_move - realized_cost
+            net_pnl_hold_pct = -pct_move - realized_cost
+
+        # ── OUTCOME CLASS + PLAN P&L ──
+        # net_pnl_pct now describes the SAME trade the label describes: the
+        # stop/target bracket decides the exit; only a true timeout exits at the
+        # horizon close. (Before, a trade that hit target on candle 7 but closed
+        # below the stop on candle 12 was labelled WIN yet stored a LOSS here.)
+        # The old hold-to-horizon figure is kept as net_pnl_hold_pct.
+        if tp_first is True:
+            outcome_class = "tp"
+            net_pnl_pct = target_pct * 100.0 - realized_cost
+        elif tp_first is False:
+            outcome_class = "sl"
+            net_pnl_pct = -risk_pct * 100.0 - realized_cost
+        else:
+            outcome_class = "timeout"
+            net_pnl_pct = net_pnl_hold_pct
 
         # ── PRIMARY WIN: configurable ──
         primary_metric = getattr(cfg, "OUTCOME_PRIMARY_METRIC", "mfe")
@@ -1708,6 +1751,18 @@ class RedisStateStore:
             "fill_price": data.get("fill_price"),
             "fees_paid_pct": data.get("fees_paid_pct"),
             "net_pnl_pct": round(net_pnl_pct, 6),
+            "net_pnl_hold_pct": round(net_pnl_hold_pct, 6),
+            "outcome_class": outcome_class,
+            "tp_candle": tp_hit_idx,
+            "sl_candle": sl_hit_idx,
+            "mfe_candle": mfe_candle,
+            "mae_candle": mae_candle,
+            "plan_sl_pct": round(risk_pct * 100.0, 4),
+            "plan_tp_pct": round(target_pct * 100.0, 4),
+            "plan_horizon": int(cfg.OUTCOME_LOOKAHEAD_CANDLES),
+            "path_fav": path_fav,
+            "path_adv": path_adv,
+            "path_close": path_close,
             "realized_cost_pct": round(realized_cost, 6),
             "cost_basis": "measured_entry_slippage_plus_assumed_exit" if (sig_p and fill_p) else "flat_estimate",
             "effective_score": data.get("effective_score"),
@@ -1835,6 +1890,7 @@ class RedisStateStore:
                                 "fees_paid_pct": f"{fees_paid_pct:.6f}" if fees_paid_pct is not None else "",
                                 "net_pnl_pct": f"{result.get('net_pnl_pct', 0.0):.6f}",
                                 "realized_cost_pct": f"{result.get('realized_cost_pct', 0.0):.6f}",
+                                **outcome_path_fields(result, stream=True),
                                 "votes": json_dumps(conf_votes) if conf_votes is not None else "",
                                 "adx_val": str(adx_val) if adx_val is not None else "",
                                 "context": json_dumps(row_context) if row_context is not None else "",
@@ -1899,6 +1955,7 @@ class RedisStateStore:
                                     "fees_paid_pct": fees_paid_pct,
                                     "net_pnl_pct": result.get("net_pnl_pct", 0.0),
                                     "realized_cost_pct": result.get("realized_cost_pct", 0.0),
+                                    **outcome_path_fields(result, stream=False),
                                     "effective_score": result.get("effective_score"),
                                     "effective_required": result.get("effective_required"),
                                     "macro_multiplier": result.get("macro_multiplier"),
@@ -2064,6 +2121,9 @@ class RedisStateStore:
                                         else ""
                                     ),
                                     "outcome_reason": result.get("outcome_reason", "unknown"),
+                                    "net_pnl_pct": f"{result.get('net_pnl_pct', 0.0):.6f}",
+                                    "realized_cost_pct": f"{result.get('realized_cost_pct', 0.0):.6f}",
+                                    **outcome_path_fields(result, stream=True),
                                     "votes": json_dumps(conf_votes) if conf_votes is not None else "",
                                     "adx_val": str(shadow_adx_val) if shadow_adx_val is not None else "",
                                     "rejection_reason": shadow_rejection_reason or "",
@@ -2128,6 +2188,7 @@ class RedisStateStore:
                                     "win_weight": result.get("win_weight", 1.0),
                                     "net_pnl_pct": result.get("net_pnl_pct", 0.0),
                                     "realized_cost_pct": result.get("realized_cost_pct", 0.0),
+                                    **outcome_path_fields(result, stream=False),
                                     "adx_val": shadow_adx_val,
                                     "rejection_reason": shadow_rejection_reason,
                                     "effective_score": result.get("effective_score"),
