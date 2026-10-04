@@ -123,11 +123,13 @@ def test_counterfactual_candidates_beat_control_shown_in_what_to_do_now():
 def test_confidence_breakdown_shows_four_independent_tiers():
     gate = {**_OPEN, "profit_p_ev_positive": 0.91, "ev_p5": 0.12,
             "oos_p_ev_positive": 0.61, "stability": True}
-    text = _plain(_report(_rows(_SPEC), gate=gate, ai_extra={"brier_score": 0.14}))
+    text = _plain(_report(_rows(_SPEC), gate=gate, ai_extra={"brier_score": 0.03}))
+
     # ACTION GATE is section 09
     sec9 = text[text.index("09 │"):]
     assert "CONFIDENCE BREAKDOWN" in sec9
-    assert "MODEL       🟢 HIGH" in sec9 and "Brier 0.14" in sec9
+    assert "MODEL       🟢 HIGH" in sec9 and "Brier 0.03" in sec9
+
     # _SPEC totals 90 trades over the default 2.5-day window: n>=60 alone
     # would rank HIGH, but the short span caps it to MEDIUM.
     assert "DATA        🔴 NOT READY" in sec9 and "90 trades" in sec9
