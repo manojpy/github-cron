@@ -30,6 +30,9 @@ Row = Dict[str, Any]
 DEFAULT_SL_GRID: Tuple[float, ...] = (0.3, 0.4, 0.5, 0.6, 0.75, 1.0, 1.25, 1.5)
 DEFAULT_TP_GRID: Tuple[float, ...] = (0.3, 0.4, 0.5, 0.6, 0.75, 1.0, 1.25, 1.5, 2.0)
 DEFAULT_HORIZONS: Tuple[int, ...] = (4, 6, 8, 12)
+BE_GRID: Tuple[float, ...] = (0.0, 0.3, 0.5, 0.75)      # move stop to breakeven after +x%
+TRAIL_GRID: Tuple[float, ...] = (0.0, 0.3, 0.5)         # trail x% behind the best move
+EXIT_VARIANTS = len(BE_GRID) * len(TRAIL_GRID) - 1      # every combination except plain
 REACH_LEVELS: Tuple[float, ...] = (0.3, 0.5, 0.75, 1.0, 1.5, 2.0)
 
 _CANDLE_SEC = 15 * 60
@@ -111,8 +114,49 @@ def has_path(row: Mapping[str, Any]) -> bool:
     return bool(row.get("path_fav")) and bool(row.get("path_adv")) and bool(row.get("path_close"))
 
 
+def replay_exit(
+    fav: Sequence[float], adv: Sequence[float], cls: Sequence[float],
+    sl: float, tp: float, horizon: int, be: float = 0.0, trail: float = 0.0,
+) -> Optional[Tuple[str, float]]:
+    """Exact replay of a bracket that may also move its stop.
+
+    be     once a candle's best move reaches +be% the stop moves to breakeven (0 = off)
+    trail  trailing stop kept `trail`% behind the best move so far (0 = off)
+
+    Stop moves take effect from the NEXT candle: the order of events inside one
+    candle is unknown, so the replay never credits a protective stop that may not
+    have existed yet.  A candle touching both stop and target counts as the stop.
+    Returns (class, gross P&L %) -- cost is subtracted by the caller.  A stop that
+    was moved into profit exits with that profit; class is then still "sl" (a stop
+    exit).  Levels are in favourable % from the fill; adv is unclamped, so a candle
+    whose low stayed above the fill has a negative adv."""
+    if len(fav) <= horizon:
+        return None
+    stop = -sl
+    be_on = False
+    best = -1e9
+    for i in range(horizon + 1):
+        if -adv[i] <= stop:             # stop touched (a tie with the target goes to the stop)
+            return "sl", stop
+        if fav[i] >= tp:
+            return "tp", tp
+        if fav[i] > best:
+            best = fav[i]
+        if be > 0 and not be_on and fav[i] >= be:
+            be_on = True
+        lvl = -sl
+        if be_on and lvl < 0.0:
+            lvl = 0.0
+        if trail > 0 and best - trail > lvl:
+            lvl = best - trail
+        if lvl > stop:
+            stop = lvl
+    return "timeout", float(cls[horizon])
+
+
 def replay_plan(
     row: Mapping[str, Any], sl_pct: float, tp_pct: float, horizon: int, default_cost_pct: float,
+    be: float = 0.0, trail: float = 0.0,
 ) -> Optional[Tuple[str, float]]:
     """(outcome_class, net_pnl_pct) this trade WOULD have produced under the
     given plan, or None if the row has no path / too few candles."""
@@ -123,6 +167,9 @@ def replay_plan(
         return None
     cost = row.get("realized_cost_pct")
     cost = float(cost) if cost is not None else float(default_cost_pct)
+    if be > 0 or trail > 0:
+        res = replay_exit(fav, adv, cls, sl_pct, tp_pct, horizon, be, trail)
+        return None if res is None else (res[0], res[1] - cost)
     for i in range(horizon + 1):
         hit_sl = adv[i] >= sl_pct
         hit_tp = fav[i] >= tp_pct
@@ -133,28 +180,72 @@ def replay_plan(
     return "timeout", float(cls[horizon]) - cost
 
 
+BLOCK_SEC = 3 * 3600   # alerts inside one 3-hour block share the same market move
+
+
+def cluster_se(values: Sequence[float], stamps: Sequence[Optional[float]], block_sec: int = BLOCK_SEC) -> Tuple[float, int]:
+    """Standard error of the mean that respects clustering in time.
+
+    30 pairs move together, so 10 alerts from one BTC swing are closer to ONE
+    observation than ten.  Rows are grouped into `block_sec` time blocks and the
+    cluster-robust variance  sum_b(sum_{i in b} e_i)^2 / n^2  is used (with the
+    usual nb/(nb-1) small-sample factor).  Rows without a timestamp each count
+    as their own block (i.e. the plain iid formula).  Returns (se, n_blocks)."""
+    n = len(values)
+    if n < 2:
+        return float("inf"), n
+    mean = sum(values) / n
+    blocks: Dict[Any, float] = {}
+    for i, (v, t) in enumerate(zip(values, stamps)):
+        k = int(t // block_sec) if t is not None else ("row", i)
+        blocks[k] = blocks.get(k, 0.0) + (v - mean)
+    nb = len(blocks)
+    if nb < 2:
+        return float("inf"), nb
+    var = sum(b * b for b in blocks.values()) / (n * n) * (nb / (nb - 1))
+    return math.sqrt(var), nb
+
+
+def max_drawdown(pnls: Sequence[float]) -> float:
+    """Largest peak-to-trough fall of the cumulative P&L curve (percentage points)."""
+    peak = cum = dd = 0.0
+    for p in pnls:
+        cum += p
+        peak = max(peak, cum)
+        dd = max(dd, peak - cum)
+    return dd
+
+
 def evaluate_plan(
     rows: Sequence[Row], sl_pct: float, tp_pct: float, horizon: int, default_cost_pct: float,
+    be: float = 0.0, trail: float = 0.0,
 ) -> Optional[Dict[str, Any]]:
     pnls: List[float] = []
+    stamps: List[Optional[float]] = []
     counts = {"tp": 0, "sl": 0, "timeout": 0}
-    for r in rows:
-        res = replay_plan(r, sl_pct, tp_pct, horizon, default_cost_pct)
+    ordered = sorted(rows, key=lambda r: (r.get("entry_ts") is None, r.get("entry_ts") or 0))
+    for r in ordered:
+        res = replay_plan(r, sl_pct, tp_pct, horizon, default_cost_pct, be, trail)
         if res is None:
             continue
         counts[res[0]] += 1
         pnls.append(res[1])
+        stamps.append(r.get("entry_ts"))
     n = len(pnls)
     if n == 0:
         return None
     ev = statistics.fmean(pnls)
-    se = (statistics.stdev(pnls) / math.sqrt(n)) if n > 1 else float("inf")
+    se, n_blocks = cluster_se(pnls, stamps)
+    half = n // 2
+    half_min = min(statistics.fmean(pnls[:half]), statistics.fmean(pnls[half:])) if half >= 3 else ev
     return {
-        "sl": sl_pct, "tp": tp_pct, "h": horizon, "n": n,
+        "sl": sl_pct, "tp": tp_pct, "h": horizon, "be": be, "trail": trail, "n": n, "n_blocks": n_blocks,
         "tp_rate": counts["tp"] / n, "sl_rate": counts["sl"] / n, "timeout_rate": counts["timeout"] / n,
         "p_profit": sum(1 for p in pnls if p > 0) / n,
-        "ev": ev, "ev_lcb": ev - 1.645 * se if se != float("inf") else float("-inf"),
+        "ev": ev, "se": se,
+        "ev_lcb": ev - 1.645 * se if se != float("inf") else float("-inf"),
         "worst10": sorted(pnls)[max(0, int(0.1 * (n - 1)))],
+        "max_dd": max_drawdown(pnls), "half_min": half_min,
     }
 
 
@@ -174,12 +265,31 @@ def grid_search(
     return out
 
 
+def exit_variants(plan_sl: float, plan_tp: float) -> List[Tuple[float, float]]:
+    """(be, trail) pairs worth testing around a chosen bracket (breakeven must be
+    below the target; a trail wider than the stop adds nothing)."""
+    out = []
+    for be in BE_GRID:
+        for tr in TRAIL_GRID:
+            if be == 0.0 and tr == 0.0:
+                continue
+            if be >= plan_tp or tr >= plan_tp:
+                continue
+            out.append((be, tr))
+    return out
+
+
 def select_plan(
     rows: Sequence[Row], default_cost_pct: float, fixed_sl: float, fixed_tp: float, fixed_h: int,
-    *, min_n: int = 40, min_holdout: int = 15, train_frac: float = 0.6,
+    *, min_n: int = 40, min_holdout: int = 15, train_frac: float = 0.6, z: float = 1.645,
+    test_exits: bool = True, min_exit_lift: float = 0.03,
 ) -> Dict[str, Any]:
     """Pick the best plan on the chronological TRAIN split, then judge it on the
     untouched HOLDOUT (train rows too close to the split are embargoed).
+
+    After the bracket is chosen, breakeven / trailing-stop variants of THAT bracket
+    are tried on train only; a variant replaces the plain bracket only if it beats
+    it on train by `min_exit_lift` percentage points.
     status: COLLECTING | NO_EDGE | FAILED_OOS | PROMISING | VALIDATED."""
     usable = sorted((r for r in rows if has_path(r) and r.get("entry_ts") is not None),
                     key=lambda r: r["entry_ts"])
@@ -197,14 +307,23 @@ def select_plan(
     if not cands:
         return res
     best = max(cands, key=lambda c: c["ev"])
-    hold_eval = evaluate_plan(hold, best["sl"], best["tp"], best["h"], default_cost_pct)
+    if test_exits:
+        plain, chosen = best, best
+        for be, tr in exit_variants(plain["sl"], plain["tp"]):
+            v = evaluate_plan(train, plain["sl"], plain["tp"], plain["h"], default_cost_pct, be, tr)
+            if v and v["n"] >= plain["n"] and v["ev"] >= plain["ev"] + min_exit_lift and v["ev"] > chosen["ev"]:
+                chosen = v
+        best = chosen
+    hold_eval = evaluate_plan(hold, best["sl"], best["tp"], best["h"], default_cost_pct,
+                              best.get("be", 0.0), best.get("trail", 0.0))
     cur_all = evaluate_plan(usable, fixed_sl, fixed_tp, fixed_h, default_cost_pct)
-    res.update({"best": best, "holdout": hold_eval, "current": cur_all, "n_train": len(train), "n_hold": len(hold)})
+    res.update({"best": best, "holdout": hold_eval, "current": cur_all, "n_train": len(train), "n_hold": len(hold),
+                "_hold_rows": hold})
     if best["ev"] <= 0:
         res["status"] = "NO_EDGE"            # no plan in the grid makes money -> the SIGNAL is the problem
     elif hold_eval is None or hold_eval["ev"] <= 0:
         res["status"] = "FAILED_OOS"
-    elif hold_eval["ev_lcb"] > 0:
+    elif hold_eval["se"] != float("inf") and hold_eval["ev"] - z * hold_eval["se"] > 0:
         res["status"] = "VALIDATED"
     else:
         res["status"] = "PROMISING"
@@ -267,6 +386,16 @@ _DIAG_LABELS = {
 }
 
 
+def plan_exit_suffix(p: Mapping[str, Any]) -> str:
+    """' | breakeven at +0.5% | trail 0.3%' for plans that move their stop, else ''."""
+    bits = []
+    if float(p.get("be") or 0) > 0:
+        bits.append(f"stop to breakeven at +{float(p['be']):g}%")
+    if float(p.get("trail") or 0) > 0:
+        bits.append(f"trail {float(p['trail']):g}%")
+    return (" | " + " | ".join(bits)) if bits else ""
+
+
 # ── Report text ───────────────────────────────────────────────────────────
 def build_plan_lab(
     rows: Sequence[Row], *, sl_pct: float, tp_pct: float, horizon: int, cost_pct: float,
@@ -325,7 +454,8 @@ def build_plan_lab(
             lines.append(f"{icon} {name_fn(ak)}: NO plan in the grid is profitable → the SIGNAL has no edge here (n={sel['n_path']})")
             continue
         lines.append(
-            f"{icon} {name_fn(ak)}: stop {b['sl']:g}% / target {b['tp']:g}% / {b['h']} candles | "
+            f"{icon} {name_fn(ak)}: stop {b['sl']:g}% / target {b['tp']:g}% / {b['h']} candles"
+            f"{plan_exit_suffix(b)} | "
             f"train EV {b['ev']:+.2f}% → holdout {(h_['ev'] if h_ else float('nan')):+.2f}% "
             f"(n={sel['n_hold']}) | now {(cur['ev'] if cur else float('nan')):+.2f}% | {sel['status']}"
         )

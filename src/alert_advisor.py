@@ -170,7 +170,7 @@ def _support_text(votes: Optional[Dict[str, bool]], weights: Optional[Dict[str, 
         return " All high-weight checks pass."
     return f" Supported by {', '.join(support)}." if support else ""
 
-def advise_pair(
+def _advise_pair_core(
     *,
     direction: str,
     score: Optional[float],
@@ -383,3 +383,103 @@ def advise_pair(
         brain_line=brain_line, edge_line=edge_line, why_line=f"💡 Why: {why}",
         risk_label="Risk", risk_line=risk_line, plan_line=plan_line, size_line=size_line,
     )
+
+# ── Playbook overlay (learner output; restrict-only by default) ───────────
+_PB_NEGATIVE = ("NO_EDGE", "FAILED_OOS", "DEMOTED", "EXPIRED")
+
+
+def _pb_plan_text(p: Dict[str, Any]) -> str:
+    txt = f"SL -{float(p['sl']):g}% | TP +{float(p['tp']):g}% | exit by {int(p['h'])} candles"
+    if float(p.get("be") or 0) > 0:
+        txt += f" | stop to breakeven at +{float(p['be']):g}%"
+    if float(p.get("trail") or 0) > 0:
+        txt += f" | trail {float(p['trail']):g}%"
+    return txt
+
+def _pb_rule_hit(playbook: Dict[str, Any], ctx: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not ctx:
+        return None
+    from rulemine import rule_matches
+    for r in playbook.get("avoid_rules") or []:
+        if rule_matches(r["rule"], ctx):
+            return r
+    return None
+
+def advise_pair(
+    *,
+    playbook: Optional[Dict[str, Any]] = None,
+    playbook_mode: str = "off",          # off | shadow | live
+    playbook_allow_upgrade: bool = False,
+    playbook_ctx: Optional[Dict[str, Any]] = None,   # {"session", "conf", "adx"} of THIS alert
+    **kwargs: Any,
+) -> PairAdvice:
+    """Core advice, optionally overlaid with the learner's validated playbook entry.
+
+    off / shadow : the advice is byte-for-byte the core advice (shadow only records).
+    live         : RESTRICT-ONLY.
+        * a served champion plan replaces the displayed SL/TP (and size, from the EV lower bound);
+        * restrict=AVOID (proven loser, two cycles)     -> TAKE/WATCH read AVOID;
+        * restrict=WATCH, or a status with no edge / demoted / expired -> TAKE reads WATCH;
+        * a matching "do not take when ..." rule       -> TAKE reads WATCH;
+        * a champion whose EV lower bound is not above zero gets no size -> TAKE reads WATCH.
+      A WATCH->TAKE upgrade needs playbook_allow_upgrade AND a VALIDATED champion
+      AND no restriction or rule hit AND no conflicts.
+    Any problem in the overlay falls back to the core advice."""
+    advice = _advise_pair_core(**kwargs)
+    if playbook_mode != "live" or not isinstance(playbook, dict):
+        return advice
+    try:
+        status = str(playbook.get("status", ""))
+        restrict = playbook.get("restrict")
+        ver = playbook.get("playbook_version") or ""
+        notes: List[str] = []
+        capped = False
+        if status in ("VALIDATED", "RECONFIRM_DUE") and isinstance(playbook.get("plan"), dict):
+            h = playbook.get("holdout") or {}
+            tag = "validated" if status == "VALIDATED" else "validation overdue"
+            ev = h.get("ev")
+            ev_txt = f", out-of-sample EV {float(ev):+.2f}% (n={int(h.get('n', 0))})" if isinstance(ev, (int, float)) else ""
+            advice.plan_line = f"🛡 {_pb_plan_text(playbook['plan'])} · {tag} plan{ev_txt} [{ver}]"
+            sm = playbook.get("size_mult")
+            if isinstance(sm, (int, float)):
+                if sm <= 0:
+                    capped = True
+                    notes.append("the plan's EV lower bound is no longer above zero")
+                elif advice.verdict != AVOID:
+                    advice.size_line = f"📐 Size {float(sm):.2f}× (from EV lower bound, advisory)"
+        elif status in _PB_NEGATIVE:
+            capped = True
+            notes.append({"NO_EDGE": "no stop/target combination has been profitable for this setup",
+                          "FAILED_OOS": "its best plan failed on unseen data",
+                          "DEMOTED": "its validated plan was just demoted",
+                          "EXPIRED": "its validated plan expired unconfirmed"}[status])
+        if restrict == "WATCH":
+            capped = True
+        rule = _pb_rule_hit(playbook, playbook_ctx)
+        if rule is not None:
+            capped = True
+            notes.append(f"it lost money on unseen trades when {rule['text']}")
+        if restrict == "AVOID" and advice.verdict in (TAKE, WATCH):
+            advice.verdict = AVOID
+            advice.qualifier = ""
+            advice.size_line = ""
+            advice.risk_label = "Risk"
+            advice.risk_line = "playbook: proven losing setup (two consecutive learner cycles); " + advice.risk_line
+        elif capped:
+            if advice.verdict == TAKE:
+                advice.verdict = WATCH
+                advice.qualifier = ""
+                advice.size_line = ""
+            if notes:
+                advice.risk_label = "Risk"
+                advice.risk_line = "playbook: " + "; ".join(notes) + "; " + advice.risk_line
+        elif (playbook_allow_upgrade and status == "VALIDATED" and advice.verdict == WATCH
+              and not kwargs.get("conflicting") and kwargs.get("bias") != "against"
+              and (advice.conviction is None or advice.conviction >= float(kwargs.get("watch_min", 50.0)))):
+            advice.verdict = TAKE
+            advice.qualifier = "validated plan"
+    except Exception:
+        return _advise_pair_core(**kwargs)
+    return advice
+
+

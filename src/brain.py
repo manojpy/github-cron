@@ -12,9 +12,11 @@ import time
 from collections import defaultdict, Counter
 from typing import Any, Dict, List, Optional, Tuple
 from alerts import escape_markdown_v2
+
 from bot_config import cfg, json_dumps, json_loads, format_ist_time, CONFLUENCE_WEIGHTS
 from state import RedisKeyPrefix, RedisStateStore, _rc
 from plan_replay import coerce_path_fields
+from playbook import KEY_CURRENT as PLAYBOOK_KEY, playbook_lookup
 import threshold_engine as engine
 from threshold_engine import CUSUMDetector, StabilityGate
 from brain_audit import get_audit, HealthStatus
@@ -63,6 +65,8 @@ class BrainCore:
         self._cached_real_raw: Optional[List[Dict[str, str]]] = None
         self._ml_calib_cache: Optional[Dict[str, Any]] = None
         self._ml_calib_cache_ts = 0.0
+        self._playbook_cache: Optional[Dict[str, Any]] = None
+        self._playbook_cache_ts = 0.0
 
     async def check_rewardable_override(
         self,
@@ -548,6 +552,28 @@ class BrainCore:
                 return None
             self._quality_cache_ts = now
         return self._quality_cache
+
+    async def get_playbook_entry(self, alert_key: str, direction: str) -> Optional[Dict[str, Any]]:
+        """Learner playbook entry for an alert (None = none / stale / Redis down).
+        Never raises; the playbook is cached for 5 minutes."""
+        if getattr(cfg, "PLAYBOOK_MODE", "off") == "off":
+            return None
+        try:
+            now = time.time()
+            if self._playbook_cache is None or now - self._playbook_cache_ts > 300:
+                if self.sdb.degraded or not self.sdb._redis:
+                    return None
+                raw = await self.sdb.get_metadata(PLAYBOOK_KEY)
+                self._playbook_cache_ts = now
+                self._playbook_cache = json.loads(raw) if raw else {}
+            from alert_registry import alert_family_of
+            return playbook_lookup(
+                self._playbook_cache, alert_key, direction, family_fn=alert_family_of,
+                now_ts=now, max_age_sec=float(getattr(cfg, "PLAYBOOK_MAX_AGE_HOURS", 36)) * 3600.0,
+            )
+        except Exception as e:
+            logging.getLogger("macd_bot").debug(f"playbook lookup failed: {e}")
+            return None
 
     async def get_trade_quality(
         self,

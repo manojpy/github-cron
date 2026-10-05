@@ -642,6 +642,8 @@ def build_pair_msg_and_verdict(
     required: Optional[float],
     bias_context: Optional[BiasContext],
     logger_pair: logging.Logger,
+    pb_by_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
+    adx_val: Optional[float] = None,
 ) -> Tuple[str, Optional[str]]:
     """Build the rich body for one pair/direction and return (body, verdict).
     Never raises: any failure degrades to a plain header + setup line (verdict
@@ -672,6 +674,15 @@ def build_pair_msg_and_verdict(
                 if cfg.ENABLE_ALERT_UNPROVEN_TAKE else None
             ),
             unproven_size=cfg.ALERT_UNPROVEN_SIZE_MULT,
+
+            playbook=next((pb_by_key[k] for k in s_keys if pb_by_key and pb_by_key.get(k)), None),
+            playbook_mode=str(getattr(cfg, "PLAYBOOK_MODE", "off")),
+            playbook_allow_upgrade=bool(getattr(cfg, "PLAYBOOK_ALLOW_UPGRADE", False)),
+            playbook_ctx={
+                "session": _get_session_from_ts(ts),
+                "conf": (score / total * 100.0) if (score is not None and total) else None,
+                "adx": adx_val,
+            },
         )
         body = build_rich_pair_msg(
             pair=pair, direction=direction, price=price, ts=ts, score=score, total=total,
@@ -2372,6 +2383,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         # Structured Telegram metadata (filled during quality pass; used at send)
         alert_tq_by_key: Dict[str, Optional[Dict[str, Any]]] = {}
+        alert_pb_by_key: Dict[str, Optional[Dict[str, Any]]] = {}
 
         if alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER:
             alert_keys_to_check = [ak for _, _, ak in alerts_to_send]
@@ -2500,6 +2512,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
                         # Always record (None is fine) so Step 6 can look up by key
                         alert_tq_by_key[alert_key] = tq
+                        try:
+                            alert_pb_by_key[alert_key] = await brain_engine.get_playbook_entry(alert_key, direction)
+                        except Exception:
+                            alert_pb_by_key[alert_key] = None
 
                         if tq and tq.get("verdict"):
                             if tq.get("market_state_p_win") is not None:
@@ -2747,6 +2763,13 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 }
                 return _out or None
 
+            def _playbook_seen_for(alert_key: str) -> Optional[Dict[str, Any]]:
+                """What the learner playbook said when this alert fired (audit trail)."""
+                _pb = alert_pb_by_key.get(alert_key)
+                if not _pb:
+                    return None
+                return {k: _pb.get(k) for k in ("key", "status", "plan", "restrict", "size_mult", "playbook_version", "via_family") if k in _pb}
+
             async def _record_one(alert_key: str):
                 s, t, v = _confluence_for(alert_key)
                 trigger_context = {
@@ -2792,6 +2815,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         (context.get("ml_ev_shadow_by_alert") or {}).get(alert_key)
                     ),
                     "gate_shadow": _gate_shadow_for(alert_key),
+                    "playbook_seen": _playbook_seen_for(alert_key),
                 }
                 # ── NEW: compute effective score after macro/cluster ──
                 eff_score = s
@@ -2951,15 +2975,14 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 items=items,
                 keys=keys,
                 tq_by_key=alert_tq_by_key,
+                pb_by_key=alert_pb_by_key,
+                adx_val=adx_val,
                 votes=confluence_votes_buy if is_buy_batch else confluence_votes_sell,
                 required=_req_msg,
                 bias_context=bias_context,
                 logger_pair=logger_pair,
             )
             msg_body = msg
-
-
-
 
             # Outcome recording and ACTIVE-state activation are DEFERRED to the
             # dispatcher, which runs them only after Telegram confirms delivery.
@@ -3166,6 +3189,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 items=items,
                 keys=keys,
                 tq_by_key=alert_tq_by_key,
+                pb_by_key=alert_pb_by_key,
+                adx_val=adx_val,
                 votes=confluence_votes_buy if is_buy_batch else confluence_votes_sell,
                 required=_req_msg,
                 bias_context=bias_context,
