@@ -523,7 +523,7 @@ def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
             "The system is currently producing poor results in the available sample.\n\n"
             f"However, only {_fmt_days(days)} of history are available, so the Brain does NOT yet "
             "have enough evidence to say whether this is a persistent strategy problem.\n\n"
-            "���️ Current priority: DIAGNOSE + COLLECT DATA\n"
+            "🎯 Current priority: DIAGNOSE + COLLECT DATA\n"
             "➡️ Not yet: AGGRESSIVE OPTIMISATION"
         )
     elif losing:
