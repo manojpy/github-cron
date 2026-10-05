@@ -102,7 +102,6 @@ COPY --chown=appuser:appuser src/threshold_repair.py ./
 COPY --chown=appuser:appuser src/threshold_engine.py ./
 COPY --chown=appuser:appuser src/brain_helpers.py ./
 COPY --chown=appuser:appuser src/brain_report.py ./
-COPY --chown=appuser:appuser src/plan_replay.py ./
 COPY --chown=appuser:appuser src/brain_recommend_baseline.py ./
 COPY --chown=appuser:appuser src/brain.py ./
 COPY --chown=appuser:appuser src/brain_recommend_full.py ./
@@ -114,6 +113,11 @@ COPY --chown=appuser:appuser src/repair_ledger.py ./
 COPY --chown=appuser:appuser src/apply_config_override.py ./
 COPY --chown=appuser:appuser src/outcome_storage.py ./
 COPY --chown=appuser:appuser src/archive_reader.py ./
+COPY --chown=appuser:appuser src/plan_replay.py ./
+COPY --chown=appuser:appuser src/playbook.py ./
+COPY --chown=appuser:appuser src/learner.py ./
+COPY --chown=appuser:appuser src/scoreboard.py ./
+COPY --chown=appuser:appuser src/rulemine.py ./
 COPY --chown=appuser:appuser src/macd_unified.py ./
 
 USER appuser
