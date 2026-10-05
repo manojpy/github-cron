@@ -195,6 +195,7 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
             ),
          
             # ── NEW: effective gate state ──
+            "fill_price": _opt_fill_price(raw.get("fill_price")),
             "effective_score": float(_eff_score) if _eff_score is not None else None,
             "effective_required": float(_eff_req) if _eff_req is not None else None,
             "macro_multiplier": float(_macro_mult) if _macro_mult is not None else None,
@@ -208,6 +209,12 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
             "migrated": is_migrated,
         }
     except Exception:
+        return None
+
+def _opt_fill_price(v: Any) -> Optional[float]:
+    try:
+        return float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
         return None
 
 def load_archived_outcomes(

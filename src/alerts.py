@@ -32,6 +32,7 @@ class AlertPayload:
     verdict: Optional[str] = None       # "TAKE" / "WATCH" / "AVOID" (None if unavailable)
 
 from alert_advisor import PairAdvice, advise_pair
+from feedback import build_keyboard
 from bot_config import (
     cfg, logger, Constants, CompiledPatterns, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
     shutdown_event, format_ist_time, json_dumps, json_loads, CONFLUENCE_WEIGHTS, BtcMacroContext,
@@ -1275,7 +1276,14 @@ async def dispatch_combined_alerts(
     all_changes: List[StateChange] = []
 
     for msg, msg_payloads in zip(messages, message_payloads):
-        if await telegram_queue.send(msg):
+        _kb = (build_keyboard([(p.pair_name, p.direction, p.ts) for p in msg_payloads],
+                              int(getattr(cfg, "TAKE_SKIP_MAX_ROWS", 8)))
+               if getattr(cfg, "ENABLE_TAKE_SKIP_BUTTONS", False) else None)
+        if _kb is not None:
+            _sent = (await telegram_queue.send_with_markup(msg, _kb)) is not None
+        else:
+            _sent = bool(await telegram_queue.send(msg))
+        if _sent:
             sent_payloads.extend(msg_payloads)
             for p in msg_payloads:
                 all_changes.extend(p.state_changes)
@@ -2671,7 +2679,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         f"[{pair_name}] 🧠 Rewardable override for {alert_key}: "
                         f"WR={failing_rate:.0%} below {cfg.MIN_WIN_RATE:.0%}, but {override_reason}"
                     )
-                    alert_extra = f"{alert_extra} | 🧠 {override_reason}"
+                    alert_extra = f"{alert_extra} | �� {override_reason}"
                     surviving_alerts.append((alert_title, alert_extra, alert_key))
                     continue
 
@@ -3273,7 +3281,13 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 )
                             all_state_changes.clear()
 
-                        send_success = await telegram_queue.send(msg)
+                        _kb1 = (build_keyboard([(pair_name, direction, ts_curr)],
+                                               int(getattr(cfg, "TAKE_SKIP_MAX_ROWS", 8)))
+                                if getattr(cfg, "ENABLE_TAKE_SKIP_BUTTONS", False) else None)
+                        if _kb1 is not None:
+                            send_success = (await telegram_queue.send_with_markup(msg, _kb1)) is not None
+                        else:
+                            send_success = await telegram_queue.send(msg)
 
                         # Outcome + ACTIVE state only once Telegram confirmed delivery,
                         # so a failed send never leaves a phantom trade behind.

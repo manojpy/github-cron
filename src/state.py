@@ -10,7 +10,7 @@ import numpy as np
 import redis.asyncio as redis  # type: ignore[import-untyped]
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError  # type: ignore[import-untyped]
 
-from plan_replay import outcome_path_fields
+from plan_replay import outcome_path_fields, outcome_path_stream_fields
 from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError, CONFIG_OVERRIDE_ALLOWED_FIELDS, CONFIG_OVERRIDE_METADATA_KEY, BRAIN_DISABLED_KEYS_METADATA_KEY, PAIR_THRESHOLDS_METADATA_KEY, _get_session_from_ts
 from fetcher import compute_backoff
 
@@ -1890,7 +1890,7 @@ class RedisStateStore:
                                 "fees_paid_pct": f"{fees_paid_pct:.6f}" if fees_paid_pct is not None else "",
                                 "net_pnl_pct": f"{result.get('net_pnl_pct', 0.0):.6f}",
                                 "realized_cost_pct": f"{result.get('realized_cost_pct', 0.0):.6f}",
-                                **outcome_path_fields(result, stream=True),
+                                **outcome_path_stream_fields(result),
                                 "votes": json_dumps(conf_votes) if conf_votes is not None else "",
                                 "adx_val": str(adx_val) if adx_val is not None else "",
                                 "context": json_dumps(row_context) if row_context is not None else "",
@@ -2120,10 +2120,11 @@ class RedisStateStore:
                                         else "0" if result.get("tp_first") is False
                                         else ""
                                     ),
+
                                     "outcome_reason": result.get("outcome_reason", "unknown"),
                                     "net_pnl_pct": f"{result.get('net_pnl_pct', 0.0):.6f}",
                                     "realized_cost_pct": f"{result.get('realized_cost_pct', 0.0):.6f}",
-                                    **outcome_path_fields(result, stream=True),
+                                    **outcome_path_stream_fields(result),
                                     "votes": json_dumps(conf_votes) if conf_votes is not None else "",
                                     "adx_val": str(shadow_adx_val) if shadow_adx_val is not None else "",
                                     "rejection_reason": shadow_rejection_reason or "",

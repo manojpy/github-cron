@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import math
 import statistics
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 Row = Dict[str, Any]
 
@@ -62,6 +62,17 @@ def outcome_path_fields(result: Mapping[str, Any], *, stream: bool) -> Dict[str,
         return out
     out = {k: ("" if v is None else str(v)) for k, v in scalars.items()}
     out["path"] = json.dumps(path, separators=(",", ":")) if path else ""
+    return out
+
+
+StreamField = Union[bytes, memoryview, str, int, float]
+
+
+def outcome_path_stream_fields(result: Mapping[str, Any]) -> Dict[StreamField, StreamField]:
+    """outcome_path_fields(stream=True) typed for Redis stream writes (every value is a string)."""
+    out: Dict[StreamField, StreamField] = {}
+    for k, v in outcome_path_fields(result, stream=True).items():
+        out[k] = str(v)
     return out
 
 

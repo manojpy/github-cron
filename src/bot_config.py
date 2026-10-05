@@ -205,6 +205,8 @@ class BotConfig(BaseModel):
     ALERT_WATCH_MIN_CONVICTION: float = Field(default=50.0, ge=0.0, le=100.0, description="Telegram alert verdict: conviction % at or above which an alert reads WATCH (below = AVOID)")
     ALERT_SHADOW_CONVICTION_CAP: float = Field(default=55.0, ge=0.0, le=100.0, description="Conviction ceiling while the only evidence is SHADOW/INSUFFICIENT, so nothing reads TAKE before it has real results")
     ALERT_BIAS_MIN_EDGE: float = Field(default=0.10, ge=0.0, le=1.0, description="Fraction of pairs by which the dominant bias bucket must lead the opposite one before an alert counts as with/against the market; otherwise the alert is treated as neutral")
+    ENABLE_TAKE_SKIP_BUTTONS: bool = Field(default=False, description="Attach Took/Skip buttons to alerts and read the taps at the start of each run (one getUpdates call). Needs no webhook on the bot; off by default.")
+    TAKE_SKIP_MAX_ROWS: int = Field(default=8, ge=1, le=20, description="Maximum pairs (button rows) per alert message")
     PLAYBOOK_MODE: str = Field(default="shadow", description="Learner playbook in alerts: off | shadow (record only) | live (restrict-only overlay)")
     PLAYBOOK_ALLOW_UPGRADE: bool = Field(default=False, description="Live mode may lift WATCH to TAKE for a VALIDATED champion plan (off = restrict-only)")
     PLAYBOOK_MAX_AGE_HOURS: float = Field(default=36.0, gt=0, description="Ignore a playbook older than this (learner outage = no change)")
@@ -226,6 +228,7 @@ class BotConfig(BaseModel):
     PLAYBOOK_SB_TAKE_MIN_BLOCKS: int = Field(default=60, ge=1, description="Scoreboard T1: independent 3h blocks of forward trades needed")
     PLAYBOOK_SB_AVOID_MIN_BLOCKS: int = Field(default=30, ge=1, description="Scoreboard A1: independent 3h blocks of forward trades needed")
     PLAYBOOK_SB_CALIB_TOL: float = Field(default=0.10, gt=0, lt=1, description="Scoreboard T3: allowed gap between realized and predicted win share")
+    PLAYBOOK_RECON_MAX_CALLS: int = Field(default=120, ge=0, le=600, description="Candle-history requests per learner run used to rebuild missing paths of old real alerts (0 = off)")
     PLAYBOOK_NOTIFY: str = Field(default="changes", description="Learner Telegram summary: changes | always | never")
     ENABLE_ALERT_UNPROVEN_TAKE: bool = Field(default=True, description="Let a very strong technical setup with no brain history read TAKE (small size) instead of always WATCH")
     ALERT_UNPROVEN_MIN_CONFLUENCE_PCT: float = Field(default=90.0, ge=0.0, le=100.0, description="Confluence % needed for an unproven (no brain history) alert to read TAKE (small size)")
@@ -509,7 +512,7 @@ class BotConfig(BaseModel):
             raise ValueError(
                 f'RSI_ADAPTIVE_SELL_CALM ({self.RSI_ADAPTIVE_SELL_CALM}) must be > '
                 f'RSI_ADAPTIVE_SELL_VOLATILE ({self.RSI_ADAPTIVE_SELL_VOLATILE}) '
-                f'— sell threshold drops as volatility rises'
+                f'�� sell threshold drops as volatility rises'
             )
         if self.CPR_ADAPTIVE_CALM >= self.CPR_ADAPTIVE_VOLATILE:
             raise ValueError(

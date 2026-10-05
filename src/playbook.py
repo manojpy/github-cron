@@ -500,7 +500,7 @@ def build_playbook(
                 if champ:
                     ce = _ev(hold_rows, champ["plan"], cost_pct)
                     beats = bool(he and ce and he["ev"] - ce["ev"] >= P["min_ev_lift"])
-                if fwd_ok and beats:
+                if fe is not None and fwd_ok and beats:
                     prev_ver = int(champ.get("version", 0)) if champ else int(st.get("last_version", 0))
                     champ = {"plan": _plan(cp), "since_ts": now_ts, "last_confirmed_ts": now_ts,
                              "last_data_ts": entry["last_row_ts"], "version": prev_ver + 1,
@@ -577,7 +577,7 @@ def build_playbook(
         restrict: Optional[str] = None
         if entry["status"] in _NEGATIVE:
             restrict = "WATCH"
-        if avoid_streak >= int(P["avoid_consecutive"]) and entry["status"] not in SERVED_STATUSES:
+        if avoid_streak >= int(P["avoid_consecutive"]) and ctl_eval is not None and entry["status"] not in SERVED_STATUSES:
             restrict = "AVOID"
             avoid_since = avoid_since or int(now_ts)
             entry["avoid_proof"] = {**_stats(ctl_eval), "ucb": round(ctl_eval["ev"] + z_adj * ctl_eval["se"], 4)}

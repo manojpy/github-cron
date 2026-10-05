@@ -149,8 +149,8 @@ def mine_rules(
     found.sort(key=lambda d: d["ucb"])
     kept: List[Dict[str, Any]] = []
     for f in found:                      # drop rules that merely narrow an already-kept rule
-        atoms = {tuple(a) for a in f["rule"]}
-        if any({tuple(a) for a in k["rule"]} <= atoms for k in kept):
+        f_set = {tuple(a) for a in f["rule"]}
+        if any({tuple(a) for a in k["rule"]} <= f_set for k in kept):
             continue
         kept.append(f)
     return kept[:max_keep], len(cands)

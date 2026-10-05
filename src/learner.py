@@ -11,6 +11,7 @@ The fast bot only uses the playbook in restrict-only mode (PLAYBOOK_MODE).
 Usage (inside the bot image, OUTCOME_DATA_DIR = clone of the outcome-data repo):
     python learner.py                    # full cycle: learn, write playbook, notify
     python learner.py --dry-run          # compute + print, write nothing, send nothing
+    python learner.py --no-recon         # do not rebuild missing candle paths of old alerts
     python learner.py --no-control       # skip candles (nothing can pass beyond PROMISING
                                          #   while PLAYBOOK_REQUIRE_CONTROL is true)
     python learner.py --rollback         # restore the previous playbook version
@@ -34,6 +35,10 @@ from alert_registry import alert_family_of, pretty_alert
 from alerts import TelegramQueue, escape_markdown_v2
 from archive_reader import load_archived_outcomes
 from bot_config import _get_session_from_ts
+from feedback import KEY_FEEDBACK, behaviour_report, format_behaviour
+from pathrecon import (
+    apply_recon, cache_key, cache_pack, cache_unpack, needs_recon, recon_path, windows_for,
+)
 from playbook import (
     ControlModel, KEY_CURRENT, KEY_LEDGER, KEY_PREV, KEY_SCORE, KEY_STATE, KEY_STATE_PREV,
     build_playbook, default_params, format_summary,
@@ -42,6 +47,8 @@ from scoreboard import build_scoreboard, format_scoreboard
 from state import RedisStateStore
 
 _TTL = 90 * 86400
+KEY_RECON = "path_recon"
+_RECON_CAP = 5000
 _LEDGER_CAP = 600
 _CANDLE_SEC = 900
 
@@ -123,7 +130,7 @@ async def fetch_control_candles(days: int) -> Tuple[Dict[str, Tuple[Any, Any, An
                 pd = parse_candles_to_numpy(res) if res else None
                 if pd is None:
                     return
-                d = pd.as_dict() if hasattr(pd, "as_dict") else pd
+                d = pd.as_dict()
                 ts = d["timestamp"] if "timestamp" in d else d["ts"]
                 keep = ts <= last_closed_open          # drop the still-forming candle
                 if int(keep.sum()) < 200:
@@ -142,6 +149,95 @@ async def fetch_control_candles(days: int) -> Tuple[Dict[str, Tuple[Any, Any, An
     if len(out) < need:
         return {}, f"only {len(out)}/{len(cfg.PAIRS)} pairs returned candles"
     return out, f"{len(out)}/{len(cfg.PAIRS)} pairs, {days}d"
+
+
+async def recover_paths(
+    rows: List[Dict[str, Any]], sdb: Any, max_calls: int, dry_run: bool,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Give REAL archived alerts that have no stored candle path one, rebuilt from the
+    exchange's candle history (see pathrecon.py).  Results are cached in Redis so each
+    row is fetched once.  Never raises: on any problem the rows are returned as they were."""
+    stats = {"missing": 0, "from_cache": 0, "rebuilt": 0, "rejected": 0, "calls": 0}
+    try:
+        need = [r for r in rows if needs_recon(r)]
+        stats["missing"] = len(need)
+        if not need:
+            return rows, stats
+        cache: Dict[str, Any] = _jl(await sdb.get_metadata(KEY_RECON, timeout=5.0), {})
+        found: Dict[str, Dict[str, Any]] = {}
+        todo: Dict[str, List[Dict[str, Any]]] = {}
+        for r in need:
+            k = cache_key(r["pair"], r["direction"], r["entry_ts"])
+            p = cache.get(k)
+            if p and p.get("f"):
+                found[k] = cache_unpack(p)
+                stats["from_cache"] += 1
+            elif p and p.get("x"):
+                stats["rejected"] += 1
+            else:
+                todo.setdefault(str(r["pair"]), []).append(r)
+        dirty = False
+        if todo and max_calls > 0:
+            from fetcher import DataFetcher, parse_candles_to_numpy
+            fetcher = DataFetcher(cfg.DELTA_API_BASE)
+            now = int(time.time())
+            last_open = (now // _CANDLE_SEC) * _CANDLE_SEC - _CANDLE_SEC
+            fd, la = int(cfg.OUTCOME_FILL_DELAY_CANDLES), int(cfg.OUTCOME_LOOKAHEAD_CANDLES)
+            for pair, prs in sorted(todo.items(), key=lambda kv: -len(kv[1])):
+                for start, end in windows_for([int(r["entry_ts"]) for r in prs]):
+                    if stats["calls"] >= max_calls:
+                        break
+                    end = min(end, last_open)
+                    stats["calls"] += 1
+                    res = await fetcher.fetch_candles(pair, "15", 1900, end, expected_open_15=end)
+                    pdata = parse_candles_to_numpy(res) if res else None
+                    if pdata is None:
+                        continue
+                    d = pdata.as_dict()
+                    ts, o, h, lo, c = d["timestamp"], d["open"], d["high"], d["low"], d["close"]
+                    keep = ts <= last_open
+                    ts, o, h, lo, c = ts[keep], o[keep], h[keep], lo[keep], c[keep]
+                    for r in prs:
+                        et = int(r["entry_ts"])
+                        if not (start <= et <= end):
+                            continue
+                        k = cache_key(r["pair"], r["direction"], et)
+                        if k in found or k in cache:
+                            continue
+                        rec = recon_path(ts, o, h, lo, c, entry_ts=et, direction=str(r["direction"]),
+                                         fill_price=r.get("fill_price"), fill_delay=fd, lookahead=la)
+                        if rec is None:
+                            covered = len(ts) > 0 and et + (fd + la + 2) * _CANDLE_SEC <= int(ts[-1])
+                            if covered:
+                                cache[k] = {"x": 1}          # data was there but did not match: do not retry
+                                stats["rejected"] += 1
+                                dirty = True
+                            continue
+                        found[k] = rec
+                        cache[k] = cache_pack(rec)
+                        stats["rebuilt"] += 1
+                        dirty = True
+            try:
+                from fetcher import SessionManager
+                await SessionManager.close_session()
+            except Exception:
+                pass
+        if dirty and not dry_run:
+            if len(cache) > _RECON_CAP:
+                keep_keys = sorted(cache, key=lambda x: int(x.rsplit("|", 1)[-1]))[-_RECON_CAP:]
+                cache = {k: cache[k] for k in keep_keys}
+            await sdb.set_metadata(KEY_RECON, json_dumps(cache), ttl=_TTL, timeout=10.0)
+        out = []
+        for r in rows:
+            if needs_recon(r):
+                k = cache_key(r["pair"], r["direction"], r["entry_ts"])
+                if k in found:
+                    r = apply_recon(r, found[k])
+            out.append(r)
+        return out, stats
+    except Exception as e:
+        _say(f"[learner] path recovery skipped: {e!r}")
+        return rows, stats
 
 
 def _jl(raw: Optional[str], default: Any) -> Any:
@@ -178,13 +274,13 @@ async def run(args: argparse.Namespace) -> int:
 
         if args.rollback:
             prev = await sdb.get_metadata(KEY_PREV, timeout=5.0)
-            prev_state = await sdb.get_metadata(KEY_STATE_PREV, timeout=5.0)
+            prev_state_raw = await sdb.get_metadata(KEY_STATE_PREV, timeout=5.0)
             if not prev:
                 _say("[learner] no previous playbook stored — nothing to roll back to")
                 return 1
             await sdb.set_metadata(KEY_CURRENT, prev, ttl=_TTL, timeout=5.0)
-            if prev_state:
-                await sdb.set_metadata(KEY_STATE, prev_state, ttl=_TTL, timeout=5.0)
+            if prev_state_raw:
+                await sdb.set_metadata(KEY_STATE, prev_state_raw, ttl=_TTL, timeout=5.0)
             label = _jl(prev, {}).get("label")
             _say(f"[learner] rolled back to playbook {label}")
             await notify(f"🧠 PLAYBOOK rolled back to {label}")
@@ -196,6 +292,10 @@ async def run(args: argparse.Namespace) -> int:
 
         now_ts = time.time()
         rows = load_rows(data_dir, int(cfg.PLAYBOOK_WINDOW_DAYS))
+        rstats: Dict[str, int] = {}
+        if not args.no_recon and int(cfg.PLAYBOOK_RECON_MAX_CALLS) > 0:
+            rows, rstats = await recover_paths(rows, sdb, int(cfg.PLAYBOOK_RECON_MAX_CALLS), bool(args.dry_run))
+            _say(f"[learner] path recovery: {rstats}")
         n_path = sum(1 for r in rows if r.get("path_fav"))
         _say(f"[learner] rows={len(rows)} with_path={n_path}")
 
@@ -230,6 +330,12 @@ async def run(args: argparse.Namespace) -> int:
             changes.append({"key": "*", "event": "CRITERIA_CHANGED", "from": prev_sb["criteria_hash"],
                             "to": sb["criteria_hash"], "detail": "pass criteria were edited", "plan": None})
         text = format_summary(blob, changes, name_fn=pretty_alert) + "\n\n" + format_scoreboard(sb)
+        fb_log = _jl(await sdb.get_metadata(KEY_FEEDBACK, timeout=5.0), {})
+        if fb_log:
+            text += "\n\n" + format_behaviour(behaviour_report(fb_log, rows, fixed=fixed, cost_pct=cost_pct))
+        if rstats.get("rebuilt") or rstats.get("from_cache"):
+            text += (f"\n\n🧩 Recovered candle paths for {rstats.get('rebuilt', 0) + rstats.get('from_cache', 0)} "
+                     f"older real alert(s) from exchange history (tagged RECON).")
         _say(text)
 
         if args.dry_run:
@@ -265,6 +371,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Slow learner: validated trade-plan playbook")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-control", action="store_true")
+    ap.add_argument("--no-recon", action="store_true", help="do not rebuild missing candle paths from history")
     ap.add_argument("--rollback", action="store_true")
     ap.add_argument("--digest", action="store_true")
     ap.add_argument("--scoreboard", action="store_true", help="print the last stored scoreboard")

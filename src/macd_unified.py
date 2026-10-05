@@ -46,6 +46,7 @@ from brain_engine import BrainEngine
 
 _ALERT_ONLY_MODE: bool = False
 
+from feedback import poll_feedback
 from alerts import (
     TelegramQueue, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
     DEDUP_STATS, reset_dedup_stats, DLQ_STATS, reset_dlq_stats, replay_telegram_dlq, format_dedup_summary
@@ -1292,6 +1293,17 @@ async def run_once() -> Optional[bool]:
         logger_run.debug("Connecting to Redis...")
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
+
+        # Took / Skip button taps from earlier alerts: one getUpdates call, never fatal.
+        if getattr(cfg, "ENABLE_TAKE_SKIP_BUTTONS", False) and not sdb.degraded:
+            try:
+                _fb = await asyncio.wait_for(
+                    poll_feedback(sdb, cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, list(cfg.PAIRS)), timeout=12.0,
+                )
+                if _fb:
+                    logger_run.info(f"📝 Recorded {_fb} Took/Skip decision(s) from Telegram")
+            except Exception as e:
+                logger_run.debug(f"feedback poll skipped: {e}")
 
         valkey_usage_start: Dict[str, Optional[float]] = {}
         if sdb and not sdb.degraded:
