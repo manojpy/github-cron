@@ -225,22 +225,22 @@ jobs:
             "repos/${REPO}/actions/workflows/learner.yml/runs?per_page=50" \
             --jq '.workflow_runs')"
 
-          # Count successful learner runs created at or after the current
-          # six-hour window start.
-          COMPLETED="$(echo "$RUNS" | jq -r \
+          # Count ANY learner dispatch that is running or finished in the
+          # current IST 6-hour window. This prevents duplicate dispatches
+          # and stops failing learners from looping every 15 minutes.
+          ATTEMPTED="$(echo "$RUNS" | jq -r \
             --arg start "$WINDOW_START_UTC" '
               map(
                 select(
                   .event == "workflow_dispatch" and
-                  .conclusion == "success" and
+                  (.status == "in_progress" or .conclusion != null) and
                   .created_at >= $start
                 )
               ) |
               length
             ')"
-
-          if [ "$COMPLETED" -gt 0 ]; then
-            echo "✅ Learner already completed in IST window ${WINDOW_KEY}."
+          if [ "$ATTEMPTED" -gt 0 ]; then
+            echo "✅ Learner already attempted or in progress in IST window ${WINDOW_KEY} (count=${ATTEMPTED})."
             echo "No learner dispatch required."
             exit 0
           fi
