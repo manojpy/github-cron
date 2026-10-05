@@ -32,10 +32,11 @@ class AlertPayload:
     verdict: Optional[str] = None       # "TAKE" / "WATCH" / "AVOID" (None if unavailable)
 
 from alert_advisor import PairAdvice, advise_pair
-from feedback import build_keyboard
+
+from feedback import build_keyboard, load_open_positions
 from bot_config import (
     cfg, logger, Constants, CompiledPatterns, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
-    shutdown_event, format_ist_time, json_dumps, json_loads, CONFLUENCE_WEIGHTS, BtcMacroContext,
+    shutdown_event, format_ist_time, json_dumps, CONFLUENCE_WEIGHTS, BtcMacroContext,
     ClusterContext, BiasContext, _get_session_from_ts,
 )
 
@@ -2094,17 +2095,14 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         # and passed in — it doesn't change while the bot loops through
         # pairs, so a per-pair GET is pure waste. Only fetch here if no
         # caller ever passed it.
+        open_positions: List[Dict[str, Any]]
         if open_positions_run is _SENTINEL_UNSET:
-            try:
-                raw = await sdb._safe_redis_op(
-                    lambda: _rc(sdb._redis).get("open_positions"),
-                    2.0, "open_positions_get",
-                )
-                open_positions = json_loads(raw) if raw else []
-            except Exception:
-                open_positions = []
+            open_positions = await load_open_positions(
+                sdb, float(cfg.PORTFOLIO_POSITION_MAX_AGE_MIN) * 60.0,
+            )
         else:
-            open_positions = open_positions_run or []
+            open_positions = cast(List[Dict[str, Any]], open_positions_run or [])
+
         direction = "buy" if gr.buy_common else ("sell" if gr.sell_common else None)
         if direction:
             verdict = engine.portfolio_heat_check(

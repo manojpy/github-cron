@@ -46,7 +46,7 @@ from brain_engine import BrainEngine
 
 _ALERT_ONLY_MODE: bool = False
 
-from feedback import poll_feedback
+from feedback import load_open_positions, poll_feedback
 from alerts import (
     TelegramQueue, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
     DEDUP_STATS, reset_dedup_stats, DLQ_STATS, reset_dlq_stats, replay_telegram_dlq, format_dedup_summary
@@ -889,16 +889,21 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             pair_thresholds_run = {}
 
     open_positions_run: List[Dict[str, Any]] = []
+
     if cfg.ENABLE_PORTFOLIO_HEAT_GATE and state_db and not state_db.degraded and state_db._redis:
-        try:
-            raw_open_positions = await state_db._safe_redis_op(
-                lambda: _rc(state_db._redis).get("open_positions"),
-                2.0, "open_positions_runload",
+        if not getattr(cfg, "ENABLE_TAKE_SKIP_BUTTONS", False):
+            logger_main.warning(
+                "Portfolio heat gate is ON but ENABLE_TAKE_SKIP_BUTTONS is off: "
+                "no 'Took' taps can be recorded, so the gate has no positions to count"
             )
-            open_positions_run = json_loads(raw_open_positions) if raw_open_positions else []
-        except Exception as e:
-            logger_main.warning(f"Open-positions pre-load failed (fail-open): {e}")
-            open_positions_run = []
+        open_positions_run = await load_open_positions(
+            state_db, float(cfg.PORTFOLIO_POSITION_MAX_AGE_MIN) * 60.0,
+        )
+        if open_positions_run:
+            logger_main.info(
+                f"Heat gate: {len(open_positions_run)} open position(s) from Took taps: "
+                + ", ".join(f"{p['pair']} {p['direction']}" for p in open_positions_run)
+            )
 
     kill_switch_active_run: bool = False
     if cfg.ENABLE_KILL_SWITCH and state_db and not state_db.degraded and state_db._redis:

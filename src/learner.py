@@ -35,7 +35,11 @@ from alert_registry import alert_family_of, pretty_alert
 from alerts import TelegramQueue, escape_markdown_v2
 from archive_reader import load_archived_outcomes
 from bot_config import _get_session_from_ts
-from feedback import KEY_FEEDBACK, behaviour_report, format_behaviour
+
+from feedback import (
+    KEY_FEEDBACK, behaviour_report, format_behaviour, format_heat_gate, format_margin,
+    heat_gate_report, margin_report,
+)
 from pathrecon import (
     apply_recon, cache_key, cache_pack, cache_unpack, needs_recon, recon_path, windows_for,
 )
@@ -331,9 +335,15 @@ async def run(args: argparse.Namespace) -> int:
                             "to": sb["criteria_hash"], "detail": "pass criteria were edited", "plan": None})
         text = format_summary(blob, changes, name_fn=pretty_alert) + "\n\n" + format_scoreboard(sb)
         fb_log = _jl(await sdb.get_metadata(KEY_FEEDBACK, timeout=5.0), {})
+
         if fb_log:
             text += "\n\n" + format_behaviour(behaviour_report(fb_log, rows, fixed=fixed, cost_pct=cost_pct))
+        if cfg.ENABLE_PORTFOLIO_HEAT_GATE:
+            text += "\n\n" + format_heat_gate(heat_gate_report(rows, fixed=fixed, cost_pct=cost_pct))
+        if cfg.ENABLE_ALERT_WHY_SURVIVED:
+            text += "\n\n" + format_margin(margin_report(rows, fixed=fixed, cost_pct=cost_pct))
         if rstats.get("rebuilt") or rstats.get("from_cache"):
+
             text += (f"\n\n🧩 Recovered candle paths for {rstats.get('rebuilt', 0) + rstats.get('from_cache', 0)} "
                      f"older real alert(s) from exchange history (tagged RECON).")
         _say(text)

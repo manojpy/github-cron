@@ -200,6 +200,42 @@ async def poll_feedback(
         return 0
 
 
+# ── Open positions for the portfolio heat gate ────────────────────────────
+def open_positions_from_log(
+    log: Mapping[str, Any], *, now: float, max_age_sec: float,
+) -> List[Dict[str, Any]]:
+    """Pure: the trades you tapped "Took" that are still assumed open.
+
+    A position is open from its alert candle until you reply with an exit price
+    ("BTC exit 64250") or `max_age_sec` passes (the outcome horizon).  One entry
+    per pair (the newest), so the heat gate never counts a pair twice."""
+    newest: Dict[str, Dict[str, Any]] = {}
+    for k, v in log.items():
+        try:
+            if v.get("d") != "T" or v.get("exit") is not None:
+                continue
+            pair, direction, ts_s = k.split("|")
+            ts = int(ts_s)
+        except Exception:
+            continue
+        if now - ts > max_age_sec or ts > now + 3600:
+            continue
+        cur = newest.get(pair)
+        if cur is None or ts > cur["ts"]:
+            newest[pair] = {"pair": pair, "direction": direction, "ts": ts}
+    return sorted(newest.values(), key=lambda p: p["ts"])
+
+
+async def load_open_positions(sdb: Any, max_age_sec: float, now: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Open positions from the Took/Skip log.  Never raises; [] when unknown."""
+    try:
+        raw = await sdb.get_metadata(KEY_FEEDBACK, timeout=3.0)
+        log = json.loads(raw) if raw else {}
+        return open_positions_from_log(log, now=now if now is not None else time.time(), max_age_sec=max_age_sec)
+    except Exception:
+        return []
+
+
 # ── Learner side: what did the decisions teach? ───────────────────────────
 def behaviour_report(
     log: Mapping[str, Any], rows: Sequence[Row], *, fixed: Mapping[str, float], cost_pct: float,
@@ -250,4 +286,79 @@ def format_behaviour(b: Mapping[str, Any]) -> str:
         out.append(f"  Real fills vs model: {b['fills']['mean_gap']:+.2f}% per trade (n={b['fills']['n']})")
     if b["unmatched"] or b["pending"]:
         out.append(f"  ({b['pending']} still resolving, {b['unmatched']} not matched to an outcome)")
+    return "\n".join(out)
+
+
+# ── Learner side: do the gates earn their place? ──────────────────────────
+def _plan_pnls(rows: Sequence[Row], fixed: Mapping[str, float], cost_pct: float) -> List[float]:
+    out: List[float] = []
+    for r in rows:
+        res = replay_plan(r, float(fixed["sl"]), float(fixed["tp"]), int(fixed["h"]), cost_pct)
+        if res is not None:
+            out.append(res[1])
+    return out
+
+
+def _pnl_stat(x: Sequence[float]) -> Dict[str, Any]:
+    return {"n": len(x), "ev": statistics.fmean(x) if x else None,
+            "win": (sum(1 for p in x if p > 0) / len(x)) if x else None}
+
+
+def _fmt_stat(s: Mapping[str, Any]) -> str:
+    return "n=0" if not s["n"] else f"n={s['n']}, EV {s['ev']:+.2f}%, wins {s['win']:.0%}"
+
+
+def heat_gate_report(rows: Sequence[Row], *, fixed: Mapping[str, float], cost_pct: float) -> Dict[str, Any]:
+    """Alerts the portfolio heat gate held back (shadow rows) vs alerts that went out (live rows),
+    both replayed on the same fixed plan."""
+    blocked = [r for r in rows if r.get("source") == "SHADOW" and r.get("rejection_reason") == "portfolio_heat"]
+    live = [r for r in rows if r.get("source") == "LIVE"]
+    return {"blocked": _pnl_stat(_plan_pnls(blocked, fixed, cost_pct)),
+            "sent": _pnl_stat(_plan_pnls(live, fixed, cost_pct)),
+            "blocked_rows": len(blocked)}
+
+
+def format_heat_gate(h: Mapping[str, Any], min_n: int = 20) -> str:
+    b, s = h["blocked"], h["sent"]
+    out = ["🛡 PORTFOLIO HEAT GATE (fixed plan)", f"  Held back: {_fmt_stat(b)}", f"  Sent: {_fmt_stat(s)}"]
+    if b["n"] < min_n or s["n"] < min_n:
+        out.append(f"  Too few to judge yet (need {min_n}+ of each)")
+    elif b["ev"] < s["ev"]:
+        out.append("  ✓ the alerts it held back did worse than the ones sent, so it is earning its place")
+    else:
+        out.append("  ⚠ the alerts it held back did as well or better than the ones sent, so it is costing edge")
+    return "\n".join(out)
+
+
+def margin_report(
+    rows: Sequence[Row], *, fixed: Mapping[str, float], cost_pct: float,
+    thin: float = 0.10, strong: float = 0.30,
+) -> Dict[str, Any]:
+    """Live alerts bucketed by how far their effective confluence score cleared the required score."""
+    buckets: Dict[str, List[Row]] = {"thin": [], "mid": [], "strong": []}
+    for r in rows:
+        if r.get("source") != "LIVE":
+            continue
+        es, rq = r.get("effective_score"), r.get("effective_required")
+        if es is None or not rq or float(rq) <= 0:
+            continue
+        m = (float(es) - float(rq)) / float(rq)
+        buckets["thin" if m < thin else ("strong" if m >= strong else "mid")].append(r)
+    out: Dict[str, Any] = {k: _pnl_stat(_plan_pnls(v, fixed, cost_pct)) for k, v in buckets.items()}
+    out["thin_below"], out["strong_from"] = thin, strong
+    return out
+
+
+def format_margin(m: Mapping[str, Any], min_n: int = 15) -> str:
+    out = ["📏 GATE MARGIN (how far alerts cleared the confluence floor, fixed plan)",
+           f"  Thin (<{m['thin_below']:.0%} over): {_fmt_stat(m['thin'])}",
+           f"  Middle: {_fmt_stat(m['mid'])}",
+           f"  Strong ({m['strong_from']:.0%}+ over): {_fmt_stat(m['strong'])}"]
+    t, s = m["thin"], m["strong"]
+    if t["n"] < min_n or s["n"] < min_n:
+        out.append(f"  Too few to judge yet (need {min_n}+ in thin and strong)")
+    elif s["ev"] - t["ev"] >= 0.10:
+        out.append("  ✓ clearing the floor by more predicts better outcomes, so margin is worth showing or raising the floor")
+    else:
+        out.append("  ○ margin does not predict outcome yet, so no change is justified")
     return "\n".join(out)
