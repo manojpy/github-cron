@@ -1,6 +1,16 @@
 name: 🔎 Redis Key & TTL Audit
 
-
+# Read-only by default. Runs src/redis_audit.py (SCAN / TYPE / TTL / XLEN /
+# MEMORY USAGE only) against the REDIS_URL secret and prints the report in the
+# job summary. With the toggles below left off it never writes, deletes or
+# expires a key, so it is safe to run any time, including while the bot runs.
+#
+# One-off heal: tick `heal_durable_ttl` to raise the standing-decision keys
+# (config_override, brain_disabled_alert_keys, brain_alert_key_history,
+# pair_confluence_thresholds) that are still on the old 7-day TTL up to 90 days.
+# It only ever lengthens a TTL (EXPIRE ... GT), changes no value, and skips
+# dynamic_weights / brain_apply_snapshots. Tick `heal_dry_run` as well to
+# preview without writing. Safe to run again: a healed key is simply skipped.
 on:
   workflow_dispatch:
     inputs:
@@ -22,10 +32,6 @@ on:
 
 permissions:
   contents: read
-
-concurrency:
-  group: redis-audit
-  cancel-in-progress: false
 
 jobs:
   audit:

@@ -1,32 +1,33 @@
 name: 🧠 Learner (validated trade-plan playbook)
 
+# The SLOW half of the advisor. Every few hours it reads the outcome archive,
+# builds a no-alert control from raw candles, runs the champion/challenger
+# validation and writes a small versioned playbook to Redis. The 15-minute bot
+# only READS that playbook (PLAYBOOK_MODE: off | shadow | live).
+#
+# It never places orders, never edits config_macd.json and never pushes to the
+# data repo. Manual runs: tick dry_run to preview, or rollback to restore the
+# previous playbook version.
 on:
+  schedule:
+    - cron: "20 */6 * * *"      # 4x a day, off the 1/16/31/46 alert minutes
   workflow_dispatch:
     inputs:
-      learner_window:
-        description: 'Automatic IST six-hour window requested by replay-outcomes'
-        required: false
-        default: ''
-        type: string
-
       dry_run:
         description: 'Compute and print only (write nothing, send nothing)'
         required: false
         default: false
         type: boolean
-
       rollback:
         description: 'Restore the previous playbook version and exit'
         required: false
         default: false
         type: boolean
-
       no_recon:
         description: 'Skip rebuilding missing candle paths of older real alerts'
         required: false
         default: false
         type: boolean
-
       no_control:
         description: 'Skip the candle-based control (nothing passes beyond PROMISING while PLAYBOOK_REQUIRE_CONTROL is on)'
         required: false
@@ -47,7 +48,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      actions: write
       contents: read
       packages: read
     steps:
@@ -120,12 +120,3 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit $RC
-
-      - name: 🔎 Dispatch Redis audit (post-learner)
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          gh workflow run redis-audit.yml --repo "$REPO" --ref main
-          echo "✅ redis-audit.yml dispatched after learner"
