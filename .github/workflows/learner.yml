@@ -23,6 +23,11 @@ on:
         required: false
         default: false
         type: boolean
+      no_recon:
+        description: 'Skip rebuilding missing candle paths of older real alerts'
+        required: false
+        default: false
+        type: boolean
       no_control:
         description: 'Skip the candle-based control (nothing passes beyond PROMISING while PLAYBOOK_REQUIRE_CONTROL is on)'
         required: false
@@ -41,7 +46,7 @@ env:
 jobs:
   learn:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: read
@@ -60,6 +65,11 @@ jobs:
           git clone --depth 1 \
             "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" \
             /tmp/data-repo
+          # The image checks at import time that the archive folder is writable
+          # (same as run-bot.yml). The learner never writes archives, and this
+          # clone is thrown away with the runner, so open the permissions.
+          mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
+          chmod -R 777 /tmp/data-repo
 
       - name: 🐳 Log in to GHCR
         uses: docker/login-action@v4
@@ -76,6 +86,7 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
           ROLLBACK: ${{ inputs.rollback }}
           NO_CONTROL: ${{ inputs.no_control }}
+          NO_RECON: ${{ inputs.no_recon }}
         run: |
           ENV_FILE="$(pwd)/.bot_env"
           cat > "$ENV_FILE" <<EOF
@@ -89,13 +100,14 @@ jobs:
           [ "$DRY_RUN" = "true" ] && ARGS="$ARGS --dry-run"
           [ "$ROLLBACK" = "true" ] && ARGS="$ARGS --rollback"
           [ "$NO_CONTROL" = "true" ] && ARGS="$ARGS --no-control"
+          [ "$NO_RECON" = "true" ] && ARGS="$ARGS --no-recon"
           set +e
           docker run --rm \
             --platform linux/amd64 \
             --env-file "$ENV_FILE" \
             -e PYTHONPATH=/app/src \
             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \
-            -v /tmp/data-repo:/data:ro \
+            -v /tmp/data-repo:/data:rw \
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" \
             python learner.py $ARGS 2>&1 | tee learner.txt
           RC=${PIPESTATUS[0]}

@@ -62,7 +62,7 @@ jobs:
              src/brain_report.py src/brain_recommend_baseline.py src/brain_recommend_full.py \
              src/health_server.py src/brain_audit.py src/outcome_storage.py src/learner.py \
              src/apply_config_override.py src/archive_reader.py src/repair_ledger.py src/playbook.py \
-             src/rulemine.py src/scoreboard.py \
+             src/rulemine.py src/scoreboard.py src/feedback.py src/pathrecon.py \
             --ignore-missing-imports 2>&1 | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "ℹ️ Non-blocking for now -- see PR description before flipping to blocking." >> $GITHUB_STEP_SUMMARY
@@ -210,6 +210,8 @@ jobs:
                 "/app/src/playbook.py"
                 "/app/src/scoreboard.py"
                 "/app/src/rulemine.py"
+                "/app/src/feedback.py"
+                "/app/src/pathrecon.py"
                 "/app/src/plan_replay.py"
                 "/app/src/cython_functions*.so"
               )
