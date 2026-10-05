@@ -60,8 +60,9 @@ jobs:
              src/threshold_models.py src/threshold_quality.py src/threshold_repair.py \
              src/brain.py src/brain_enhanced.py src/brain_engine.py src/brain_helpers.py \
              src/brain_report.py src/brain_recommend_baseline.py src/brain_recommend_full.py \
-             src/health_server.py src/brain_audit.py src/outcome_storage.py \
-             src/apply_config_override.py src/archive_reader.py src/repair_ledger.py \
+             src/health_server.py src/brain_audit.py src/outcome_storage.py src/learner.py \
+             src/apply_config_override.py src/archive_reader.py src/repair_ledger.py src/playbook.py \
+             src/rulemine.py src/scoreboard.py \ 
             --ignore-missing-imports 2>&1 | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "ℹ️ Non-blocking for now -- see PR description before flipping to blocking." >> $GITHUB_STEP_SUMMARY
@@ -172,7 +173,6 @@ jobs:
                 "/app/src/aot_bridge.py"
                 "/app/src/aot_meta.py"
                 "/app/src/numba_functions_shared.py"
-
                 "/app/src/numeric_selftest.py"
                 "/app/src/alert_registry.py"
                 "/app/src/config_base.py"
@@ -206,10 +206,13 @@ jobs:
                 "/app/src/apply_config_override.py" 
                 "/app/src/outcome_storage.py"
                 "/app/src/archive_reader.py"
+                "/app/src/learner.py"
+                "/app/src/playbook.py"
+                "/app/src/scoreboard.py"
+                "/app/src/rulemine.py"
                 "/app/src/plan_replay.py"
                 "/app/src/cython_functions*.so"
               )
-
               for file in "${FILES[@]}"; do
                 if ! compgen -G "$file" > /dev/null; then
                   echo "❌ MISSING: $file"
