@@ -118,6 +118,8 @@ COPY --chown=appuser:appuser src/playbook.py ./
 COPY --chown=appuser:appuser src/learner.py ./
 COPY --chown=appuser:appuser src/scoreboard.py ./
 COPY --chown=appuser:appuser src/rulemine.py ./
+COPY --chown=appuser:appuser src/feedback.py ./
+COPY --chown=appuser:appuser src/pathrecon.py ./
 COPY --chown=appuser:appuser src/macd_unified.py ./
 
 USER appuser
