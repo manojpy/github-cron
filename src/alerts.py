@@ -1140,6 +1140,11 @@ async def replay_telegram_dlq(
             await sdb.dlq_set_attempts(key, entry, attempts + 1)
         break
 
+def _buttons_on(queue: Any) -> bool:
+    """Took/Skip buttons only when switched on AND the sender supports markup."""
+    return (getattr(cfg, "ENABLE_TAKE_SKIP_BUTTONS", False) is True
+            and callable(getattr(queue, "send_with_markup", None)))
+
 async def dispatch_combined_alerts(
     payloads: List[AlertPayload],
     telegram_queue: TelegramQueue,
@@ -1278,7 +1283,7 @@ async def dispatch_combined_alerts(
     for msg, msg_payloads in zip(messages, message_payloads):
         _kb = (build_keyboard([(p.pair_name, p.direction, p.ts) for p in msg_payloads],
                               int(getattr(cfg, "TAKE_SKIP_MAX_ROWS", 8)))
-               if getattr(cfg, "ENABLE_TAKE_SKIP_BUTTONS", False) else None)
+               if _buttons_on(telegram_queue) else None)
         if _kb is not None:
             _sent = (await telegram_queue.send_with_markup(msg, _kb)) is not None
         else:
@@ -3283,7 +3288,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
                         _kb1 = (build_keyboard([(pair_name, direction, ts_curr)],
                                                int(getattr(cfg, "TAKE_SKIP_MAX_ROWS", 8)))
-                                if getattr(cfg, "ENABLE_TAKE_SKIP_BUTTONS", False) else None)
+                                if _buttons_on(telegram_queue) else None)
                         if _kb1 is not None:
                             send_success = (await telegram_queue.send_with_markup(msg, _kb1)) is not None
                         else:
