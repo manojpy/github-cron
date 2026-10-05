@@ -1,16 +1,5 @@
 name: 🧠 Learner (validated trade-plan playbook)
-
-# The SLOW half of the advisor. Every few hours it reads the outcome archive,
-# builds a no-alert control from raw candles, runs the champion/challenger
-# validation and writes a small versioned playbook to Redis. The 15-minute bot
-# only READS that playbook (PLAYBOOK_MODE: off | shadow | live).
-#
-# It never places orders, never edits config_macd.json and never pushes to the
-# data repo. Manual runs: tick dry_run to preview, or rollback to restore the
-# previous playbook version.
 on:
-  schedule:
-    - cron: "20 */6 * * *"      # 4x a day, off the 1/16/31/46 alert minutes
   workflow_dispatch:
     inputs:
       dry_run:
