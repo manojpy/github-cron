@@ -100,12 +100,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🔥 Pull Latest Image
+      - name: 🔥 Pull Image (commit-matched, else latest)
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          BASE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          IMAGE="$BASE:sha-${GITHUB_SHA}"
           echo "🐳 Pulling image..."
           START=$(date +%s)
-          docker pull --quiet --platform linux/amd64 "$IMAGE"
+          if ! docker pull --quiet --platform linux/amd64 "$IMAGE"; then
+            echo "::warning::Image for commit ${GITHUB_SHA} not built yet — running :latest (config may be newer than code)"
+            IMAGE="$BASE:latest"
+            docker pull --quiet --platform linux/amd64 "$IMAGE"
+          fi
+          echo "RUN_IMAGE=$IMAGE" >> "$GITHUB_ENV"
           echo "✅ Image ready in $(( $(date +%s) - START ))s"
 
       - name: ✅ Apply Brain Plan (on-demand)
@@ -124,7 +130,7 @@ jobs:
             --env-file "$ENV_FILE" \
             -e PYTHONPATH=/app/src \
             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \
-            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" \
+            "${{ env.RUN_IMAGE }}" \
             python macd_unified.py --apply-brain
 
           rm -f "$ENV_FILE"
@@ -246,7 +252,7 @@ jobs:
           mkdir -p logs
           echo "::group::🔥 Launch Macd-Unified...🔥"
           echo "🕐 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
-          echo "🏷️ Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo "🏷️ Image: ${{ env.RUN_IMAGE }}"
           echo "🧪 Dry Run: $DRY_RUN"
           echo "🧹 Clear Redis: $CLEAR_REDIS"
           BRAIN_FULL="${{ steps.brain_depth.outputs.brain_full }}"
@@ -273,7 +279,7 @@ jobs:
           CLEAR_KILL_SWITCH=$CLEAR_KILL_SWITCH
           EOF
 
-          timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run             --rm             --name "macd_bot_${{ github.run_id }}"             --platform linux/amd64             --memory="900m"             --memory-swap="1800m"             --cpus="2.0"             --security-opt=no-new-privileges             --read-only             --tmpfs /tmp:rw,noexec,nosuid,size=64m             --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m             --env-file "$ENV_FILE"             -e TZ=Asia/Kolkata             -e PYTHONPATH=/app/src             -e PYTHONUNBUFFERED=1             -e NUMBA_NUM_THREADS=2             -e OMP_NUM_THREADS=2             -e OUTCOME_DATA_DIR=/tmp/data-repo             -v "/tmp/data-repo:/tmp/data-repo:rw"             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro"             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>&1 | tee logs/bot_output.log
+          timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run             --rm             --name "macd_bot_${{ github.run_id }}"             --platform linux/amd64             --memory="900m"             --memory-swap="1800m"             --cpus="2.0"             --security-opt=no-new-privileges             --read-only             --tmpfs /tmp:rw,noexec,nosuid,size=64m             --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m             --env-file "$ENV_FILE"             -e TZ=Asia/Kolkata             -e PYTHONPATH=/app/src             -e PYTHONUNBUFFERED=1             -e NUMBA_NUM_THREADS=2             -e OMP_NUM_THREADS=2             -e OUTCOME_DATA_DIR=/tmp/data-repo             -v "/tmp/data-repo:/tmp/data-repo:rw"             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro"                         ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>&1 | tee logs/bot_output.log
 
           EXIT_CODE=${PIPESTATUS[0]}
           DURATION=$(( $(date +%s) - START_TIME ))

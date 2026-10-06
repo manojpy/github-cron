@@ -67,8 +67,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🔥 Pull latest image
-        run: docker pull --quiet --platform linux/amd64 "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+      - name: 🔥 Pull Image (commit-matched, else latest)
+        run: |
+          BASE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          IMAGE="$BASE:sha-${GITHUB_SHA}"
+          echo "🐳 Pulling image..."
+          START=$(date +%s)
+          if ! docker pull --quiet --platform linux/amd64 "$IMAGE"; then
+            echo "::warning::Image for commit ${GITHUB_SHA} not built yet — running :latest (config may be newer than code)"
+            IMAGE="$BASE:latest"
+            docker pull --quiet --platform linux/amd64 "$IMAGE"
+          fi
+          echo "RUN_IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "✅ Image ready in $(( $(date +%s) - START ))s"
 
       - name: 🧠 Run learner
         env:
@@ -97,7 +108,7 @@ jobs:
             -e PYTHONPATH=/app/src \
             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \
             -v /tmp/data-repo:/data:rw \
-            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" \
+            "${{ env.RUN_IMAGE }}" \
             python learner.py $ARGS 2>&1 | tee learner.txt
           RC=${PIPESTATUS[0]}
           set -e

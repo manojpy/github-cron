@@ -89,7 +89,8 @@ jobs:
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
-            type=sha,prefix=sha-,format=short
+            type=sha,prefix=sha-,format=long
+
             type=schedule,pattern={{date 'YYYYMMDD-HHmm'}},enable=true
           labels: |
             org.opencontainers.image.title=MACD Unified Bot
