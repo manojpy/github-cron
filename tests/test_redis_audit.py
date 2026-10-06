@@ -268,3 +268,59 @@ def test_cli_without_heal_flag_writes_nothing(monkeypatch):
     monkeypatch.setitem(sys.modules, "redis", types.SimpleNamespace(from_url=lambda *a, **k: fake))
     assert ra.main(["--url", "redis://x"]) == 0
     assert fake.expired == [] and fake.ttls["metadata:config_override"] == 3 * DAY
+
+# ── one-off TTL-leak heal ───────────────────────────────────────────────────
+
+def test_plan_ttl_leak_heal_only_ttl_required_no_ttl():
+    recs = [
+        _rec("brain_threshold_history:BCHUSD", -1),   # planned
+        _rec("brain_threshold_history:LABUSD", -1),   # planned
+        _rec("pair_state:BTCUSD", DAY),               # has TTL → skip
+        _rec("outcome_log_stream", -1, "stream"),     # no_ttl_ok → skip
+        _rec("legacy_blob", -1),                      # orphan → skip
+        _rec("brain_threshold_history:XAUTUSD", 5 * DAY),  # already has TTL
+    ]
+    plan = ra.plan_ttl_leak_heal(recs)
+    assert [p["key"] for p in plan] == [
+        "brain_threshold_history:BCHUSD",
+        "brain_threshold_history:LABUSD",
+    ]
+    assert all(p["target"] == ra.LEAK_HEAL_TTL_SEC for p in plan)
+
+def test_apply_ttl_leak_heal_sets_and_dry_run():
+    r = _HealRedis({
+        "brain_threshold_history:BCHUSD": -1,
+        "brain_threshold_history:LABUSD": -1,
+    })
+    plan = ra.plan_ttl_leak_heal([
+        _rec("brain_threshold_history:BCHUSD", -1),
+        _rec("brain_threshold_history:LABUSD", -1),
+    ])
+    out = ra.apply_ttl_leak_heal(r, plan)
+    assert all(row["status"] == "set" for row in out["keys"])
+    assert r.ttls["brain_threshold_history:BCHUSD"] == ra.LEAK_HEAL_TTL_SEC
+
+    r2 = _HealRedis({"brain_threshold_history:BCHUSD": -1})
+    out2 = ra.apply_ttl_leak_heal(r2, plan[:1], dry_run=True)
+    assert out2["keys"][0]["status"] == "would_set"
+    assert r2.expired == [] and r2.ttls["brain_threshold_history:BCHUSD"] == -1
+
+def test_render_includes_leak_heal_section():
+    rep = ra.summarize([_rec("brain_threshold_history:BCHUSD", -1)])
+    rep["leak_heal"] = {
+        "target_days": 30.0,
+        "dry_run": False,
+        "keys": [{
+            "key": "brain_threshold_history:BCHUSD",
+            "family": "brain_threshold_history",
+            "ttl_before": -1,
+            "target": ra.LEAK_HEAL_TTL_SEC,
+            "ttl_after": ra.LEAK_HEAL_TTL_SEC,
+            "status": "set",
+        }],
+    }
+    text = ra.render(rep)
+    assert "TTL-leak heal → 30d" in text
+    assert "brain_threshold_history:BCHUSD" in text
+    assert "[set]" in text
+
