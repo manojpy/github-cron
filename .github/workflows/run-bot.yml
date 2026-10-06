@@ -331,6 +331,8 @@ jobs:
 
       - name: 📋 Generate Summary Report
         if: always()
+        env:
+          ERROR_MSG: ${{ steps.results.outputs.error_msg }}
         run: |
           echo "## 🤖 MACD Bot Execution Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -338,7 +340,7 @@ jobs:
           if [ "${{ steps.results.outputs.status }}" != "Success" ]; then
             echo "### ❌ Error Details" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-            echo "${{ steps.results.outputs.error_msg }}" >> $GITHUB_STEP_SUMMARY
+            echo "$ERROR_MSG" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           else
             echo "### ✅ Run Completed Successfully" >> $GITHUB_STEP_SUMMARY
@@ -392,10 +394,10 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATUS: ${{ steps.results.outputs.status || 'Unknown' }}
+          ERROR_MSG: ${{ steps.results.outputs.error_msg || 'See workflow logs' }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          STATUS="${{ steps.results.outputs.status || 'Unknown' }}"
-          ERROR_MSG="${{ steps.results.outputs.error_msg || 'See workflow logs' }}"
           EXIT_CODE="${{ steps.bot_run.outputs.exit_code || 'N/A' }}"
           DURATION="${{ steps.bot_run.outputs.execution_time || 'N/A' }}"
 

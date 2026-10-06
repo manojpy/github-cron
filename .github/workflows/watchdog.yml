@@ -47,7 +47,8 @@ jobs:
 
           ALERT=""
 
-          if [ "$LATEST_STATUS" = "completed" ] && [ "$LATEST_CONCLUSION" != "success" ]; then
+          if [ "$LATEST_STATUS" = "completed" ] && [ "$LATEST_CONCLUSION" != "success" ] \
+             && [ "$LATEST_CONCLUSION" != "cancelled" ] && [ "$LATEST_CONCLUSION" != "skipped" ]; then
             ALERT="⚠️ Latest run-bot.yml run finished with conclusion: ${LATEST_CONCLUSION}"$'\n'"Run: ${LATEST_URL}"
           fi
 
