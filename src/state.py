@@ -1131,7 +1131,11 @@ class RedisStateStore:
 
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int, window_sec: Optional[int] = None) -> bool:
         if self.degraded:
-            return True
+            logger.error(
+                f"check_recent_alert: Redis degraded — failing closed for {pair}:{alert_key} "
+                f"(no dedup claim possible, alert blocked)"
+            )
+            return False
         if not self._redis:
             logger.critical(
                 f"check_recent_alert: degraded=False but _redis is None (state desync) — "
@@ -1162,7 +1166,11 @@ class RedisStateStore:
         if not alert_keys:
             return {}
         if self.degraded:
-            return {k: True for k in alert_keys}
+            logger.error(
+                f"batch_check_recent_alerts: Redis degraded — failing closed for {pair} "
+                f"(no dedup claim possible, {len(alert_keys)} alert(s) blocked)"
+            )
+            return {k: False for k in alert_keys}
         if not self._redis:
             logger.critical(
                 f"batch_check_recent_alerts: degraded=False but _redis is None (state desync) — "
@@ -1198,9 +1206,12 @@ class RedisStateStore:
     # ── Telegram dead-letter queue ───────────────────────────────────────
     # One Redis key per parked alert: telegram_dlq:{pair}:{candle_ts}:{digest}.
     # The digest makes a re-park of the identical message idempotent.
+
     async def dlq_push(
         self, pair: str, message: str, ts: int, *,
         dedup_keys: Optional[List[str]] = None, source: str = "",
+        state_changes: Optional[List[Any]] = None,
+        outcomes: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
         """Park a failed-to-send alert. Returns True if it is (now) stored."""
         if self.degraded or not self._redis:
@@ -1210,6 +1221,10 @@ class RedisStateStore:
         entry = {
             "pair": pair, "ts": int(ts), "message": message,
             "dedup_keys": list(dedup_keys or []), "source": source,
+            # Side effects owed once the message is finally delivered: ACTIVE
+            # alert state and the pending-outcome rows (see replay_telegram_dlq).
+            "state_changes": [list(c) for c in (state_changes or [])],
+            "outcomes": list(outcomes or []),
             "attempts": 0, "queued_at": int(time.time()),
         }
         ttl = int(cfg.TELEGRAM_DLQ_MAX_AGE_SEC) * 2

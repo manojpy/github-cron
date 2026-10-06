@@ -891,17 +891,21 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     open_positions_run: List[Dict[str, Any]] = []
 
     if cfg.ENABLE_PORTFOLIO_HEAT_GATE and state_db and not state_db.degraded and state_db._redis:
-        if not getattr(cfg, "ENABLE_TAKE_SKIP_BUTTONS", False):
+        if (cfg.PORTFOLIO_POSITION_SOURCE == "taps"
+                and not getattr(cfg, "ENABLE_TAKE_SKIP_BUTTONS", False)):
             logger_main.warning(
-                "Portfolio heat gate is ON but ENABLE_TAKE_SKIP_BUTTONS is off: "
-                "no 'Took' taps can be recorded, so the gate has no positions to count"
+                "Portfolio heat gate is ON with PORTFOLIO_POSITION_SOURCE='taps' but "
+                "ENABLE_TAKE_SKIP_BUTTONS is off: no 'Took' taps can be recorded, so the "
+                "gate has no positions to count (use PORTFOLIO_POSITION_SOURCE='alerts')"
             )
         open_positions_run = await load_open_positions(
             state_db, float(cfg.PORTFOLIO_POSITION_MAX_AGE_MIN) * 60.0,
+            source=cfg.PORTFOLIO_POSITION_SOURCE,
         )
         if open_positions_run:
             logger_main.info(
-                f"Heat gate: {len(open_positions_run)} open position(s) from Took taps: "
+                f"Heat gate: {len(open_positions_run)} open position(s) "
+                f"(source={cfg.PORTFOLIO_POSITION_SOURCE}): "
                 + ", ".join(f"{p['pair']} {p['direction']}" for p in open_positions_run)
             )
 
@@ -913,8 +917,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 2.0, "kill_switch_poll_runload",
             ))
         except Exception as e:
-            logger_main.warning(f"Kill-switch pre-load failed (fail-open): {e}")
-            kill_switch_active_run = False
+            logger_main.critical(f"Kill-switch pre-load failed — blocking dispatch this run (fail-closed): {e}")
+            kill_switch_active_run = True
 
     # ── Last-processed candle timestamps: load ONCE per run ──
     # One MGET replaces one GET per pair during evaluation.
@@ -1118,6 +1122,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     eval_elapsed = time.time() - eval_start
     logger_main.debug(f"Evaluation complete: {eval_elapsed:.1f}s")
 
+
+    kill_switch_tripped_this_run = False
     if cfg.ENABLE_KILL_SWITCH and state_db and not state_db.degraded and state_db._redis:
         try:
             
@@ -1142,6 +1148,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                     ks_state["reason"] = f"DOWNGRADED: {ks_state['reason']} (EV positive)"
 
             if ks_state["tripped"]:
+                kill_switch_tripped_this_run = True
                 ttl = int(cfg.KILL_SWITCH_COOLDOWN_HOURS * 3600)
                 await state_db._safe_redis_op(
                     lambda: _rc(state_db._redis).set(
@@ -1177,6 +1184,17 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             valid_results.append((r[0], r[1]))
             if len(r) >= 3 and r[2] is not None:
                 batched_payloads.append(r[2])
+
+    # A kill switch that tripped during THIS run must also stop this run's queued
+    # alerts. Give their dedup claims back so nothing stays suppressed afterwards.
+    if kill_switch_tripped_this_run and batched_payloads:
+        logger_main.critical(
+            f"🛑 Kill switch tripped this run — discarding {len(batched_payloads)} queued alert payload(s)"
+        )
+        for _pl in batched_payloads:
+            for _dk in _pl.dedup_keys:
+                await state_db.release_recent_alert(_pl.pair_name, _dk)
+        batched_payloads = []
 
     # ── Run-level combined dispatch ──
     if batched_payloads:

@@ -26,14 +26,14 @@ class AlertPayload:
     ts: int
     macro_shadow: Optional[Dict[str, Any]] = None
     alert_keys: List[str] = field(default_factory=list)
-    record_win_rate: Optional[Callable[[], Awaitable[None]]] = None
+    record_win_rate: Optional[Callable[..., Awaitable[None]]] = None   # optional arg: sink list to capture instead of write
     record_win_rate_after_send: Optional[Callable[[], Awaitable[None]]] = None
     mark_candle_processed: bool = False
     verdict: Optional[str] = None       # "TAKE" / "WATCH" / "AVOID" (None if unavailable)
 
 from alert_advisor import PairAdvice, advise_pair
+from feedback import build_keyboard, load_open_positions, record_auto_positions
 
-from feedback import build_keyboard, load_open_positions
 from bot_config import (
     cfg, logger, Constants, CompiledPatterns, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
     shutdown_event, format_ist_time, json_dumps, CONFLUENCE_WEIGHTS, BtcMacroContext,
@@ -1064,6 +1064,18 @@ async def _run_post_send_hooks(p: AlertPayload, sdb: RedisStateStore,
         except Exception as e:
             logger_run.error(f"[{p.pair_name}] Failed to mark candle processed: {e}")
 
+async def _record_auto_positions(sdb: RedisStateStore, payloads: List[AlertPayload]) -> None:
+    """Heat gate without Telegram taps: remember delivered TAKE alerts as open positions."""
+    if not (cfg.ENABLE_PORTFOLIO_HEAT_GATE
+            and cfg.PORTFOLIO_POSITION_SOURCE in ("alerts", "both")
+            and payloads and not getattr(sdb, "degraded", False)):
+        return
+    await record_auto_positions(
+        sdb, [(p.pair_name, p.direction, p.ts, p.verdict) for p in payloads],
+        verdicts=cfg.PORTFOLIO_AUTO_VERDICTS,
+        max_age_sec=float(cfg.PORTFOLIO_POSITION_MAX_AGE_MIN) * 60.0,
+    )
+
 async def coalesce_window_for(sdb: RedisStateStore, alert_keys: List[str]) -> int:
     """Coalesce window for a pair+direction bundle. Fixed unless adaptive windows
     are enabled, in which case it can only be LENGTHENED (never below the
@@ -1078,13 +1090,20 @@ async def coalesce_window_for(sdb: RedisStateStore, alert_keys: List[str]) -> in
 async def queue_failed_alert(
     sdb: RedisStateStore, pair_name: str, message: str, ts: int,
     dedup_keys: List[str], source: str, log: logging.Logger,
+    state_changes: Optional[List[Any]] = None,
+    outcomes: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
     """Park an alert whose Telegram send failed so the next run re-sends it.
+    state_changes / outcomes are the side effects that normally follow a
+    successful send; they are stored with the entry and applied on replay.
     Returns True when the alert is safely stored in the dead-letter queue."""
     if not getattr(cfg, "ENABLE_TELEGRAM_DLQ", True) or cfg.DRY_RUN_MODE:
         return False
-    try:
-        ok = await sdb.dlq_push(pair_name, message, ts, dedup_keys=dedup_keys, source=source)
+    try:      
+        ok = await sdb.dlq_push(
+            pair_name, message, ts, dedup_keys=dedup_keys, source=source,
+            state_changes=state_changes, outcomes=outcomes,
+        )
     except Exception as e:
         log.error(f"[{pair_name}] Telegram DLQ push raised: {e}")
         ok = False
@@ -1125,7 +1144,21 @@ async def replay_telegram_dlq(
             DLQ_STATS["expired"] += 1
             log.warning(f"[{pair}] DLQ alert expired (candle {age}s old) — dropped")
             continue
+
         if await telegram_queue.send(prefix + str(entry["message"])):
+            # Delivered: now (and only now) apply what a normal send would have
+            # applied, so the Brain sees this trade and the pair state is ACTIVE.
+            for kw in (entry.get("outcomes") or []):
+                try:
+                    await sdb.record_pending_outcome(**kw)
+                except Exception as e:
+                    log.error(f"[{pair}] DLQ replay: outcome record failed: {e}")
+            _sc = [tuple(c) for c in (entry.get("state_changes") or [])]
+            if _sc:
+                try:
+                    await sdb.atomic_batch_update(_sc)
+                except Exception as e:
+                    log.error(f"[{pair}] DLQ replay: state update failed: {e}")
             await sdb.dlq_delete(key)
             DLQ_STATS["replayed_ok"] += 1
             log.info(f"[{pair}] DLQ alert delivered on retry (attempt {attempts + 1})")
@@ -1304,6 +1337,7 @@ async def dispatch_combined_alerts(
             alerts_sent_ref[0] += sum(p.budget_count for p in sent_payloads)
         for p in sent_payloads:
             await _run_post_send_hooks(p, sdb, logger_run)
+        await _record_auto_positions(sdb, sent_payloads)
         logger_run.info(
             f"🔔 Combined dispatch sent {len(sent_payloads)} pair(s) in {len(messages)} message(s)"
         )
@@ -1338,15 +1372,25 @@ async def dispatch_combined_alerts(
                 await sdb.atomic_batch_update(p.state_changes)
             async with alerts_sent_lock:
                 alerts_sent_ref[0] += p.budget_count
+
             await _run_post_send_hooks(p, sdb, logger_run)
+            await _record_auto_positions(sdb, [p])
             fallback_sent += p.budget_count
         else:
             # Send failed. Park the message in the Telegram DLQ: the DLQ now
             # owns delivery, so keep the dedup claims and mark the candle
             # processed (no duplicate re-fire). If it cannot be parked, release
             # the claims so the alert can retry normally.
+            _owed: List[Dict[str, Any]] = []
+            if p.record_win_rate is not None:
+                try:
+                    await p.record_win_rate(_owed)   # sink mode: builds the rows, writes nothing
+                except Exception as e:
+                    logger_run.warning(f"[{p.pair_name}] could not capture outcome rows for DLQ: {e}")
+                    _owed = []
             if await queue_failed_alert(
                 sdb, p.pair_name, full_msg, p.ts, p.dedup_keys, "combined_fallback", logger_run,
+                state_changes=list(p.state_changes), outcomes=_owed,
             ):
                 await sdb.set_last_processed_candle_ts(p.pair_name, p.ts)
             else:
@@ -2099,6 +2143,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         if open_positions_run is _SENTINEL_UNSET:
             open_positions = await load_open_positions(
                 sdb, float(cfg.PORTFOLIO_POSITION_MAX_AGE_MIN) * 60.0,
+                source=cfg.PORTFOLIO_POSITION_SOURCE,
             )
         else:
             open_positions = cast(List[Dict[str, Any]], open_positions_run or [])
@@ -2753,8 +2798,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
             alerts_to_send = surviving_alerts
            
-        async def _record_win_rates() -> None:
-            """Records this pair's fired alerts for later win-rate scoring. ..."""
+        async def _record_win_rates(sink: Optional[List[Dict[str, Any]]] = None) -> None:
+            """Records this pair's fired alerts for later win-rate scoring.
+            With `sink`, the rows are appended to it instead of written (DLQ capture)."""
             recorded = [ak for _, _, ak in alerts_to_send]
             logger_pair.info(
                 f"[{pair_name}] RECORD ts={ts_curr} keys={recorded}"
@@ -2854,10 +2900,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     if macro_mult is not None and getattr(cfg, "MACRO_CONTEXT_LIVE", False):
                         eff_required = eff_required * macro_mult
 
-                await sdb.record_pending_outcome(
-                    pair_name, alert_key,
-                    "buy" if alert_key in BUY_ALERT_KEYS else "sell",
-                    ts_curr, close_curr,
+                _outcome_kw: Dict[str, Any] = dict(
+                    pair=pair_name, alert_key=alert_key,
+                    direction="buy" if alert_key in BUY_ALERT_KEYS else "sell",
+                    entry_ts=ts_curr, entry_price=close_curr,
                     confluence_score=s, confluence_total=t, confluence_votes=v,
                     adx_val=adx_val,
                     context=trigger_context,
@@ -2869,6 +2915,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     cluster_penalty=clust_pen,
                     gate_passed=True,
                 )
+                if sink is not None:
+                    sink.append(_outcome_kw)
+                else:
+                    await sdb.record_pending_outcome(**_outcome_kw)
             await asyncio.gather(*(_record_one(alert_key) for _, _, alert_key in alerts_to_send))
 
         coalesced_dedup_key: Optional[str] = None
@@ -2894,21 +2944,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     f"records because no alert was delivered."
                 )
 
-                # These pending outcomes were created before the coalescing
-                # decision. Since no Telegram alert was actually delivered,
-                # they must not remain in the real-trade population.
-                if cfg.ENABLE_WIN_RATE_FILTER and not cfg.DRY_RUN_MODE:
-                    await asyncio.gather(
-                        *(
-                            sdb.cancel_pending_outcome(
-                                pair_name,
-                                alert_key,
-                                ts_curr,
-                            )
-                            for _, _, alert_key in alerts_to_send
-                        )
-                    )
-
+                # Nothing to cancel: pending outcomes are only written AFTER Telegram
+                # confirms delivery (deferred_record), so none exist for this candle.
                 await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
 
                 return pair_name, {
@@ -3315,13 +3352,15 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"processed — will retry next run"
                         )
                     else:
-                        await queue_failed_alert(
+                        if await queue_failed_alert(
                             sdb, pair_name, msg, ts_curr,
                             [coalesced_dedup_key] if coalesced_dedup_key
                             else [ak for _, _, ak in alerts_to_send],
                             "single_path", logger_pair,
-                        )
-                        await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
+                        ):
+                            await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
+                        else:
+                            await _release_dedup_claims()
                         logger_pair.error(
                             f"Alert send failed | {pair_name} | "
                             f"Outcome NOT recorded, state NOT activated, budget consumed | "

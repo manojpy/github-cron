@@ -124,7 +124,7 @@ def main():
         print("Aborted — nothing written.")
         return
 
-    r.set(key, json.dumps(merged))
+    r.set(key, json.dumps(merged), ex=90 * 86400)   # same 90-day policy as state.DURABLE_METADATA_TTL_SEC
     print("✅ Pushed. Check the bot's next run log for a line starting with")
     print("   '⚙️ Config override active from Redis this run' to confirm it applied.")
 

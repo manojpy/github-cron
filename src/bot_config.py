@@ -29,7 +29,7 @@ class BotConfig(BaseModel):
     REDIS_URL: str = Field(..., min_length=1)
     DELTA_API_BASE: str = Field(..., min_length=1)
     DEBUG_MODE: bool = Field(default=False)
-    SEND_TEST_MESSAGE: bool = Field(default=True, description="Send test message on startup")
+    SEND_TEST_MESSAGE: bool = Field(default=False, description="Send test message on startup")
     BOT_NAME: str = "Unified Alert Bot"
     PAIRS: List[str] = Field(default=["ETHUSD", "AVAXUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD", "PAXGUSD", "PIPPINUSD", "RIVERUSD", "BLESSUSD", "BASEDUSD","SKYAIUSD","HUSD","EDENUSD","XAUTUSD", "ZECUSD", "LABUSD", "BTCUSD", "LINKUSD", "ARBUSD", "KITEUSD", "VVVUSD", "BEATUSD", "BILLUSD", "BCHUSD", "WLDUSD" ], min_length=1) 
     PPO_FAST: int = Field(default=7, ge=1, le=50, description="PPO fast period")
@@ -432,6 +432,8 @@ class BotConfig(BaseModel):
     CHALLENGER_STREAK_MIN_GAP_SEC: int = Field(default=3600, ge=60, le=86400, description="Minimum seconds between two evaluations that count toward the streak (maybe_promote_challenger runs more than once per Brain run).")
     ABLATION_NOISE_THRESHOLD: float = Field(default=0.01, ge=0.0, le=0.20, description="Permutation importance |imp| below this → condition treated as noise " "(candidate for weight reduction). Advisory until plan gate passes.") 
     ABLATION_EDGE_THRESHOLD: float = Field(default=0.03, ge=0.0, le=0.50, description="Permutation importance above this → condition treated as carrying real edge.") 
+    PORTFOLIO_POSITION_SOURCE: str = Field(default="taps", pattern="^(taps|alerts|both)$", description="Where the heat gate learns which positions are open: 'taps' = trades you tapped Took on (needs ENABLE_TAKE_SKIP_BUTTONS); 'alerts' = alerts the bot actually delivered with a verdict in PORTFOLIO_AUTO_VERDICTS, assumed open for PORTFOLIO_POSITION_MAX_AGE_MIN; 'both' = union of the two.")
+    PORTFOLIO_AUTO_VERDICTS: List[str] = Field(default_factory=lambda: ["TAKE"], description="Verdicts that count as an open position when PORTFOLIO_POSITION_SOURCE is 'alerts' or 'both'. AVOID/WATCH alerts are not trades you were told to take, so they do not fill the book by default.")
 
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:

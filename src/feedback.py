@@ -24,11 +24,11 @@ from plan_replay import Row, replay_plan
 
 KEY_FEEDBACK = "feedback_log"
 KEY_OFFSET = "tg_updates_offset"
+KEY_AUTO_POSITIONS = "auto_open_positions"
 _LOG_CAP = 3000
 _TTL = 90 * 86400
 _PREFIX = "ts"
 _FILL_RE = re.compile(r"^\s*([A-Za-z0-9]{2,12})\s+(?:entry\s+([0-9]*\.?[0-9]+)\s+)?exit\s+([0-9]*\.?[0-9]+)\s*$", re.I)
-
 
 def _short(pair: str) -> str:
     return pair[:-3] if pair.endswith("USD") and len(pair) > 3 else pair
@@ -225,16 +225,89 @@ def open_positions_from_log(
             newest[pair] = {"pair": pair, "direction": direction, "ts": ts}
     return sorted(newest.values(), key=lambda p: p["ts"])
 
+def open_positions_from_auto(
+    auto: Mapping[str, Any], *, now: float, max_age_sec: float,
+) -> List[Dict[str, Any]]:
+    """Pure: positions inferred from delivered alerts (no Telegram taps needed).
 
-async def load_open_positions(sdb: Any, max_age_sec: float, now: Optional[float] = None) -> List[Dict[str, Any]]:
-    """Open positions from the Took/Skip log.  Never raises; [] when unknown."""
+    `auto` is {pair: {"d": "buy"|"sell", "ts": candle_ts}}.  A position is assumed
+    open from its alert candle until `max_age_sec` passes."""
+    out: List[Dict[str, Any]] = []
+    for pair, v in auto.items():
+        try:
+            ts = int(v["ts"])
+            direction = str(v["d"]).lower()
+        except Exception:
+            continue
+        if direction not in ("buy", "sell") or now - ts > max_age_sec or ts > now + 3600:
+            continue
+        out.append({"pair": str(pair), "direction": direction, "ts": ts})
+    return sorted(out, key=lambda p: p["ts"])
+
+
+def merge_open_positions(*lists: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """Pure: union of position lists, newest entry per pair."""
+    newest: Dict[str, Dict[str, Any]] = {}
+    for lst in lists:
+        for p in lst:
+            cur = newest.get(str(p["pair"]))
+            if cur is None or int(p["ts"]) > int(cur["ts"]):
+                newest[str(p["pair"])] = dict(p)
+    return sorted(newest.values(), key=lambda p: p["ts"])
+
+
+async def load_open_positions(
+    sdb: Any, max_age_sec: float, now: Optional[float] = None, source: str = "taps",
+) -> List[Dict[str, Any]]:
+    """Open positions for the heat gate.  Never raises; [] when unknown.
+
+    source "taps"   -> trades you tapped Took on (feedback_log)
+           "alerts" -> TAKE alerts the bot delivered (auto_open_positions)
+           "both"   -> union, newest per pair"""
+    t_now = now if now is not None else time.time()
+    taps: List[Dict[str, Any]] = []
+    auto: List[Dict[str, Any]] = []
     try:
-        raw = await sdb.get_metadata(KEY_FEEDBACK, timeout=3.0)
-        log = json.loads(raw) if raw else {}
-        return open_positions_from_log(log, now=now if now is not None else time.time(), max_age_sec=max_age_sec)
+        if source in ("taps", "both"):
+            raw = await sdb.get_metadata(KEY_FEEDBACK, timeout=3.0)
+            taps = open_positions_from_log(json.loads(raw) if raw else {}, now=t_now, max_age_sec=max_age_sec)
     except Exception:
-        return []
+        taps = []
+    try:
+        if source in ("alerts", "both"):
+            raw = await sdb.get_metadata(KEY_AUTO_POSITIONS, timeout=3.0)
+            auto = open_positions_from_auto(json.loads(raw) if raw else {}, now=t_now, max_age_sec=max_age_sec)
+    except Exception:
+        auto = []
+    return merge_open_positions(taps, auto) if source == "both" else (auto if source == "alerts" else taps)
 
+
+async def record_auto_positions(
+    sdb: Any, delivered: Sequence[Tuple[str, str, int, Optional[str]]], *,
+    verdicts: Sequence[str], max_age_sec: float, now: Optional[float] = None,
+) -> None:
+    """Remember delivered alerts whose verdict is in `verdicts` as open positions.
+
+    `delivered` is [(pair, direction, candle_ts, verdict)].  One GET + one SET per
+    run, and only when at least one qualifying alert went out.  Never raises."""
+    rows = [(p, d, int(ts)) for p, d, ts, v in delivered if v in verdicts and d in ("buy", "sell")]
+    if not rows:
+        return
+    try:
+        t_now = now if now is not None else time.time()
+        raw = await sdb.get_metadata(KEY_AUTO_POSITIONS, timeout=3.0)
+        cur: Dict[str, Any] = json.loads(raw) if raw else {}
+        cur = {k: v for k, v in cur.items() if isinstance(v, dict) and t_now - int(v.get("ts", 0)) <= max_age_sec}
+        for pair, direction, ts in rows:
+            prev = cur.get(pair)
+            if prev is None or ts >= int(prev["ts"]):
+                cur[pair] = {"d": direction, "ts": ts}
+        await sdb.set_metadata(
+            KEY_AUTO_POSITIONS, json.dumps(cur, separators=(",", ":")),
+            ttl=int(max_age_sec * 2) + 3600, timeout=3.0,
+        )
+    except Exception:
+        return
 
 # ── Learner side: what did the decisions teach? ───────────────────────────
 def behaviour_report(
