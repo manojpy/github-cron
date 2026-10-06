@@ -1,3 +1,8 @@
+from __future__ import annotations
+import importlib
+import pathlib
+import pytest
+
 """Smoke test: every production module in src/ must import cleanly.
 
 This doesn't test behavior — it only catches import-time breakage
@@ -6,10 +11,7 @@ but only surface on a real import, config validation failures) that
 nothing else in CI exercises today, since the only other test file
 only imports threshold_engine (and bot_config transitively).
 """
-import importlib
-import pathlib
 
-import pytest
 
 SRC_DIR = pathlib.Path(__file__).resolve().parent.parent / "src"
 MODULE_NAMES = sorted(

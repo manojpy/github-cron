@@ -1,20 +1,30 @@
 from __future__ import annotations
+import asyncio
+import random
+import re
+import time
+import brain_enhanced as be
+from archive_reader import _parse_jsonl_row
+from brain_audit import HealthStatus, get_audit
+from outcome_storage import OUTCOME_SCHEMA_VERSION
+import json
+import confluence_tier_report as ctr
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import cleanup_outcomes as co
+import alerts
+import outcome_storage
+from brain_enhanced import BrainEngineV2, PLAN_HISTORY_KEY
+import logging
+from bot_config import cfg, json_dumps, json_loads
+import threshold_engine as engine
 
 # ======================================================================
 # from test_brain_report_v2.py
 # ======================================================================
 """Slim 9-section Brain report: structure, honesty caps, Telegram safety."""
 
-import asyncio
-import random
-import re
-import time
 
-import brain_enhanced as be
-from archive_reader import _parse_jsonl_row
-from bot_config import cfg
-from brain_audit import HealthStatus, get_audit
-from outcome_storage import OUTCOME_SCHEMA_VERSION
 
 _NOW = int(time.time())
 _SPECIAL = set("_*[]()~>#+-=|{}.!")
@@ -287,10 +297,7 @@ def test_build_profit_action_plan_is_gone():
 # from test_confluence_tier_report.py
 # ======================================================================
 """Tier report: grouping maths, verdict wording, and an end-to-end archive read."""
-import json
 
-import confluence_tier_report as ctr
-from outcome_storage import OUTCOME_SCHEMA_VERSION
 
 
 def _row(conf, win, ev, direction="buy"):
@@ -345,10 +352,7 @@ def test_reads_the_real_archive_format(tmp_path, capsys):
 # from test_report_retention.py
 # ======================================================================
 """Reports are kept 7 days (exact, from the file name); outcomes keep their own limit."""
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-import cleanup_outcomes as co
 
 
 def _mk(dirpath: Path, name: str) -> Path:
@@ -412,12 +416,7 @@ def test_workflows_use_12_hour_cadence_and_stage_reports():
 # from test_run_health_and_plan_history.py
 # ======================================================================
 """Run-health counters, Brain plan audit trail, and the JSONL round trip."""
-import asyncio
-import json
 
-import alerts
-import outcome_storage
-from brain_enhanced import BrainEngineV2, PLAN_HISTORY_KEY
 
 
 class FakeSdb:
@@ -534,13 +533,7 @@ def test_redis_key_inventory_counts_prefixes_and_no_ttl():
 # ======================================================================
 """#6: snapshot at apply + objective post-apply harm monitor + safe revert."""
 
-import asyncio
-import logging
-import random
-import time
 
-import brain_enhanced as be
-from bot_config import cfg, json_dumps, json_loads
 
 HOUR = 3600
 LOG = logging.getLogger("t")
@@ -785,10 +778,7 @@ def test_regime_shift_explains_drop_is_withheld():
 # ======================================================================
 """#17: strategy broken vs current regime underrepresented vs regime-mix shift."""
 
-import random
-import time
 
-import threshold_engine as engine
 
 DAY = 86400
 

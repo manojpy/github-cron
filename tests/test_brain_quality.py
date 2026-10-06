@@ -1,10 +1,21 @@
 from __future__ import annotations
+import threshold_engine as engine
+import random
+import asyncio
+import brain as brain_mod
+import pytest
+import alert_advisor as adv
+import time
+from threshold_engine import build_calibration_curves, calibration_gate_decision
+from types import SimpleNamespace
+import state as state_mod
+import json
+from pathlib import Path
 
 # ======================================================================
 # from test_trade_quality_evidence.py
 # ======================================================================
 """trade_quality_score: evidence cap, drift flag, ensemble Bayesian input."""
-import threshold_engine as engine
 
 
 def _ev(n, oos=False, drop=None, hier=None, recent=None):
@@ -58,11 +69,7 @@ def test_ensemble_uses_bayesian_and_recent():
 # from test_regime_gate.py
 # ======================================================================
 """Regime-aware live quality gate: sample-gated, OOS-confirmed, restrict-only."""
-import random
-import asyncio
-import brain as brain_mod
 
-import threshold_engine as engine
 
 
 def _row__regime_gate(key, d, adx, ts, win):
@@ -214,14 +221,8 @@ def test_shadow_and_off_never_change_the_verdict(monkeypatch):
 # from test_zone_profiles.py
 # ======================================================================
 """Validated TP/SL zones: replay, OOS validation, safety rails, streak promotion."""
-import asyncio
-import random
 
-import pytest
 
-import alert_advisor as adv
-import brain as brain_mod
-import threshold_engine as engine
 
 
 @pytest.fixture(autouse=True)
@@ -372,9 +373,7 @@ def test_dispatch_attaches_zone_only_in_live_mode(monkeypatch):
 # ======================================================================
 # from test_calibration_roundtrip.py
 # ======================================================================
-import time
 
-from threshold_engine import build_calibration_curves, calibration_gate_decision
 
 def _row__calibration_roundtrip(alert_key: str, conf_pct: float, win: bool) -> dict:
     return {
@@ -510,11 +509,7 @@ def test_calibration_persistence_roundtrip():
 """Regression tests: online calibration keeps history + is cursor-safe,
 ablation separates informative votes from noise, reasoning chain reads real data."""
 
-import asyncio
-import random
-import time
 
-import threshold_engine as engine
 
 
 def _rows__calibration_online_and_ablation(n, seed, p_win=0.55, ak="ppo_cross_buy"):
@@ -680,10 +675,7 @@ def test_ablation_skips_unmeasurable_votes():
 # from test_weight_path_enforcement.py
 # ======================================================================
 """Live CONFLUENCE_WEIGHTS may change only via promotion or rollback."""
-import asyncio
-from types import SimpleNamespace
 
-import state as state_mod
 
 
 class _FakeRedisStateStore:
@@ -728,9 +720,6 @@ def test_direct_write_allowed_when_not_enforced(monkeypatch):
 # ======================================================================
 """Smoke: resolved outcome → JSONL → trade_quality / calibration / ablation."""
 
-import json
-import time
-from pathlib import Path
 
 def test_alert_pending_resolve_jsonl_brain_quality(tmp_path, monkeypatch):
     """Smoke: resolved outcome → JSONL → trade_quality / calibration / ablation."""

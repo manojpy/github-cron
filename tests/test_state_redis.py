@@ -1,13 +1,21 @@
 from __future__ import annotations
+import json
+import redis_audit as ra
+import asyncio
+import redis_audit
+import state
+from alerts import ALERT_KEYS
+from threshold_engine import alert_family_of
+import time
+from archive_reader import load_archived_outcomes
+from outcome_storage import OUTCOME_SCHEMA_VERSION
 
 # ======================================================================
 # from test_redis_audit.py
 # ======================================================================
 """Redis key inventory / TTL audit: classification, findings, read-only scan."""
 
-import json
 
-import redis_audit as ra
 
 DAY = 86400
 
@@ -380,12 +388,7 @@ def test_cli_heal_ttl_leaks_end_to_end(monkeypatch, capsys):
 2. Every alert key maps to a real family (none fall into "Other"), so a newly
    added alert cannot silently skip family analysis.
 """
-import asyncio
 
-import redis_audit
-import state
-from alerts import ALERT_KEYS
-from threshold_engine import alert_family_of
 
 
 class _Store:
@@ -479,11 +482,7 @@ def test_all_alert_keys_have_a_family():
 # from test_archive_integrity.py
 # ======================================================================
 """Archive read-path integrity: idempotent rows and reconcilable counters."""
-import json
-import time
 
-from archive_reader import load_archived_outcomes
-from outcome_storage import OUTCOME_SCHEMA_VERSION
 
 
 def _row(pair="ETHUSD", key="ppo_cross_up", ts=None, **over):
