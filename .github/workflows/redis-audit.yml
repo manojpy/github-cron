@@ -19,7 +19,7 @@ on:
         default: false
         type: boolean
       heal_ttl_leaks:
-        description: 'ONE-OFF WRITE: set a 30-day TTL on NO_TTL_LEAK keys so Redis auto-removes them'
+        description: 'ONE-OFF WRITE: set a 30-day TTL on NO_TTL_LEAK keys (allow-listed families only)'
         required: false
         default: false
         type: boolean
