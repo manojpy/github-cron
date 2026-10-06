@@ -18,8 +18,13 @@ on:
         required: false
         default: false
         type: boolean
+      heal_ttl_leaks:
+        description: 'ONE-OFF WRITE: set a 30-day TTL on NO_TTL_LEAK keys so Redis auto-removes them'
+        required: false
+        default: false
+        type: boolean
       heal_dry_run:
-        description: 'With heal_durable_ttl: only show what would change, write nothing'
+        description: 'With heal_durable_ttl or heal_ttl_leaks: only show what would change, write nothing'
         required: false
         default: false
         type: boolean
@@ -50,6 +55,7 @@ jobs:
           REDIS_URL: ${{ secrets.REDIS_URL }}
           FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings }}
           HEAL_DURABLE_TTL: ${{ inputs.heal_durable_ttl }}
+          HEAL_TTL_LEAKS: ${{ inputs.heal_ttl_leaks }}
           HEAL_DRY_RUN: ${{ inputs.heal_dry_run }}
         run: |
           set -o pipefail
@@ -57,7 +63,12 @@ jobs:
           if [ "$FAIL_ON_FINDINGS" = "true" ]; then ARGS="--fail-on-findings"; fi
           if [ "$HEAL_DURABLE_TTL" = "true" ]; then
             ARGS="$ARGS --heal-durable-ttl"
-            if [ "$HEAL_DRY_RUN" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          fi
+          if [ "$HEAL_TTL_LEAKS" = "true" ]; then
+            ARGS="$ARGS --heal-ttl-leaks"
+          fi
+          if [ "$HEAL_DRY_RUN" = "true" ]; then
+            ARGS="$ARGS --dry-run"
           fi
           set +e
           python3 src/redis_audit.py $ARGS | tee audit.txt
