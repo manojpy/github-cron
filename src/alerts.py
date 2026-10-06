@@ -155,7 +155,7 @@ class TelegramQueue:
             if shutdown_event.is_set():
                 return False
             try:
-                async with session.post(url, data=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                async with session.post(url, data=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                     if resp.status == 429:
                         wait_sec = min(int(resp.headers.get("Retry-After", 1)), Constants.CIRCUIT_BREAKER_MAX_WAIT)
                         await asyncio.sleep(wait_sec + random.uniform(0.1, 0.5))
@@ -173,6 +173,14 @@ class TelegramQueue:
                             f"Telegram API error {resp.status}: {description} | "
                             f"chat_id={getattr(self, 'chat_id', '?')}"
                         )
+                        if (resp.status == 400 and "parse entities" in str(description).lower()
+                                and params.get("parse_mode")):
+                            # A formatting bug must not lose the alert: resend once as
+                            # plain text (escape backslashes removed) instead of parking
+                            # a message that can never parse.
+                            params.pop("parse_mode", None)
+                            params["text"] = re.sub(r"\\(.)", r"\1", str(params["text"]))
+                            continue
                         return False
                     raise Exception(f"Telegram API error {resp.status}")
 
@@ -214,7 +222,7 @@ class TelegramQueue:
             if shutdown_event.is_set():
                 return None
             try:
-                async with session.post(url, data=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                async with session.post(url, data=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                     if resp.status == 429:
                         wait_sec = min(int(resp.headers.get("Retry-After", 1)), Constants.CIRCUIT_BREAKER_MAX_WAIT)
                         await asyncio.sleep(wait_sec + random.uniform(0.1, 0.5))

@@ -91,6 +91,7 @@ HEAL_EXEMPT = {"dynamic_weights", "brain_apply_snapshots"}
 HEAL_METADATA = DURABLE_METADATA - HEAL_EXEMPT
 LEAK_HEAL_FAMILIES = {
     "brain_threshold_history",
+    "brain_vote_counts",
 }
 LEAK_HEAL_TTL_SEC = 30 * 86400
 

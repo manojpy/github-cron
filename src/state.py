@@ -1458,6 +1458,7 @@ class RedisStateStore:
             async with self._redis.pipeline() as pipe:
                 pipe.lpush(key, str(count))
                 pipe.ltrim(key, 0, self.VOTE_COUNT_HISTORY_MAX - 1)
+                pipe.expire(key, 30 * 86400)
                 await self._safe_redis_op(
                     lambda: pipe.execute(),
                     2.0,
@@ -2548,6 +2549,7 @@ class RedisStateStore:
             async with self._redis.pipeline() as pipe:
                 pipe.lpush(key, str(value))
                 pipe.ltrim(key, 0, 9)
+                pipe.expire(key, 30 * 86400)
                 await self._safe_redis_op(
                     lambda: pipe.execute(), 2.0, f"threshold_history_save:{key_suffix or 'global'}",
                 )
