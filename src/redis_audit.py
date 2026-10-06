@@ -9,7 +9,7 @@ Brain decisions only live as long as their TTL.
 By default it only calls SCAN / TYPE / TTL / XLEN / MEMORY USAGE. It never
 writes, deletes or expires a key, so it is safe to run against production.
 
-The only write exceptions are the opt-in heal flags (see below).  Both only
+The only write exceptions are the opt-in heal flags (see below). Both only
 ever set or raise a TTL; nothing is deleted and no value is changed.
 
 Usage:
@@ -89,6 +89,9 @@ HEAL_TARGET_TTL_SEC = 90 * 86400
 # brain_apply_snapshots with 365d; neither is ever touched by the heal.
 HEAL_EXEMPT = {"dynamic_weights", "brain_apply_snapshots"}
 HEAL_METADATA = DURABLE_METADATA - HEAL_EXEMPT
+LEAK_HEAL_FAMILIES = {
+    "brain_threshold_history",
+}
 LEAK_HEAL_TTL_SEC = 30 * 86400
 
 def _text(key: Any) -> str:
@@ -311,6 +314,7 @@ def _raise_ttl(client: Any, key: str, target: int) -> bool:
             return bool(client.expire(key, target))
         return False
 
+
 def apply_durable_ttl_heal(
     client: Any, plan: List[Dict[str, Any]], dry_run: bool = False,
 ) -> Dict[str, Any]:
@@ -332,10 +336,9 @@ def plan_ttl_leak_heal(
     records: Iterable[Dict[str, Any]],
     target_ttl: int = LEAK_HEAL_TTL_SEC,
 ) -> List[Dict[str, Any]]:
-    """Pure: keys that are NO_TTL_LEAK (ttl_required family + ttl == -1).
+    """Pure: keys that are NO_TTL_LEAK *and* belong to an allow-listed family.
 
-    Only those keys are planned; orphans, streams, and keys that already have
-    a TTL are left alone.  The heal can only ever *add* an expiry.
+    Only families in LEAK_HEAL_FAMILIES are healed automatically.
     """
     plan: List[Dict[str, Any]] = []
     for rec in records:
@@ -345,24 +348,52 @@ def plan_ttl_leak_heal(
         name, policy = classify_key(key)
         if policy != "ttl_required":
             continue
-        plan.append({"key": key, "family": name, "ttl_before": -1, "target": target_ttl})
+        if name not in LEAK_HEAL_FAMILIES:
+            continue
+        plan.append({
+            "key": key,
+            "family": name,
+            "ttl_before": -1,
+            "target": target_ttl,
+        })
     return sorted(plan, key=lambda p: p["key"])
 
+
+def _set_ttl_only_if_missing(client: Any, key: str, target_ttl: int) -> bool:
+    """Set TTL only if the key currently has no TTL.
+
+    Uses EXPIRE ... NX when available. Falls back to TTL check + EXPIRE
+    for older Redis servers.
+    """
+    try:
+        return bool(client.expire(key, target_ttl, nx=True))
+    except Exception:
+        try:
+            if int(client.ttl(key)) == -1:
+                return bool(client.expire(key, target_ttl))
+        except Exception:
+            return False
+        return False
+
+
 def apply_ttl_leak_heal(
-    client: Any, plan: List[Dict[str, Any]], dry_run: bool = False,
+    client: Any,
+    plan: List[Dict[str, Any]],
+    dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """Execute (or describe) the leak-heal plan, then re-read each TTL."""
+    """Execute or describe the leak-heal plan, then re-read each TTL."""
     rows: List[Dict[str, Any]] = []
     for p in plan:
         row = dict(p)
         if dry_run:
             row["status"] = "would_set"
         else:
-            # EXPIRE on a key that currently has no TTL simply sets one.
-            # Re-read so the report shows the verified after value.
-            ok = bool(client.expire(p["key"], p["target"]))
-            row["ttl_after"] = int(client.ttl(p["key"]))
-            row["status"] = "set" if ok else "skipped"
+            changed = _set_ttl_only_if_missing(client, p["key"], p["target"])
+            try:
+                row["ttl_after"] = int(client.ttl(p["key"]))
+            except Exception:
+                row["ttl_after"] = None
+            row["status"] = "set" if changed else "skipped"
         rows.append(row)
     return {
         "target_days": LEAK_HEAL_TTL_SEC / 86400.0,
@@ -420,6 +451,7 @@ def render(report: Dict[str, Any], truncated: bool = False) -> str:
             lines.append(f"  [{fd['severity'].upper()}] {fd['kind']} {fd['family']} (n={fd['count']}): {fd['detail']}")
             for ex in fd.get("examples", []):
                 lines.append(f"      e.g. {ex}")
+
     heal = report.get("heal")
     if heal is not None:
         lines.append("")
@@ -437,7 +469,7 @@ def render(report: Dict[str, Any], truncated: bool = False) -> str:
         mode = "DRY RUN — nothing written" if leak_heal["dry_run"] else "applied"
         lines.append(f"TTL-leak heal → {leak_heal['target_days']:.0f}d ({mode})")
         if not leak_heal["keys"]:
-            lines.append("  nothing to heal: no NO_TTL_LEAK keys found")
+            lines.append("  nothing to heal: no allow-listed NO_TTL_LEAK keys found")
         for row in leak_heal["keys"]:
             after = f" → {_fmt_ttl(row['ttl_after'])}" if "ttl_after" in row else ""
             lines.append(
@@ -460,7 +492,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "(never lowers a TTL, never touches dynamic_weights / brain_apply_snapshots)")
     ap.add_argument("--heal-ttl-leaks", action="store_true",
                     help="One-off, opt-in WRITE: set a 30-day TTL on keys reported as NO_TTL_LEAK "
-                         "(ttl_required family written without expiry). Never deletes.")
+                         "that belong to LEAK_HEAL_FAMILIES. Never deletes.")
     ap.add_argument("--dry-run", action="store_true",
                     help="With --heal-durable-ttl or --heal-ttl-leaks: show what would change without writing")
     args = ap.parse_args(argv)
