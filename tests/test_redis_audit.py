@@ -140,18 +140,19 @@ class _HealRedis:
     def ttl(self, k):
         return self.ttls.get(k, -2)
 
-    def expire(self, k, seconds, gt=False):
+    def expire(self, k, seconds, gt=False, nx=False):
         if gt and not self.supports_gt:
             raise RuntimeError("ERR syntax error")
         cur = self.ttls.get(k, -2)
         if cur == -2:
+            return False
+        if nx and cur != -1:
             return False
         if gt and cur != -1 and seconds <= cur:
             return False
         self.ttls[k] = seconds
         self.expired.append(k)
         return True
-
 
 class _HealPipe:
     def __init__(self, c):
@@ -271,13 +272,16 @@ def test_cli_without_heal_flag_writes_nothing(monkeypatch):
 
 # ── one-off TTL-leak heal ───────────────────────────────────────────────────
 
-def test_plan_ttl_leak_heal_only_ttl_required_no_ttl():
+def test_plan_ttl_leak_heal_only_allowlisted_families():
     recs = [
-        _rec("brain_threshold_history:BCHUSD", -1),   # planned
-        _rec("brain_threshold_history:LABUSD", -1),   # planned
-        _rec("pair_state:BTCUSD", DAY),               # has TTL → skip
-        _rec("outcome_log_stream", -1, "stream"),     # no_ttl_ok → skip
-        _rec("legacy_blob", -1),                      # orphan → skip
+        _rec("brain_threshold_history:BCHUSD", -1),   # allowed → planned
+        _rec("brain_threshold_history:LABUSD", -1),   # allowed → planned
+        _rec("pair_state:BTCUSD", -1),                # ttl_required but not allow-listed
+        _rec("lock:foo", -1),                         # must never be healed
+        _rec("outcome_pending:x", -1),                # must never be healed
+        _rec("recent_alert:y", -1),                   # must never be healed
+        _rec("outcome_log_stream", -1, "stream"),     # no_ttl_ok
+        _rec("legacy_blob", -1),                      # orphan
         _rec("brain_threshold_history:XAUTUSD", 5 * DAY),  # already has TTL
     ]
     plan = ra.plan_ttl_leak_heal(recs)
@@ -286,6 +290,19 @@ def test_plan_ttl_leak_heal_only_ttl_required_no_ttl():
         "brain_threshold_history:LABUSD",
     ]
     assert all(p["target"] == ra.LEAK_HEAL_TTL_SEC for p in plan)
+    assert all(p["family"] == "brain_threshold_history" for p in plan)
+
+
+def test_set_ttl_only_if_missing_respects_nx():
+    r = _HealRedis({"brain_threshold_history:BCHUSD": -1})
+    assert ra._set_ttl_only_if_missing(r, "brain_threshold_history:BCHUSD", ra.LEAK_HEAL_TTL_SEC)
+    assert r.ttls["brain_threshold_history:BCHUSD"] == ra.LEAK_HEAL_TTL_SEC
+
+    # Already has a TTL → must not change it
+    r2 = _HealRedis({"brain_threshold_history:BCHUSD": 5 * DAY})
+    assert not ra._set_ttl_only_if_missing(r2, "brain_threshold_history:BCHUSD", ra.LEAK_HEAL_TTL_SEC)
+    assert r2.ttls["brain_threshold_history:BCHUSD"] == 5 * DAY
+
 
 def test_apply_ttl_leak_heal_sets_and_dry_run():
     r = _HealRedis({
@@ -299,11 +316,13 @@ def test_apply_ttl_leak_heal_sets_and_dry_run():
     out = ra.apply_ttl_leak_heal(r, plan)
     assert all(row["status"] == "set" for row in out["keys"])
     assert r.ttls["brain_threshold_history:BCHUSD"] == ra.LEAK_HEAL_TTL_SEC
+    assert r.ttls["brain_threshold_history:LABUSD"] == ra.LEAK_HEAL_TTL_SEC
 
     r2 = _HealRedis({"brain_threshold_history:BCHUSD": -1})
     out2 = ra.apply_ttl_leak_heal(r2, plan[:1], dry_run=True)
     assert out2["keys"][0]["status"] == "would_set"
     assert r2.expired == [] and r2.ttls["brain_threshold_history:BCHUSD"] == -1
+
 
 def test_render_includes_leak_heal_section():
     rep = ra.summarize([_rec("brain_threshold_history:BCHUSD", -1)])
@@ -324,3 +343,24 @@ def test_render_includes_leak_heal_section():
     assert "brain_threshold_history:BCHUSD" in text
     assert "[set]" in text
 
+    rep["leak_heal"] = {"target_days": 30.0, "dry_run": True, "keys": []}
+    assert "nothing to heal" in ra.render(rep) and "DRY RUN" in ra.render(rep)
+
+def test_cli_heal_ttl_leaks_end_to_end(monkeypatch, capsys):
+    import sys, types
+    fake = _HealRedis({
+        "brain_threshold_history:BCHUSD": -1,
+        "pair_state:BTCUSD": -1,          # not allow-listed → must stay -1
+    })
+    fake.ping = lambda: True
+    fake.scan_iter = lambda match="*", count=500: iter(list(fake.ttls))
+    fake.type = lambda k: b"string"
+    fake.memory_usage = lambda k: 10
+    fake.xlen = lambda s: 0
+    mod = types.SimpleNamespace(from_url=lambda *a, **k: fake)
+    monkeypatch.setitem(sys.modules, "redis", mod)
+    assert ra.main(["--url", "redis://x", "--heal-ttl-leaks"]) == 0
+    out = capsys.readouterr().out
+    assert "brain_threshold_history:BCHUSD" in out and "[set]" in out
+    assert fake.ttls["brain_threshold_history:BCHUSD"] == ra.LEAK_HEAL_TTL_SEC
+    assert fake.ttls["pair_state:BTCUSD"] == -1          # untouched
