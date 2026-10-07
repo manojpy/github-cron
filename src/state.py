@@ -1788,6 +1788,91 @@ class RedisStateStore:
             "gate_passed": data.get("gate_passed"),
         }, ""
 
+    def _early_close_payload(self, raw: str, data_15m: "PriceData", i15: int) -> Optional[str]:
+        """If this pending trade's stop or target has already been touched on a
+        closed candle, return its JSON with closed_ts/closed_reason added; else None.
+        Uses the same fill candle and R:R levels as the horizon resolution, so
+        'closed' means exactly what the final outcome will later say."""
+        try:
+            data = json_loads(raw)
+            if data.get("closed_ts") is not None:
+                return None
+            entry_ts = int(data["entry_ts"])
+            entry_price = float(data["entry_price"])
+            if entry_price <= 0:
+                return None
+            is_buy = str(data["direction"]).lower() in ("buy", "long")
+            hits = np.flatnonzero(data_15m.ts == entry_ts)
+            if hits.size == 0:
+                return None
+            entry_idx = int(hits[-1])
+            fill_delay = max(0, int(getattr(cfg, "OUTCOME_FILL_DELAY_CANDLES", 1)))
+            fill_idx = entry_idx + fill_delay
+            if fill_delay > 0:
+                if fill_idx > i15 or fill_idx >= len(data_15m.open):
+                    return None
+                anchor = float(data_15m.open[fill_idx])
+                path_start = fill_idx
+            else:
+                anchor = float(data.get("fill_price") or entry_price)
+                path_start = entry_idx + 1
+            lows = data_15m.low[path_start:i15 + 1]
+            highs = data_15m.high[path_start:i15 + 1]
+            if not len(lows):
+                return None
+            risk = cfg.OUTCOME_MAE_LOSS_PCT / 100.0
+            target = risk * cfg.OUTCOME_RR_TARGET
+            if is_buy:
+                tp_hit = bool((highs >= anchor * (1 + target)).any())
+                sl_hit = bool((lows <= anchor * (1 - risk)).any())
+            else:
+                tp_hit = bool((lows <= anchor * (1 - target)).any())
+                sl_hit = bool((highs >= anchor * (1 + risk)).any())
+            if not (tp_hit or sl_hit):
+                return None
+            data["closed_ts"] = int(time.time())
+            data["closed_reason"] = "both" if (tp_hit and sl_hit) else ("target" if tp_hit else "stop")
+            return json_dumps(data)
+        except Exception:
+            return None
+
+    async def get_active_trade(self, pair: str) -> Optional[Dict[str, Any]]:
+        """The open recorded trade for this pair, or None.
+
+        Open = a pending-outcome row that exists and is not marked closed.
+        Uses the run-level key pre-scan (no extra SCAN); costs one pipelined
+        GET batch, and only when the pair has pending keys at all."""
+        if self.degraded or not self._redis:
+            return None
+        try:
+            keys = await self._fetch_pending_keys(
+                pair, "_pending_outcome_keys_by_pair", RedisKeyPrefix.OUTCOME_PENDING,
+                logger, "pending",
+            )
+            if not keys:
+                return None
+            async with self._redis.pipeline() as pipe:
+                for k in keys:
+                    pipe.get(k)
+                raws = await asyncio.wait_for(_execute_pipeline(pipe), timeout=2.0)
+            best: Optional[Dict[str, Any]] = None
+            for k, raw in zip(keys, raws):
+                if not raw:
+                    continue
+                d = json_loads(raw)
+                if d.get("closed_ts") is not None:
+                    continue
+                ets = int(d["entry_ts"])
+                if best is None or ets > best["entry_ts"]:
+                    key_s = k.decode() if isinstance(k, (bytes, bytearray)) else str(k)
+                    parts = key_s.split(":")
+                    best = {"pair": pair, "alert_key": parts[-2] if len(parts) >= 2 else "",
+                            "direction": str(d.get("direction", "")), "entry_ts": ets}
+            return best
+        except Exception as e:
+            logger.warning(f"get_active_trade failed for {pair}: {e}")
+            return None
+
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
                                        logger_pair: logging.Logger) -> None:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not self._redis:
@@ -1848,6 +1933,14 @@ class RedisStateStore:
                             continue
                         if skip_reason == "not_ready":
                             not_ready_count += 1
+                            if cfg.ENABLE_SINGLE_ACTIVE_TRADE and raw:
+                                # Stop or target already hit: the trade is over for the
+                                # one-active-trade rule. The row stays until its normal
+                                # horizon resolution, so the Brain statistics are unchanged.
+                                _closed = self._early_close_payload(raw, data_15m, i15)
+                                if _closed is not None:
+                                    write_pipe.set(key, _closed, keepttl=True)
+                                    pending_writes += 1
                             continue
                         if result is None:
                             continue

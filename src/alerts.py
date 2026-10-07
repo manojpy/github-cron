@@ -599,6 +599,7 @@ def build_rich_pair_msg(
     setup_line: str,
     advice: PairAdvice,
     primary_emoji: Optional[str] = None,
+    record_line: Optional[str] = None,
 ) -> str:
     """Structured Telegram body (MarkdownV2-escaped) WITHOUT bias/datetime footer."""
     side_word = "BUY" if direction.lower() == "buy" else "SELL"
@@ -616,6 +617,8 @@ def build_rich_pair_msg(
     ]
     if advice.size_line:
         lines.append(advice.size_line)
+    if record_line:
+        lines.append(record_line)
     return "\n".join(escape_markdown_v2(x) for x in lines)
 
 def _bias_alignment(
@@ -637,6 +640,16 @@ def _bias_alignment(
     market_up = up > down
     return "with" if (direction == "buy") == market_up else "against"
 
+def _record_status_line(status: str, active: Optional[Dict[str, Any]]) -> str:
+    """One-line Telegram label for the one-active-trade rule."""
+    if status == "IGNORED" and active:
+        side = "buy" if str(active.get("direction", "")).lower() in ("buy", "long") else "sell"
+        since = format_ist_time(int(active["entry_ts"]), "%H:%M IST")
+        return f"⏭ Ignored — {active.get('pair', '')} {side} trade open since {since}, not recorded"
+    if status == "SHADOWED":
+        return "👁 Shadowed — tracked for the Brain, not counted as a trade"
+    return "📝 Recorded as trade"
+
 def build_pair_msg_and_verdict(
     *,
     pair: str,
@@ -654,6 +667,7 @@ def build_pair_msg_and_verdict(
     logger_pair: logging.Logger,
     pb_by_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
     adx_val: Optional[float] = None,
+    record_line: Optional[str] = None,
 ) -> Tuple[str, Optional[str]]:
     """Build the rich body for one pair/direction and return (body, verdict).
     Never raises: any failure degrades to a plain header + setup line (verdict
@@ -698,6 +712,7 @@ def build_pair_msg_and_verdict(
             pair=pair, direction=direction, price=price, ts=ts, score=score, total=total,
             setup_line=_combined_setup_line(s_items), advice=advice,
             primary_emoji=_leading_emoji(s_items[0][0]),
+            record_line=record_line,
         )
         return body, advice.verdict
     except Exception as e:
@@ -2809,7 +2824,20 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         async def _record_win_rates(sink: Optional[List[Dict[str, Any]]] = None) -> None:
             """Records this pair's fired alerts for later win-rate scoring.
             With `sink`, the rows are appended to it instead of written (DLQ capture)."""
-            recorded = [ak for _, _, ak in alerts_to_send]
+            to_record = list(alerts_to_send)
+            if cfg.ENABLE_SINGLE_ACTIVE_TRADE:
+                if record_status == "IGNORED":
+                    logger_pair.info(
+                        f"[{pair_name}] NOT RECORDED ts={ts_curr}: trade already open "
+                        f"({(record_active or {}).get('alert_key')} @ {(record_active or {}).get('entry_ts')})"
+                    )
+                    return
+                # One trade per pair per candle: the strongest edge represents it.
+                def _edge(a: Tuple[str, str, str]) -> float:
+                    v = (alert_tq_by_key.get(a[2]) or {}).get("net_ev")
+                    return float(v) if isinstance(v, (int, float)) else -999.0
+                to_record = [max(alerts_to_send, key=_edge)]
+            recorded = [ak for _, _, ak in to_record]
             logger_pair.info(
                 f"[{pair_name}] RECORD ts={ts_curr} keys={recorded}"
             )
@@ -2881,6 +2909,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     ),
                     "gate_shadow": _gate_shadow_for(alert_key),
                     "playbook_seen": _playbook_seen_for(alert_key),
+                    "co_fired_keys": (
+                        [ak for _, _, ak in alerts_to_send if ak != alert_key]
+                        if cfg.ENABLE_SINGLE_ACTIVE_TRADE else None
+                    ),
                 }
                 # ── NEW: compute effective score after macro/cluster ──
                 eff_score = s
@@ -2927,7 +2959,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     sink.append(_outcome_kw)
                 else:
                     await sdb.record_pending_outcome(**_outcome_kw)
-            await asyncio.gather(*(_record_one(alert_key) for _, _, alert_key in alerts_to_send))
+            await asyncio.gather(*(_record_one(alert_key) for _, _, alert_key in to_record))
 
         coalesced_dedup_key: Optional[str] = None
         if alerts_to_send and cfg.ENABLE_ALERT_COALESCING:
@@ -3008,6 +3040,17 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 (f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None)
             )
 
+        # One recorded trade per pair at a time. The alert is still sent; it is only
+        # labelled and, when a trade is already open, not recorded for the Brain.
+        record_status = "RECORDED"
+        record_active: Optional[Dict[str, Any]] = None
+        record_line: Optional[str] = None
+        if cfg.ENABLE_SINGLE_ACTIVE_TRADE and alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER:
+            record_active = await sdb.get_active_trade(pair_name)
+            if record_active:
+                record_status = "IGNORED"
+            record_line = _record_status_line(record_status, record_active)
+
         if batch_mode and alerts_to_send:
             direction = "buy" if is_buy_batch else "sell"
             items = [(t, e) for t, e, _ in alerts_to_send[:25]]
@@ -3037,6 +3080,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 required=_req_msg,
                 bias_context=bias_context,
                 logger_pair=logger_pair,
+                record_line=record_line,
             )
             msg_body = msg
 
@@ -3251,6 +3295,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 required=_req_msg,
                 bias_context=bias_context,
                 logger_pair=logger_pair,
+                record_line=record_line,
             )
             # Footer: candle OPEN time (e.g. 16:00 for the 16:00-16:15 candle,
             # delivered ~16:16). The timestamp is always present; the bias
