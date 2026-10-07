@@ -30,7 +30,6 @@ on:
         required: false
         default: false
         type: boolean
-      
 
 # Prevent overlapping runs from cron + manual dispatch
 concurrency:
@@ -238,16 +237,14 @@ jobs:
           else
             IMAGE="${{ env.RUN_IMAGE }}"
           fi
-          SIZE_MB=$(( $(docker image inspect -f '{{.Size}}' "$IMAGE") / 1048576 ))
-          echo "✅ Image ready: pull ran $(( $(date +%s) - PULL_STARTED ))s in total, this step waited $(( $(date +%s) - WAIT_START ))s, ${SIZE_MB} MB on disk"
-
-      - name: ✅ Apply Brain Plan (on-demand)
           if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
             echo "::error::Image $IMAGE is not present locally after pull"
             exit 1
           fi
           SIZE_MB=$(( $(docker image inspect -f '{{.Size}}' "$IMAGE") / 1048576 ))
           echo "✅ Image ready: pull ran $(( $(date +%s) - PULL_STARTED ))s in total, this step waited $(( $(date +%s) - WAIT_START ))s, ${SIZE_MB} MB on disk"
+
+      - name: ✅ Apply Brain Plan (on-demand)
         if: inputs.apply_brain_plan == true
         run: |
           set -o pipefail
@@ -475,7 +472,10 @@ jobs:
 
           MSG="🔴 MACD Bot workflow FAILED"$'\n'"Status: ${STATUS}"$'\n'"Exit code: ${EXIT_CODE} | Duration: ${DURATION}s"$'\n'"Error: ${ERROR_MSG}"$'\n'"Run: ${RUN_URL}"
 
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}"             --data-urlencode "text=${MSG}"             -o /dev/null -w "Telegram notify HTTP %{http_code}\n"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" \
+            -o /dev/null -w "Telegram notify HTTP %{http_code}\n"
 
       - name: 📤 Persist outcomes to data repo
         id: persist
@@ -533,7 +533,6 @@ jobs:
             ls -la outcomes/ 2>/dev/null || echo "(no outcomes dir)"
             ls -la shadow/   2>/dev/null || echo "(no shadow dir)"
             exit 0
-          
           fi
 
           git commit -m "chore: persist outcomes $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -554,7 +553,6 @@ jobs:
               git rebase --abort 2>/dev/null || true
               exit 1
             fi
-        
           done
           echo "::error::Could not push outcomes after 5 attempts"
           exit 1
