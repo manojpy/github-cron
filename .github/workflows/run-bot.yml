@@ -57,6 +57,25 @@ jobs:
       actions: write
 
     steps:
+      # PHASE 0: START THE IMAGE PULL FIRST
+      # The pull is the slowest step. It runs in the background while checkout,
+      # config checks and the archive checkout proceed, and a later step waits for it.
+      - name: 🐳 Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔥 Start image pull (background)
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA}"
+          echo "RUN_IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "PULL_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+          rm -f /tmp/image-pull.rc /tmp/image-pull.log
+          nohup sh -c "docker pull --quiet --platform linux/amd64 '$IMAGE' > /tmp/image-pull.log 2>&1; echo \$? > /tmp/image-pull.rc" > /dev/null 2>&1 &
+          echo "🐳 Pulling $IMAGE in the background"
+
       # PHASE 1: VALIDATION & SETUP
       - name: 🔥 Checkout repository (for config_macd.json)
         uses: actions/checkout@v7
@@ -92,49 +111,6 @@ jobs:
             exit 1
           fi
           echo "✅ Config loaded from repository: config_macd.json"
-
-      - name: 🐳 Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 🔥 Pull Image (commit-matched, else latest)
-        run: |
-          BASE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          IMAGE="$BASE:sha-${GITHUB_SHA}"
-          echo "🐳 Pulling image..."
-          START=$(date +%s)
-          if ! docker pull --quiet --platform linux/amd64 "$IMAGE"; then
-            echo "::warning::Image for commit ${GITHUB_SHA} not built yet — running :latest (config may be newer than code)"
-            IMAGE="$BASE:latest"
-            docker pull --quiet --platform linux/amd64 "$IMAGE"
-          fi
-          echo "RUN_IMAGE=$IMAGE" >> "$GITHUB_ENV"
-          echo "✅ Image ready in $(( $(date +%s) - START ))s"
-
-      - name: ✅ Apply Brain Plan (on-demand)
-        if: inputs.apply_brain_plan == true
-        run: |
-          ENV_FILE="$(pwd)/.bot_env"
-          cat > "$ENV_FILE" <<EOF
-          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
-          REDIS_URL=${{ secrets.REDIS_URL }}
-          DELTA_API_BASE=${{ secrets.DELTA_API_BASE }}
-          EOF
-
-          docker run --rm \
-            --platform linux/amd64 \
-            --env-file "$ENV_FILE" \
-            -e PYTHONPATH=/app/src \
-            -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \
-            "${{ env.RUN_IMAGE }}" \
-            python macd_unified.py --apply-brain
-
-          rm -f "$ENV_FILE"
-          echo "✅ Apply-brain step finished — see logs above for applied changes." >> $GITHUB_STEP_SUMMARY
 
       - name: ⏱️ Check Dispatch Latency
         if: inputs.apply_brain_plan != true
@@ -241,6 +217,70 @@ jobs:
           done
 
           echo "data_checkout_seconds=$(( $(date +%s) - START ))"
+
+      - name: ⏳ Wait for image
+        run: |
+          BASE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          WAIT_START=$(date +%s)
+          for _ in $(seq 1 240); do
+            [ -f /tmp/image-pull.rc ] && break
+            sleep 1
+          done
+          if [ "$(cat /tmp/image-pull.rc 2>/dev/null || echo 1)" != "0" ]; then
+            echo "::warning::Image for commit ${GITHUB_SHA} not available — running :latest (config may be newer than code)"
+            cat /tmp/image-pull.log 2>/dev/null || true
+            IMAGE="$BASE:latest"
+            docker pull --quiet --platform linux/amd64 "$IMAGE"
+            echo "RUN_IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          else
+            IMAGE="$RUN_IMAGE"
+          fi
+          SIZE_MB=$(( $(docker image inspect -f '{{.Size}}' "$IMAGE") / 1048576 ))
+          echo "✅ Image ready: pull ran $(( $(date +%s) - PULL_STARTED ))s in total, this step waited $(( $(date +%s) - WAIT_START ))s, ${SIZE_MB} MB on disk"
+
+      - name: ✅ Apply Brain Plan (on-demand)
+        if: inputs.apply_brain_plan == true
+        run: |
+          ENV_FILE="$(pwd)/.bot_env"
+          cat > "$ENV_FILE" <<EOF
+          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+          REDIS_URL=${{ secrets.REDIS_URL }}
+          DELTA_API_BASE=${{ secrets.DELTA_API_BASE }}
+          EOF
+
+          docker run --rm \
+            --platform linux/amd64 \
+            --env-file "$ENV_FILE" \
+            -e PYTHONPATH=/app/src \
+        
+          timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
+            --rm \
+            --pull=never \
+            --name "macd_bot_${{ github.run_id }}" \
+            --platform linux/amd64 \
+            --memory="900m" \
+            --memory-swap="1800m" \
+            --cpus="2.0" \
+            --security-opt=no-new-privileges \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m \
+            --env-file "$ENV_FILE" \
+            -e TZ=Asia/Kolkata \
+            -e PYTHONPATH=/app/src \
+            -e PYTHONUNBUFFERED=1 \
+            -e NUMBA_NUM_THREADS=2 \
+            -e OMP_NUM_THREADS=2 \
+            -e OUTCOME_DATA_DIR=/tmp/data-repo \
+            -v "/tmp/data-repo:/tmp/data-repo:rw" \
+            -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \
+            "${{ env.RUN_IMAGE }}" 2>&1 | tee logs/bot_output.log
+            "${{ env.RUN_IMAGE }}" \
+            python macd_unified.py --apply-brain
+
+          rm -f "$ENV_FILE"
+          echo "✅ Apply-brain step finished — see logs above for applied changes." >> $GITHUB_STEP_SUMMARY
 
       - name: 🚀 Execute MACD Bot
         if: inputs.apply_brain_plan != true
