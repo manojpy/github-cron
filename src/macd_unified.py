@@ -588,7 +588,10 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     async def _scan_prefix(prefix: str) -> List[str]:
         # count=2000: SCAN walks the WHOLE keyspace for a MATCH, one round trip
         # per `count` keys, so a small count costs many round trips.
-        return [k async for k in state_db._redis.scan_iter(match=f"{prefix}*", count=2000)]
+        client = state_db._redis
+        if client is None:
+            return []
+        return [k async for k in client.scan_iter(match=f"{prefix}*", count=2000)]
 
     async def _calibration_blob() -> Any:
         try:

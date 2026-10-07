@@ -1864,7 +1864,7 @@ class RedisStateStore:
                     continue
                 ets = int(d["entry_ts"])
                 if best is None or ets > best["entry_ts"]:
-                    key_s = k.decode() if isinstance(k, (bytes, bytearray)) else str(k)
+                    key_s = str(k)
                     parts = key_s.split(":")
                     best = {"pair": pair, "alert_key": parts[-2] if len(parts) >= 2 else "",
                             "direction": str(d.get("direction", "")), "entry_ts": ets}
