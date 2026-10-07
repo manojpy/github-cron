@@ -3714,6 +3714,20 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
             logger_pair.debug(f"😒 {pair_name} | Suppression: {', '.join(reasons)}") 
 
+        # Mark quiet candles processed so the next 15-min run does not
+        # re-evaluate the same closed bar for every pair (CPU / Redis waste).
+        # Do NOT mark on inconclusive/retry paths that return earlier and
+        # intentionally leave the candle open for the next run.
+        # Failure is non-fatal: marker is an optimization only.
+        if not alerts_to_send:
+            try:
+                await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
+            except Exception as e:
+                logger_pair.warning(
+                    f"[{pair_name}] NO_SIGNAL candle marker failed; "
+                    f"same candle may be re-evaluated next run: {e}"
+                )
+
         return pair_name, {
             "state": "ALERT_SENT" if alerts_to_send else "NO_SIGNAL",
             "ts": int(time.time()),

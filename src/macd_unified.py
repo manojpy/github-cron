@@ -1549,9 +1549,9 @@ async def run_once() -> Optional[bool]:
 
         if sdb.degraded and not sdb.degraded_alerted:
             logger_run.critical(
-                "🚨 Redis is in degraded mode – alert deduplication disabled!"
+                "🚨 Redis is in degraded mode – dedup claims unavailable; "
+                "alerts are blocked (fail-closed) until Redis recovers"
             )
-
         if sdb and not sdb.degraded and (cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP):
             logger_run.debug("Checking daily reset conditions...")
             day_tracker_key = "global:last_reset_date"
@@ -1617,8 +1617,9 @@ async def run_once() -> Optional[bool]:
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
         if sdb.degraded:
             logger_run.warning(
-                "⚠️ Redis degraded — skipping distributed lock, proceeding without "
-                "duplicate-run protection (core alerting still runs)"
+                "⚠️ Redis degraded — skipping distributed lock; "
+                "no duplicate-run protection. Alerts remain fail-closed "
+                "(dedup cannot claim keys)"
             )
             lock = None
             lock_acquired = False

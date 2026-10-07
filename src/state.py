@@ -1931,6 +1931,7 @@ class RedisStateStore:
                                     f"last_ts={data_15m.ts[-1] if len(data_15m.ts) else None}"
                                 )
                             continue
+
                         if skip_reason == "not_ready":
                             not_ready_count += 1
                             if cfg.ENABLE_SINGLE_ACTIVE_TRADE and raw:
@@ -1941,6 +1942,17 @@ class RedisStateStore:
                                 if _closed is not None:
                                     write_pipe.set(key, _closed, keepttl=True)
                                     pending_writes += 1
+                                    try:
+                                        _d = json_loads(_closed)
+                                        logger_pair.info(
+                                            f"[{pair}] Early-close for one-active-trade | "
+                                            f"key={key} | "
+                                            f"reason={_d.get('closed_reason')} | "
+                                            f"entry_ts={_d.get('entry_ts')} | "
+                                            f"closed_ts={_d.get('closed_ts')}"
+                                        )
+                                    except Exception:
+                                        pass
                             continue
                         if result is None:
                             continue

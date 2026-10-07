@@ -41,15 +41,21 @@ try:
 except ImportError:
     sys.exit("Missing dependency: pip install redis")
 
+# Prefer the canonical safelist from config_base (no bot deps).
+# Fallback keeps this script usable when run outside the package tree.
+try:
+    from config_base import CONFIG_OVERRIDE_ALLOWED_FIELDS as ALLOWED_FIELDS
+except ImportError:
+    ALLOWED_FIELDS = {
+        "CONFLUENCE_MIN_ABS_SCORE",
+        "CONFLUENCE_MIN_PCT",
+        "RSI_ADAPTIVE_BUY_VOLATILE",
+        "RSI_ADAPTIVE_SELL_VOLATILE",
+        "PPO_ADAPTIVE_VOLATILE",
+    }
+
 METADATA_PREFIX = "metadata:"
 CONFIG_OVERRIDE_KEY = "config_override"
-ALLOWED_FIELDS = {
-    "CONFLUENCE_MIN_ABS_SCORE",
-    "CONFLUENCE_MIN_PCT",
-    "RSI_ADAPTIVE_BUY_VOLATILE",
-    "RSI_ADAPTIVE_SELL_VOLATILE",
-    "PPO_ADAPTIVE_VOLATILE",
-}
 
 def parse_kv(s: str):
     if "=" not in s:
