@@ -1,14 +1,25 @@
 from __future__ import annotations
+from bot_config import cfg, BiasContext
+import logging
+from types import SimpleNamespace as NS
+import alerts as A
+from alert_advisor import advise_pair, AVOID, TAKE, WATCH
+import asyncio
+from alerts import AlertPayload, dispatch_combined_alerts
+import outcome_storage
+from state import RedisStateStore
+import alerts
+import time
+from threshold_engine import (
+    KillSwitch, portfolio_heat_check, build_calibration_curves,
+    calibration_gate_decision, fill_reconciliation,
+)
 
 # ======================================================================
 # from test_alert_advisor.py
 # ======================================================================
 """Conviction / verdict logic and the per-pair Telegram body."""
-import logging
-from types import SimpleNamespace as NS
 
-import alerts as A
-from alert_advisor import advise_pair, AVOID, TAKE, WATCH
 
 LOG = logging.getLogger("t")
 DOWN = NS(up_pct=0.20, down_pct=0.47)
@@ -213,10 +224,6 @@ def test_why_line_says_all_high_weight_checks_pass_instead_of_repeating_top3():
 # from test_alert_dispatch_format.py
 # ======================================================================
 """Dispatcher: ordering by confluence %, same-underlying note, bias footer."""
-import asyncio
-import logging
-from alerts import AlertPayload, dispatch_combined_alerts
-from bot_config import BiasContext
 
 
 def _bias(up, down, neutral):
@@ -320,10 +327,7 @@ A failed send must NOT leave a recorded trade or an ACTIVE alert state behind
 (phantom trade), and a failing post-send hook must not skip the
 candle-processed marker (which would allow a duplicate alert next run).
 """
-import asyncio
-import logging
 
-from alerts import AlertPayload, dispatch_combined_alerts
 
 
 class FakeTelegram:
@@ -407,13 +411,8 @@ def test_post_send_hook_error_still_marks_candle_processed():
 # ======================================================================
 """Resolved outcomes must reach the file archive BEFORE the Redis pending key
 is deleted. If the archive write fails, the pending key must survive."""
-import asyncio
-import logging
 
 
-import outcome_storage
-from bot_config import cfg
-from state import RedisStateStore
 
 
 class FakePipe:
@@ -511,10 +510,7 @@ def test_archive_failure_keeps_pending_key(monkeypatch):
 # ======================================================================
 """#25 survival checklist + #26 BRAIN FILTER Telegram notice (build_* / _notify_brain_filter)."""
 
-import asyncio
 
-import alerts
-from bot_config import cfg
 
 
 class _Q:
@@ -639,11 +635,6 @@ def test_never_raises_on_send_failure(monkeypatch):
 # ======================================================================
 # from test_new_gates.py
 # ======================================================================
-import time
-from threshold_engine import (
-    KillSwitch, portfolio_heat_check, build_calibration_curves,
-    calibration_gate_decision, fill_reconciliation,
-)
 
 
 def _row(win, pct=0.5, ts=None, ak="ppo_signal_up", conf=75.0,
