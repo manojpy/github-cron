@@ -295,6 +295,8 @@ class RedisKeyPrefix:
     VOTE_COUNT_HISTORY = "brain_vote_counts:"
     LAST_PROCESSED_CANDLE = "last_processed_candle:"  # NEW
     TELEGRAM_DLQ = "telegram_dlq:"
+    OUTCOME_EVENT = "outcome_event:"   # per-pair recent TP/SL event for alert mention
+    TARGET_COOLDOWN = "target_cooldown:"  # per-pair until_ts after Target Done
 
 class RedisStateStore:
     POOL_MAX_AGE_SECONDS = 3600
@@ -1887,6 +1889,128 @@ class RedisStateStore:
             logger.warning(f"get_active_trade failed for {pair}: {e}")
             return None
 
+    async def record_outcome_event(
+        self,
+        pair: str,
+        kind: str,
+        closed_reason: str,
+        entry_ts: int,
+        direction: str,
+        candle_ts: Optional[int] = None,
+        alert_key: str = "",
+    ) -> None:
+        """Persist a short-lived TP/SL event so the next alert for this pair can mention it.
+
+        kind: "Recorded" | "Shadowed"
+        closed_reason: "target" | "stop" | "both"
+        """
+        if self.degraded or not self._redis:
+            return
+        if not getattr(cfg, "ENABLE_OUTCOME_EVENT_IN_ALERT", True):
+            return
+        reason = str(closed_reason or "").lower()
+        if reason not in ("target", "stop", "both"):
+            return
+        try:
+            payload = {
+                "pair": pair,
+                "kind": kind,
+                "closed_reason": reason,
+                "entry_ts": int(entry_ts),
+                "direction": str(direction or ""),
+                "alert_key": str(alert_key or ""),
+                "candle_ts": int(candle_ts) if candle_ts is not None else None,
+                "detected_ts": int(time.time()),
+            }
+            key = f"{RedisKeyPrefix.OUTCOME_EVENT}{pair}"
+            # Keep long enough for several bot runs to pick it up in the next alert.
+            ttl = max(
+                4 * 15 * 60,
+                int(getattr(cfg, "TARGET_DONE_COOLDOWN_CANDLES", 3)) * 15 * 60 + 900,
+            )
+            await self._redis.set(key, json_dumps(payload), ex=ttl)
+            if reason in ("target", "both"):
+                await self.set_target_cooldown(pair, candle_ts)
+            logger.info(
+                f"[{pair}] Outcome event recorded | kind={kind} | reason={reason} | "
+                f"entry_ts={entry_ts} | candle_ts={candle_ts}"
+            )
+        except Exception as e:
+            logger.warning(f"record_outcome_event failed for {pair}: {e}")
+
+    async def set_target_cooldown(self, pair: str, hit_candle_ts: Optional[int] = None) -> None:
+        """Block Recording/Shadowing for TARGET_DONE_COOLDOWN_CANDLES after a target hit."""
+        if self.degraded or not self._redis:
+            return
+        n = int(getattr(cfg, "TARGET_DONE_COOLDOWN_CANDLES", 3) or 0)
+        if n <= 0:
+            return
+        try:
+            base = int(hit_candle_ts) if hit_candle_ts is not None else int(time.time())
+            # Align to 15m if we only have wall-clock time.
+            if hit_candle_ts is None:
+                base = base - (base % 900)
+            until_ts = base + n * 900
+            key = f"{RedisKeyPrefix.TARGET_COOLDOWN}{pair}"
+            ttl = n * 15 * 60 + 900
+            await self._redis.set(key, str(until_ts), ex=ttl)
+            logger.info(
+                f"[{pair}] Target-done cooldown set | until_ts={until_ts} | "
+                f"candles={n}"
+            )
+        except Exception as e:
+            logger.warning(f"set_target_cooldown failed for {pair}: {e}")
+
+    async def is_in_target_cooldown(self, pair: str, candle_ts: int) -> bool:
+        """True if Recording/Shadowing should be skipped for this pair on candle_ts."""
+        if self.degraded or not self._redis:
+            return False
+        if int(getattr(cfg, "TARGET_DONE_COOLDOWN_CANDLES", 3) or 0) <= 0:
+            return False
+        try:
+            key = f"{RedisKeyPrefix.TARGET_COOLDOWN}{pair}"
+            raw = await self._redis.get(key)
+            if not raw:
+                return False
+            until_ts = int(raw)
+            return int(candle_ts) <= until_ts
+        except Exception as e:
+            logger.warning(f"is_in_target_cooldown failed for {pair}: {e}")
+            return False
+
+    async def get_and_consume_outcome_event(self, pair: str) -> Optional[Dict[str, Any]]:
+        """Fetch the pending outcome event for pair and delete it (one-shot for alert mention)."""
+        if self.degraded or not self._redis:
+            return None
+        if not getattr(cfg, "ENABLE_OUTCOME_EVENT_IN_ALERT", True):
+            return None
+        try:
+            key = f"{RedisKeyPrefix.OUTCOME_EVENT}{pair}"
+            raw = await self._redis.get(key)
+            if not raw:
+                return None
+            data = json_loads(raw)
+            await self._redis.delete(key)
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            logger.warning(f"get_and_consume_outcome_event failed for {pair}: {e}")
+            return None
+
+    async def peek_outcome_event(self, pair: str) -> Optional[Dict[str, Any]]:
+        """Fetch without consuming (for logging / multi-path reads)."""
+        if self.degraded or not self._redis:
+            return None
+        try:
+            key = f"{RedisKeyPrefix.OUTCOME_EVENT}{pair}"
+            raw = await self._redis.get(key)
+            if not raw:
+                return None
+            data = json_loads(raw)
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            logger.warning(f"peek_outcome_event failed for {pair}: {e}")
+            return None
+
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
                                        logger_pair: logging.Logger) -> None:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not self._redis:
@@ -1948,14 +2072,16 @@ class RedisStateStore:
 
                         if skip_reason == "not_ready":
                             not_ready_count += 1
-                            if cfg.ENABLE_SINGLE_ACTIVE_TRADE and raw:
+                            if raw:
                                 # Stop or target already hit: the trade is over for the
                                 # one-active-trade rule. The row stays until its normal
                                 # horizon resolution, so the Brain statistics are unchanged.
+                                # Also surface the event in the next Telegram alert.
                                 _closed = self._early_close_payload(raw, data_15m, i15)
                                 if _closed is not None:
-                                    write_pipe.set(key, _closed, keepttl=True)
-                                    pending_writes += 1
+                                    if cfg.ENABLE_SINGLE_ACTIVE_TRADE:
+                                        write_pipe.set(key, _closed, keepttl=True)
+                                        pending_writes += 1
                                     try:
                                         _d = json_loads(_closed)
                                         logger_pair.info(
@@ -1964,6 +2090,25 @@ class RedisStateStore:
                                             f"reason={_d.get('closed_reason')} | "
                                             f"entry_ts={_d.get('entry_ts')} | "
                                             f"closed_ts={_d.get('closed_ts')}"
+                                        )
+                                        _candle_ts = (
+                                            int(data_15m.ts[i15])
+                                            if i15 is not None and 0 <= i15 < len(data_15m.ts)
+                                            else None
+                                        )
+                                        _key_s = str(key)
+                                        _parts = _key_s.split(":")
+                                        _ak = _parts[-2] if len(_parts) >= 2 else ""
+                                        # Only fire once: _early_close_payload returns None
+                                        # if closed_ts was already set.
+                                        await self.record_outcome_event(
+                                            pair=pair,
+                                            kind="Recorded",
+                                            closed_reason=str(_d.get("closed_reason") or ""),
+                                            entry_ts=int(_d.get("entry_ts") or 0),
+                                            direction=str(_d.get("direction") or ""),
+                                            candle_ts=_candle_ts,
+                                            alert_key=_ak,
                                         )
                                     except Exception:
                                         pass
@@ -1986,6 +2131,46 @@ class RedisStateStore:
                         signal_price = result.get("signal_price")
                         fill_price = result.get("fill_price")
                         fees_paid_pct = result.get("fees_paid_pct")
+                        # Surface Target/Stop in the next alert when the horizon
+                        # resolves to a bracket exit. Skip if the row was already
+                        # early-closed (event already recorded then).
+                        try:
+                            _or = str(result.get("outcome_reason") or "")
+                            _already_closed = False
+                            if raw:
+                                try:
+                                    _already_closed = json_loads(raw).get("closed_ts") is not None
+                                except Exception:
+                                    pass
+                            if not _already_closed and _or in (
+                                "target_hit", "stop_hit", "both_hit",
+                                "target_hit_ever", "stop_hit_ever",
+                            ):
+                                _cr = (
+                                    "target" if "target" in _or
+                                    else "stop" if "stop" in _or
+                                    else "both"
+                                )
+                                if _or == "both_hit":
+                                    _cr = "both"
+                                _candle_ts = (
+                                    int(data_15m.ts[i15])
+                                    if i15 is not None and 0 <= i15 < len(data_15m.ts)
+                                    else None
+                                )
+                                await self.record_outcome_event(
+                                    pair=pair,
+                                    kind="Recorded",
+                                    closed_reason=_cr,
+                                    entry_ts=int(entry_ts),
+                                    direction=str(direction),
+                                    candle_ts=_candle_ts,
+                                    alert_key=str(alert_key),
+                                )
+                        except Exception as _ev_err:
+                            logger_pair.debug(
+                                f"[{pair}] record_outcome_event on resolve skipped: {_ev_err}"
+                            )
                         stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
                         write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
                         write_pipe.expire(stats_key, stats_ttl)
@@ -2199,6 +2384,41 @@ class RedisStateStore:
                         result, skip_reason = self._parse_pending_outcome_row(
                             key, raw, data_15m, i15
                         )
+                        if skip_reason == "not_ready" and raw:
+                            # Detect Target/Stop early for Shadowed trades so the
+                            # next alert can say e.g. BTCUSD(Shadowed) Target Done.
+                            # Stamp closed_ts so we only emit the event once.
+                            _closed = self._early_close_payload(raw, data_15m, i15)
+                            if _closed is not None:
+                                write_pipe.set(key, _closed, keepttl=True)
+                                pending_writes += 1
+                                try:
+                                    _d = json_loads(_closed)
+                                    _candle_ts = (
+                                        int(data_15m.ts[i15])
+                                        if i15 is not None and 0 <= i15 < len(data_15m.ts)
+                                        else None
+                                    )
+                                    _key_s = str(key)
+                                    _parts = _key_s.split(":")
+                                    _ak = _parts[-2] if len(_parts) >= 2 else ""
+                                    await self.record_outcome_event(
+                                        pair=pair,
+                                        kind="Shadowed",
+                                        closed_reason=str(_d.get("closed_reason") or ""),
+                                        entry_ts=int(_d.get("entry_ts") or 0),
+                                        direction=str(_d.get("direction") or ""),
+                                        candle_ts=_candle_ts,
+                                        alert_key=_ak,
+                                    )
+                                    logger_pair.info(
+                                        f"[{pair}] Shadow early TP/SL | key={key} | "
+                                        f"reason={_d.get('closed_reason')} | "
+                                        f"entry_ts={_d.get('entry_ts')}"
+                                    )
+                                except Exception:
+                                    pass
+                            continue
                         if skip_reason:
                             continue
                         if result is None:
@@ -2215,6 +2435,46 @@ class RedisStateStore:
                         conf_total = result["conf_total"]
                         conf_votes = result["conf_votes"]
                         row_context = result.get("context") or {}
+
+                        # Horizon resolve: surface Target/Stop for Shadowed if not
+                        # already emitted via the early-close path above.
+                        try:
+                            _or = str(result.get("outcome_reason") or "")
+                            _already_closed = False
+                            if raw:
+                                try:
+                                    _already_closed = json_loads(raw).get("closed_ts") is not None
+                                except Exception:
+                                    pass
+                            if not _already_closed and _or in (
+                                "target_hit", "stop_hit", "both_hit",
+                                "target_hit_ever", "stop_hit_ever",
+                            ):
+                                _cr = (
+                                    "target" if "target" in _or
+                                    else "stop" if "stop" in _or
+                                    else "both"
+                                )
+                                if _or == "both_hit":
+                                    _cr = "both"
+                                _candle_ts = (
+                                    int(data_15m.ts[i15])
+                                    if i15 is not None and 0 <= i15 < len(data_15m.ts)
+                                    else None
+                                )
+                                await self.record_outcome_event(
+                                    pair=pair,
+                                    kind="Shadowed",
+                                    closed_reason=_cr,
+                                    entry_ts=int(entry_ts),
+                                    direction=str(direction),
+                                    candle_ts=_candle_ts,
+                                    alert_key=str(alert_key),
+                                )
+                        except Exception as _ev_err:
+                            logger_pair.debug(
+                                f"[{pair}] shadow record_outcome_event skipped: {_ev_err}"
+                            )
 
                         shadow_adx_val = row_context.get("adx_val")
                         shadow_rejection_reason = row_context.get("rejection_reason")

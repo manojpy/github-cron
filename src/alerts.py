@@ -646,9 +646,24 @@ def _record_status_line(status: str, active: Optional[Dict[str, Any]]) -> str:
         side = "buy" if str(active.get("direction", "")).lower() in ("buy", "long") else "sell"
         since = format_ist_time(int(active["entry_ts"]), "%H:%M IST")
         return f"⏭ Ignored — {active.get('pair', '')} {side} trade open since {since}, not recorded"
+    if status == "COOLDOWN":
+        return "⏸ Cooldown — Target Done recently; not recorded/shadowed for next candles"
     if status == "SHADOWED":
         return "👁 Shadowed — tracked for the Brain, not counted as a trade"
     return "📝 Recorded as trade"
+
+def _outcome_event_line(event: Dict[str, Any]) -> str:
+    """Format e.g. BTCUSD(Recorded) Target Done / BTCUSD(Shadowed) Stop Hit."""
+    pair = str(event.get("pair") or "")
+    kind = str(event.get("kind") or "Recorded")
+    reason = str(event.get("closed_reason") or "").lower()
+    if reason in ("target", "both"):
+        label = "Target Done"
+    elif reason == "stop":
+        label = "Stop Hit"
+    else:
+        label = reason.replace("_", " ").title() or "Closed"
+    return f"{pair}({kind}) {label}"
 
 def build_pair_msg_and_verdict(
     *,
@@ -2789,31 +2804,41 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     "ichimoku_gate_ok_buy": gr.ichimoku_gate_ok_buy,
                     "ichimoku_gate_ok_sell": gr.ichimoku_gate_ok_sell,
                 }
-
                 if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
-                    await sdb.record_shadow_pending_outcome(
-                        pair_name, alert_key, direction, ts_curr, close_curr,
-                        confluence_score=alert_score, confluence_total=alert_total,
-                        confluence_votes=alert_votes,
-                        context=shadow_context,
-                    )
-                    if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
-                        from outcome_storage import append_outcome
-                        await asyncio.to_thread(
-                            append_outcome,
-                            {
-                                "pair": pair_name,
-                                "alert_key": alert_key,
-                                "direction": direction,
-                                "entry_ts": ts_curr,
-                                "price": close_curr,
-                                "score": alert_score,
-                                "total": alert_total,
-                                "votes": alert_votes,
-                                "context": shadow_context,
-                            },
-                            True,
+                    _shadow_blocked = False
+                    try:
+                        _shadow_blocked = await sdb.is_in_target_cooldown(pair_name, ts_curr)
+                    except Exception:
+                        _shadow_blocked = False
+                    if _shadow_blocked:
+                        logger_pair.info(
+                            f"[{pair_name}] Shadow skipped (Target Done cooldown) "
+                            f"{alert_key} ts={ts_curr}"
                         )
+                    else:
+                        await sdb.record_shadow_pending_outcome(
+                            pair_name, alert_key, direction, ts_curr, close_curr,
+                            confluence_score=alert_score, confluence_total=alert_total,
+                            confluence_votes=alert_votes,
+                            context=shadow_context,
+                        )
+                        if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                            from outcome_storage import append_outcome
+                            await asyncio.to_thread(
+                                append_outcome,
+                                {
+                                    "pair": pair_name,
+                                    "alert_key": alert_key,
+                                    "direction": direction,
+                                    "entry_ts": ts_curr,
+                                    "price": close_curr,
+                                    "score": alert_score,
+                                    "total": alert_total,
+                                    "votes": alert_votes,
+                                    "context": shadow_context,
+                                },
+                                True,
+                            )
                 logger_pair.info(
                     f"[{pair_name}] Win-rate filter dropped {alert_key}: {fail_note}"
                 )
@@ -2825,6 +2850,11 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             """Records this pair's fired alerts for later win-rate scoring.
             With `sink`, the rows are appended to it instead of written (DLQ capture)."""
             to_record = list(alerts_to_send)
+            if record_status == "COOLDOWN":
+                logger_pair.info(
+                    f"[{pair_name}] NOT RECORDED ts={ts_curr}: Target Done cooldown active"
+                )
+                return
             if cfg.ENABLE_SINGLE_ACTIVE_TRADE:
                 if record_status == "IGNORED":
                     logger_pair.info(
@@ -2832,6 +2862,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         f"({(record_active or {}).get('alert_key')} @ {(record_active or {}).get('entry_ts')})"
                     )
                     return
+
                 # One trade per pair per candle: the strongest edge represents it.
                 def _edge(a: Tuple[str, str, str]) -> float:
                     v = (alert_tq_by_key.get(a[2]) or {}).get("net_ev")
@@ -3066,14 +3097,46 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         # One recorded trade per pair at a time. The alert is still sent; it is only
         # labelled and, when a trade is already open, not recorded for the Brain.
+        # Also: after Target Done, TARGET_DONE_COOLDOWN_CANDLES blocks recording/shadowing.
         record_status = "RECORDED"
         record_active: Optional[Dict[str, Any]] = None
         record_line: Optional[str] = None
-        if cfg.ENABLE_SINGLE_ACTIVE_TRADE and alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER:
-            record_active = await sdb.get_active_trade(pair_name)
-            if record_active:
-                record_status = "IGNORED"
-            record_line = _record_status_line(record_status, record_active)
+        outcome_event_line: Optional[str] = None
+        # Peek only: consume after Telegram delivery so a suppressed send
+        # does not lose the Target/Stop mention for the next run.
+        pending_outcome_event: Optional[Dict[str, Any]] = None
+        if getattr(cfg, "ENABLE_OUTCOME_EVENT_IN_ALERT", True):
+            try:
+                pending_outcome_event = await sdb.peek_outcome_event(pair_name)
+                if pending_outcome_event:
+                    outcome_event_line = _outcome_event_line(pending_outcome_event)
+                    logger_pair.info(
+                        f"[{pair_name}] Including outcome event in alert: {outcome_event_line}"
+                    )
+            except Exception as _oe:
+                logger_pair.debug(f"[{pair_name}] outcome event fetch failed: {_oe}")
+        if alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER:
+            in_cooldown = False
+            try:
+                in_cooldown = await sdb.is_in_target_cooldown(pair_name, ts_curr)
+            except Exception:
+                in_cooldown = False
+            if in_cooldown:
+                record_status = "COOLDOWN"
+                record_line = _record_status_line(record_status, None)
+            elif cfg.ENABLE_SINGLE_ACTIVE_TRADE:
+                record_active = await sdb.get_active_trade(pair_name)
+                if record_active:
+                    record_status = "IGNORED"
+                record_line = _record_status_line(record_status, record_active)
+            else:
+                record_line = _record_status_line(record_status, None)
+        # Prepend Target/Stop mention so it is visible at the top of the body.
+        if outcome_event_line:
+            record_line = (
+                f"{outcome_event_line}"
+                + (f"\n{record_line}" if record_line else "")
+            )
 
         if batch_mode and alerts_to_send:
             direction = "buy" if is_buy_batch else "sell"
@@ -3219,6 +3282,15 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 for _, _, alert_key in alerts_to_send:
                     dedup_keys.append(alert_key)
 
+            async def _consume_outcome_event() -> None:
+                if pending_outcome_event is not None:
+                    try:
+                        await sdb.get_and_consume_outcome_event(pair_name)
+                    except Exception as e:
+                        logger_pair.debug(
+                            f"[{pair_name}] consume outcome event failed: {e}"
+                        )
+
             payload = AlertPayload(
                 pair_name=pair_name,
                 direction=direction,
@@ -3232,7 +3304,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 macro_shadow=macro_shadow,
                 alert_keys=[ak for _, _, ak in alerts_to_send],
                 record_win_rate=deferred_record,      # runs only after Telegram confirms delivery
-                record_win_rate_after_send=None,
+                record_win_rate_after_send=_consume_outcome_event if pending_outcome_event else None,
                 mark_candle_processed=True,    # dispatcher marks candle after delivery
                 verdict=pair_verdict,
             )
@@ -3247,7 +3319,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 }
             }, payload
 
-        # ═════════════════════════════════════════════�������════════════════════
+        # ═════════════════════════════════════════════���������════════════════════
         # IMMEDIATE MODE  →  legacy per-pair Telegram send (unchanged logic)
         # ══════════════════════════════════════����═════════════════════════════
         async def _refund_alert_budget(n: int) -> None:
@@ -3413,6 +3485,13 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 await _record_win_rates()
                             if new_alert_activations:
                                 await sdb.atomic_batch_update(new_alert_activations)
+                            if pending_outcome_event is not None:
+                                try:
+                                    await sdb.get_and_consume_outcome_event(pair_name)
+                                except Exception as e:
+                                    logger_pair.debug(
+                                        f"[{pair_name}] consume outcome event failed: {e}"
+                                    )
 
                     if send_success:
                         # State and outcome were committed just above. Mark the candle
@@ -3734,37 +3813,4 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             if not oscillator_group_ok_buy:
                 reasons.append(f"Oscillator group buy: need {Constants.OSCILLATOR_GROUP_MIN_VOTES}-of-3 (PPO/RSI/TK) — not met")
             if not oscillator_group_ok_sell:
-                reasons.append(f"Oscillator group sell: need {Constants.OSCILLATOR_GROUP_MIN_VOTES}-of-3 (PPO/RSI/TK) — not met")
-
-            logger_pair.debug(f"😒 {pair_name} | Suppression: {', '.join(reasons)}") 
-
-        return pair_name, {
-            "state": "ALERT_SENT" if alerts_to_send else "NO_SIGNAL",
-            "ts": int(time.time()),
-            "summary": {
-                "alerts": len(alerts_to_send),
-                "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                "hist_rma": round(hist_curr, 4),
-                "suppression": ", ".join(failed_conditions + reasons) if (failed_conditions or reasons) else "No conditions met"
-            }
-        }, None
-    except asyncio.CancelledError:
-        logger_pair.warning(f"Evaluation cancelled for {pair_name}")
-        raise
-    except RuntimeError as e:
-        logger_pair.critical(f"🚨 INVARIANT VIOLATION in {pair_name}: {e}")
-        return pair_name, {
-            "state": "INVARIANT_VIOLATION",
-            "ts": int(time.time()),
-            "summary": {
-                "alerts": 0,
-                "future_cloud": "neutral",
-                "hist_rma": 0.0,
-                "error": str(e)
-            }
-        }, None
-    except Exception as e:
-        logger_pair.exception(
-            f"❌ Error in _apply_and_dispatch_alerts for {pair_name}: {e} | Correlation: {correlation_id}"
-        )
-        return None
+                reasons.append(f"O
