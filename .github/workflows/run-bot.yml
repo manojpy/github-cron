@@ -259,6 +259,12 @@ jobs:
           DELTA_API_BASE=${{ secrets.DELTA_API_BASE }}
           EOF
 
+          # The archive checkout is skipped for apply runs; create the folder the
+          # image probes for writability at import time.
+          mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
+          chmod -R 777 /tmp/data-repo
+
+          set +e
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
             --pull=never \
@@ -284,6 +290,7 @@ jobs:
             python macd_unified.py --apply-brain 2>&1 | tee logs/bot_output.log
 
           EXIT_CODE=${PIPESTATUS[0]}
+          set -e
           if [ $EXIT_CODE -ne 0 ]; then
             echo "❌ Apply-brain failed with exit code $EXIT_CODE" >> $GITHUB_STEP_SUMMARY
             exit $EXIT_CODE
@@ -329,6 +336,7 @@ jobs:
           CLEAR_KILL_SWITCH=$CLEAR_KILL_SWITCH
           EOF
 
+          set +e
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
             --pull=never \
@@ -353,6 +361,7 @@ jobs:
             "${{ env.RUN_IMAGE }}" 2>&1 | tee logs/bot_output.log
 
           EXIT_CODE=${PIPESTATUS[0]}
+          set -e
           DURATION=$(( $(date +%s) - START_TIME ))
           echo "execution_time=${DURATION}" >> $GITHUB_OUTPUT
           echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
