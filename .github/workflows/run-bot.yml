@@ -227,18 +227,27 @@ jobs:
             sleep 1
           done
           if [ "$(cat /tmp/image-pull.rc 2>/dev/null || echo 1)" != "0" ]; then
-            echo "::warning::Image for commit ${GITHUB_SHA} not available — running :latest (config may be newer than code)"
+            echo "::warning::Image for commit ${GITHUB_SHA} not available — trying :latest"
             cat /tmp/image-pull.log 2>/dev/null || true
             IMAGE="$BASE:latest"
-            docker pull --quiet --platform linux/amd64 "$IMAGE"
+            if ! docker pull --quiet --platform linux/amd64 "$IMAGE"; then
+              echo "::error::Neither sha-${GITHUB_SHA} nor :latest is available in the registry"
+              exit 1
+            fi
             echo "RUN_IMAGE=$IMAGE" >> "$GITHUB_ENV"
           else
-            IMAGE="$RUN_IMAGE"
+            IMAGE="${{ env.RUN_IMAGE }}"
           fi
           SIZE_MB=$(( $(docker image inspect -f '{{.Size}}' "$IMAGE") / 1048576 ))
           echo "✅ Image ready: pull ran $(( $(date +%s) - PULL_STARTED ))s in total, this step waited $(( $(date +%s) - WAIT_START ))s, ${SIZE_MB} MB on disk"
 
       - name: ✅ Apply Brain Plan (on-demand)
+          if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "::error::Image $IMAGE is not present locally after pull"
+            exit 1
+          fi
+          SIZE_MB=$(( $(docker image inspect -f '{{.Size}}' "$IMAGE") / 1048576 ))
+          echo "✅ Image ready: pull ran $(( $(date +%s) - PULL_STARTED ))s in total, this step waited $(( $(date +%s) - WAIT_START ))s, ${SIZE_MB} MB on disk"
         if: inputs.apply_brain_plan == true
         run: |
           set -o pipefail
