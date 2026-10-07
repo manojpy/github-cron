@@ -51,6 +51,31 @@ RUN set -e; \
         exit 1; \
     fi
 
+# ---------- STAGE 3b: RUNTIME VENV (pruned copy of the build venv) ----------
+# The build venv carries things the running bot never imports. Cutting them
+# shrinks the image the runner has to pull on every 15-minute run.
+FROM deps-builder AS runtime-venv
+
+# KEEP_JIT_FALLBACK=1 keeps numba + llvmlite + tbb (about 165 MB) so the slow
+# Numba JIT can take over if the compiled Cython module ever fails to load.
+# The build already refuses to produce an image without Cython (CYTHON_STRICT)
+# and the smoke test in build.yml requires AOT, so the default drops them.
+ARG KEEP_JIT_FALLBACK=0
+
+RUN set -e; \
+    SP="$VIRTUAL_ENV/lib/python3.11/site-packages"; \
+    uv pip uninstall cython setuptools wheel py-cpuinfo; \
+    if [ "$KEEP_JIT_FALLBACK" != "1" ]; then \
+        uv pip uninstall numba llvmlite tbb; \
+    fi; \
+    rm -rf "$SP"/Cython "$SP"/cython* "$SP"/pyximport "$SP"/setuptools* "$SP"/pkg_resources \
+           "$SP"/_distutils_hack "$SP"/wheel* "$SP"/cpuinfo "$SP"/py_cpuinfo*; \
+    if [ "$KEEP_JIT_FALLBACK" != "1" ]; then \
+        rm -rf "$SP"/numba* "$SP"/llvmlite* "$SP"/tbb* "$SP"/TBB*; \
+    fi; \
+    find "$SP/numpy" -type d -name tests -prune -exec rm -rf {} +; \
+    echo "runtime venv: $(du -sm "$VIRTUAL_ENV" | cut -f1) MB"
+
 # ---------- STAGE 4: FINAL RUNTIME ----------
 FROM python:3.11-slim-bookworm AS final
 
@@ -70,57 +95,20 @@ RUN useradd --uid 1000 --no-log-init -m appuser && \
 WORKDIR /app/src
 
 # Copy Virtual Environment from deps-builder
-COPY --from=deps-builder /opt/venv /opt/venv
+COPY --from=runtime-venv /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy compiled Cython extension (filename carries the ABI tag, e.g. .cpython-311-x86_64-linux-gnu.so)
 COPY --from=cython-builder --chown=appuser:appuser /build/cython_functions*.so ./
 
-# Copy AOT / bridge files (change rarely — keep early for layer cache)
-COPY --chown=appuser:appuser src/aot_meta.py ./
-COPY --chown=appuser:appuser src/numba_functions_shared.py ./
-COPY --chown=appuser:appuser src/aot_bridge.py ./
-COPY --chown=appuser:appuser src/numeric_selftest.py ./
+# All application modules in ONE layer (was ~40 separate layers: every layer
+# is its own registry round trip when the runner pulls the image).
+COPY --chown=appuser:appuser src/*.py ./
 
-# Copy business logic modules (change frequently)
-COPY --chown=appuser:appuser src/alert_registry.py ./
-COPY --chown=appuser:appuser src/config_base.py ./
-COPY --chown=appuser:appuser src/bot_config.py ./
-COPY --chown=appuser:appuser src/state.py ./
-COPY --chown=appuser:appuser src/fetcher.py ./
-COPY --chown=appuser:appuser src/indicators.py ./
-COPY --chown=appuser:appuser src/gates.py ./
-COPY --chown=appuser:appuser src/alerts.py ./
-COPY --chown=appuser:appuser src/alert_advisor.py ./
-COPY --chown=appuser:appuser src/confluence_tier_report.py ./
-COPY --chown=appuser:appuser src/threshold_stats.py ./
-COPY --chown=appuser:appuser src/threshold_analysis.py ./
-COPY --chown=appuser:appuser src/threshold_validation.py ./
-COPY --chown=appuser:appuser src/threshold_models.py ./
-COPY --chown=appuser:appuser src/threshold_quality.py ./
-COPY --chown=appuser:appuser src/threshold_repair.py ./
-COPY --chown=appuser:appuser src/threshold_engine.py ./
-COPY --chown=appuser:appuser src/brain_helpers.py ./
-COPY --chown=appuser:appuser src/brain_report.py ./
-COPY --chown=appuser:appuser src/brain_recommend_baseline.py ./
-COPY --chown=appuser:appuser src/brain.py ./
-COPY --chown=appuser:appuser src/brain_recommend_full.py ./
-COPY --chown=appuser:appuser src/brain_enhanced.py ./
-COPY --chown=appuser:appuser src/brain_engine.py ./
-COPY --chown=appuser:appuser src/health_server.py ./
-COPY --chown=appuser:appuser src/brain_audit.py ./
-COPY --chown=appuser:appuser src/repair_ledger.py ./
-COPY --chown=appuser:appuser src/apply_config_override.py ./
-COPY --chown=appuser:appuser src/outcome_storage.py ./
-COPY --chown=appuser:appuser src/archive_reader.py ./
-COPY --chown=appuser:appuser src/plan_replay.py ./
-COPY --chown=appuser:appuser src/playbook.py ./
-COPY --chown=appuser:appuser src/learner.py ./
-COPY --chown=appuser:appuser src/scoreboard.py ./
-COPY --chown=appuser:appuser src/rulemine.py ./
-COPY --chown=appuser:appuser src/feedback.py ./
-COPY --chown=appuser:appuser src/pathrecon.py ./
-COPY --chown=appuser:appuser src/macd_unified.py ./
+# Pre-compile the app modules. The container runs --read-only with
+# PYTHONDONTWRITEBYTECODE=1, so without this Python recompiles every module
+# from source on every single run. -o 2 matches PYTHONOPTIMIZE=2 below.
+RUN python -m compileall -q -o 2 /app/src
 
 USER appuser
 
@@ -128,7 +116,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONOPTIMIZE=2 \
     NUMBA_CACHE_DIR=/tmp/numba_cache \
-    NUMBA_WARNINGS=0 \  
+    NUMBA_WARNINGS=0 \
     NUMBA_THREADING_LAYER=tbb \
     NUMBA_NUM_THREADS=2 \
     OMP_NUM_THREADS=2 \
