@@ -11,7 +11,7 @@ import argparse
 import psutil
 import gc
 
-from typing import Dict, Any, Optional, Tuple, Set, List, Sequence, cast 
+from typing import Dict, Any, Optional, Tuple, Set, List, Sequence, Callable, Awaitable, cast 
 
 from datetime import datetime, timezone
 import numpy as np
@@ -529,6 +529,38 @@ async def compute_bias_context(
         up_pct=up / counted, down_pct=down / counted, neutral_pct=neutral / counted,
     )
 
+class _Preloads:
+    """Redis reads started early so they overlap the candle fetch, and collected
+    at the spot where they used to run. A read that was not started (or whose
+    result is not there) simply runs inline, so behaviour is unchanged; a read
+    that failed re-raises at the collection point, inside the caller's own
+    try/except."""
+
+    def __init__(self) -> None:
+        self._tasks: Dict[str, "asyncio.Future[Tuple[bool, Any]]"] = {}
+
+    def start(self, name: str, factory: Callable[[], Awaitable[Any]]) -> None:
+        async def _run() -> Tuple[bool, Any]:
+            try:
+                return True, await factory()
+            except Exception as e:      # collected (and re-raised) in take()
+                return False, e
+        self._tasks[name] = asyncio.ensure_future(_run())
+
+    async def take(self, name: str, factory: Callable[[], Awaitable[Any]]) -> Any:
+        fut = self._tasks.pop(name, None)
+        if fut is None:
+            return await factory()
+        ok, value = await fut
+        if ok:
+            return value
+        raise value
+
+    def cancel_all(self) -> None:
+        for fut in self._tasks.values():
+            fut.cancel()
+        self._tasks.clear()
+
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict],
     pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue,
     correlation_id: str, lock: Optional[RedisLock], reference_time: int,
@@ -546,6 +578,80 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     deferred_pairs: List[str] = []
     memory_soft_stop = False
     soft_limit_ratio = cfg.MEMORY_SOFT_STOP_RATIO
+
+    # ── Redis reads that do not depend on candle data: start them NOW so they
+    # run during the candle fetch instead of one after another once it ends.
+    # Each is collected (preloads.take) where it used to be read.
+    preloads = _Preloads()
+    _redis_ready = bool(state_db and not state_db.degraded and state_db._redis)
+
+    async def _scan_prefix(prefix: str) -> List[str]:
+        # count=2000: SCAN walks the WHOLE keyspace for a MATCH, one round trip
+        # per `count` keys, so a small count costs many round trips.
+        return [k async for k in state_db._redis.scan_iter(match=f"{prefix}*", count=2000)]
+
+    async def _calibration_blob() -> Any:
+        try:
+            _calib_brain = BrainEngine(state_db)
+            await _calib_brain.maybe_refresh_calibration(logger_main)
+        except Exception as e:
+            logger_main.warning(
+                f"Calibration refresh step failed (continuing with existing curve): {e}"
+            )
+        from brain import CALIBRATION_CURVES_KEY
+        return await state_db._safe_redis_op(
+            lambda: _rc(state_db._redis).get(CALIBRATION_CURVES_KEY),
+            2.0, "calibration_curves_runload",
+        )
+
+    async def _ml_blobs() -> Tuple[Any, Any]:
+        from brain import MARKET_STATE_MODEL_KEY, ML_CALIBRATION_KEY
+        return await asyncio.gather(
+            state_db._safe_redis_op(
+                lambda: _rc(state_db._redis).get(MARKET_STATE_MODEL_KEY),
+                2.0, "ml_model_runload",
+            ),
+            state_db._safe_redis_op(
+                lambda: _rc(state_db._redis).get(ML_CALIBRATION_KEY),
+                2.0, "ml_calibration_runload",
+            ),
+        )
+
+    async def _kill_switch_flag() -> bool:
+        return bool(await state_db._safe_redis_op(
+            lambda: _rc(state_db._redis).exists("brain:kill_switch_active"),
+            2.0, "kill_switch_poll_runload",
+        ))
+
+    async def _heat_positions() -> List[Dict[str, Any]]:
+        return await load_open_positions(
+            state_db, float(cfg.PORTFOLIO_POSITION_MAX_AGE_MIN) * 60.0,
+            source=cfg.PORTFOLIO_POSITION_SOURCE,
+        )
+
+    def _oi_hist_keys() -> List[str]:
+        return [f"oi_hist:{p}" for p in pairs_to_process if products_map.get(p)]
+
+    if _redis_ready:
+        if cfg.ENABLE_WIN_RATE_FILTER:
+            preloads.start("pending_scan", lambda: _scan_prefix(RedisKeyPrefix.OUTCOME_PENDING))
+        if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
+            preloads.start("shadow_scan", lambda: _scan_prefix(RedisKeyPrefix.SHADOW_PENDING))
+        if cfg.ENABLE_CALIBRATION_GATE and cfg.ENABLE_BRAIN:
+            preloads.start("calibration", _calibration_blob)
+        if getattr(cfg, "ENABLE_ML_EV_SHADOW", False) or getattr(cfg, "ENABLE_ML_EV_GATE", False):
+            preloads.start("ml_blobs", _ml_blobs)
+        preloads.start("disabled_keys", state_db.get_disabled_alert_keys)
+        if cfg.ENABLE_PAIR_THRESHOLDS:
+            preloads.start("pair_thresholds", state_db.get_pair_thresholds)
+        if cfg.ENABLE_PORTFOLIO_HEAT_GATE:
+            preloads.start("heat_positions", _heat_positions)
+        if cfg.ENABLE_KILL_SWITCH:
+            preloads.start("kill_switch", _kill_switch_flag)
+        preloads.start("last_processed",
+                       lambda: state_db.get_last_processed_candle_ts_bulk(pairs_to_process))
+        if cfg.ENABLE_OI_FUNDING_FILTER:
+            preloads.start("oi_hist", lambda: state_db.batch_get_metadata(_oi_hist_keys()))
 
     ticker_task = None
     if cfg.ENABLE_OI_FUNDING_FILTER:
@@ -582,6 +688,12 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     daily_cache_misses = 0
     daily_cache_bypassed = False
 
+    # Start the 15m/5m candle fetch first so the daily-cache lookup below
+    # (one Redis round trip) overlaps it instead of delaying it.
+    live_task = asyncio.ensure_future(
+        fetcher.fetch_all_candles_truly_parallel(pair_requests, reference_time)
+    )
+
     if fetch_daily and daily_symbols:
         day_key = get_utc_date_key(reference_time)
         seconds_into_utc_day = reference_time % 86400
@@ -617,9 +729,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 for sym in miss_symbols
             ), return_exceptions=True)
 
-    live_candles = await fetcher.fetch_all_candles_truly_parallel(
-        pair_requests, reference_time
-    )
+    live_candles = await live_task
     for sym, res in live_candles.items():
         all_candles.setdefault(sym, {}).update(res)
 
@@ -680,8 +790,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             meta_keys_to_read.append(meta_key)
 
         # Pass 2 — ONE round-trip for ALL history reads
-        prev_raw_map = await state_db.batch_get_metadata(meta_keys_to_read)
-
+        prev_raw_map = await preloads.take(
+            "oi_hist", lambda: state_db.batch_get_metadata(meta_keys_to_read)
+        )
         new_histories: Dict[str, str] = {}
         for (pair_name, current, meta_key) in oi_entries:
             oi_hist, funding_hist, price_hist = [], [], []
@@ -723,8 +834,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     if cfg.ENABLE_WIN_RATE_FILTER and not state_db.degraded and state_db._redis:
         try:
-            pattern = f"{RedisKeyPrefix.OUTCOME_PENDING}*"
-            keys = [k async for k in state_db._redis.scan_iter(match=pattern, count=500)]
+            keys = await preloads.take(
+                "pending_scan", lambda: _scan_prefix(RedisKeyPrefix.OUTCOME_PENDING)
+            )
             prefix_len = len(RedisKeyPrefix.OUTCOME_PENDING)
             pending_by_pair: Dict[str, List[str]] = {}
             for k in keys:
@@ -743,8 +855,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE and not state_db.degraded and state_db._redis:
         try:
-            pattern = f"{RedisKeyPrefix.SHADOW_PENDING}*"
-            keys = [k async for k in state_db._redis.scan_iter(match=pattern, count=500)]
+            keys = await preloads.take(
+                "shadow_scan", lambda: _scan_prefix(RedisKeyPrefix.SHADOW_PENDING)
+            )
             prefix_len = len(RedisKeyPrefix.SHADOW_PENDING)
             shadow_by_pair: Dict[str, List[str]] = {}
             for k in keys:
@@ -762,24 +875,13 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     # ── Calibration curves: optional lightweight refresh, then load ONCE ──
     calibration_curves: Dict[str, Any] = {}
+
     if (cfg.ENABLE_CALIBRATION_GATE and cfg.ENABLE_BRAIN
             and state_db and not state_db.degraded and state_db._redis):
         try:
-            # Refresh first so this run's gate uses a fresh curve when needed.
-            # Works on shallow-archive runs (Redis streams only).
-            _calib_brain = BrainEngine(state_db)
-            await _calib_brain.maybe_refresh_calibration(logger_main)
-        except Exception as e:
-            logger_main.warning(
-                f"Calibration refresh step failed (continuing with existing curve): {e}"
-            )
-
-        try:
-            from brain import CALIBRATION_CURVES_KEY
-            raw = await state_db._safe_redis_op(
-                lambda: _rc(state_db._redis).get(CALIBRATION_CURVES_KEY),
-                2.0, "calibration_curves_runload",
-            )
+            # The refresh (so this run's gate uses a fresh curve when needed) and
+            # the load both ran in the background during the candle fetch.
+            raw = await preloads.take("calibration", _calibration_blob)
             if raw:
                 payload = json_loads(raw)
                 calibration_curves = payload.get("curves", {}) or {}
@@ -833,17 +935,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         and state_db and not state_db.degraded and state_db._redis
     ):
         try:
-            from brain import MARKET_STATE_MODEL_KEY, ML_CALIBRATION_KEY
-            raw_model, raw_curve = await asyncio.gather(
-                state_db._safe_redis_op(
-                    lambda: _rc(state_db._redis).get(MARKET_STATE_MODEL_KEY),
-                    2.0, "ml_model_runload",
-                ),
-                state_db._safe_redis_op(
-                    lambda: _rc(state_db._redis).get(ML_CALIBRATION_KEY),
-                    2.0, "ml_calibration_runload",
-                ),
-            )
+            raw_model, raw_curve = await preloads.take("ml_blobs", _ml_blobs)
             if raw_model:
                 _m = json_loads(raw_model)
                 if _m.get("valid"):
@@ -875,7 +967,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     disabled_alert_keys_run: Set[str] = set()
     if state_db and not state_db.degraded:
         try:
-            disabled_alert_keys_run = await state_db.get_disabled_alert_keys()
+            disabled_alert_keys_run = await preloads.take("disabled_keys", state_db.get_disabled_alert_keys)
         except Exception as e:
             logger_main.warning(f"Disabled-alert-keys pre-load failed (fail-open): {e}")
             disabled_alert_keys_run = set()
@@ -883,7 +975,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     pair_thresholds_run: Dict[str, float] = {}
     if cfg.ENABLE_PAIR_THRESHOLDS and state_db and not state_db.degraded:
         try:
-            pair_thresholds_run = await state_db.get_pair_thresholds()
+            pair_thresholds_run = await preloads.take("pair_thresholds", state_db.get_pair_thresholds)
         except Exception as e:
             logger_main.warning(f"Pair-thresholds pre-load failed (fail-open): {e}")
             pair_thresholds_run = {}
@@ -895,13 +987,11 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 and not getattr(cfg, "ENABLE_TAKE_SKIP_BUTTONS", False)):
             logger_main.warning(
                 "Portfolio heat gate is ON with PORTFOLIO_POSITION_SOURCE='taps' but "
+
                 "ENABLE_TAKE_SKIP_BUTTONS is off: no 'Took' taps can be recorded, so the "
                 "gate has no positions to count (use PORTFOLIO_POSITION_SOURCE='alerts')"
             )
-        open_positions_run = await load_open_positions(
-            state_db, float(cfg.PORTFOLIO_POSITION_MAX_AGE_MIN) * 60.0,
-            source=cfg.PORTFOLIO_POSITION_SOURCE,
-        )
+        open_positions_run = await preloads.take("heat_positions", _heat_positions)
         if open_positions_run:
             logger_main.info(
                 f"Heat gate: {len(open_positions_run)} open position(s) "
@@ -912,25 +1002,26 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     kill_switch_active_run: bool = False
     if cfg.ENABLE_KILL_SWITCH and state_db and not state_db.degraded and state_db._redis:
         try:
-            kill_switch_active_run = bool(await state_db._safe_redis_op(
-                lambda: _rc(state_db._redis).exists("brain:kill_switch_active"),
-                2.0, "kill_switch_poll_runload",
-            ))
+            kill_switch_active_run = bool(await preloads.take("kill_switch", _kill_switch_flag))
         except Exception as e:
             logger_main.critical(f"Kill-switch pre-load failed — blocking dispatch this run (fail-closed): {e}")
             kill_switch_active_run = True
 
     # ── Last-processed candle timestamps: load ONCE per run ──
     # One MGET replaces one GET per pair during evaluation.
+
     last_processed_candles_run: Dict[str, Optional[int]] = {}
     if state_db and not state_db.degraded:
         try:
-            last_processed_candles_run = await state_db.get_last_processed_candle_ts_bulk(
-                pairs_to_process
+            last_processed_candles_run = await preloads.take(
+                "last_processed",
+                lambda: state_db.get_last_processed_candle_ts_bulk(pairs_to_process),
             )
         except Exception as e:
             logger_main.warning(f"Last-processed-candle bulk pre-load failed (fail-open): {e}")
             last_processed_candles_run = {}
+
+    preloads.cancel_all()   # anything started but not needed (flag flipped mid-run)
 
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
     prepared_tasks = []
@@ -1325,34 +1416,38 @@ async def run_once() -> Optional[bool]:
                 )
                 if _fb:
                     logger_run.info(f"📝 Recorded {_fb} Took/Skip decision(s) from Telegram")
+
             except Exception as e:
                 logger_run.debug(f"feedback poll skipped: {e}")
 
+        # Three independent startup reads, issued together (one wait instead of three).
         valkey_usage_start: Dict[str, Optional[float]] = {}
         if sdb and not sdb.degraded:
-            try:
-                valkey_usage_start = await sdb.get_valkey_usage_snapshot()
-            except Exception as e:
-                logger_run.debug(f"Valkey start snapshot unavailable: {e}")
-                valkey_usage_start = {}
+            _snap_r, _cb_r, _ovr_r = await asyncio.gather(
+                sdb.get_valkey_usage_snapshot(),
+                sdb.get_metadata("circuit_breaker_state"),
+                sdb.load_config_override(),
+                return_exceptions=True,
+            )
+            if isinstance(_snap_r, BaseException):
+                logger_run.debug(f"Valkey start snapshot unavailable: {_snap_r}")
+            else:
+                valkey_usage_start = _snap_r
 
-        if sdb and not sdb.degraded:
             try:
-                cb_state_raw = await sdb.get_metadata("circuit_breaker_state")
-                if cb_state_raw:
-                    await fetcher.circuit_breaker.restore(json_loads(cb_state_raw))
+                if isinstance(_cb_r, BaseException):
+                    raise _cb_r
+                if _cb_r:
+                    await fetcher.circuit_breaker.restore(json_loads(_cb_r))
             except Exception as e:
                 logger_run.warning(f"Could not restore circuit breaker state from Redis: {e}")
 
-        if sdb and not sdb.degraded:
-            try:
-                applied_overrides = await sdb.load_config_override()
-                if applied_overrides:
-                    logger_run.warning(
-                        "⚙️ Config override active from Redis this run: " + "; ".join(applied_overrides)
-                    )
-            except Exception as e:
-                logger_run.warning(f"Could not load config override from Redis (non-fatal): {e}")
+            if isinstance(_ovr_r, BaseException):
+                logger_run.warning(f"Could not load config override from Redis (non-fatal): {_ovr_r}")
+            elif _ovr_r:
+                logger_run.warning(
+                    "⚙️ Config override active from Redis this run: " + "; ".join(_ovr_r)
+                )
 
         # ── Dynamic Vote Weights (Brain Phase 1.5 productionization) ────────
         if getattr(cfg, "BRAIN_AUTO_APPLY_DYNAMIC_WEIGHTS", False) and sdb and not sdb.degraded:
@@ -1659,10 +1754,28 @@ async def run_once() -> Optional[bool]:
         # Structured summary for workflow artifacts / external monitors
         candle_freshness: Dict[str, Any] = {"pairs": {}, "stale": []}
         try:
-            _merged_candles = (
-                await sdb.merge_last_successful_candles(dict(LAST_CANDLE_OK_THIS_RUN))
-                if (sdb and not sdb.degraded) else dict(LAST_CANDLE_OK_THIS_RUN)
+            _tail_live = bool(sdb and not sdb.degraded)
+
+            async def _no_plan_state() -> None:
+                return None
+
+            async def _no_dlq() -> None:
+                return None
+
+            async def _local_candles() -> Dict[str, int]:
+                return dict(LAST_CANDLE_OK_THIS_RUN)
+
+            # Independent reads for the summary, issued together.
+            _merged_r, _ps_raw_r, _dlq_pending_r = await asyncio.gather(
+                (sdb.merge_last_successful_candles(dict(LAST_CANDLE_OK_THIS_RUN))
+                 if _tail_live else _local_candles()),
+                (sdb.get_metadata("brain_plan_state") if _tail_live else _no_plan_state()),
+                (sdb.dlq_count() if _tail_live else _no_dlq()),
+                return_exceptions=True,
             )
+            if isinstance(_merged_r, BaseException):
+                raise _merged_r
+            _merged_candles = _merged_r
             candle_freshness = build_candle_freshness(
                 pairs_to_process, _merged_candles, LAST_CANDLE_OK_THIS_RUN,
                 int(time.time()), int(cfg.LAST_CANDLE_STALE_AFTER_SEC),
@@ -1674,9 +1787,9 @@ async def run_once() -> Optional[bool]:
                 )
             _plan_state = None
             try:
-                if sdb and not sdb.degraded:
-                    _ps_raw = await sdb.get_metadata("brain_plan_state")
-                    _plan_state = json_loads(_ps_raw) if _ps_raw else None
+                if isinstance(_ps_raw_r, BaseException):
+                    raise _ps_raw_r
+                _plan_state = json_loads(_ps_raw_r) if _ps_raw_r else None
             except Exception as _ps_err:
                 logger_run.debug(f"Could not read brain plan state: {_ps_err}")
             structured = {
@@ -1707,7 +1820,7 @@ async def run_once() -> Optional[bool]:
                 "dedup_text": _dedup_line,
                 "telegram_dlq": {
                     **DLQ_STATS,
-                    "pending": (await sdb.dlq_count()) if (sdb and not sdb.degraded) else None,
+                    "pending": (None if isinstance(_dlq_pending_r, BaseException) else _dlq_pending_r),
                 },
                 "last_successful_candle": candle_freshness["pairs"],
                 "stale_candle_pairs": candle_freshness["stale"],
@@ -1810,29 +1923,35 @@ async def run_once() -> Optional[bool]:
                 await asyncio.wait_for(lock_extension_task, timeout=1.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
+
             except Exception as e:
                 logger_run.error(f"Error cancelling lock extension task: {e}")
 
-        if lock_acquired and lock and lock.acquired_by_me:
-            try:
-                await asyncio.wait_for(lock.release(timeout=3.0), timeout=4.0)
-                logger_run.debug("🔏 Redis lock released")
-            except asyncio.TimeoutError:
-                logger_run.error("Timeout releasing lock")
-            except Exception as e:
-                logger_run.error(f"Error releasing lock: {e}", exc_info=False)
+        async def _release_lock() -> None:
+            if lock_acquired and lock and lock.acquired_by_me:
+                try:
+                    await asyncio.wait_for(lock.release(timeout=3.0), timeout=4.0)
+                    logger_run.debug("🔏 Redis lock released")
+                except asyncio.TimeoutError:
+                    logger_run.error("Timeout releasing lock")
+                except Exception as e:
+                    logger_run.error(f"Error releasing lock: {e}", exc_info=False)
 
-        if sdb and not sdb.degraded and fetcher:
-            try:
-                cb_snapshot = await fetcher.circuit_breaker.snapshot()
-                await asyncio.wait_for(
-                    sdb.set_metadata("circuit_breaker_state", json_dumps(cb_snapshot), ttl=3600),
-                    timeout=2.0
-                )
-            except asyncio.TimeoutError:
-                logger_run.error("Timeout persisting circuit breaker state")
-            except Exception as e:
-                logger_run.error(f"Error persisting circuit breaker state: {e}", exc_info=False)
+        async def _persist_breaker() -> None:
+            if sdb and not sdb.degraded and fetcher:
+                try:
+                    cb_snapshot = await fetcher.circuit_breaker.snapshot()
+                    await asyncio.wait_for(
+                        sdb.set_metadata("circuit_breaker_state", json_dumps(cb_snapshot), ttl=3600),
+                        timeout=2.0
+                    )
+                except asyncio.TimeoutError:
+                    logger_run.error("Timeout persisting circuit breaker state")
+                except Exception as e:
+                    logger_run.error(f"Error persisting circuit breaker state: {e}", exc_info=False)
+
+        # Two independent Redis writes: one wait instead of two.
+        await asyncio.gather(_release_lock(), _persist_breaker())
 
         if sdb:
             try:

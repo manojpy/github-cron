@@ -1247,7 +1247,7 @@ class RedisStateStore:
         pattern = f"{RedisKeyPrefix.TELEGRAM_DLQ}*"
 
         async def _scan() -> List[str]:
-            return [k async for k in _rc(self._redis).scan_iter(match=pattern, count=100)]
+            return [k async for k in _rc(self._redis).scan_iter(match=pattern, count=2000)]
 
         keys = await self._safe_redis_op(_scan, 3.0, "dlq_scan")
         if not keys:
@@ -1275,7 +1275,7 @@ class RedisStateStore:
         pattern = f"{RedisKeyPrefix.TELEGRAM_DLQ}*"
 
         async def _scan() -> List[str]:
-            return [k async for k in _rc(self._redis).scan_iter(match=pattern, count=100)]
+            return [k async for k in _rc(self._redis).scan_iter(match=pattern, count=2000)]
 
         keys = await self._safe_redis_op(_scan, 3.0, "dlq_count")
         return len(keys or [])
@@ -1499,7 +1499,7 @@ class RedisStateStore:
             return precomputed.get(pair, [])
         try:
             pattern = f"{key_prefix}{pair}:*"
-            return [k async for k in _rc(self._redis).scan_iter(match=pattern, count=100)]
+            return [k async for k in _rc(self._redis).scan_iter(match=pattern, count=2000)]
         except Exception as e:
             logger_pair.debug(f"Failed to scan {label} outcomes for {pair}: {e}")
             return []
