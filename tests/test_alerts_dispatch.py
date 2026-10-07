@@ -1,26 +1,14 @@
 from __future__ import annotations
-import logging
-from types import SimpleNamespace as NS
-import alerts as A
-from alert_advisor import advise_pair, AVOID, TAKE, WATCH
-import asyncio
-from alerts import AlertPayload, dispatch_combined_alerts
-from bot_config import BiasContext
-import outcome_storage
-from bot_config import cfg
-from state import RedisStateStore
-import alerts
-import time
-from threshold_engine import (
-    KillSwitch, portfolio_heat_check, build_calibration_curves,
-    calibration_gate_decision, fill_reconciliation,
-)
 
 # ======================================================================
 # from test_alert_advisor.py
 # ======================================================================
 """Conviction / verdict logic and the per-pair Telegram body."""
+import logging
+from types import SimpleNamespace as NS
 
+import alerts as A
+from alert_advisor import advise_pair, AVOID, TAKE, WATCH
 
 LOG = logging.getLogger("t")
 DOWN = NS(up_pct=0.20, down_pct=0.47)
@@ -225,6 +213,10 @@ def test_why_line_says_all_high_weight_checks_pass_instead_of_repeating_top3():
 # from test_alert_dispatch_format.py
 # ======================================================================
 """Dispatcher: ordering by confluence %, same-underlying note, bias footer."""
+import asyncio
+import logging
+from alerts import AlertPayload, dispatch_combined_alerts
+from bot_config import BiasContext
 
 
 def _bias(up, down, neutral):
@@ -328,7 +320,10 @@ A failed send must NOT leave a recorded trade or an ACTIVE alert state behind
 (phantom trade), and a failing post-send hook must not skip the
 candle-processed marker (which would allow a duplicate alert next run).
 """
+import asyncio
+import logging
 
+from alerts import AlertPayload, dispatch_combined_alerts
 
 
 class FakeTelegram:
@@ -412,8 +407,13 @@ def test_post_send_hook_error_still_marks_candle_processed():
 # ======================================================================
 """Resolved outcomes must reach the file archive BEFORE the Redis pending key
 is deleted. If the archive write fails, the pending key must survive."""
+import asyncio
+import logging
 
 
+import outcome_storage
+from bot_config import cfg
+from state import RedisStateStore
 
 
 class FakePipe:
@@ -511,7 +511,10 @@ def test_archive_failure_keeps_pending_key(monkeypatch):
 # ======================================================================
 """#25 survival checklist + #26 BRAIN FILTER Telegram notice (build_* / _notify_brain_filter)."""
 
+import asyncio
 
+import alerts
+from bot_config import cfg
 
 
 class _Q:
@@ -636,6 +639,11 @@ def test_never_raises_on_send_failure(monkeypatch):
 # ======================================================================
 # from test_new_gates.py
 # ======================================================================
+import time
+from threshold_engine import (
+    KillSwitch, portfolio_heat_check, build_calibration_curves,
+    calibration_gate_decision, fill_reconciliation,
+)
 
 
 def _row(win, pct=0.5, ts=None, ak="ppo_signal_up", conf=75.0,
@@ -820,3 +828,89 @@ def test_auto_open_positions_count_only_delivered_takes():
     live, stale, taps = asyncio.run(go())
     assert [(p["pair"], p["direction"]) for p in live] == [("BTCUSD", "sell")]
     assert stale == [] and taps == []
+
+
+# ======================================================================
+# one recorded trade per pair until stop/target
+# ======================================================================
+def _one_trade_price_data(highs, lows):
+    import numpy as np
+    from fetcher import PriceData
+    n = len(highs)
+    ts = np.arange(n, dtype=np.int64) * 900 + 1_000_000
+    flat = np.full(n, 100.0)
+    return PriceData(ts=ts, open=flat.copy(), high=np.array(highs, float),
+                     low=np.array(lows, float), close=flat.copy(), volume=flat.copy())
+
+
+def _one_trade_row(direction="buy", entry_idx=0):
+    import json
+    return json.dumps({"entry_ts": 1_000_000 + entry_idx * 900, "entry_price": 100.0,
+                       "direction": direction})
+
+
+def _one_trade_store(rows, degraded=False):
+    import state
+
+    class _P:
+        def __init__(self): self.keys = []
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        def get(self, k): self.keys.append(k)
+        async def execute(self): return [rows.get(k) for k in self.keys]
+
+    class _R:
+        def pipeline(self, transaction=False): return _P()
+
+    s = object.__new__(state.RedisStateStore)
+    s.degraded = degraded
+    s._redis = _R()
+
+    async def _keys(*a, **k): return list(rows)
+    s._fetch_pending_keys = _keys
+    return s
+
+
+def test_early_close_marks_target_stop_and_leaves_open_trades_alone():
+    import json
+    import state
+    store = object.__new__(state.RedisStateStore)
+    f = store._early_close_payload
+    # fill at open[1]=100; target 102, stop 99 (defaults 1% risk, 2R)
+    quiet = _one_trade_price_data([100, 100.5, 100.5, 100.5], [100, 99.5, 99.5, 99.5])
+    assert f(_one_trade_row(), quiet, 3) is None
+    up = _one_trade_price_data([100, 100.5, 102.5, 100.5], [100, 99.5, 99.5, 99.5])
+    out = json.loads(f(_one_trade_row(), up, 3))
+    assert out["closed_reason"] == "target" and out["closed_ts"]
+    dn = _one_trade_price_data([100, 100.5, 100.5, 100.5], [100, 99.5, 98.9, 99.5])
+    assert json.loads(f(_one_trade_row(), dn, 3))["closed_reason"] == "stop"
+    # a sell trade reads the same path the other way round
+    deep = _one_trade_price_data([100, 100.5, 100.5, 100.5], [100, 99.5, 97.9, 99.5])
+    assert json.loads(f(_one_trade_row("sell"), deep, 3))["closed_reason"] == "target"
+    # already closed rows are not rewritten
+    assert f(out and json.dumps(out), up, 3) is None
+    # the fill candle itself is not closed yet
+    assert f(_one_trade_row(), up, 0) is None
+
+
+def test_get_active_trade_ignores_closed_rows_and_picks_newest():
+    import asyncio
+    import json
+    base = "outcome_pending:BTCUSD:"
+    open_old = _one_trade_row(entry_idx=0)
+    open_new = _one_trade_row(entry_idx=2)
+    closed = json.dumps({**json.loads(_one_trade_row(entry_idx=5)), "closed_ts": 1})
+    rows = {base + "a_key:1000000": open_old, base + "b_key:1001800": open_new,
+            base + "c_key:1004500": closed}
+    got = asyncio.run(_one_trade_store(rows).get_active_trade("BTCUSD"))
+    assert got["alert_key"] == "b_key" and got["entry_ts"] == 1_001_800
+    only_closed = {base + "c_key:1004500": closed}
+    assert asyncio.run(_one_trade_store(only_closed).get_active_trade("BTCUSD")) is None
+    assert asyncio.run(_one_trade_store(rows, degraded=True).get_active_trade("BTCUSD")) is None
+
+
+def test_record_status_line_text():
+    line = A._record_status_line("IGNORED", {"pair": "BTCUSD", "direction": "buy", "entry_ts": 1_000_000})
+    assert line.startswith("⏭ Ignored") and "BTCUSD buy" in line
+    assert A._record_status_line("RECORDED", None).startswith("📝 Recorded")
+    assert A._record_status_line("SHADOWED", None).startswith("👁 Shadowed")
