@@ -241,6 +241,7 @@ jobs:
       - name: ✅ Apply Brain Plan (on-demand)
         if: inputs.apply_brain_plan == true
         run: |
+          mkdir -p logs
           ENV_FILE="$(pwd)/.bot_env"
           cat > "$ENV_FILE" <<EOF
           TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -249,15 +250,10 @@ jobs:
           DELTA_API_BASE=${{ secrets.DELTA_API_BASE }}
           EOF
 
-          docker run --rm \
-            --platform linux/amd64 \
-            --env-file "$ENV_FILE" \
-            -e PYTHONPATH=/app/src \
-        
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
             --pull=never \
-            --name "macd_bot_${{ github.run_id }}" \
+            --name "macd_bot_apply_${{ github.run_id }}" \
             --platform linux/amd64 \
             --memory="900m" \
             --memory-swap="1800m" \
@@ -275,11 +271,15 @@ jobs:
             -e OUTCOME_DATA_DIR=/tmp/data-repo \
             -v "/tmp/data-repo:/tmp/data-repo:rw" \
             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \
-            "${{ env.RUN_IMAGE }}" 2>&1 | tee logs/bot_output.log
             "${{ env.RUN_IMAGE }}" \
-            python macd_unified.py --apply-brain
+            python macd_unified.py --apply-brain 2>&1 | tee logs/bot_output.log
 
+          EXIT_CODE=${PIPESTATUS[0]}
           rm -f "$ENV_FILE"
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "❌ Apply-brain failed with exit code $EXIT_CODE" >> $GITHUB_STEP_SUMMARY
+            exit $EXIT_CODE
+          fi
           echo "✅ Apply-brain step finished — see logs above for applied changes." >> $GITHUB_STEP_SUMMARY
 
       - name: 🚀 Execute MACD Bot
@@ -319,7 +319,28 @@ jobs:
           CLEAR_KILL_SWITCH=$CLEAR_KILL_SWITCH
           EOF
 
-          timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run             --rm             --name "macd_bot_${{ github.run_id }}"             --platform linux/amd64             --memory="900m"             --memory-swap="1800m"             --cpus="2.0"             --security-opt=no-new-privileges             --read-only             --tmpfs /tmp:rw,noexec,nosuid,size=64m             --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m             --env-file "$ENV_FILE"             -e TZ=Asia/Kolkata             -e PYTHONPATH=/app/src             -e PYTHONUNBUFFERED=1             -e NUMBA_NUM_THREADS=2             -e OMP_NUM_THREADS=2             -e OUTCOME_DATA_DIR=/tmp/data-repo             -v "/tmp/data-repo:/tmp/data-repo:rw"             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro"                         ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>&1 | tee logs/bot_output.log
+          timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
+            --rm \
+            --pull=never \
+            --name "macd_bot_${{ github.run_id }}" \
+            --platform linux/amd64 \
+            --memory="900m" \
+            --memory-swap="1800m" \
+            --cpus="2.0" \
+            --security-opt=no-new-privileges \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m \
+            --env-file "$ENV_FILE" \
+            -e TZ=Asia/Kolkata \
+            -e PYTHONPATH=/app/src \
+            -e PYTHONUNBUFFERED=1 \
+            -e NUMBA_NUM_THREADS=2 \
+            -e OMP_NUM_THREADS=2 \
+            -e OUTCOME_DATA_DIR=/tmp/data-repo \
+            -v "/tmp/data-repo:/tmp/data-repo:rw" \
+            -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \
+            "${{ env.RUN_IMAGE }}" 2>&1 | tee logs/bot_output.log
 
           EXIT_CODE=${PIPESTATUS[0]}
           DURATION=$(( $(date +%s) - START_TIME ))
