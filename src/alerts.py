@@ -3813,4 +3813,37 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             if not oscillator_group_ok_buy:
                 reasons.append(f"Oscillator group buy: need {Constants.OSCILLATOR_GROUP_MIN_VOTES}-of-3 (PPO/RSI/TK) — not met")
             if not oscillator_group_ok_sell:
-                reasons.append(f"O
+                reasons.append(f"Oscillator group sell: need {Constants.OSCILLATOR_GROUP_MIN_VOTES}-of-3 (PPO/RSI/TK) — not met")
+
+            logger_pair.debug(f"😒 {pair_name} | Suppression: {', '.join(reasons)}") 
+
+        return pair_name, {
+            "state": "ALERT_SENT" if alerts_to_send else "NO_SIGNAL",
+            "ts": int(time.time()),
+            "summary": {
+                "alerts": len(alerts_to_send),
+                "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                "hist_rma": round(hist_curr, 4),
+                "suppression": ", ".join(failed_conditions + reasons) if (failed_conditions or reasons) else "No conditions met"
+            }
+        }, None
+    except asyncio.CancelledError:
+        logger_pair.warning(f"Evaluation cancelled for {pair_name}")
+        raise
+    except RuntimeError as e:
+        logger_pair.critical(f"🚨 INVARIANT VIOLATION in {pair_name}: {e}")
+        return pair_name, {
+            "state": "INVARIANT_VIOLATION",
+            "ts": int(time.time()),
+            "summary": {
+                "alerts": 0,
+                "future_cloud": "neutral",
+                "hist_rma": 0.0,
+                "error": str(e)
+            }
+        }, None
+    except Exception as e:
+        logger_pair.exception(
+            f"❌ Error in _apply_and_dispatch_alerts for {pair_name}: {e} | Correlation: {correlation_id}"
+        )
+        return None
