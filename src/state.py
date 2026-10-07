@@ -550,9 +550,9 @@ class RedisStateStore:
 
         logger.warning("""
     🚨 REDIS DEGRADED MODE ACTIVE:
-    - Alert deduplication:  DISABLED (may get duplicates)
+    - Alert deduplication:  UNAVAILABLE (claims fail closed)
     - State persistence:    DISABLED (alerts reset each run)
-    - Trading alerts:       STILL ACTIVE (core functionality preserved)
+    - Trading alerts:       BLOCKED (no dedup claim possible, nothing is sent)
     """)
 
         if cfg.FAIL_ON_REDIS_DOWN:
@@ -1129,33 +1129,47 @@ class RedisStateStore:
         self._adaptive_dedup_cache = out
         return out
 
-    async def check_recent_alert(self, pair: str, alert_key: str, ts: int, window_sec: Optional[int] = None) -> bool:
+    async def claim_recent_alert(self, pair: str, alert_key: str, ts: int,
+                                 window_sec: Optional[int] = None) -> Optional[bool]:
+        """Try to claim the dedup window for pair:alert_key.
+
+        True  = claim taken (safe to send)
+        False = key already exists (genuine duplicate)
+        None  = Redis degraded or errored; outcome unknown (caller fails closed)
+        """
         if self.degraded:
             logger.error(
-                f"check_recent_alert: Redis degraded — failing closed for {pair}:{alert_key} "
+                f"claim_recent_alert: Redis degraded — failing closed for {pair}:{alert_key} "
                 f"(no dedup claim possible, alert blocked)"
             )
-            return False
+            return None
         if not self._redis:
             logger.critical(
-                f"check_recent_alert: degraded=False but _redis is None (state desync) — "
+                f"claim_recent_alert: degraded=False but _redis is None (state desync) — "
                 f"failing closed for {pair}:{alert_key}, this alert will be blocked"
             )
-            return False  # fail-closed, consistent with the except-branch policy below
+            return None
         recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
         effective_window = window_sec if window_sec is not None else cfg.ALERT_DEDUP_WINDOW_SEC
-        try:
-            result = await asyncio.wait_for(
-                self._redis.set(recent_key, str(ts), nx=True, ex=effective_window),
-                timeout=3.0
-            )
-            should_send = bool(result)
-            if cfg.DEBUG_MODE and not should_send:
-                logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
-            return should_send
-        except Exception as e:
-            logger.error(f"Dedup check FAILED for {pair}:{alert_key}: {e}")
-            return False   # fail-closed, not fail-open
+        for attempt in (1, 2):
+            try:
+                result = await asyncio.wait_for(
+                    self._redis.set(recent_key, str(ts), nx=True, ex=effective_window),
+                    timeout=3.0
+                )
+                should_send = bool(result)
+                if cfg.DEBUG_MODE and not should_send:
+                    logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
+                return should_send
+            except Exception as e:
+                logger.error(
+                    f"Dedup claim attempt {attempt}/2 FAILED for {pair}:{alert_key}: {e}"
+                )
+        return None
+
+    async def check_recent_alert(self, pair: str, alert_key: str, ts: int, window_sec: Optional[int] = None) -> bool:
+        """Boolean wrapper kept for existing callers: True only when the claim was taken."""
+        return (await self.claim_recent_alert(pair, alert_key, ts, window_sec)) is True
 
     async def batch_check_recent_alerts(self, pair: str, alert_keys: List[str], ts: int,
                                           window_sec: Optional[int] = None,

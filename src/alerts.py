@@ -2967,14 +2967,38 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             sell_present = any(ak in SELL_ALERT_KEYS for _, _, ak in alerts_to_send)
             direction = "MIXED" if (buy_present and sell_present) else ("BUY" if buy_present else "SELL")
             coalesced_dedup_key = f"coalesced_{direction}"
-            should_send = await sdb.check_recent_alert(
+            claim = await sdb.claim_recent_alert(
                 pair_name, coalesced_dedup_key, ts_curr,
                 window_sec=await coalesce_window_for(
                     sdb, [ak for _, _, ak in alerts_to_send]
                 ),
             )
+            should_send = claim is True
             if should_send:
                 DEDUP_STATS["claims_taken"] += 1
+            elif claim is None:
+                # Redis error/degraded: not a real duplicate. Do not mark the
+                # candle processed, so a re-evaluation of this candle can retry.
+                logger_pair.warning(
+                    f"[{pair_name}] Coalesce claim failed (Redis error/degraded) — "
+                    f"alert not sent; candle NOT marked processed"
+                )
+                return pair_name, {
+                    "state": "SUPPRESSED_DEDUP_ERROR",
+                    "ts": int(time.time()),
+                    "summary": {
+                        "alerts": 0,
+                        "future_cloud": (
+                            "green"
+                            if cloud_up
+                            else "red"
+                            if cloud_down
+                            else "neutral"
+                        ),
+                        "hist_rma": round(hist_curr, 4),
+                        "suppression": "Dedup claim failed (Redis) — candle left open for retry",
+                    },
+                }, None
             else:
                 DEDUP_STATS["coalesced_suppressed"] += 1
             if not should_send:
@@ -3713,20 +3737,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 reasons.append(f"Oscillator group sell: need {Constants.OSCILLATOR_GROUP_MIN_VOTES}-of-3 (PPO/RSI/TK) — not met")
 
             logger_pair.debug(f"😒 {pair_name} | Suppression: {', '.join(reasons)}") 
-
-        # Mark quiet candles processed so the next 15-min run does not
-        # re-evaluate the same closed bar for every pair (CPU / Redis waste).
-        # Do NOT mark on inconclusive/retry paths that return earlier and
-        # intentionally leave the candle open for the next run.
-        # Failure is non-fatal: marker is an optimization only.
-        if not alerts_to_send:
-            try:
-                await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
-            except Exception as e:
-                logger_pair.warning(
-                    f"[{pair_name}] NO_SIGNAL candle marker failed; "
-                    f"same candle may be re-evaluated next run: {e}"
-                )
 
         return pair_name, {
             "state": "ALERT_SENT" if alerts_to_send else "NO_SIGNAL",

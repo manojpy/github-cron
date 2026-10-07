@@ -1608,7 +1608,8 @@ async def run_once() -> Optional[bool]:
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
             await telegram_queue.send(escape_markdown_v2(
                 f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
-                f"Alert deduplication is disabled. You may receive duplicate alerts.\n"
+                f"Dedup claims cannot be taken, so ALL alerts are blocked (fail-closed) "
+                f"until Redis recovers. No alerts will be sent.\n"
                 f"Time: {format_ist_time()}"
             ))
             sdb.degraded_alerted = True
