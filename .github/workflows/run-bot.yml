@@ -241,8 +241,11 @@ jobs:
       - name: ✅ Apply Brain Plan (on-demand)
         if: inputs.apply_brain_plan == true
         run: |
+          set -o pipefail
           mkdir -p logs
           ENV_FILE="$(pwd)/.bot_env"
+          trap 'rm -f "$ENV_FILE"' EXIT
+
           cat > "$ENV_FILE" <<EOF
           TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
@@ -275,7 +278,6 @@ jobs:
             python macd_unified.py --apply-brain 2>&1 | tee logs/bot_output.log
 
           EXIT_CODE=${PIPESTATUS[0]}
-          rm -f "$ENV_FILE"
           if [ $EXIT_CODE -ne 0 ]; then
             echo "❌ Apply-brain failed with exit code $EXIT_CODE" >> $GITHUB_STEP_SUMMARY
             exit $EXIT_CODE
@@ -289,6 +291,7 @@ jobs:
         env:
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
         run: |
+          set -o pipefail
           mkdir -p logs
           echo "::group::🔥 Launch Macd-Unified...🔥"
           echo "🕐 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
@@ -299,13 +302,14 @@ jobs:
           if [ "$BRAIN_FULL" = "true" ]; then BRAIN_SHALLOW=false; else BRAIN_SHALLOW=true; fi
           echo "🧠 Brain Report: $BRAIN_FULL (shallow archive: $BRAIN_SHALLOW)"
           echo "🔓 Clear Kill Switch: $CLEAR_KILL_SWITCH"
-          echo "::endgroup::"  
+          echo "::endgroup::"
 
           START_TIME=$(date +%s)
           echo "🕐 TRIGGER_TIMESTAMP=$START_TIME ($(TZ=Asia/Kolkata date -d @$START_TIME '+%Y-%m-%d %H:%M:%S IST'))"
 
-
           ENV_FILE="$(pwd)/.bot_env"
+          trap 'rm -f "$ENV_FILE"' EXIT
+
           cat > "$ENV_FILE" <<EOF
           TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
@@ -346,8 +350,6 @@ jobs:
           DURATION=$(( $(date +%s) - START_TIME ))
           echo "execution_time=${DURATION}" >> $GITHUB_OUTPUT
           echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
-
-          rm -f "$ENV_FILE"
 
           if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ]; then
             echo "⚠️ Bot execution timed out after ${DURATION}s" | tee -a logs/bot_output.log
