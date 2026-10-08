@@ -1224,6 +1224,25 @@ async def send_trade_close_notices(
         return 0
     sdb.trade_close_events.clear()
 
+    # ── Run-level close summary (log only) ──
+    # Counts Target / Stop / Both per source and derives a simple win rate.
+    # "both" (target + stop in the same candle) is treated as a non-win.
+    for source in ("Recorded", "Shadowed"):
+        src_events = [e for e in events if e.get("source") == source]
+        if not src_events:
+            continue
+        targets = sum(1 for e in src_events if e.get("reason") == "target")
+        stops = sum(1 for e in src_events if e.get("reason") == "stop")
+        boths = sum(1 for e in src_events if e.get("reason") == "both")
+        total = len(src_events)
+        decided = targets + stops + boths
+        win_rate = (targets / decided * 100.0) if decided else 0.0
+        both_part = f", Both - {boths}" if boths else ""
+        logger_run.info(
+            f"{source} - {total}, Target Achieved - {targets}, "
+            f"Stop loss Hit - {stops}{both_part}, Win Rate - {win_rate:.0f}%"
+        )
+
     label = {
         "target": "Target Done",
         "stop": "Stop Loss Hit",
