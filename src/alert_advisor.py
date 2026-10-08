@@ -140,15 +140,14 @@ def _plan(tqs: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return best
 
 def _px(v: float) -> str:
-    """Price with enough decimals for low-priced pairs (levels sit well under 1% apart)."""
+    """Price with enough decimals for low-priced pairs (levels sit well under 1% apart).
+    Rules: >=10 → 2dp, >=1 → 3dp, <1 → 4dp."""
     v = float(v)
-    if v >= 1000:
+    if v >= 10:
         return f"${v:,.2f}"
     if v >= 1:
-        return f"${v:,.4f}"
-    if v >= 0.01:
-        return f"${v:,.5f}"
-    return f"${v:,.7f}"
+        return f"${v:,.3f}"
+    return f"${v:,.4f}"
 
 def _level(price: float, direction: Optional[str], pct: float, favourable: bool) -> float:
     """Absolute price of a level `pct` percent from entry. favourable=True is the

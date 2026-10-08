@@ -305,15 +305,15 @@ def _combined_setup_line(items: List[Tuple[str, str]]) -> str:
     return f"{names[0]}, {names[1]}(+{len(names) - 2})"
 
 def _format_price(price: Any) -> str:
-    """Format a price with enough precision to be useful for low-priced pairs
-    (a $0.0462 asset must not be shown as $0.05)."""
+    """Format a price with enough precision to be useful for low-priced pairs.
+    Rules: >=10 → 2dp, >=1 → 3dp, <1 → 4dp."""
     if not isinstance(price, (int, float)):
         return "N/A"
-    if price >= 1:
+    if price >= 10:
         return f"${price:,.2f}"
-    if price >= 0.01:
-        return f"${price:,.4f}"
-    return f"${price:,.6f}"
+    if price >= 1:
+        return f"${price:,.3f}"
+    return f"${price:,.4f}"
 
 def _fmt_num(n: float) -> str:
     """Format a number with no trailing '.0' when it's a whole number."""
@@ -786,7 +786,7 @@ def create_pivot_alert(level: str, is_buy: bool) -> Dict[str, Any]:
                 get_pivot_alert_info(ctx, level, is_buy=True)[0]
             )),
             "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-                f"${ctx['pivots'][level]:,.2f} "
+                f"{_format_price(ctx['pivots'][level])} "
                 f"[Dist: {abs(ctx['pivots'][level] - ctx['close_curr'])/ctx['pivots'][level]*100:.2f}%] "
             ),
             "requires": ["pivots"]
@@ -805,7 +805,7 @@ def create_pivot_alert(level: str, is_buy: bool) -> Dict[str, Any]:
                 get_pivot_alert_info(ctx, level, is_buy=False)[0]
             )),
             "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-                f"${ctx['pivots'][level]:,.2f} "
+                f"{_format_price(ctx['pivots'][level])} "
                 f"[Dist: {abs(ctx['pivots'][level] - ctx['close_curr'])/ctx['pivots'][level]*100:.2f}%] "
             ),
             "requires": ["pivots"]
