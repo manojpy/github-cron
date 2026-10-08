@@ -159,18 +159,20 @@ def _level(price: float, direction: Optional[str], pct: float, favourable: bool)
 def _plan_line(plan: Optional[Dict[str, float]], default_sl: float, rr: float,
                direction: Optional[str] = None, price: Optional[float] = None) -> str:
     use_px = isinstance(price, (int, float)) and price > 0 and direction in ("buy", "sell")
+    # Narrow for mypy: use_px already guarantees a positive numeric price.
+    px: float = float(price) if use_px else 0.0
     if plan:
         r1, r2 = plan["tp1"] / plan["sl"], plan["tp2"] / plan["sl"]
         tag = " · validated zone" if plan.get("validated") else ""
         if use_px:
-            return (f"🛡 SL {_px(_level(price, direction, plan['sl'], False))}"
-                    f" | TP1 {_px(_level(price, direction, plan['tp1'], True))} ({r1:.1f}R)"
-                    f" | TP2 {_px(_level(price, direction, plan['tp2'], True))} ({r2:.1f}R){tag}")
+            return (f"🛡 SL {_px(_level(px, direction, plan['sl'], False))}"
+                    f" | TP1 {_px(_level(px, direction, plan['tp1'], True))} ({r1:.1f}R)"
+                    f" | TP2 {_px(_level(px, direction, plan['tp2'], True))} ({r2:.1f}R){tag}")
         return (f"🛡 SL -{plan['sl']:.2f}% | TP1 +{plan['tp1']:.2f}% ({r1:.1f}R)"
                 f" | TP2 +{plan['tp2']:.2f}% ({r2:.1f}R){tag}")
     if use_px:
-        return (f"🛡 SL {_px(_level(price, direction, default_sl, False))}"
-                f" | TP {_px(_level(price, direction, default_sl * rr, True))} "
+        return (f"🛡 SL {_px(_level(px, direction, default_sl, False))}"
+                f" | TP {_px(_level(px, direction, default_sl * rr, True))} "
                 f"({rr:.1f}R) · default plan, no history")
     return (f"🛡 SL -{default_sl:.2f}% | TP +{default_sl * rr:.2f}% "
             f"({rr:.1f}R) · default plan, no history")
