@@ -294,6 +294,7 @@ class RedisKeyPrefix:
     THRESHOLD_HISTORY = "brain_threshold_history:"
     VOTE_COUNT_HISTORY = "brain_vote_counts:"
     LAST_PROCESSED_CANDLE = "last_processed_candle:"  # NEW
+    TRADE_COOLDOWN = "trade_cooldown:"
     TELEGRAM_DLQ = "telegram_dlq:"
 
 class RedisStateStore:
@@ -332,6 +333,8 @@ class RedisStateStore:
         self.metadata_expiry_seconds = 7 * 86400
         self._pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None
         self._shadow_pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None
+        self.trade_close_events: List[Dict[str, Any]] = []
+        self._close_event_ids: Set[Tuple[str, str, str, int]] = set()
         self._run_resolved_total: int = 0
         self._run_archived_total: int = 0
         self.degraded = False
@@ -1340,8 +1343,15 @@ class RedisStateStore:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
             return
 
-        key = f"{RedisKeyPrefix.OUTCOME_PENDING}{pair}:{alert_key}:{entry_ts}"
+        _cd_hit = await self.in_trade_cooldown(pair, entry_ts)
+        if _cd_hit is not None:
+            logger.info(
+                f"[{pair}] Cooldown after target (hit candle {_cd_hit}) — "
+                f"not recording {alert_key} @ {entry_ts}"
+            )
+            return
 
+        key = f"{RedisKeyPrefix.OUTCOME_PENDING}{pair}:{alert_key}:{entry_ts}"
         try:
             payload = json_dumps({
                 "direction": direction,
@@ -1427,8 +1437,15 @@ class RedisStateStore:
         if self.degraded or not getattr(cfg, "ENABLE_BRAIN", False):
             return
 
-        key = f"{RedisKeyPrefix.SHADOW_PENDING}{pair}:{alert_key}:{entry_ts}"
+        _cd_hit = await self.in_trade_cooldown(pair, entry_ts)
+        if _cd_hit is not None:
+            logger.info(
+                f"[{pair}] Cooldown after target (hit candle {_cd_hit}) — "
+                f"not shadowing {alert_key} @ {entry_ts}"
+            )
+            return
 
+        key = f"{RedisKeyPrefix.SHADOW_PENDING}{pair}:{alert_key}:{entry_ts}"
         try:
             payload = json_dumps({
                 "direction": direction,
@@ -1704,9 +1721,6 @@ class RedisStateStore:
             else:
                 entry_slip_pct = (sig_p - fill_p) / sig_p * 100
 
-
-
-
             realized_cost = (fee_pct * 2) * 100 + abs(entry_slip_pct) * 2
         else:
             realized_cost = base_cost_pct
@@ -1834,18 +1848,31 @@ class RedisStateStore:
             highs = data_15m.high[path_start:i15 + 1]
             if not len(lows):
                 return None
+
             risk = cfg.OUTCOME_MAE_LOSS_PCT / 100.0
             target = risk * cfg.OUTCOME_RR_TARGET
             if is_buy:
-                tp_hit = bool((highs >= anchor * (1 + target)).any())
-                sl_hit = bool((lows <= anchor * (1 - risk)).any())
+                tp_mask = highs >= anchor * (1 + target)
+                sl_mask = lows <= anchor * (1 - risk)
             else:
-                tp_hit = bool((lows <= anchor * (1 - target)).any())
-                sl_hit = bool((highs >= anchor * (1 + risk)).any())
+                tp_mask = lows <= anchor * (1 - target)
+                sl_mask = highs >= anchor * (1 + risk)
+            tp_hit = bool(tp_mask.any())
+            sl_hit = bool(sl_mask.any())
             if not (tp_hit or sl_hit):
                 return None
+            n_path = len(lows)
+            tp_idx = int(np.argmax(tp_mask)) if tp_hit else n_path
+            sl_idx = int(np.argmax(sl_mask)) if sl_hit else n_path
+            if tp_idx < sl_idx:
+                reason, hit_idx = "target", tp_idx
+            elif sl_idx < tp_idx:
+                reason, hit_idx = "stop", sl_idx
+            else:
+                reason, hit_idx = "both", tp_idx  # both touched inside the same candle
             data["closed_ts"] = int(time.time())
-            data["closed_reason"] = "both" if (tp_hit and sl_hit) else ("target" if tp_hit else "stop")
+            data["closed_reason"] = reason
+            data["closed_candle_ts"] = int(data_15m.ts[path_start + hit_idx])
             return json_dumps(data)
         except Exception:
             return None
@@ -1887,6 +1914,82 @@ class RedisStateStore:
             logger.warning(f"get_active_trade failed for {pair}: {e}")
             return None
 
+    async def in_trade_cooldown(self, pair: str, entry_ts: int) -> Optional[int]:
+        """Return the target-hit candle ts when `entry_ts` is inside the pair's
+        re-entry cooldown, else None. Fails open (Redis problem = no cooldown)."""
+        n = int(getattr(cfg, "TRADE_CLOSE_COOLDOWN_CANDLES", 0))
+        if (
+            n <= 0
+            or not getattr(cfg, "ENABLE_TRADE_CLOSE_NOTICE", True)
+            or self.degraded
+            or not self._redis
+        ):
+            return None
+        try:
+            raw = await asyncio.wait_for(
+                _rc(self._redis).get(f"{RedisKeyPrefix.TRADE_COOLDOWN}{pair}"),
+                timeout=2.0,
+            )
+            if raw is None:
+                return None
+            hit_ts = int(raw)
+        except Exception:
+            return None
+        return hit_ts if int(entry_ts) <= hit_ts + n * 900 else None
+
+    async def _start_trade_cooldown(self, pair: str, hit_ts: int,
+                                    logger_pair: logging.Logger) -> None:
+        if self.degraded or not self._redis:
+            return
+        key = f"{RedisKeyPrefix.TRADE_COOLDOWN}{pair}"
+        ttl = int((int(cfg.TRADE_CLOSE_COOLDOWN_CANDLES) + 4) * 900)
+        try:
+            raw = await asyncio.wait_for(_rc(self._redis).get(key), timeout=2.0)
+            if raw is not None and int(raw) >= int(hit_ts):
+                return  # never move the cooldown backwards
+            await asyncio.wait_for(
+                _rc(self._redis).set(key, str(int(hit_ts)), ex=ttl), timeout=2.0
+            )
+        except Exception as e:
+            logger_pair.warning(f"[{pair}] Could not start trade cooldown: {e}")
+
+    async def _publish_close_events(self, pair: str, rows: List[Dict[str, Any]],
+                                    source: str, logger_pair: logging.Logger) -> None:
+        """Queue 'Target Done / Stop Hit' notices for this run's Telegram update and
+        start the re-entry cooldown. Call only AFTER the closed_ts write succeeded,
+        so each trade is announced once. `source` is 'Recorded' or 'Shadowed'."""
+        if not getattr(cfg, "ENABLE_TRADE_CLOSE_NOTICE", True):
+            return
+        cooldown_hit_ts: Optional[int] = None
+        for d in rows:
+            try:
+                entry_ts = int(d.get("entry_ts"))
+            except (TypeError, ValueError):
+                continue
+            direction = "buy" if str(d.get("direction", "")).lower() in ("buy", "long") else "sell"
+            ident = (pair, source, direction, entry_ts)
+            if ident in self._close_event_ids:
+                continue
+            self._close_event_ids.add(ident)
+            reason = str(d.get("closed_reason") or "")
+            hit_ts = d.get("closed_candle_ts")
+            self.trade_close_events.append({
+                "pair": pair,
+                "source": source,
+                "direction": direction,
+                "entry_ts": entry_ts,
+                "reason": reason,
+                "hit_ts": int(hit_ts) if hit_ts is not None else None,
+            })
+            starts_cooldown = reason == "target" or (
+                reason in ("stop", "both")
+                and getattr(cfg, "TRADE_CLOSE_COOLDOWN_ON_STOP", False)
+            )
+            if starts_cooldown and hit_ts is not None:
+                cooldown_hit_ts = max(int(hit_ts), cooldown_hit_ts or 0)
+        if cooldown_hit_ts is not None and int(getattr(cfg, "TRADE_CLOSE_COOLDOWN_CANDLES", 0)) > 0:
+            await self._start_trade_cooldown(pair, cooldown_hit_ts, logger_pair)
+
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
                                        logger_pair: logging.Logger) -> None:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not self._redis:
@@ -1918,6 +2021,7 @@ class RedisStateStore:
 
         stats_ttl = max(cfg.STATE_EXPIRY_DAYS * 86400, 7 * 86400)
         resolved_for_file: List[Dict[str, Any]] = []
+        close_events: List[Dict[str, Any]] = []
         try:
             async with self._redis.pipeline() as write_pipe:
                 pending_writes = 0
@@ -1925,7 +2029,6 @@ class RedisStateStore:
                 for key, raw in zip(keys, raw_values):
                     try:
                         result, skip_reason = self._parse_pending_outcome_row(key, raw, data_15m, i15)
-
                         if skip_reason == "raced":
                             continue
                         if skip_reason == "bad_entry_price":
@@ -1948,7 +2051,7 @@ class RedisStateStore:
 
                         if skip_reason == "not_ready":
                             not_ready_count += 1
-                            if cfg.ENABLE_SINGLE_ACTIVE_TRADE and raw:
+                            if (cfg.ENABLE_SINGLE_ACTIVE_TRADE or cfg.ENABLE_TRADE_CLOSE_NOTICE) and raw:
                                 # Stop or target already hit: the trade is over for the
                                 # one-active-trade rule. The row stays until its normal
                                 # horizon resolution, so the Brain statistics are unchanged.
@@ -1958,6 +2061,7 @@ class RedisStateStore:
                                     pending_writes += 1
                                     try:
                                         _d = json_loads(_closed)
+                                        close_events.append(_d)
                                         logger_pair.info(
                                             f"[{pair}] Early-close for one-active-trade | "
                                             f"key={key} | "
@@ -2131,7 +2235,10 @@ class RedisStateStore:
                 f"[{pair}] Failed to persist resolved outcomes (Redis pipeline): {e}{dup_risk}"
             )
             return
-        
+
+        if close_events:
+            await self._publish_close_events(pair, close_events, "Recorded", logger_pair)
+
         self._run_resolved_total += resolved_count
         logger_pair.debug(
             f"[{pair}] Outcome resolution | "
@@ -2188,8 +2295,10 @@ class RedisStateStore:
 
         resolved_count = 0
         hiconf_pct = getattr(cfg, "BRAIN_REWARDABLE_MIN_CONFLUENCE_PCT", 80.0)
+
         stats_ttl = max(cfg.STATE_EXPIRY_DAYS * 86400, 7 * 86400)
         resolved_for_file: List[Dict[str, Any]] = []
+        close_events: List[Dict[str, Any]] = []
 
         try:
             async with self._redis.pipeline() as write_pipe:
@@ -2200,6 +2309,15 @@ class RedisStateStore:
                             key, raw, data_15m, i15
                         )
                         if skip_reason:
+                            if skip_reason == "not_ready" and raw and cfg.ENABLE_TRADE_CLOSE_NOTICE:
+                                _closed = self._early_close_payload(raw, data_15m, i15)
+                                if _closed is not None:
+                                    write_pipe.set(key, _closed, keepttl=True)
+                                    pending_writes += 1
+                                    try:
+                                        close_events.append(json_loads(_closed))
+                                    except Exception:
+                                        pass
                             continue
                         if result is None:
                             continue
@@ -2215,7 +2333,6 @@ class RedisStateStore:
                         conf_total = result["conf_total"]
                         conf_votes = result["conf_votes"]
                         row_context = result.get("context") or {}
-
                         shadow_adx_val = row_context.get("adx_val")
                         shadow_rejection_reason = row_context.get("rejection_reason")
                         shadow_effective_score = row_context.get("effective_score")
@@ -2365,6 +2482,9 @@ class RedisStateStore:
                 f"[{pair}] Failed to persist resolved shadow outcomes (Redis pipeline): {e}{dup_risk}"
             )
             return
+
+        if close_events:
+            await self._publish_close_events(pair, close_events, "Shadowed", logger_pair)
 
         if resolved_count:
             logger_pair.debug(

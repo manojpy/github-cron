@@ -47,9 +47,11 @@ from brain_engine import BrainEngine
 _ALERT_ONLY_MODE: bool = False
 
 from feedback import load_open_positions, poll_feedback
+
 from alerts import (
     TelegramQueue, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
-    DEDUP_STATS, reset_dedup_stats, DLQ_STATS, reset_dlq_stats, replay_telegram_dlq, format_dedup_summary
+    DEDUP_STATS, reset_dedup_stats, DLQ_STATS, reset_dlq_stats, replay_telegram_dlq, format_dedup_summary,
+    send_trade_close_notices,
 )
 from alert_registry import ALERT_KEYS, keys_for
 
@@ -1306,6 +1308,12 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         if sent:
             logger_main.info(f"🎯 Batch dispatch delivered {sent} alert(s)")
 
+    try:
+        announced = await send_trade_close_notices(state_db, telegram_queue, logger_main)
+        if announced:
+            logger_main.info(f"🎯 Trade-update notice sent for {announced} closed trade(s)")
+    except Exception as e:
+        logger_main.warning(f"Trade-update notice failed (non-fatal): {e}")
 
     logger_main.debug(
         f"Results: {len(valid_results)} successful, {len(results) - len(valid_results)} failed"

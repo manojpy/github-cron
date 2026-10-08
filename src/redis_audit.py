@@ -57,6 +57,7 @@ FAMILIES: List[Tuple[str, str, str]] = [
     ("brain_threshold_history", "brain_threshold_history:", "ttl_required"),
     ("brain_vote_counts", "brain_vote_counts:", "ttl_required"),
     ("last_processed_candle", "last_processed_candle:", "ttl_required"),
+    ("trade_cooldown", "trade_cooldown:", "ttl_required"),
     ("brain_filter_tg", "brain_filter_tg:", "ttl_required"),
     ("telegram_dlq", "telegram_dlq:", "ttl_required"),
     ("metadata", "metadata:", "ttl_required"),

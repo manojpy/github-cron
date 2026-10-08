@@ -648,6 +648,9 @@ def _record_status_line(status: str, active: Optional[Dict[str, Any]]) -> str:
         return f"⏭ Ignored — {active.get('pair', '')} {side} trade open since {since}, not recorded"
     if status == "SHADOWED":
         return "👁 Shadowed — tracked for the Brain, not counted as a trade"
+    if status == "COOLDOWN":
+        resume = format_ist_time(int((active or {}).get("until_ts", 0)) + 900, "%H:%M IST")
+        return f"⏸ Cooldown — target recently hit, not recorded or shadowed until the {resume} candle"
     return "📝 Recorded as trade"
 
 def build_pair_msg_and_verdict(
@@ -1201,6 +1204,56 @@ def _buttons_on(queue: Any) -> bool:
     """Took/Skip buttons only when switched on AND the sender supports markup."""
     return (getattr(cfg, "ENABLE_TAKE_SKIP_BUTTONS", False) is True
             and callable(getattr(queue, "send_with_markup", None)))
+
+async def send_trade_close_notices(
+    sdb: RedisStateStore,
+    telegram_queue: TelegramQueue,
+    logger_run: logging.Logger,
+) -> int:
+    """One Telegram message for every Recorded/Shadowed trade that touched its
+    target or stop since the last run. Returns the number of trades announced."""
+    events = list(getattr(sdb, "trade_close_events", None) or [])
+    if not events or not getattr(cfg, "ENABLE_TRADE_CLOSE_NOTICE", True):
+        return 0
+    sdb.trade_close_events.clear()
+
+    label = {
+        "target": "Target Done",
+        "stop": "Stop Loss Hit",
+        "both": "Target and Stop both touched in one candle",
+    }
+    icon = {"target": "✅", "stop": "🛑", "both": "⚠️"}
+    events.sort(key=lambda e: (e["source"] != "Recorded", e["pair"], e["entry_ts"]))
+
+    lines = ["🎯 Trade updates"]
+    for e in events[:30]:
+        side = "BUY" if e["direction"] == "buy" else "SELL"
+        hit = e.get("hit_ts")
+        when = (
+            f"{format_ist_time(int(hit), '%H:%M')}–{format_ist_time(int(hit) + 900, '%H:%M')} candle"
+            if hit else "latest candle"
+        )
+        lines.append(
+            f"{icon.get(e['reason'], '•')} {e['pair']} ({e['source']}) "
+            f"{label.get(e['reason'], 'Closed')} — {side} from "
+            f"{format_ist_time(int(e['entry_ts']), '%H:%M')} candle, hit in {when}"
+        )
+    if len(events) > 30:
+        lines.append(f"… and {len(events) - 30} more")
+
+    text = "\n".join(lines)
+    if cfg.DRY_RUN_MODE:
+        logger_run.info(f"[DRY RUN] Would send trade updates:\n{text}")
+        return len(events)
+    try:
+        ok = await telegram_queue.send(escape_markdown_v2(text))
+    except Exception as e:
+        logger_run.error(f"Trade-update notice failed to send: {e}")
+        return 0
+    if not ok:
+        logger_run.error("Trade-update notice was not delivered (Telegram send returned False)")
+        return 0
+    return len(events)
 
 async def dispatch_combined_alerts(
     payloads: List[AlertPayload],
@@ -2825,6 +2878,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             """Records this pair's fired alerts for later win-rate scoring.
             With `sink`, the rows are appended to it instead of written (DLQ capture)."""
             to_record = list(alerts_to_send)
+            if record_status == "COOLDOWN":
+                logger_pair.info(
+                    f"[{pair_name}] NOT RECORDED ts={ts_curr}: cooldown after target hit "
+                    f"(hit candle {(record_active or {}).get('hit_ts')})"
+                )
+                return
             if cfg.ENABLE_SINGLE_ACTIVE_TRADE:
                 if record_status == "IGNORED":
                     logger_pair.info(
@@ -3069,7 +3128,20 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         record_status = "RECORDED"
         record_active: Optional[Dict[str, Any]] = None
         record_line: Optional[str] = None
-        if cfg.ENABLE_SINGLE_ACTIVE_TRADE and alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER:
+        if alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER and cfg.ENABLE_TRADE_CLOSE_NOTICE:
+            _cd_fn = getattr(sdb, "in_trade_cooldown", None)
+            _cd_hit = await _cd_fn(pair_name, ts_curr) if _cd_fn else None
+            if _cd_hit is not None:
+                record_status = "COOLDOWN"
+                record_active = {
+                    "hit_ts": _cd_hit,
+                    "until_ts": _cd_hit + int(cfg.TRADE_CLOSE_COOLDOWN_CANDLES) * 900,
+                }
+                record_line = _record_status_line(record_status, record_active)
+        if (
+            record_status != "COOLDOWN"
+            and cfg.ENABLE_SINGLE_ACTIVE_TRADE and alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER
+        ):
             record_active = await sdb.get_active_trade(pair_name)
             if record_active:
                 record_status = "IGNORED"
@@ -3247,7 +3319,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 }
             }, payload
 
-        # ═════════════════════════════════════════════�������════════════════════
+        # ═════════════════════════════════════════════���������════════════════════
         # IMMEDIATE MODE  →  legacy per-pair Telegram send (unchanged logic)
         # ══════════════════════════════════════����═════════════════════════════
         async def _refund_alert_budget(n: int) -> None:
