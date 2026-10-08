@@ -2575,6 +2575,65 @@ class RedisStateStore:
             logger.warning(f"batch_get_alert_win_rates({pair}) failed for {len(alert_keys)} keys: {e}")
             return {k: (None, 0) for k in alert_keys}
 
+    async def get_cumulative_outcome_stats(self) -> Dict[str, Dict[str, int]]:
+        """All-time wins/losses for Recorded (ALERT_STATS) and Shadowed (SHADOW_STATS).
+
+        Only base keys ``prefix{pair}:{alert_key}`` are counted; session-scoped
+        keys are skipped. Returns
+        ``{"Recorded": {"wins": W, "losses": L, "total": T}, "Shadowed": {...}}``.
+        """
+        empty = {"wins": 0, "losses": 0, "total": 0}
+        out: Dict[str, Dict[str, int]] = {
+            "Recorded": dict(empty),
+            "Shadowed": dict(empty),
+        }
+        if self.degraded or not self._redis:
+            return out
+
+        prefix_map = {
+            RedisKeyPrefix.ALERT_STATS: "Recorded",
+            RedisKeyPrefix.SHADOW_STATS: "Shadowed",
+        }
+        try:
+            for prefix, label in prefix_map.items():
+                async def _consume(p: str = prefix) -> List[str]:
+                    return [k async for k in self._redis.scan_iter(match=f"{p}*", count=200)]  # type: ignore[union-attr]
+
+                try:
+                    collected = await asyncio.wait_for(_consume(), timeout=8.0)
+                except (asyncio.TimeoutError, Exception):
+                    collected = []
+
+                # base key = exactly one ":" after the prefix (pair:alert_key)
+                base_keys = [
+                    k for k in collected
+                    if str(k)[len(prefix):].count(":") == 1
+                ]
+                if not base_keys:
+                    continue
+
+                async with _rc(self._redis).pipeline() as pipe:
+                    for k in base_keys:
+                        pipe.hgetall(k)
+                    rows = await asyncio.wait_for(
+                        _execute_pipeline(pipe), timeout=5.0
+                    )
+
+                wins = losses = 0
+                for data in rows:
+                    if not data:
+                        continue
+                    wins += int(data.get("wins", 0) or 0)
+                    losses += int(data.get("losses", 0) or 0)
+                out[label] = {
+                    "wins": wins,
+                    "losses": losses,
+                    "total": wins + losses,
+                }
+        except Exception as e:
+            logger.warning(f"get_cumulative_outcome_stats failed: {e}")
+        return out
+
     async def batch_get_all_alert_states(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, bool]:
         if not self._redis or self.degraded or not alert_keys:
             return {k: False for k in alert_keys}

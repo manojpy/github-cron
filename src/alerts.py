@@ -1224,25 +1224,23 @@ async def send_trade_close_notices(
         return 0
     sdb.trade_close_events.clear()
 
-    # ── Run-level close summary (log only) ──
-    # Counts Target / Stop / Both per source and derives a simple win rate.
-    # "both" (target + stop in the same candle) is treated as a non-win.
-    for source in ("Recorded", "Shadowed"):
-        src_events = [e for e in events if e.get("source") == source]
-        if not src_events:
-            continue
-        targets = sum(1 for e in src_events if e.get("reason") == "target")
-        stops = sum(1 for e in src_events if e.get("reason") == "stop")
-        boths = sum(1 for e in src_events if e.get("reason") == "both")
-        total = len(src_events)
-        decided = targets + stops + boths
-        win_rate = (targets / decided * 100.0) if decided else 0.0
-        both_part = f", Both - {boths}" if boths else ""
-        logger_run.info(
-            f"{source} - {total}, Target Achieved - {targets}, "
-            f"Stop loss Hit - {stops}{both_part}, Win Rate - {win_rate:.0f}%"
-        )
-
+    # ── All-time close summary (from Redis stats, beginning of data collection) ──
+    try:
+        cum = await sdb.get_cumulative_outcome_stats()
+        for source in ("Recorded", "Shadowed"):
+            s = cum.get(source) or {}
+            total = int(s.get("total", 0))
+            if total == 0:
+                continue
+            targets = int(s.get("wins", 0))      # wins ≈ target achieved
+            stops = int(s.get("losses", 0))      # losses ≈ stop-loss hit
+            win_rate = (targets / total * 100.0) if total else 0.0
+            logger_run.info(
+                f"{source} - {total}, Target Achieved - {targets}, "
+                f"Stop loss Hit - {stops}, Win Rate - {win_rate:.0f}%"
+            )
+    except Exception as e:
+        logger_run.warning(f"Cumulative outcome stats log failed: {e}")
     label = {
         "target": "Target Done",
         "stop": "Stop Loss Hit",
