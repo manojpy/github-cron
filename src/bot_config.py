@@ -89,7 +89,7 @@ class BotConfig(BaseModel):
     REDIS_CONNECTION_RETRIES: int = 3
     REDIS_RETRY_DELAY: float = 2.0
     REDIS_RECOVERY_COOLDOWN_SEC: float = Field(default=30.0, ge=1.0, le=300.0, description="Minimum seconds between mid-run Redis recovery probes while degraded")
-    REDIS_LOCK_EXPIRY: int = Field(default=900, ge=900, description="Redis lock TTL in seconds")
+    REDIS_LOCK_EXPIRY: int = Field(default=600, ge=300, description="Redis lock TTL in seconds")
     ALERT_DEDUP_WINDOW_SEC: int = Field(default=120, ge=0, description="Dedup window for repeat alerts")
     ENABLE_ALERT_COALESCING: bool = Field(default=True) 
     ENABLE_SINGLE_ACTIVE_TRADE: bool = Field(default=True, description="One recorded trade per pair at a time. While a recorded trade for a pair is still open (its stop or target not yet hit, and its outcome horizon not yet reached), further alerts for that pair are still sent but are labelled 'Ignored' and NOT recorded for the Brain. A same-candle batch of several alert keys records only one trade (the strongest edge), with the other keys kept in its context.")

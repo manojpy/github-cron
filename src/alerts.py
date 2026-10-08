@@ -243,6 +243,13 @@ class TelegramQueue:
                             f"Telegram API error {resp.status}: {description} | "
                             f"chat_id={getattr(self, 'chat_id', '?')}"
                         )
+                        if (resp.status == 400 and "parse entities" in str(description).lower()
+                                and params.get("parse_mode")):
+                            # Same safeguard as _send_impl: resend once as plain text
+                            # instead of losing an alert over a formatting bug.
+                            params.pop("parse_mode", None)
+                            params["text"] = re.sub(r"\\(.)", r"\1", str(params["text"]))
+                            continue
                         return None
                     raise Exception(f"Telegram API error {resp.status}")
 
@@ -1290,6 +1297,7 @@ async def dispatch_combined_alerts(
 
     # ── Global budget enforcement ──
     total_budget = sum(p.budget_count for p in ordered)
+    dropped_pairs: List[str] = []
     async with alerts_sent_lock:
         if alerts_sent_ref[0] + total_budget > max_alerts_per_run:
             allowed = max_alerts_per_run - alerts_sent_ref[0]
@@ -1300,6 +1308,7 @@ async def dispatch_combined_alerts(
                     kept.append(p)
                     running += p.budget_count
                 else:
+                    dropped_pairs.append(p.pair_name)
                     # Release dedup claims for dropped payloads
                     for dk in p.dedup_keys:
                         await sdb.release_recent_alert(p.pair_name, dk)
@@ -1308,6 +1317,15 @@ async def dispatch_combined_alerts(
                 f"Combined dispatch truncated to fit global limit "
                 f"({sum(p.budget_count for p in ordered)}/{max_alerts_per_run})"
             )
+
+    if dropped_pairs:
+        try:
+            await telegram_queue.send(escape_markdown_v2(
+                f"⚠️ Alert limit reached ({max_alerts_per_run}/run): "
+                f"{len(dropped_pairs)} pair alert(s) NOT sent: {', '.join(dropped_pairs[:10])}"
+            ))
+        except Exception as e:
+            logger_run.warning(f"Could not send truncation notice: {e}")
 
     if not ordered:
         return 0

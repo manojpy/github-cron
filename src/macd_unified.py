@@ -586,14 +586,20 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     # Each is collected (preloads.take) where it used to be read.
     preloads = _Preloads()
     _redis_ready = bool(state_db and not state_db.degraded and state_db._redis)
+    _pending_scan: Dict[str, Any] = {}
 
     async def _scan_prefix(prefix: str) -> List[str]:
+        # One SCAN walk serves both outcome_pending: and shadow_pending: lookups.
         # count=2000: SCAN walks the WHOLE keyspace for a MATCH, one round trip
         # per `count` keys, so a small count costs many round trips.
         client = state_db._redis
         if client is None:
             return []
-        return [k async for k in client.scan_iter(match=f"{prefix}*", count=2000)]
+        if "all" not in _pending_scan:
+            async def _walk() -> List[str]:
+                return [k async for k in client.scan_iter(match="*_pending:*", count=2000)]
+            _pending_scan["all"] = asyncio.ensure_future(_walk())
+        return [k for k in await _pending_scan["all"] if k.startswith(prefix)]
 
     async def _calibration_blob() -> Any:
         try:
@@ -1752,6 +1758,16 @@ async def run_once() -> Optional[bool]:
             f"Redis: {redis_status}{redis_mem_field}"
         )
         logger_run.info(summary)
+        if sdb is not None and sdb.degraded and not sdb.degraded_alerted:
+            try:
+                await telegram_queue.send(escape_markdown_v2(
+                    f"⚠️ {cfg.BOT_NAME} - Redis degraded DURING this run. "
+                    f"Alerts evaluated after the failure were blocked (fail-closed).\n"
+                    f"Time: {format_ist_time()}"
+                ))
+                sdb.degraded_alerted = True
+            except Exception as e:
+                logger_run.warning(f"Mid-run degraded notice failed: {e}")
         _dedup_line = format_dedup_summary(DEDUP_STATS)
         logger_run.info(f"🔁 {_dedup_line}")
         if any(DLQ_STATS.values()):
@@ -1793,6 +1809,14 @@ async def run_once() -> Optional[bool]:
                 pairs_to_process, _merged_candles, LAST_CANDLE_OK_THIS_RUN,
                 int(time.time()), int(cfg.LAST_CANDLE_STALE_AFTER_SEC),
             )
+            if candle_freshness["stale"] and sdb and not sdb.degraded:
+                try:
+                    await telegram_queue.send(escape_markdown_v2(
+                        f"🕒 {cfg.BOT_NAME}: no fresh candle for {len(candle_freshness['stale'])} pair(s): "
+                        f"{', '.join(candle_freshness['stale'][:8])}"
+                    ))
+                except Exception:
+                    pass
             if candle_freshness["stale"]:
                 logger_run.warning(
                     f"🕒 Pairs without a fresh successful candle: "
@@ -1893,14 +1917,6 @@ async def run_once() -> Optional[bool]:
                     await telegram_queue.send(escape_markdown_v2("\n".join(_diag)))
             except Exception as e:
                 logger_run.debug(f"Run diagnostic Telegram failed: {e}")
-
-        if alerts_sent_ref[0] > MAX_ALERTS_PER_RUN:
-            await telegram_queue.send(escape_markdown_v2(
-                f"⚠️ HIGH ALERT VOLUME\n"
-                f"Alerts sent: {alerts_sent_ref[0]}\n"
-                f"Pairs processed: {len(all_results)}\n"
-                f"Time: {format_ist_time()}"
-            ))
 
         return True
 

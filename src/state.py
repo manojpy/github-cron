@@ -333,6 +333,8 @@ class RedisStateStore:
         self.metadata_expiry_seconds = 7 * 86400
         self._pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None
         self._shadow_pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None
+        self._dlq_empty_at_start: bool = False
+        self._dlq_pushed_this_run: bool = False
         self.trade_close_events: List[Dict[str, Any]] = []
         self._close_event_ids: Set[Tuple[str, str, str, int]] = set()
         self._run_resolved_total: int = 0
@@ -691,6 +693,18 @@ class RedisStateStore:
             parser=lambda r: r if r else None,
         )
 
+    async def get_durable_metadata(self, key: str, timeout: float = 2.0) -> Optional[str]:
+        """get_metadata for standing decisions: GETEX also pushes the 90-day TTL
+        forward on every read, so an override the bot keeps using never lapses."""
+        return await self._safe_redis_op(
+            lambda: _rc(self._redis).getex(
+                f"{self.meta_prefix}{key}", ex=DURABLE_METADATA_TTL_SEC
+            ),
+            timeout,
+            f"getex_metadata {key}",
+            parser=lambda r: r if r else None,
+        )
+
     async def set_metadata(self, key: str, value: str, timeout: float = 2.0,
                          ttl: Optional[int] = None) -> None:
         if ttl is None:
@@ -716,7 +730,7 @@ class RedisStateStore:
         before deciding whether to auto-disable/auto-reinstate it)."""
         if self.degraded or not self._redis:
             return {}
-        raw = await self.get_metadata(CONFIG_OVERRIDE_METADATA_KEY)
+        raw = await self.get_durable_metadata(CONFIG_OVERRIDE_METADATA_KEY)
         if not raw:
             return {}
         try:
@@ -741,7 +755,8 @@ class RedisStateStore:
             old_value = getattr(cfg, field)
             try:
                 coerced = type(old_value)(new_value)
-                setattr(cfg, field, coerced)
+                # enforces Field(ge/le) and model validators; a ValidationError (a ValueError) leaves cfg unchanged
+                type(cfg).__pydantic_validator__.validate_assignment(cfg, field, coerced)
                 applied.append(f"{field}: {old_value} -> {coerced}")
             except (TypeError, ValueError) as e:
                 logger.warning(f"Ignoring config_override field '{field}' — could not coerce {new_value!r}: {e}")
@@ -786,7 +801,7 @@ class RedisStateStore:
         return True
 
     async def get_disabled_alert_keys(self) -> Set[str]:
-        raw = await self.get_metadata(BRAIN_DISABLED_KEYS_METADATA_KEY)
+        raw = await self.get_durable_metadata(BRAIN_DISABLED_KEYS_METADATA_KEY)
         if not raw:
             return set()
         try:
@@ -855,7 +870,8 @@ class RedisStateStore:
     async def get_pair_thresholds(self) -> Dict[str, float]:
         """All pair -> confluence-abs-score-floor overrides currently stored,
         as learned/written by the brain. Missing or malformed data returns {}."""
-        raw = await self.get_metadata(PAIR_THRESHOLDS_METADATA_KEY)
+
+        raw = await self.get_durable_metadata(PAIR_THRESHOLDS_METADATA_KEY)
         if not raw:
             return {}
         try:
@@ -1233,6 +1249,7 @@ class RedisStateStore:
         """Park a failed-to-send alert. Returns True if it is (now) stored."""
         if self.degraded or not self._redis:
             return False
+        self._dlq_pushed_this_run = True
         digest = hashlib.sha1(message.encode("utf-8")).hexdigest()[:10]
         key = f"{RedisKeyPrefix.TELEGRAM_DLQ}{pair}:{int(ts)}:{digest}"
         entry = {
@@ -1268,6 +1285,7 @@ class RedisStateStore:
 
         keys = await self._safe_redis_op(_scan, 3.0, "dlq_scan")
         if not keys:
+            self._dlq_empty_at_start = True
             return []
         raw_values = await self._safe_redis_op(
             lambda: _rc(self._redis).mget(keys), 3.0, "dlq_mget",
@@ -1289,6 +1307,8 @@ class RedisStateStore:
         """Number of parked alerts (0 if Redis is unavailable)."""
         if self.degraded or not self._redis:
             return 0
+        if getattr(self, "_dlq_empty_at_start", False) and not getattr(self, "_dlq_pushed_this_run", False):
+            return 0  # list was empty at run start and nothing was parked since: skip the SCAN
         pattern = f"{RedisKeyPrefix.TELEGRAM_DLQ}*"
 
         async def _scan() -> List[str]:
@@ -2589,7 +2609,7 @@ class RedisStateStore:
             await self._record_redis_failure(f"batch_get_all_alert_states({pair})", e)
             return {k: False for k in alert_keys}
 
-    async def atomic_batch_update(self, updates: Sequence[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
+    async def atomic_batch_update(self, updates: Sequence[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0, _retried: bool = False) -> bool:
         if self.degraded or not self._redis:
             return False
 
@@ -2651,6 +2671,9 @@ class RedisStateStore:
                 await asyncio.wait_for(pipe.execute(), timeout=timeout)
             return True
         except asyncio.TimeoutError as e:
+            if not _retried:
+                logger.warning("atomic_batch_update timed out — retrying once before degrading")
+                return await self.atomic_batch_update(updates, deletes, timeout, _retried=True)
             await self._record_redis_failure("atomic_batch_update", e)
             return False
         except Exception as e:

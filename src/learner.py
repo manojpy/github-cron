@@ -243,13 +243,29 @@ async def recover_paths(
         _say(f"[learner] path recovery skipped: {e!r}")
         return rows, stats
 
-
 def _jl(raw: Optional[str], default: Any) -> Any:
     try:
         return json.loads(raw) if raw else default
     except Exception:
         return default
 
+async def _strict_get(sdb: RedisStateStore, key: str) -> Optional[str]:
+    """None only when the key is absent; any Redis failure raises (learner exits, nothing overwritten)."""
+    rc = sdb._redis
+    if rc is None:
+        raise RuntimeError("learner: Redis client not connected")
+    return await asyncio.wait_for(rc.get(f"{sdb.meta_prefix}{key}"), timeout=5.0)
+
+
+async def _strict_set_many(sdb: RedisStateStore, items: List[Tuple[str, str]], ttl: int) -> None:
+    """All keys written in one MULTI/EXEC; any failure raises, so the learner never half-writes."""
+    rc = sdb._redis
+    if rc is None:
+        raise RuntimeError("learner: Redis client not connected")
+    async with rc.pipeline(transaction=True) as pipe:
+        for key, value in items:
+            pipe.set(f"{sdb.meta_prefix}{key}", value, ex=ttl)
+        await asyncio.wait_for(pipe.execute(), timeout=10.0)
 
 async def run(args: argparse.Namespace) -> int:
     data_dir = args.data_dir or os.environ.get("OUTCOME_DATA_DIR") or ""
@@ -277,14 +293,15 @@ async def run(args: argparse.Namespace) -> int:
             return 0
 
         if args.rollback:
-            prev = await sdb.get_metadata(KEY_PREV, timeout=5.0)
-            prev_state_raw = await sdb.get_metadata(KEY_STATE_PREV, timeout=5.0)
+            prev = await _strict_get(sdb, KEY_PREV)
+            prev_state_raw = await _strict_get(sdb, KEY_STATE_PREV)
             if not prev:
                 _say("[learner] no previous playbook stored — nothing to roll back to")
                 return 1
-            await sdb.set_metadata(KEY_CURRENT, prev, ttl=_TTL, timeout=5.0)
+            rb_items = [(KEY_CURRENT, prev)]
             if prev_state_raw:
-                await sdb.set_metadata(KEY_STATE, prev_state_raw, ttl=_TTL, timeout=5.0)
+                rb_items.append((KEY_STATE, prev_state_raw))
+            await _strict_set_many(sdb, rb_items, _TTL)
             label = _jl(prev, {}).get("label")
             _say(f"[learner] rolled back to playbook {label}")
             await notify(f"🧠 PLAYBOOK rolled back to {label}")
@@ -313,7 +330,8 @@ async def run(args: argparse.Namespace) -> int:
                     control, control_note = None, "candle history too short"
         _say(f"[learner] control: {'on' if control else 'OFF'} ({control_note})")
 
-        prev_state = _jl(await sdb.get_metadata(KEY_STATE, timeout=5.0), {})
+        prev_state = _jl(await _strict_get(sdb, KEY_STATE), {})
+
         fixed = {
             "sl": float(cfg.OUTCOME_MAE_LOSS_PCT),
             "tp": float(cfg.OUTCOME_MAE_LOSS_PCT) * float(cfg.OUTCOME_RR_TARGET),
@@ -325,7 +343,7 @@ async def run(args: argparse.Namespace) -> int:
             params=params_from_cfg(), control=control, control_note=control_note,
             family_fn=alert_family_of, cost_by_pair=typical_cost_by_pair(rows),
         )
-        prev_sb = _jl(await sdb.get_metadata(KEY_SCORE, timeout=5.0), {})
+        prev_sb = _jl(await _strict_get(sdb, KEY_SCORE), {})
         sb = build_scoreboard(blob, rows, cost_pct=cost_pct, fixed=fixed, criteria=criteria_from_cfg(),
                               family_fn=alert_family_of)
         if prev_sb.get("criteria_hash") and prev_sb["criteria_hash"] != sb["criteria_hash"]:
@@ -352,18 +370,22 @@ async def run(args: argparse.Namespace) -> int:
             _say("[learner] --dry-run: nothing written")
             return 0
 
-        cur = await sdb.get_metadata(KEY_CURRENT, timeout=5.0)
-        cur_state = await sdb.get_metadata(KEY_STATE, timeout=5.0)
-        if cur and changes:                      # keep the last version only when something changed
-            await sdb.set_metadata(KEY_PREV, cur, ttl=_TTL, timeout=5.0)
-            if cur_state:
-                await sdb.set_metadata(KEY_STATE_PREV, cur_state, ttl=_TTL, timeout=5.0)
-        await sdb.set_metadata(KEY_CURRENT, json_dumps(blob), ttl=_TTL, timeout=5.0)
-        await sdb.set_metadata(KEY_STATE, json_dumps(new_state), ttl=_TTL, timeout=5.0)
-        await sdb.set_metadata(KEY_SCORE, json_dumps(sb), ttl=_TTL, timeout=5.0)
-        led = _jl(await sdb.get_metadata(KEY_LEDGER, timeout=5.0), [])
+        cur = await _strict_get(sdb, KEY_CURRENT)
+        cur_state = await _strict_get(sdb, KEY_STATE)
+        led = _jl(await _strict_get(sdb, KEY_LEDGER), [])
         led = (led + [e for e in ledger if e.get("decision") != "COLLECTING"])[-_LEDGER_CAP:]
-        await sdb.set_metadata(KEY_LEDGER, json_dumps(led), ttl=_TTL, timeout=5.0)
+        writes: List[Tuple[str, str]] = []
+        if cur and changes:                      # keep the last version only when something changed
+            writes.append((KEY_PREV, cur))
+            if cur_state:
+                writes.append((KEY_STATE_PREV, cur_state))
+        writes += [
+            (KEY_CURRENT, json_dumps(blob)),
+            (KEY_STATE, json_dumps(new_state)),
+            (KEY_SCORE, json_dumps(sb)),
+            (KEY_LEDGER, json_dumps(led)),
+        ]
+        await _strict_set_many(sdb, writes, _TTL)
         _say(f"[learner] playbook {blob['label']} written ({len(blob['entries'])} entries, {len(changes)} change(s))")
 
         mode = str(cfg.PLAYBOOK_NOTIFY)
