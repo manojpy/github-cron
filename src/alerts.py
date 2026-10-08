@@ -1239,8 +1239,8 @@ async def send_trade_close_notices(
                 f"{source} - {total}, Target Achieved - {targets}, "
                 f"Stop loss Hit - {stops}, Win Rate - {win_rate:.0f}%"
             )
-    except Exception as e:
-        logger_run.warning(f"Cumulative outcome stats log failed: {e}")
+    except Exception as exc:
+        logger_run.warning(f"Cumulative outcome stats log failed: {exc}")
     label = {
         "target": "Target Done",
         "stop": "Stop Loss Hit",
