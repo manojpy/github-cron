@@ -2576,62 +2576,105 @@ class RedisStateStore:
             return {k: (None, 0) for k in alert_keys}
 
     async def get_cumulative_outcome_stats(self) -> Dict[str, Dict[str, int]]:
-        """All-time wins/losses for Recorded (ALERT_STATS) and Shadowed (SHADOW_STATS).
+        """Return cumulative Recorded/Shadowed outcome totals.
 
-        Only base keys ``prefix{pair}:{alert_key}`` are counted; session-scoped
-        keys are skipped. Returns
-        ``{"Recorded": {"wins": W, "losses": L, "total": T}, "Shadowed": {...}}``.
+        Counts:
+        1. Fully resolved outcomes already stored in ALERT_STATS/SHADOW_STATS.
+        2. Pending outcomes that have already been closed early because their
+           target or stop was hit before the normal 12-candle horizon.
+
+        A pending row is counted here only when it has ``closed_reason``.
+        Still-open pending trades are not counted.
+
+        Closed pending rows are counted only until the normal resolver processes
+        them. Once resolved, they are deleted from the pending set and their
+        result is already present in ALERT_STATS/SHADOW_STATS, so there is no
+        double-counting.
         """
         empty = {"wins": 0, "losses": 0, "total": 0}
-        out: Dict[str, Dict[str, int]] = {
-            "Recorded": dict(empty),
-            "Shadowed": dict(empty),
-        }
+        out: Dict[str, Dict[str, int]] = {"Recorded": dict(empty), "Shadowed": dict(empty)}
+
         if self.degraded or not self._redis:
             return out
 
-        prefix_map = {
-            RedisKeyPrefix.ALERT_STATS: "Recorded",
-            RedisKeyPrefix.SHADOW_STATS: "Shadowed",
-        }
+        prefix_map = {RedisKeyPrefix.ALERT_STATS: "Recorded", RedisKeyPrefix.SHADOW_STATS: "Shadowed"}
+
         try:
+            # 1. Count fully resolved outcomes already written to statistics.
             for prefix, label in prefix_map.items():
+
                 async def _consume(p: str = prefix) -> List[str]:
                     return [k async for k in self._redis.scan_iter(match=f"{p}*", count=200)]  # type: ignore[union-attr]
 
                 try:
                     collected = await asyncio.wait_for(_consume(), timeout=8.0)
-                except (asyncio.TimeoutError, Exception):
+                except Exception:
                     collected = []
 
-                # base key = exactly one ":" after the prefix (pair:alert_key)
-                base_keys = [
-                    k for k in collected
-                    if str(k)[len(prefix):].count(":") == 1
-                ]
+                # Base key = exactly one ":" after the statistics prefix.
+                # Session-scoped keys contain an additional ":" and must not be counted.
+                base_keys = [k for k in collected if str(k)[len(prefix):].count(":") == 1]
+
                 if not base_keys:
                     continue
 
                 async with _rc(self._redis).pipeline() as pipe:
                     for k in base_keys:
                         pipe.hgetall(k)
-                    rows = await asyncio.wait_for(
-                        _execute_pipeline(pipe), timeout=5.0
-                    )
+                    rows = await asyncio.wait_for(_execute_pipeline(pipe), timeout=5.0)
 
-                wins = losses = 0
                 for data in rows:
                     if not data:
                         continue
-                    wins += int(data.get("wins", 0) or 0)
-                    losses += int(data.get("losses", 0) or 0)
-                out[label] = {
-                    "wins": wins,
-                    "losses": losses,
-                    "total": wins + losses,
-                }
+                    out[label]["wins"] += int(data.get("wins", 0) or 0)
+                    out[label]["losses"] += int(data.get("losses", 0) or 0)
+
+            # 2. Add early-closed pending outcomes.
+            pending_map = {RedisKeyPrefix.OUTCOME_PENDING: "Recorded", RedisKeyPrefix.SHADOW_PENDING: "Shadowed"}
+
+            for prefix, label in pending_map.items():
+                try:
+                    pending_keys = [k async for k in self._redis.scan_iter(match=f"{prefix}*", count=2000)]  # type: ignore[union-attr]
+                except Exception as e:
+                    logger.debug(f"Pending outcome scan failed for {label}: {e}")
+                    continue
+
+                if not pending_keys:
+                    continue
+
+                async with _rc(self._redis).pipeline() as pipe:
+                    for key in pending_keys:
+                        pipe.get(key)
+                    pending_rows = await asyncio.wait_for(_execute_pipeline(pipe), timeout=5.0)
+
+                for raw in pending_rows:
+                    if not raw:
+                        continue
+
+                    try:
+                        data = json_loads(raw)
+                    except Exception:
+                        continue
+
+                    # Only count trades whose TP/SL has actually been hit.
+                    closed_reason = str(data.get("closed_reason") or "").lower()
+
+                    if not closed_reason:
+                        continue
+
+                    if closed_reason == "target":
+                        out[label]["wins"] += 1
+                    elif closed_reason in ("stop", "both"):
+                        # "both" means TP and SL were touched inside the same candle.
+                        out[label]["losses"] += 1
+
+            # 3. Recalculate totals after adding early-closed outcomes.
+            for label in ("Recorded", "Shadowed"):
+                out[label]["total"] = out[label]["wins"] + out[label]["losses"]
+
         except Exception as e:
             logger.warning(f"get_cumulative_outcome_stats failed: {e}")
+
         return out
 
     async def batch_get_all_alert_states(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, bool]:
@@ -2742,7 +2785,7 @@ class RedisStateStore:
             await self._record_redis_failure("atomic_batch_update", e)
             return False
 
-    # ── CUSUM state persistence ────────────────────────────────���────────
+    # ── CUSUM state persistence ────────────────────────────────�����───────
     async def load_cusum_state(self, alert_key: str) -> Optional[Dict[str, Any]]:
         """Load persisted CUSUM accumulator for one alert_key."""
         if self.degraded or not self._redis:
