@@ -38,6 +38,8 @@ def get_dir_size(path: Path) -> int:
     total = 0
     try:
         for entry in path.rglob("*"):
+            if ".git" in entry.relative_to(path).parts:
+                continue
             if entry.is_file():
                 total += entry.stat().st_size
     except (OSError, PermissionError):

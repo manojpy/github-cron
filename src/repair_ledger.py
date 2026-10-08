@@ -9,6 +9,7 @@ learn. This module gives each repair an identity, a "before" snapshot, an
 in the shop depends on.
 """
 from __future__ import annotations
+import asyncio
 import hashlib
 import time
 from collections import defaultdict
@@ -107,6 +108,20 @@ async def _load_ledger(sdb) -> List[dict]:
     except Exception:
         return []
 
+async def _load_ledger_strict(sdb) -> List[dict]:
+    """Like _load_ledger, but raises when Redis can't be read or the payload
+    is corrupt, so a writer never overwrites real history with an empty list."""
+    rc = sdb._redis
+    if rc is None or sdb.degraded:
+        raise RuntimeError("repair ledger: Redis unavailable")
+    raw = await asyncio.wait_for(rc.get(f"{sdb.meta_prefix}{LEDGER_KEY}"), timeout=5.0)
+    if not raw:
+        return []
+    data = json_loads(raw)
+    if not isinstance(data, list):
+        raise ValueError("repair ledger: payload is not a list")
+    return data
+
 async def _save_ledger(sdb, entries: List[dict]) -> None:
     entries = entries[:LEDGER_MAX]
     await sdb.set_metadata(LEDGER_KEY, json_dumps(entries),
@@ -144,7 +159,12 @@ async def record_repair_issued(sdb, rec: Dict[str, Any],
         "verdict": None,
         "delta_observed": None,
     }
-    entries = await _load_ledger(sdb)
+    if sdb.degraded or not sdb._redis:
+        return None
+    try:
+        entries = await _load_ledger_strict(sdb)
+    except Exception:
+        return None
     # If this repair was already issued in the same 15m bucket, refresh it
     # rather than duplicating.
     for i, e in enumerate(entries):
@@ -159,7 +179,10 @@ async def record_repair_issued(sdb, rec: Dict[str, Any],
 async def mark_plan_applied(sdb, plan_ts: int) -> int:
     """Called by apply_pending_plan. Marks every repair whose issued_at is
     within APPLY_WINDOW_SEC of the plan's own timestamp. Returns count."""
-    entries = await _load_ledger(sdb)
+    try:
+        entries = await _load_ledger_strict(sdb)
+    except Exception:
+        return 0
     n = 0
     now = int(time.time())
     for e in entries:

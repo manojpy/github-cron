@@ -708,6 +708,7 @@ def build_pair_msg_and_verdict(
                 if cfg.ENABLE_ALERT_UNPROVEN_TAKE else None
             ),
             unproven_size=cfg.ALERT_UNPROVEN_SIZE_MULT,
+            price=float(price) if isinstance(price, (int, float)) else None,
 
             playbook=next((pb_by_key[k] for k in s_keys if pb_by_key and pb_by_key.get(k)), None),
             playbook_mode=str(getattr(cfg, "PLAYBOOK_MODE", "off")),

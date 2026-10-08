@@ -278,7 +278,10 @@ class BrainCore:
             if raw:
                 existing = json_loads(raw)
                 built_at = existing.get("built_at")
-                if existing.get("curves") and built_at is not None:
+                if built_at is not None and (
+                    existing.get("curves")
+                    or existing.get("status") == "INSUFFICIENT_SAMPLES"
+                ):
                     age_hr = (time.time() - float(built_at)) / 3600.0
                     if age_hr < max_age_hr:
                         if getattr(cfg, "ENABLE_ONLINE_CALIBRATION", True):
@@ -981,7 +984,9 @@ class BrainCore:
             if not rows_sorted:
                 continue
 
+            last_consumed = watermark
             for r in rows_sorted:
+                last_consumed = r.get("entry_ts", 0)
                 # Deliberately binary: CUSUM detects edge DECAY. s_neg only
                 # accumulates on losses (x < mu), so bonus-weighting wins
                 # cannot change decay detection — keep raw win/loss here.
@@ -1003,7 +1008,8 @@ class BrainCore:
                         ),
                     })
                     break
-            to_save.append((alert_key, det.to_dict(), rows_sorted[-1]["entry_ts"]))
+
+            to_save.append((alert_key, det.to_dict(), last_consumed))
         await self.sdb.save_cusum_bulk(to_save)
         return drift_alerts
 

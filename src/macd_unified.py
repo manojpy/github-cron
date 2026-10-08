@@ -1223,12 +1223,10 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     )
     eval_elapsed = time.time() - eval_start
     logger_main.debug(f"Evaluation complete: {eval_elapsed:.1f}s")
-
-
     kill_switch_tripped_this_run = False
-    if cfg.ENABLE_KILL_SWITCH and state_db and not state_db.degraded and state_db._redis:
-        try:
-            
+    if (cfg.ENABLE_KILL_SWITCH and not kill_switch_active_run
+            and state_db and not state_db.degraded and state_db._redis):
+        try:      
             from outcome_storage import load_recent_outcomes
             recent = load_recent_outcomes(hours=cfg.KILL_SWITCH_LOOKBACK_HOURS)
             ks_state = engine.KillSwitch(

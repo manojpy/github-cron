@@ -139,15 +139,41 @@ def _plan(tqs: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
             }, n, validated
     return best
 
-def _plan_line(plan: Optional[Dict[str, float]], default_sl: float, rr: float) -> str:
+def _px(v: float) -> str:
+    """Price with enough decimals for low-priced pairs (levels sit well under 1% apart)."""
+    v = float(v)
+    if v >= 1000:
+        return f"${v:,.2f}"
+    if v >= 1:
+        return f"${v:,.4f}"
+    if v >= 0.01:
+        return f"${v:,.5f}"
+    return f"${v:,.7f}"
+
+def _level(price: float, direction: Optional[str], pct: float, favourable: bool) -> float:
+    """Absolute price of a level `pct` percent from entry. favourable=True is the
+    profit side (TP): above entry for a buy, below for a sell; False is the stop."""
+    sign = 1.0 if (str(direction).lower() == "buy") == favourable else -1.0
+    return price * (1.0 + sign * float(pct) / 100.0)
+
+def _plan_line(plan: Optional[Dict[str, float]], default_sl: float, rr: float,
+               direction: Optional[str] = None, price: Optional[float] = None) -> str:
+    use_px = isinstance(price, (int, float)) and price > 0 and direction in ("buy", "sell")
     if plan:
         r1, r2 = plan["tp1"] / plan["sl"], plan["tp2"] / plan["sl"]
         tag = " · validated zone" if plan.get("validated") else ""
+        if use_px:
+            return (f"🛡 SL {_px(_level(price, direction, plan['sl'], False))}"
+                    f" | TP1 {_px(_level(price, direction, plan['tp1'], True))} ({r1:.1f}R)"
+                    f" | TP2 {_px(_level(price, direction, plan['tp2'], True))} ({r2:.1f}R){tag}")
         return (f"🛡 SL -{plan['sl']:.2f}% | TP1 +{plan['tp1']:.2f}% ({r1:.1f}R)"
                 f" | TP2 +{plan['tp2']:.2f}% ({r2:.1f}R){tag}")
+    if use_px:
+        return (f"🛡 SL {_px(_level(price, direction, default_sl, False))}"
+                f" | TP {_px(_level(price, direction, default_sl * rr, True))} "
+                f"({rr:.1f}R) · default plan, no history")
     return (f"🛡 SL -{default_sl:.2f}% | TP +{default_sl * rr:.2f}% "
             f"({rr:.1f}R) · default plan, no history")
-
 
 def _support_labels(votes: Optional[Dict[str, bool]], weights: Optional[Dict[str, float]],
                     passing: bool, limit: int) -> List[str]:
@@ -188,6 +214,7 @@ def _advise_pair_core(
     vote_weights: Optional[Dict[str, float]] = None,
     unproven_take_min_pct: Optional[float] = None,   # 0-100; None = feature off
     unproven_size: float = 0.25,
+    price: Optional[float] = None,
 ) -> PairAdvice:
     data = [t for t in tqs if isinstance(t, dict) and _num(t.get("net_ev")) is not None]
     blocked = any(isinstance(t, dict) and str(t.get("verdict")) == "BLOCKED" for t in tqs)
@@ -205,8 +232,8 @@ def _advise_pair_core(
     else:
         tech = "Marginal technical setup"
 
-    plan = _plan(data)
-    plan_line = _plan_line(plan, default_sl_pct, default_rr)
+    plan = _plan(data)  
+    plan_line = _plan_line(plan, default_sl_pct, default_rr, direction, price)
     support = _support_labels(votes, vote_weights, True, 3)
     weak = _support_labels(votes, vote_weights, False, 2)
     support_txt = _support_text(votes, vote_weights, support)
@@ -387,11 +414,18 @@ def _advise_pair_core(
 # ── Playbook overlay (learner output; restrict-only by default) ───────────
 _PB_NEGATIVE = ("NO_EDGE", "FAILED_OOS", "DEMOTED", "EXPIRED")
 
-
-def _pb_plan_text(p: Dict[str, Any]) -> str:
-    txt = f"SL -{float(p['sl']):g}% | TP +{float(p['tp']):g}% | exit by {int(p['h'])} candles"
-    if float(p.get("be") or 0) > 0:
-        txt += f" | stop to breakeven at +{float(p['be']):g}%"
+def _pb_plan_text(p: Dict[str, Any], direction: Optional[str] = None,
+                  price: Optional[float] = None) -> str:
+    if isinstance(price, (int, float)) and price > 0 and direction in ("buy", "sell"):
+        txt = (f"SL {_px(_level(price, direction, float(p['sl']), False))} | "
+               f"TP {_px(_level(price, direction, float(p['tp']), True))} | "
+               f"exit by {int(p['h'])} candles")
+        if float(p.get("be") or 0) > 0:
+            txt += f" | stop to breakeven at {_px(_level(price, direction, float(p['be']), True))}"
+    else:
+        txt = f"SL -{float(p['sl']):g}% | TP +{float(p['tp']):g}% | exit by {int(p['h'])} candles"
+        if float(p.get("be") or 0) > 0:
+            txt += f" | stop to breakeven at +{float(p['be']):g}%"
     if float(p.get("trail") or 0) > 0:
         txt += f" | trail {float(p['trail']):g}%"
     return txt
@@ -439,7 +473,7 @@ def advise_pair(
             tag = "validated" if status == "VALIDATED" else "validation overdue"
             ev = h.get("ev")
             ev_txt = f", out-of-sample EV {float(ev):+.2f}% (n={int(h.get('n', 0))})" if isinstance(ev, (int, float)) else ""
-            advice.plan_line = f"🛡 {_pb_plan_text(playbook['plan'])} · {tag} plan{ev_txt} [{ver}]"
+            advice.plan_line = f"🛡 {_pb_plan_text(playbook['plan'], kwargs.get('direction'), kwargs.get('price'))} · {tag} plan{ev_txt} [{ver}]"
             sm = playbook.get("size_mult")
             if isinstance(sm, (int, float)):
                 if sm <= 0:

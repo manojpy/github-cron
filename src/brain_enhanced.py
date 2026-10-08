@@ -1313,13 +1313,14 @@ class BrainEngineV2(BrainCore):
                     + "\n".join(applied)
                     + trailer
                 )
-                await telegram_queue.send(escape_markdown_v2(msg))
+
                 await self._record_plan_event(plan.get("plan_id"), "applied", "; ".join(applied)[:200])
                 await self._save_apply_snapshot(
                     plan.get("plan_id"), snap_overrides, snap_disabled, snap_weights,
                 )
                 # Clear the pending plan
                 await self.sdb.set_metadata("brain_pending_plan", "{}", ttl=60)
+                await telegram_queue.send(escape_markdown_v2(msg))
                 return True
             else:
                 await telegram_queue.send(escape_markdown_v2(
