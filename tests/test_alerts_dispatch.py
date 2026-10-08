@@ -107,12 +107,13 @@ def test_bias_alignment():
     assert A._bias_alignment("buy", NS(up_pct=0.3, down_pct=0.3)) == "neutral"
     assert A._bias_alignment("buy", None) == "neutral"
 
-
 def test_price_precision_for_low_priced_pairs():
+    # Rules: >=10 → 2dp, >=1 → 3dp, <1 → 4dp
     assert A._format_price(0.0462) == "$0.0462"
-    assert A._format_price(0.00731) == "$0.007310"
-    assert A._format_price(1.1934) == "$1.19" and A._format_price(108420) == "$108,420.00"
-
+    assert A._format_price(0.00731) == "$0.0073"
+    assert A._format_price(1.1934) == "$1.193"
+    assert A._format_price(10.5) == "$10.50"
+    assert A._format_price(108420) == "$108,420.00"
 
 def _msg(**over):
     kw = dict(pair="LABUSD", direction="sell", price=0.0462, ts=1790826300, score=24, total=27,
