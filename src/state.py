@@ -1982,8 +1982,11 @@ class RedisStateStore:
             return
         cooldown_hit_ts: Optional[int] = None
         for d in rows:
+            raw_entry = d.get("entry_ts")
+            if raw_entry is None:
+                continue
             try:
-                entry_ts = int(d.get("entry_ts"))
+                entry_ts = int(raw_entry)
             except (TypeError, ValueError):
                 continue
             direction = "buy" if str(d.get("direction", "")).lower() in ("buy", "long") else "sell"
