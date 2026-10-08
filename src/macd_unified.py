@@ -1329,7 +1329,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             targets = int(s.get("wins", 0))
             stops = int(s.get("losses", 0))
             win_rate = (targets / total * 100.0) if total else 0.0
-            logger_....info(
+            logger_main.info(
                 f"{source} - {total}, Target Achieved - {targets}, "
                 f"Stop loss Hit - {stops}, Win Rate - {win_rate:.0f}%"
             )
