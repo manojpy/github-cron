@@ -159,7 +159,8 @@ def _plan_line(plan: Optional[Dict[str, float]], default_sl: float, rr: float,
                direction: Optional[str] = None, price: Optional[float] = None) -> str:
     use_px = isinstance(price, (int, float)) and price > 0 and direction in ("buy", "sell")
     # Narrow for mypy: use_px already guarantees a positive numeric price.
-    px: float = float(price) if use_px else 0.0
+    px: float = float(price) if (use_px and price is not None) else 0.0
+
     if plan:
         r1, r2 = plan["tp1"] / plan["sl"], plan["tp2"] / plan["sl"]
         tag = " · validated zone" if plan.get("validated") else ""
