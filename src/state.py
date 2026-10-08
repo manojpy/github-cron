@@ -1555,8 +1555,10 @@ class RedisStateStore:
             logger_pair.debug(f"Failed to scan {label} outcomes for {pair}: {e}")
             return []
 
+
     def _parse_pending_outcome_row(
         self, key: str, raw: Optional[str], data_15m: "PriceData", i15: int,
+        end_idx: Optional[int] = None,
     ) -> Tuple[Optional[Dict[str, Any]], str]:
         if raw is None:
             return None, "raced"
@@ -1601,6 +1603,9 @@ class RedisStateStore:
         # FIX (Issue 2): Anchor lookahead horizon to the fill candle, not the signal candle.
         # This ensures the trade is evaluated over the full N candles post-execution.
         target_idx = fill_idx + cfg.OUTCOME_LOOKAHEAD_CANDLES
+        if end_idx is not None:
+            # Early grading: stop at the candle that touched target/stop.
+            target_idx = min(int(end_idx), target_idx)
         if target_idx > i15:
             return None, "not_ready"
         future_price = float(data_15m.close[target_idx])
@@ -1897,6 +1902,93 @@ class RedisStateStore:
         except Exception:
             return None
 
+    def _early_close_result(
+        self, key: str, closed_json: str, data_15m: "PriceData", i15: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Final outcome of a trade whose target/stop has already been touched,
+        graded on the path up to the hit candle only (same rules as the full
+        12-candle grading, which cannot change a win/loss that is already
+        decided). Returns None when the hit candle cannot be located."""
+        try:
+            hit_ts = json_loads(closed_json).get("closed_candle_ts")
+            if hit_ts is None:
+                return None
+            hits = np.flatnonzero(data_15m.ts == int(hit_ts))
+            if hits.size == 0:
+                return None
+            result, skip_reason = self._parse_pending_outcome_row(
+                key, closed_json, data_15m, i15, end_idx=int(hits[-1]),
+            )
+            return result if not skip_reason else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _early_archive_row(
+        pair: str, result: Dict[str, Any], closed_json: str, shadow: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """Archive row for a trade that closed early. Win/loss, bracket P&L and
+        conditions are final; anything that depends on the rest of the 12-candle
+        path is left empty (never fabricated). The full row written at the
+        horizon carries the same _stream_id and replaces this one in the reader."""
+        conf_score = result.get("conf_score")
+        conf_total = result.get("conf_total")
+        if conf_score is None or conf_total is None:
+            return None
+        entry_ts = result["entry_ts"]
+        row_context = result.get("context")
+        _ctx = row_context if isinstance(row_context, dict) else {}
+        path_scalars = outcome_path_fields(result, stream=False)
+        path_scalars.update({
+            "path": None, "mfe_candle": None, "mae_candle": None,
+            "net_pnl_hold_pct": None,
+        })
+        try:
+            closed_candle_ts = json_loads(closed_json).get("closed_candle_ts")
+        except Exception:
+            closed_candle_ts = None
+        row: Dict[str, Any] = {
+            "_stream_id": f"{pair}:{result['alert_key']}:{entry_ts}",
+            "pair": str(pair),
+            "alert_key": str(result["alert_key"]),
+            "direction": str(result["direction"]),
+            "entry_ts": entry_ts,
+            "score": conf_score,
+            "total": conf_total,
+            "win": result["win"],
+            "pct_move": result["pct_move"],
+            "session": _get_session_from_ts(entry_ts) if entry_ts else "dead",
+            "votes": result.get("conf_votes"),
+            "context": row_context,
+            # ── Final facts of an early close ──
+            "tp_first": result.get("tp_first"),
+            "outcome_reason": result.get("outcome_reason", "unknown"),
+            "net_pnl_pct": result.get("net_pnl_pct", 0.0),
+            "realized_cost_pct": result.get("realized_cost_pct", 0.0),
+            "signal_price": result.get("signal_price"),
+            "fill_price": result.get("fill_price"),
+            "fees_paid_pct": result.get("fees_paid_pct"),
+            "effective_score": result.get("effective_score"),
+            "effective_required": result.get("effective_required"),
+            "macro_multiplier": result.get("macro_multiplier"),
+            "cluster_penalty": result.get("cluster_penalty"),
+            "gate_passed": result.get("gate_passed"),
+            # ── Needs the full path: left empty until the horizon row arrives ──
+            "mae": None, "mfe": None,
+            "close_win": None, "mfe_win": None, "mae_loss": None,
+            "bonus_win": None, "rr_achieved": None, "win_weight": None,
+            **path_scalars,
+            "adx_val": result.get("adx_val"),
+            "early_close": True,
+            "path_complete": False,
+            "closed_candle_ts": closed_candle_ts,
+        }
+        if shadow:
+            row["shadow"] = True
+            row["adx_val"] = _ctx.get("adx_val")
+            row["rejection_reason"] = _ctx.get("rejection_reason")
+        return row
+
     async def get_active_trade(self, pair: str) -> Optional[Dict[str, Any]]:
         """The open recorded trade for this pair, or None.
 
@@ -2044,6 +2136,7 @@ class RedisStateStore:
 
         stats_ttl = max(cfg.STATE_EXPIRY_DAYS * 86400, 7 * 86400)
         resolved_for_file: List[Dict[str, Any]] = []
+        early_for_file: List[Dict[str, Any]] = []
         close_events: List[Dict[str, Any]] = []
         try:
             async with self._redis.pipeline() as write_pipe:
@@ -2079,9 +2172,18 @@ class RedisStateStore:
                                 # one-active-trade rule. The row stays until its normal
                                 # horizon resolution, so the Brain statistics are unchanged.
                                 _closed = self._early_close_payload(raw, data_15m, i15)
+
                                 if _closed is not None:
                                     write_pipe.set(key, _closed, keepttl=True)
                                     pending_writes += 1
+                                    if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                                        _er = self._early_close_result(key, _closed, data_15m, i15)
+                                        _erow = (
+                                            self._early_archive_row(pair, _er, _closed, False)
+                                            if _er else None
+                                        )
+                                        if _erow is not None:
+                                            early_for_file.append(_erow)
                                     try:
                                         _d = json_loads(_closed)
                                         close_events.append(_d)
@@ -2235,11 +2337,11 @@ class RedisStateStore:
                     # write fails we bail out before the Redis pipeline executes, so
                     # the pending outcomes stay in Redis and are retried next run
                     # instead of being lost from the Brain archive.
-                    if resolved_for_file and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                    if (resolved_for_file or early_for_file) and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                         try:                    
                             from outcome_storage import append_outcome_batch
                             await asyncio.to_thread(
-                                append_outcome_batch, resolved_for_file, False
+                                append_outcome_batch, resolved_for_file + early_for_file, False
                             )
                             self._run_archived_total += len(resolved_for_file)
                         except Exception as e:
@@ -2321,6 +2423,7 @@ class RedisStateStore:
 
         stats_ttl = max(cfg.STATE_EXPIRY_DAYS * 86400, 7 * 86400)
         resolved_for_file: List[Dict[str, Any]] = []
+        early_for_file: List[Dict[str, Any]] = []
         close_events: List[Dict[str, Any]] = []
 
         try:
@@ -2337,6 +2440,14 @@ class RedisStateStore:
                                 if _closed is not None:
                                     write_pipe.set(key, _closed, keepttl=True)
                                     pending_writes += 1
+                                    if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                                        _er = self._early_close_result(key, _closed, data_15m, i15)
+                                        _erow = (
+                                            self._early_archive_row(pair, _er, _closed, True)
+                                            if _er else None
+                                        )
+                                        if _erow is not None:
+                                            early_for_file.append(_erow)
                                     try:
                                         close_events.append(json_loads(_closed))
                                     except Exception:
@@ -2485,11 +2596,11 @@ class RedisStateStore:
                     # write fails we bail out before the Redis pipeline runs,
                     # so the shadow pending outcomes stay in Redis and are
                     # retried next run instead of being lost from the archive.
-                    if resolved_for_file and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                    if (resolved_for_file or early_for_file) and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                         try:
                             from outcome_storage import append_outcome_batch
                             await asyncio.to_thread(
-                                append_outcome_batch, resolved_for_file, True
+                                append_outcome_batch, resolved_for_file + early_for_file, True
                             )
                         except Exception as e:
                             logger_pair.error(

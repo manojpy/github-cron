@@ -205,8 +205,11 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
             "adx_val": float(_adx_val) if _adx_val is not None and _adx_val != "" else None,
             "rejection_reason": _rejection_reason,
             # ── Provenance — lets downstream consumers audit vintage ──
+
             "schema_version": row_schema,
             "migrated": is_migrated,
+            # False = closed early at target/stop; the full-path row replaces it later
+            "path_complete": _coerce_bool(raw.get("path_complete"), default=True),
         }
     except Exception:
         return None
@@ -256,6 +259,7 @@ def load_archived_outcomes(
         "migrated_forward": 0,
         "dropped_before_window": 0,
         "dropped_duplicate_sid": 0,
+        "upgraded_early": 0,
         "kept": 0,
     }
 
@@ -264,8 +268,7 @@ def load_archived_outcomes(
 
     cutoff = time.time() - (window_days * 86400)
     rows: List[Dict[str, Any]] = []
-    seen_ids: set = set()
-
+    seen_ids: Dict[str, Optional[int]] = {}   # _stream_id -> index in rows (None = not kept)
     # Filenames are YYYY-MM-DD.jsonl (per outcome_storage._today_file).
     # Reverse lexicographic = newest date first, which lets the mtime
     all_files = list(root.glob("*.jsonl")) + list(root.glob("*.jsonl.gz"))
@@ -299,12 +302,23 @@ def load_archived_outcomes(
 
                     # Deduplicate by stream ID if present (Redis-exported rows)
                     sid = raw.get("_stream_id")
+                    replace_idx: Optional[int] = None
                     if sid:
-                        if sid in seen_ids:
-                            stats["dropped_duplicate_sid"] += 1
-                            continue
-                        seen_ids.add(sid)
-
+                        if sid in seen_ids and seen_ids[sid] is not None:
+                            # Same trade seen twice. Keep one row: the full-path row
+                            # (path_complete) wins over an early-close row.
+                            prev_idx = seen_ids[sid]
+                            if (
+                                prev_idx is not None
+                                and _coerce_bool(raw.get("path_complete"), default=True)
+                                and rows[prev_idx].get("path_complete") is False
+                            ):
+                                replace_idx = prev_idx
+                            else:
+                                stats["dropped_duplicate_sid"] += 1
+                                continue
+                        else:
+                            seen_ids[sid] = None
                     # Time filter
                     ts = int(raw.get("entry_ts", 0))
                     if ts < cutoff:
@@ -326,8 +340,13 @@ def load_archived_outcomes(
                             migrated = True
 
                     parsed = _parse_jsonl_row(raw, drop_stale_schema=drop_stale_schema)
-                    if parsed:
+                    if parsed and replace_idx is not None:
+                        rows[replace_idx] = parsed          # early row upgraded to full row
+                        stats["upgraded_early"] += 1
+                    elif parsed:
                         rows.append(parsed)
+                        if sid:
+                            seen_ids[sid] = len(rows) - 1
                         stats["kept"] += 1
                         if migrated:
                             stats["migrated_forward"] += 1
