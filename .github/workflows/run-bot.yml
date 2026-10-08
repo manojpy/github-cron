@@ -246,18 +246,22 @@ jobs:
 
       - name: ✅ Apply Brain Plan (on-demand)
         if: inputs.apply_brain_plan == true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          DELTA_API_BASE: ${{ secrets.DELTA_API_BASE }}
         run: |
           set -o pipefail
           mkdir -p logs
           ENV_FILE="$(pwd)/.bot_env"
           trap 'rm -f "$ENV_FILE"' EXIT
-
-          cat > "$ENV_FILE" <<EOF
-          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
-          REDIS_URL=${{ secrets.REDIS_URL }}
-          DELTA_API_BASE=${{ secrets.DELTA_API_BASE }}
-          EOF
+          {
+            printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TELEGRAM_BOT_TOKEN"
+            printf 'TELEGRAM_CHAT_ID=%s\n' "$TELEGRAM_CHAT_ID"
+            printf 'REDIS_URL=%s\n' "$REDIS_URL"
+            printf 'DELTA_API_BASE=%s\n' "$DELTA_API_BASE"
+          } > "$ENV_FILE"
 
           # The archive checkout is skipped for apply runs; create the folder the
           # image probes for writability at import time.
@@ -301,8 +305,13 @@ jobs:
         if: inputs.apply_brain_plan != true
         id: bot_run
         timeout-minutes: 12
+
         env:
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          DELTA_API_BASE: ${{ secrets.DELTA_API_BASE }}
         run: |
           set -o pipefail
           mkdir -p logs
@@ -323,18 +332,18 @@ jobs:
           ENV_FILE="$(pwd)/.bot_env"
           trap 'rm -f "$ENV_FILE"' EXIT
 
-          cat > "$ENV_FILE" <<EOF
-          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
-          REDIS_URL=${{ secrets.REDIS_URL }}
-          DELTA_API_BASE=${{ secrets.DELTA_API_BASE }}
-          DRY_RUN_MODE=$DRY_RUN
-          TRIGGER_TIMESTAMP=$START_TIME
-          CLEAR_REDIS=$CLEAR_REDIS
-          BRAIN_REPORT_ON_DEMAND=$BRAIN_FULL
-          BRAIN_ARCHIVE_SHALLOW=$BRAIN_SHALLOW
-          CLEAR_KILL_SWITCH=$CLEAR_KILL_SWITCH
-          EOF
+          {
+            printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TELEGRAM_BOT_TOKEN"
+            printf 'TELEGRAM_CHAT_ID=%s\n' "$TELEGRAM_CHAT_ID"
+            printf 'REDIS_URL=%s\n' "$REDIS_URL"
+            printf 'DELTA_API_BASE=%s\n' "$DELTA_API_BASE"
+            printf 'DRY_RUN_MODE=%s\n' "$DRY_RUN"
+            printf 'TRIGGER_TIMESTAMP=%s\n' "$START_TIME"
+            printf 'CLEAR_REDIS=%s\n' "$CLEAR_REDIS"
+            printf 'BRAIN_REPORT_ON_DEMAND=%s\n' "$BRAIN_FULL"
+            printf 'BRAIN_ARCHIVE_SHALLOW=%s\n' "$BRAIN_SHALLOW"
+            printf 'CLEAR_KILL_SWITCH=%s\n' "$CLEAR_KILL_SWITCH"
+          } > "$ENV_FILE"
 
           set +e
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
@@ -440,7 +449,7 @@ jobs:
           fi
 
       - name: 📦 Upload Execution Logs
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: bot-execution-logs-${{ github.run_number }}
@@ -554,6 +563,9 @@ jobs:
             if git push "$PUSH_URL" HEAD:main; then
               echo "✅ Outcomes pushed (attempt ${attempt})"
               exit 0
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              break
             fi
             echo "::warning::Push rejected (attempt ${attempt}/5) — rebasing onto latest main"
             sleep $(( attempt * 2 + RANDOM % 3 ))

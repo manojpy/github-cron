@@ -87,15 +87,20 @@ jobs:
           ROLLBACK: ${{ inputs.rollback }}
           NO_CONTROL: ${{ inputs.no_control }}
           NO_RECON: ${{ inputs.no_recon }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          DELTA_API_BASE: ${{ secrets.DELTA_API_BASE }}
         run: |
           ENV_FILE="$(pwd)/.bot_env"
-          cat > "$ENV_FILE" <<EOF
-          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
-          REDIS_URL=${{ secrets.REDIS_URL }}
-          DELTA_API_BASE=${{ secrets.DELTA_API_BASE }}
-          OUTCOME_DATA_DIR=/data
-          EOF
+          {
+            printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TELEGRAM_BOT_TOKEN"
+            printf 'TELEGRAM_CHAT_ID=%s\n' "$TELEGRAM_CHAT_ID"
+            printf 'REDIS_URL=%s\n' "$REDIS_URL"
+            printf 'DELTA_API_BASE=%s\n' "$DELTA_API_BASE"
+            printf 'OUTCOME_DATA_DIR=%s\n' "/data"
+          } > "$ENV_FILE"
+
           ARGS=""
           [ "$DRY_RUN" = "true" ] && ARGS="$ARGS --dry-run"
           [ "$ROLLBACK" = "true" ] && ARGS="$ARGS --rollback"

@@ -1,12 +1,15 @@
 name: 🧹 Cleanup Outcome Archives
 
 on:
-  schedule:
-    - cron: "0 2 * * *"   # Every day at 2 AM UTC
   workflow_dispatch:
     inputs:
       wipe_all:
         description: '🚨 Wipe ALL outcomes/ + shadow/ + reports/ data (ignores age/size limits)'
+        required: false
+        default: false
+        type: boolean
+      squash_history:
+        description: '🗜 Squash outcome-data git history into one commit (run only when no bot run is active)'
         required: false
         default: false
         type: boolean
@@ -67,6 +70,9 @@ jobs:
               echo "✅ Cleanup pushed (attempt ${attempt})"
               exit 0
             fi
+            if [ "$attempt" -eq 5 ]; then
+              break
+            fi
             echo "::warning::Push rejected (attempt ${attempt}/5) — rebasing onto latest main"
             sleep $(( attempt * 2 + RANDOM % 3 ))
             if ! git pull --rebase --no-tags origin main; then
@@ -77,3 +83,14 @@ jobs:
           done
           echo "::error::Could not push cleanup after 5 attempts"
           exit 1
+
+      - name: 🗜 Squash git history (manual only)
+        if: inputs.squash_history == true
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          cd /tmp/data-repo
+          git checkout --orphan squashed
+          git add -A
+          git commit -m "chore: squash history $(date -u +%Y-%m-%d)"
+          git push --force "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" squashed:main
