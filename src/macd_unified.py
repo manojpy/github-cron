@@ -1313,13 +1313,30 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         )
         if sent:
             logger_main.info(f"🎯 Batch dispatch delivered {sent} alert(s)")
-
     try:
         announced = await send_trade_close_notices(state_db, telegram_queue, logger_main)
         if announced:
             logger_main.info(f"🎯 Trade-update notice sent for {announced} closed trade(s)")
     except Exception as e:
         logger_main.warning(f"Trade-update notice failed (non-fatal): {e}")
+
+    # All-time Recorded / Shadowed totals (from beginning of data collection)
+    try:
+        cum = await state_db.get_cumulative_outcome_stats()
+        for source in ("Recorded", "Shadowed"):
+            s = cum.get(source) or {}
+            total = int(s.get("total", 0))
+            if total == 0:
+                continue
+            targets = int(s.get("wins", 0))
+            stops = int(s.get("losses", 0))
+            win_rate = (targets / total * 100.0) if total else 0.0
+            logger_main.info(
+                f"{source} - {total}, Target Achieved - {targets}, "
+                f"Stop loss Hit - {stops}, Win Rate - {win_rate:.0f}%"
+            )
+    except Exception as exc:
+        logger_main.warning(f"Cumulative outcome stats log failed: {exc}")
 
     logger_main.debug(
         f"Results: {len(valid_results)} successful, {len(results) - len(valid_results)} failed"
