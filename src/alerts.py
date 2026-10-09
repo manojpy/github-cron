@@ -82,6 +82,7 @@ DEDUP_STATS: Dict[str, int] = {
     "kept_mark_disagree": 0,     # claim KEPT: mark price disagreed with candle
     "duplicate_suppressed": 0,   # per-alert-key duplicate inside its window
     "coalesced_suppressed": 0,   # pair+direction bundle already sent inside window
+    "recovered_midrun": 0,       # Redis recovered mid-run and the dedup claim was retried
 }
 
 def format_dedup_summary(stats: Optional[Dict[str, int]] = None) -> str:
@@ -95,6 +96,7 @@ def format_dedup_summary(stats: Optional[Dict[str, int]] = None) -> str:
         f"mark-disagree {s.get('kept_mark_disagree', 0)}) | "
         f"suppressed: duplicate {s.get('duplicate_suppressed', 0)}, "
         f"coalesced {s.get('coalesced_suppressed', 0)}"
+        + (f" | recovered mid-run {s['recovered_midrun']}" if s.get("recovered_midrun") else "")
     )
 
 def reset_dedup_stats() -> None:
@@ -3062,12 +3064,26 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             sell_present = any(ak in SELL_ALERT_KEYS for _, _, ak in alerts_to_send)
             direction = "MIXED" if (buy_present and sell_present) else ("BUY" if buy_present else "SELL")
             coalesced_dedup_key = f"coalesced_{direction}"
+
+            _coalesce_window = await coalesce_window_for(
+                sdb, [ak for _, _, ak in alerts_to_send]
+            )
             claim = await sdb.claim_recent_alert(
                 pair_name, coalesced_dedup_key, ts_curr,
-                window_sec=await coalesce_window_for(
-                    sdb, [ak for _, _, ak in alerts_to_send]
-                ),
+                window_sec=_coalesce_window,
             )
+            if claim is None and await sdb.maybe_recover_from_degraded():
+                # Redis is healthy again: retry the claim once instead of
+                # silencing this alert for the whole run.
+                claim = await sdb.claim_recent_alert(
+                    pair_name, coalesced_dedup_key, ts_curr,
+                    window_sec=_coalesce_window,
+                )
+                if claim is not None:
+                    DEDUP_STATS["recovered_midrun"] += 1
+                    logger_pair.info(
+                        f"[{pair_name}] Redis recovered mid-run — coalesce claim retried"
+                    )
             should_send = claim is True
             if should_send:
                 DEDUP_STATS["claims_taken"] += 1
@@ -3130,7 +3146,13 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         elif alerts_to_send:
             keys_to_check = [alert_key for _, _, alert_key in alerts_to_send]
+            if getattr(sdb, "degraded", False) and await sdb.maybe_recover_from_degraded():
+                DEDUP_STATS["recovered_midrun"] += 1
+                logger_pair.info(
+                    f"[{pair_name}] Redis recovered mid-run — dedup claims proceed"
+                )
             claim_results = await sdb.batch_check_recent_alerts(
+
                 pair_name, keys_to_check, ts_curr,
                 windows=await sdb.get_adaptive_dedup_windows(),
             )

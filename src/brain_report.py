@@ -888,7 +888,7 @@ def _confidence_tier(value: Optional[float], high: float, medium: float) -> str:
     return "🔴 NOT READY"
 
 def _confidence_breakdown(F: Dict[str, Any], cfg) -> List[Tuple[str, str, str]]:
-    """(axis, tier, detail) for the four independent confidence axes —
+    """(axis, tier, detail) for the four independent confidence axes ��
     MODEL (classifier calibration), DATA (sample size), CHANGE (does a
     candidate beat control with confidence), DEPLOYMENT (survived OOS and
     currently stable). Kept separate rather than blended into one score:
@@ -1002,9 +1002,12 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
             continue
         rows.append((f"{'🟢' if g.get(k) else '🔴'} {lab}:", "PASS" if g.get(k) else "FAIL"))
     out.extend(_c_split(_table(rows, "ll")))
-    out.append(_p("CONFIDENCE BREAKDOWN\n\n" + "\n".join(
-        f"{axis.ljust(12)}{tier}  ({detail})" for axis, tier, detail in _confidence_breakdown(F, cfg)
-    )))
+    out.append(_p("CONFIDENCE BREAKDOWN"))
+    _cb_rows = []
+    for axis, tier, detail in _confidence_breakdown(F, cfg):
+        _emoji, _tier_txt = _split_leading_emoji(tier)
+        _cb_rows.append((f"{_emoji or '⚪'} {axis}", f"{_tier_txt}  ({detail})"))
+    out.extend(_c_split(_table(_cb_rows, "ll")))
     out.append(_p(
         "OVERALL:\n\n"
 
