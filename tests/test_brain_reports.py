@@ -143,13 +143,13 @@ def test_confidence_breakdown_shows_four_independent_tiers():
     # ACTION GATE is section 09
     sec9 = text[text.index("09 │"):]
     assert "CONFIDENCE BREAKDOWN" in sec9
-    assert "MODEL       🟢 HIGH" in sec9 and "Brier 0.03" in sec9
+    assert "🟢 MODEL       HIGH" in sec9 and "Brier 0.03" in sec9
 
     # _SPEC totals 90 trades over the default 2.5-day window: n>=60 alone
     # would rank HIGH, but the short span caps it to MEDIUM.
-    assert "DATA        🔴 NOT READY" in sec9 and "90 trades" in sec9
-    assert "CHANGE      🟢 HIGH" in sec9 and "P(EV>0) 91%" in sec9 and "EV p5 +0.12%" in sec9
-    assert "DEPLOYMENT  🟡 MEDIUM" in sec9 and "OOS P(EV>0) 61%" in sec9
+    assert "🔴 DATA        NOT READY" in sec9 and "90 trades" in sec9
+    assert "🟢 CHANGE      HIGH" in sec9 and "P(EV>0) 91%" in sec9 and "EV p5 +0.12%" in sec9
+    assert "🟡 DEPLOYMENT  MEDIUM" in sec9 and "OOS P(EV>0) 61%" in sec9
 
 def test_confidence_breakdown_not_ready_on_active_drift_regardless_of_oos_score():
     # A near-perfect OOS score must still show NOT READY once stability
@@ -160,8 +160,9 @@ def test_confidence_breakdown_not_ready_on_active_drift_regardless_of_oos_score(
     text = _plain(_report(_rows__brain_report_v2(_SPEC), gate=gate, ai_extra={"brier_score": None}))
     # ACTION GATE is section 09
     sec9 = text[text.index("09 │"):]
-    assert "MODEL       ⚪ N/A" in sec9 and "no calibration data yet" in sec9
-    assert "DEPLOYMENT  🔴 NOT READY" in sec9 and "active drift" in sec9
+
+    assert "⚪ MODEL       N/A" in sec9 and "no calibration data yet" in sec9
+    assert "🔴 DEPLOYMENT  NOT READY" in sec9 and "active drift" in sec9
 
 def test_low_history_says_diagnose_and_never_advises_disabling():
     text = _plain(_report(_rows__brain_report_v2(_SPEC)))
