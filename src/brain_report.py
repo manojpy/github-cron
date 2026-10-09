@@ -161,8 +161,9 @@ def _collect_facts(recs: Dict[str, Any], cfg) -> Dict[str, Any]:
     wins = sum(1 for r in rows if r["win"])
     F: Dict[str, Any] = {
         "audit": audit, "rows": rows, "ai": ai, "n": n,
-        "wr": wins / n if n else 0.0,
+        "wr": wins / n if n else 0.0,  
         "net_ev": ai.get("net_ev", 0.0) or 0.0,
+        "net_ev_known": ai.get("net_ev") is not None,
         "gate": ai.get("action_gate", {}) or {},
         "cfg_patch": recs.get("config_patch", []) or [],
         "shadow_rows": recs.get("_shadow_rows", []) or [],
@@ -332,9 +333,30 @@ def _outcome_anatomy(rows: List[Dict[str, Any]], cfg) -> Tuple[Optional[str], Di
 def _goal_wr(cfg) -> float:
     return float(getattr(cfg, "MIN_WIN_RATE", 0.55))
 
-def _profit_status(net_ev: float, n: int) -> str:
+def _ev_text(F: Dict[str, Any]) -> str:
+    """Net EV as text; 'n/a' when the Brain has not computed one yet (too few
+    trades) instead of showing a misleading +0.00%."""
+    return f"{F['net_ev']:+.2f}%" if F.get("net_ev_known") else "n/a"
+
+def _shadow_line(F: Dict[str, Any]) -> Optional[str]:
+    """One line for the rejected (shadowed) alerts and how they ended."""
+    rows = F.get("shadow_rows") or []
+    if not rows:
+        return None
+    n = len(rows)
+    wins = sum(1 for r in rows if r.get("win"))
+    swr = wins / n
+    text = (f"👻 SHADOWED (rejected alerts, not sent): {n} trades | "
+            f"{wins} wins | {n - wins} losses | WR {swr:.0%}")
+    if n >= 10 and F.get("n", 0) >= 10 and swr - F["wr"] >= 0.10:
+        text += "\nRejected alerts did better than the alerts sent: the filters may be too strict."
+    return text
+
+def _profit_status(net_ev: float, n: int, known: bool = True) -> str:
     if n == 0:
         return "⚪ NO DATA"
+    if not known:
+        return "⚪ NOT ENOUGH DATA"
     return "🔴 POOR" if net_ev <= -0.05 else "🟡 FLAT" if net_ev < 0.05 else "🟢 POSITIVE"
 
 def _data_status(F: Dict[str, Any]) -> str:
@@ -363,7 +385,7 @@ def _icon(ok: Optional[bool]) -> str:
     return "🟢" if ok else "🔴"
 
 def _overall(F: Dict[str, Any]) -> str:
-    prof = _profit_status(F["net_ev"], F["n"])
+    prof = _profit_status(F["net_ev"], F["n"], F.get("net_ev_known", True))
     rec = _recording_status(F)
     if prof.startswith("🔴") or rec.startswith("🔴"):
         return "🔴 NEEDS ATTENTION"
@@ -499,7 +521,7 @@ def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
     validated_mode = F["gate_ok"] and net_ev > 0 and F["conf"] in ("MODERATE", "HIGH")
     if validated_mode:
         return _sec_verdict(F, cfg)
-    prof = _profit_status(net_ev, n)
+    prof = _profit_status(net_ev, n, F["net_ev_known"])
     out = [_hdr(2, 'EXECUTIVE SUMMARY — "WHAT DO I NEED TO KNOW?"')]
     out.append(_p(f"OVERALL SYSTEM STATUS\n{_overall(F)}"))
     out.append(_c("\n".join(_kv_table([
@@ -512,12 +534,15 @@ def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
     out.append(_c("\n".join(
         [f"📊 {n} resolved trades"] + _table([
             ("📈 Win Rate:", f"{wr:.0%}"),
-            ("💰 Net EV/trade:", f"{net_ev:+.2f}%"),
+            ("💰 Net EV/trade:", _ev_text(F)),
             ("📅 History available:", _fmt_days(days)),
             ("📅 History requested:", f"{F['req_days']} days"),
         ], "lr")
     )))
-    losing = net_ev <= -0.05
+    _shadow = _shadow_line(F)
+    if _shadow:
+        out.append(_p(_shadow))
+    losing = F["net_ev_known"] and net_ev <= -0.05
     if losing and F["low_trust"]:
         text = (
             "The system is currently producing poor results in the available sample.\n\n"
@@ -593,6 +618,9 @@ def _sec_verdict(F: Dict[str, Any], cfg) -> List[_Piece]:
         f"🤖 RECOMMENDED ACTION\n{action}\n\n"
         f"Confidence: {F['conf']}\nAction Gate: APPROVED"
     ))
+    _shadow = _shadow_line(F)
+    if _shadow:
+        out.append(_p(_shadow))
     return out
 
 def _cf_verdict(scenario: Dict[str, Any], cfg) -> Tuple[str, str]:
@@ -683,7 +711,7 @@ def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
             if "PROMOTION-ELIGIBLE" in verdict and s.get("ev", 0.0) <= 0:
                 verdict = "🕒 HOLD (still negative EV)"
             lines.append(
-                f"• {s.get('label', '?')}: {F['net_ev']:+.2f}% → {s.get('ev', 0.0):+.2f}% "
+                f"• {s.get('label', '?')}: {_ev_text(F)} → {s.get('ev', 0.0):+.2f}% "
                 f"(n={s.get('n', 0)}) — {verdict}"
             )
         out.append(_p("🥇 CANDIDATE CONFIGS (beat current live config)\n\n" + "\n".join(lines)))
@@ -705,8 +733,9 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
         ("Trades", str(n),
          "🟢 Good sample" if n >= 100 else "🟡 Small sample" if n >= 30 else "🔴 Tiny sample"),
         ("Win Rate", f"{wr:.0%}", wr_verdict),
-        ("Net EV", f"{net_ev:+.2f}%",
-         "🟢 Positive" if net_ev > 0.05 else "🟡 Flat" if net_ev > -0.05 else "🔴 Negative"),
+        ("Net EV", _ev_text(F),
+         "⚪ Not computed yet" if not F["net_ev_known"]
+         else "🟢 Positive" if net_ev > 0.05 else "🟡 Flat" if net_ev > -0.05 else "🔴 Negative"),
         ("History", "n/a" if days is None else f"{days:.1f}d",
          "🟢 Long enough" if (days or 0) >= 30 else "🟡 Short" if (days or 0) >= 14 else "🔴 Too short"),
         ("After costs?", "YES" if F["gate"].get("execution", True) else "NO",
@@ -722,7 +751,10 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
         rows.append((emoji or "⚪", metric, value, rest))
     out.extend(_c_split(_table(rows, "llrl")))
 
-    if net_ev < 0:
+    if not F["net_ev_known"]:
+        meaning = ("Net EV is not computed yet (too few trades), so profit cannot be judged. "
+                   "The win rate and the trade outcomes below are the only guide for now.")
+    elif net_ev < 0:
         meaning = ("The observed trades are losing money after costs.\n\n"
                    + ("BUT the Brain does not yet know whether this will persist across different "
                       "market conditions." if F["low_trust"]
@@ -736,7 +768,10 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
         ("Confidence in the DATA PIPELINE", '🟢 GOOD' if recon_ok else '🟡 CHECK SECTION 14'),
     ]))))
     if F["anatomy_text"]:
-        out.append(_p("🎲 WHY THE WIN RATE LOOKS LOW\n\n" + F["anatomy_text"]))
+        _anat_title = ("🎲 WHY THE WIN RATE LOOKS LOW" if (be is not None and wr < be)
+                       else "🎲 HOW THE TRADES ENDED")
+        out.append(_p(f"{_anat_title}\n\n" + F["anatomy_text"]))
+
     if F.get("plan_text"):
         out.append(_p("🧪 TRADE-PLAN LAB — \"WOULD A DIFFERENT TARGET/STOP HAVE WORKED?\"\n\n" + F["plan_text"]))
     return out
@@ -985,61 +1020,17 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     return out
 
 def _sec_reasoning_chain(F: Dict[str, Any], cfg) -> List[_Piece]:
-    """Roadmap #19 — explicit Brain decision narrative."""
+    """Roadmap #19 — explicit Brain decision narrative. Trade counts, session,
+    calibration, OOS and gate detail are shown in sections 02, 04, 08 and 09, so
+    this section carries only what they do not: the verdict and why, the
+    recent-vs-earlier win-rate comparison, and the strategy-state reading."""
     out = [_hdr(1, 'BRAIN DECISION — "WHY THIS VERDICT?"')]
     try:
         n = int(F.get("n") or 0)
-        wr = float(F.get("wr") or 0.0)
         net_ev = float(F.get("net_ev") or 0.0)
-        days = F.get("days")
         gate = F.get("gate") or {}
         ai = F.get("ai") or {}
         conf = str(F.get("conf") or "LOW")
-
-        market_line = "regime tags limited in this window"
-        sessions = F.get("sessions") or []
-        # session_breakdown() returns (session, wr, n) tuples, worst first.
-        if sessions and isinstance(sessions[0], (tuple, list)) and len(sessions[0]) >= 3:
-            w_name, w_wr, w_n = sessions[0][0], float(sessions[0][1]), int(sessions[0][2])
-            market_line = f"weakest session={w_name} (WR={w_wr:.0%}, n={w_n})"
-        hist_line = (
-            f"n={n} trades over {_fmt_days(days)} | "
-            f"WR={wr:.0%} | Net EV/trade={net_ev:+.2f}%"
-        )
-
-        recent_wr, older_wr, recent_n = engine.detect_temporal_drift(F.get("rows") or [])
-        if recent_wr is not None and recent_n:
-            recent_line = (
-                f"Recent WR={float(recent_wr):.0%} (n={recent_n}) "
-                f"vs earlier {float(older_wr):.0%}"
-            )
-        else:
-            recent_line = "recent window not separately scored this report"
-        ece = ai.get("calibration_ece_mean")
-        if ece is None:
-            calib_line = "no calibration curve yet"
-        else:
-            ece_f = float(ece)
-            tag = "GOOD" if ece_f < 0.08 else "WATCH" if ece_f < 0.15 else "POOR"
-            calib_line = f"mean-per-alert ECE={ece_f:.3f} — {tag}"
-        if gate.get("oos_prediction"):
-            oos_line = "PASS"
-        elif gate.get("oos_p_ev_positive") is None:
-            oos_line = "N/A (walk-forward not run)"
-        else:
-            oos_line = "FAIL"
-
-        drift_line = "NONE detected" if gate.get("stability") else "CUSUM drift active"
-        _ss = (ai.get("strategy_state") or {}).get("state")
-        _ss_text = {
-            "STRATEGY_DEGRADED": "strategy degraded (drop persists within the same regimes)",
-            "REGIME_UNDERREPRESENTED": "current regime underrepresented in history — not proof of decay",
-            "REGIME_SHIFT": "regime mix shifted to a weaker regime — expected dip",
-            "DEGRADED_REGIME_UNKNOWN": "WR fell; ADX data too thin to attribute",
-            "STABLE": "no significant WR drop",
-        }.get(_ss or "")
-        if _ss_text:
-            drift_line = f"{drift_line} | {_ss_text}"
 
         if F.get("gate_ok") and net_ev > 0 and conf in ("MODERATE", "HIGH"):
             decision = "APPROVED — evidence supports limited parameter change (still via shadow/plan)"
@@ -1051,21 +1042,29 @@ def _sec_reasoning_chain(F: Dict[str, Any], cfg) -> List[_Piece]:
             decision = "BLOCKED — drift detected; freeze parameter changes"
         else:
             decision = "BLOCKED — action gate not satisfied (see ACTION GATE)"
+        lines = [f"Decision:  {decision}"]
 
-        lines = [
-            f"Market:      {market_line}",
-            f"Historical:  {hist_line}",
-            f"Recent:      {recent_line}",
-            f"Calibration: {calib_line}",
-            f"OOS:         {oos_line}",
-            f"Drift:       {drift_line}",
-            f"Decision:    {decision}",
-        ]
+        recent_wr, older_wr, recent_n = engine.detect_temporal_drift(F.get("rows") or [])
+        if recent_wr is not None and recent_n:
+            lines.append(
+                f"Recent:    WR={float(recent_wr):.0%} (n={recent_n}) "
+                f"vs earlier {float(older_wr):.0%}"
+            )
+        _ss = (ai.get("strategy_state") or {}).get("state")
+        _ss_text = {
+            "STRATEGY_DEGRADED": "strategy degraded (drop persists within the same regimes)",
+            "REGIME_UNDERREPRESENTED": "current regime underrepresented in history — not proof of decay",
+            "REGIME_SHIFT": "regime mix shifted to a weaker regime — expected dip",
+            "DEGRADED_REGIME_UNKNOWN": "WR fell; ADX data too thin to attribute",
+        }.get(_ss or "")
+        _drift = "CUSUM drift active" if not gate.get("stability") else ""
+        if _drift and _ss_text:
+            _drift = f"{_drift} | {_ss_text}"
+        elif _ss_text:
+            _drift = _ss_text
+        if _drift:
+            lines.append(f"Drift:     {_drift}")
         out.append(_c("\n".join(lines)))
-        out.append(_p(
-            "Hard signal rules are unchanged. This block only states the Brain's "
-            "quality assessment and whether any plan is allowed to proceed."
-        ))
     except Exception as e:
         out.append(_p(f"Reasoning chain unavailable: {type(e).__name__}"))
     return out
