@@ -36,6 +36,13 @@ def _coerce_bool(val, default=None):
         return False
     return default
 
+def _outcome_rank(raw: dict) -> int:
+    """How final an archived row is. When one trade has several rows (closed
+    early, later finished), the highest rank is the one kept."""
+    if _coerce_bool(raw.get("path_complete"), default=True):
+        return 2
+    return 1 if _coerce_bool(raw.get("final"), default=False) else 0
+
 def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[dict]:
     """Convert archived JSONL row → Brain _parse_rows format.
 
@@ -210,6 +217,8 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
             "migrated": is_migrated,
             # False = closed early at target/stop; the full-path row replaces it later
             "path_complete": _coerce_bool(raw.get("path_complete"), default=True),
+            # 2 = full 12-candle row, 1 = finished early (stop / target+bonus), 0 = closed early, still open
+            "outcome_rank": _outcome_rank(raw),
         }
     except Exception:
         return None
@@ -306,12 +315,11 @@ def load_archived_outcomes(
                     if sid:
                         if sid in seen_ids and seen_ids[sid] is not None:
                             # Same trade seen twice. Keep one row: the full-path row
-                            # (path_complete) wins over an early-close row.
+                            # (highest outcome_rank) wins over an earlier, less final row.
                             prev_idx = seen_ids[sid]
                             if (
                                 prev_idx is not None
-                                and _coerce_bool(raw.get("path_complete"), default=True)
-                                and rows[prev_idx].get("path_complete") is False
+                                and _outcome_rank(raw) > rows[prev_idx].get("outcome_rank", 2)
                             ):
                                 replace_idx = prev_idx
                             else:
