@@ -1926,6 +1926,7 @@ class RedisStateStore:
     @staticmethod
     def _early_archive_row(
         pair: str, result: Dict[str, Any], closed_json: str, shadow: bool,
+        final: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Archive row for a trade that closed early. Win/loss, bracket P&L and
         conditions are final; anything that depends on the rest of the 12-candle
@@ -1983,11 +1984,96 @@ class RedisStateStore:
             "path_complete": False,
             "closed_candle_ts": closed_candle_ts,
         }
+        if final:
+            # Trade is finished (stop hit, or target + bonus R:R reached): nothing
+            # more will be learned from waiting, so this row is the last one.
+            row["final"] = True
+            row["bonus_win"] = result.get("bonus_win")
+            row["rr_achieved"] = result.get("rr_achieved")
+            row["win_weight"] = result.get("win_weight")
         if shadow:
             row["shadow"] = True
             row["adx_val"] = _ctx.get("adx_val")
             row["rejection_reason"] = _ctx.get("rejection_reason")
         return row
+
+    @staticmethod
+    def _bonus_hit_idx(
+        closed: Dict[str, Any], data_15m: "PriceData", i15: int,
+    ) -> Optional[int]:
+        """Absolute candle index where a trade first reached the bonus R:R
+        (OUTCOME_BONUS_RR) on or after its fill candle and inside the outcome
+        horizon; None if it has not reached it yet."""
+        try:
+            entry_ts = int(closed["entry_ts"])
+            entry_price = float(closed["entry_price"])
+            is_buy = str(closed["direction"]).lower() in ("buy", "long")
+            hits = np.flatnonzero(data_15m.ts == entry_ts)
+            if hits.size == 0 or entry_price <= 0:
+                return None
+            entry_idx = int(hits[-1])
+            fill_delay = max(0, int(getattr(cfg, "OUTCOME_FILL_DELAY_CANDLES", 1)))
+            fill_idx = entry_idx + fill_delay
+            if fill_delay > 0:
+                if fill_idx > i15 or fill_idx >= len(data_15m.open):
+                    return None
+                anchor = float(data_15m.open[fill_idx])
+                path_start = fill_idx
+            else:
+                anchor = float(closed.get("fill_price") or entry_price)
+                path_start = entry_idx + 1
+            last = min(i15, fill_idx + int(cfg.OUTCOME_LOOKAHEAD_CANDLES))
+            if last < path_start:
+                return None
+            bonus = (cfg.OUTCOME_MAE_LOSS_PCT / 100.0) * cfg.OUTCOME_BONUS_RR
+            if is_buy:
+                mask = data_15m.high[path_start:last + 1] >= anchor * (1 + bonus)
+            else:
+                mask = data_15m.low[path_start:last + 1] <= anchor * (1 - bonus)
+            if not bool(mask.any()):
+                return None
+            return path_start + int(np.argmax(mask))
+        except Exception:
+            return None
+
+    def _early_finalize_plan(
+        self, raw: Optional[str], data_15m: "PriceData", i15: int,
+    ) -> Tuple[Optional[int], Optional[str], bool]:
+        """Decide whether a pending trade is already finished.
+
+        Returns (end_idx, closed_json, newly_closed):
+          * stop / same-candle tie hit  -> finished at the hit candle.
+          * target hit                  -> finished once the bonus R:R is reached;
+                                           until then (end_idx None) it stays pending,
+                                           already counted as a win, and is finished at
+                                           the 12-candle horizon at the latest.
+          * neither hit                 -> (None, None, False): waits for the horizon.
+        newly_closed is True when this run is the first to see the hit."""
+        if not raw:
+            return None, None, False
+        try:
+            already = json_loads(raw).get("closed_ts") is not None
+            closed_json = raw if already else self._early_close_payload(raw, data_15m, i15)
+            if closed_json is None:
+                return None, None, False
+            closed = json_loads(closed_json)
+            hit_ts = closed.get("closed_candle_ts")
+            if hit_ts is None:
+                return None, None, False
+            hits = np.flatnonzero(data_15m.ts == int(hit_ts))
+            if hits.size == 0:
+                return None, None, False
+            hit_idx = int(hits[-1])
+            reason = str(closed.get("closed_reason") or "")
+            if reason in ("stop", "both"):
+                return hit_idx, closed_json, not already
+            if reason == "target":
+                bonus_idx = self._bonus_hit_idx(closed, data_15m, i15)
+                if bonus_idx is not None:
+                    return max(hit_idx, bonus_idx), closed_json, not already
+            return None, closed_json, not already
+        except Exception:
+            return None, None, False
 
     async def get_active_trade(self, pair: str) -> Optional[Dict[str, Any]]:
         """The open recorded trade for this pair, or None.
@@ -2141,10 +2227,13 @@ class RedisStateStore:
         try:
             async with self._redis.pipeline() as write_pipe:
                 pending_writes = 0
-
                 for key, raw in zip(keys, raw_values):
                     try:
-                        result, skip_reason = self._parse_pending_outcome_row(key, raw, data_15m, i15)
+                        _fin_idx, _fin_json, _fin_new = self._early_finalize_plan(raw, data_15m, i15)
+                        _early_final = _fin_idx is not None
+                        result, skip_reason = self._parse_pending_outcome_row(
+                            key, raw, data_15m, i15, end_idx=_fin_idx,
+                        )
                         if skip_reason == "raced":
                             continue
                         if skip_reason == "bad_entry_price":
@@ -2200,6 +2289,11 @@ class RedisStateStore:
                         if result is None:
                             continue
 
+                        if _early_final and _fin_new and _fin_json:
+                            try:
+                                close_events.append(json_loads(_fin_json))
+                            except Exception:
+                                pass
                         alert_key = result["alert_key"]
                         direction = result["direction"]
                         entry_ts = result["entry_ts"]
@@ -2283,6 +2377,12 @@ class RedisStateStore:
                                     f"Confluence was not computed for this alert's direction "
                                     f"(check ENABLE_CONFLUENCE_GATE and gate_passed)."
                                 )
+                            elif _early_final:
+                                _frow = self._early_archive_row(
+                                    pair, result, _fin_json or "", False, final=True,
+                                )
+                                if _frow is not None:
+                                    resolved_for_file.append(_frow)
                             else:
                                 resolved_for_file.append({
                                     # Stable per-outcome ID: archive_reader dedups on
@@ -2431,8 +2531,13 @@ class RedisStateStore:
                 pending_writes = 0
                 for key, raw in zip(keys, raw_values):
                     try:
+                        _fin_idx, _fin_json, _fin_new = (
+                            self._early_finalize_plan(raw, data_15m, i15)
+                            if cfg.ENABLE_TRADE_CLOSE_NOTICE else (None, None, False)
+                        )
+                        _early_final = _fin_idx is not None
                         result, skip_reason = self._parse_pending_outcome_row(
-                            key, raw, data_15m, i15
+                            key, raw, data_15m, i15, end_idx=_fin_idx,
                         )
                         if skip_reason:
                             if skip_reason == "not_ready" and raw and cfg.ENABLE_TRADE_CLOSE_NOTICE:
@@ -2456,6 +2561,11 @@ class RedisStateStore:
                         if result is None:
                             continue
 
+                        if _early_final and _fin_new and _fin_json:
+                            try:
+                                close_events.append(json_loads(_fin_json))
+                            except Exception:
+                                pass
                         alert_key = result["alert_key"]
                         direction = result["direction"]
                         entry_ts = result["entry_ts"]
@@ -2547,6 +2657,12 @@ class RedisStateStore:
                                     f"Confluence was not computed for this alert's direction "
                                     f"(check ENABLE_CONFLUENCE_GATE and gate_passed)."
                                 )
+                            elif _early_final:
+                                _frow = self._early_archive_row(
+                                    pair, result, _fin_json or "", True, final=True,
+                                )
+                                if _frow is not None:
+                                    resolved_for_file.append(_frow)
                             else:
                                 resolved_for_file.append({
                                     "pair": str(pair),
