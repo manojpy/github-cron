@@ -274,6 +274,24 @@ def _compute_win_weight(rr_achieved: float, is_win: bool) -> float:
     frac = (rr_achieved - target) / (bonus - target)
     return 1.0 + (cap - 1.0) * frac
 
+OUTCOME_WIN_LABEL = "Target Achieved"
+OUTCOME_LOSS_LABEL = "Stop loss Hit"
+
+def format_outcome_totals(source: str, stats: Optional[Dict[str, int]], icon: str = "") -> str:
+    """One-line all-time Recorded/Shadowed totals, for example
+    '👁 Shadowed - 18, Target Achieved - 13, Stop loss Hit - 5, Win Rate - 72%'.
+    The per-run log and the Brain report both use this, so they always match."""
+    s = stats or {}
+    total = int(s.get("total", 0))
+    wins = int(s.get("wins", 0))
+    losses = int(s.get("losses", 0))
+    win_rate = (wins / total * 100.0) if total else 0.0
+    prefix = f"{icon} " if icon else ""
+    return (
+        f"{prefix}{source} - {total}, {OUTCOME_WIN_LABEL} - {wins}, "
+        f"{OUTCOME_LOSS_LABEL} - {losses}, Win Rate - {win_rate:.0f}%"
+    )
+
 class RedisKeyPrefix:
     """Centralized Redis key prefixes"""
     PAIR_STATE = "pair_state:"
@@ -2196,6 +2214,10 @@ class RedisStateStore:
             self._close_event_ids.add(ident)
             reason = str(d.get("closed_reason") or "")
             hit_ts = d.get("closed_candle_ts")
+            logger_pair.info(
+                f"[{pair}] {source} trade closed | {reason or 'closed'} | {direction} | "
+                f"entry_ts={entry_ts} | hit_ts={hit_ts}"
+            )
             self.trade_close_events.append({
                 "pair": pair,
                 "source": source,
@@ -2759,8 +2781,8 @@ class RedisStateStore:
             await self._publish_close_events(pair, close_events, "Shadowed", logger_pair)
 
         if resolved_count:
-            logger_pair.debug(
-                f"[{pair}] Shadow outcome resolution| resolved={resolved_count}"
+            logger_pair.info(
+                f"[{pair}] Shadow outcome resolution | resolved={resolved_count}"
             )
 
     async def get_alert_win_rate(self, pair: str, alert_key: str) -> Tuple[Optional[float], int]:

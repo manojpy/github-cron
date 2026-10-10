@@ -1357,6 +1357,10 @@ class BrainEngineV2(BrainCore):
             # Layered 16-section report. If building it raises, the outer
             # handler below falls back to the base technical report.
             recs["_plan_lifecycle"] = await self._load_plan_lifecycle()
+            try:
+                recs["_outcome_totals"] = await self.sdb.get_cumulative_outcome_stats()
+            except Exception as e:
+                logger_run.debug(f"Outcome totals unavailable for Brain report: {e}")
             sections, stamp = build_brain_report_sections(recs, cfg)
             plan_messages = render_report_messages(sections, stamp)   # already MarkdownV2-escaped
             self._archive_report(sections, stamp, logger_run)

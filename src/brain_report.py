@@ -12,6 +12,7 @@ from brain_audit import DataCoverage, HealthStatus, get_audit
 import threshold_engine as engine
 from plan_replay import build_plan_lab
 from alerts import escape_markdown_v2
+from state import format_outcome_totals
 from alert_registry import alert_family_of as _registry_family_of, pretty_alert as _pretty_alert
 
 _PHASE_MIN_SAMPLES = {
@@ -167,6 +168,7 @@ def _collect_facts(recs: Dict[str, Any], cfg) -> Dict[str, Any]:
         "gate": ai.get("action_gate", {}) or {},
         "cfg_patch": recs.get("config_patch", []) or [],
         "shadow_rows": recs.get("_shadow_rows", []) or [],
+        "outcome_totals": recs.get("_outcome_totals") or {},
         "archive_stats": recs.get("_archive_stats", {}) or {},
         "conf": audit.statistical_confidence_label(),
         "recon": audit.reconciliation_snapshot(),
@@ -351,6 +353,16 @@ def _shadow_line(F: Dict[str, Any]) -> Optional[str]:
     if n >= 10 and F.get("n", 0) >= 10 and swr - F["wr"] >= 0.10:
         text += "\nRejected alerts did better than the alerts sent: the filters may be too strict."
     return text
+
+def _outcome_totals_lines(F: Dict[str, Any]) -> Optional[str]:
+    """All-time Recorded / Shadowed totals, in the same format as the per-run log."""
+    cum = F.get("outcome_totals") or {}
+    if not cum:
+        return None
+    return "\n".join(
+        format_outcome_totals(source, cum.get(source), icon)
+        for source, icon in (("Recorded", "📝"), ("Shadowed", "👁"))
+    )
 
 def _profit_status(net_ev: float, n: int, known: bool = True) -> str:
     if n == 0:
@@ -542,6 +554,9 @@ def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
     _shadow = _shadow_line(F)
     if _shadow:
         out.append(_p(_shadow))
+    _totals = _outcome_totals_lines(F)
+    if _totals:
+        out.append(_p(_totals))
     losing = F["net_ev_known"] and net_ev <= -0.05
     if losing and F["low_trust"]:
         text = (
@@ -621,6 +636,9 @@ def _sec_verdict(F: Dict[str, Any], cfg) -> List[_Piece]:
     _shadow = _shadow_line(F)
     if _shadow:
         out.append(_p(_shadow))
+    _totals = _outcome_totals_lines(F)
+    if _totals:
+        out.append(_p(_totals))
     return out
 
 def _cf_verdict(scenario: Dict[str, Any], cfg) -> Tuple[str, str]:
@@ -888,7 +906,7 @@ def _confidence_tier(value: Optional[float], high: float, medium: float) -> str:
     return "🔴 NOT READY"
 
 def _confidence_breakdown(F: Dict[str, Any], cfg) -> List[Tuple[str, str, str]]:
-    """(axis, tier, detail) for the four independent confidence axes ��
+    """(axis, tier, detail) for the four independent confidence axes ���
     MODEL (classifier calibration), DATA (sample size), CHANGE (does a
     candidate beat control with confidence), DEPLOYMENT (survived OOS and
     currently stable). Kept separate rather than blended into one score:

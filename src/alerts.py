@@ -59,7 +59,7 @@ from fetcher import (
     detect_reversal_candle_pattern_with_context,
 )
 
-from state import RedisStateStore, TokenBucket, _rc
+from state import RedisStateStore, TokenBucket, _rc, format_outcome_totals
 
 from gates import GateResult, IndicatorCache
 import threshold_engine as engine
@@ -1230,16 +1230,10 @@ async def send_trade_close_notices(
         cum = await sdb.get_cumulative_outcome_stats()
         for source in ("Recorded", "Shadowed"):
             s = cum.get(source) or {}
-            total = int(s.get("total", 0))
-            if total == 0:
+            if int(s.get("total", 0)) == 0:
                 continue
-            targets = int(s.get("wins", 0))      # wins: target hit first, or closed in profit on timeout
-            stops = int(s.get("losses", 0))      # losses: stop hit first, or closed at a loss on timeout
-            win_rate = (targets / total * 100.0) if total else 0.0
-            logger_run.info(
-                f"{source} - {total}, Wins - {targets}, "
-                f"Losses - {stops}, Win Rate - {win_rate:.0f}%"
-            )
+            logger_run.info(format_outcome_totals(source, s))
+
     except Exception as exc:
         logger_run.warning(f"Cumulative outcome stats log failed: {exc}")
     label = {

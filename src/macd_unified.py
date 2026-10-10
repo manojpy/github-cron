@@ -37,7 +37,7 @@ from indicators import (
 
 from state import (
     _blanket_reset_pair, _clear_all_redis_states, _redis_key_inventory, build_products_map_from_cfg,
-    RedisKeyPrefix, RedisStateStore, RedisLock, _rc,
+    RedisKeyPrefix, RedisStateStore, RedisLock, _rc, format_outcome_totals,
 )
 
 from gates import GateResult, compute_confluence_score, _eval_gate, _resolve_pair_outcomes
@@ -1322,16 +1322,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     try:
         cum = await state_db.get_cumulative_outcome_stats()
         for source in ("Recorded", "Shadowed"):
-            s = cum.get(source) or {}
-            total = int(s.get("total", 0))
-            targets = int(s.get("wins", 0))
-            stops = int(s.get("losses", 0))
-            win_rate = (targets / total * 100.0) if total else 0.0
             icon = "📝" if source == "Recorded" else "👁"
-            logger_main.info(
-                f"{icon} {source} - {total}, Wins - {targets}, "
-                f"Losses - {stops}, Win Rate - {win_rate:.0f}%"
-            )
+            logger_main.info(format_outcome_totals(source, cum.get(source), icon))
+
     except Exception as exc:
         logger_main.warning(f"Cumulative outcome stats log failed: {exc}")
 
