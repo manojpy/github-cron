@@ -232,12 +232,15 @@ Recorded and Shadowed trades keep **separate cooldowns** (`trade_cooldown:{pair}
 ### Reading the totals line
 
 ```
-📝 Recorded - 53, Wins - 18, Losses - 35, Win Rate - 34%
-👁 Shadowed - 18, Wins - 13, Losses - 5, Win Rate - 72%
+📝 Recorded - 53, Target Achieved - 18, Stop loss Hit - 35, Win Rate - 34%
+👁 Shadowed - 18, Target Achieved - 13, Stop loss Hit - 5, Win Rate - 72%
 ```
 
+This line is logged on every run (every 15 minutes) and is also included in the Brain report, which is sent every 12 hours (00:00 and 12:00 UTC). Both use the same formatter (`format_outcome_totals` in `state.py`).
+
 - These are **all-time** totals of completed trades, not a rolling 24-hour counter.
-- A trade is a win if its target is hit before its stop, a loss if the stop comes first. If neither is hit within `OUTCOME_LOOKAHEAD_CANDLES` (12 candles = 3 h), it is classified by whether it closed in profit.
+- A trade counts as Target Achieved if its target is hit before its stop, and as Stop loss Hit if the stop comes first. If neither is hit within `OUTCOME_LOOKAHEAD_CANDLES` (12 candles = 3 h), it is counted by whether it closed in profit, so those timeouts are folded into the two counts.
+- Trades are counted as soon as their target or stop is hit, even before the 12 candles are over. A `<Recorded|Shadowed> trade closed | …` line is logged at that moment.
 - A new shadow registration does not change the total until it resolves, which can take up to 12 candles. `Pre-scanned N shadow pending outcome(s)` at run start shows how many are still open.
 - Shadow rows record every blocked alert key, including several on the same pair and candle. They do not follow the one-trade-per-pair rule, so Shadowed and Recorded win rates are not directly comparable.
 - Several shadow gates only activate once enough history exists: the win-rate filter needs `MIN_WIN_RATE_SAMPLE` resolved trades per pair and alert key, calibration needs curves from past outcomes, and the OOD gate needs `OOD_MIN_HISTORY` vote-count samples. Until then the confluence gate is the main source of shadow trades.
