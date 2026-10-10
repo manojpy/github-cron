@@ -1363,11 +1363,13 @@ class RedisStateStore:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
             return
 
-        _cd_hit = await self.in_trade_cooldown(pair, entry_ts, "Shadowed")
+        _cd_hit = await self.in_trade_cooldown(pair, entry_ts)
         if _cd_hit is not None:
             logger.info(
                 f"[{pair}] Cooldown after target (hit candle {_cd_hit}) — "
-                f"not shadowing {alert_key} @ {entry_ts}"
+                f"not recording {alert_key} @ {entry_ts}"
+            )
+            return
 
         key = f"{RedisKeyPrefix.OUTCOME_PENDING}{pair}:{alert_key}:{entry_ts}"
         try:
@@ -1457,7 +1459,7 @@ class RedisStateStore:
         if self.degraded or not getattr(cfg, "ENABLE_BRAIN", False):
             return "disabled"
 
-        _cd_hit = await self.in_trade_cooldown(pair, entry_ts)
+        _cd_hit = await self.in_trade_cooldown(pair, entry_ts, "Shadowed")
         if _cd_hit is not None:
             logger.info(
                 f"[{pair}] Cooldown after target (hit candle {_cd_hit}) — "
