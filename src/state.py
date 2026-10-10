@@ -1363,13 +1363,11 @@ class RedisStateStore:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
             return
 
-        _cd_hit = await self.in_trade_cooldown(pair, entry_ts)
+        _cd_hit = await self.in_trade_cooldown(pair, entry_ts, "Shadowed")
         if _cd_hit is not None:
             logger.info(
                 f"[{pair}] Cooldown after target (hit candle {_cd_hit}) — "
-                f"not recording {alert_key} @ {entry_ts}"
-            )
-            return
+                f"not shadowing {alert_key} @ {entry_ts}"
 
         key = f"{RedisKeyPrefix.OUTCOME_PENDING}{pair}:{alert_key}:{entry_ts}"
         try:
@@ -1408,7 +1406,8 @@ class RedisStateStore:
         except Exception as e:
             logger.warning(
                 f"Failed to record pending outcome for {pair}:{alert_key}: {e}"
-            ) 
+            )
+            return
         if confluence_votes is not None:
             await self.record_vote_count(alert_key, confluence_votes)
 
@@ -1452,10 +1451,11 @@ class RedisStateStore:
         confluence_total: Optional[float] = None,
         confluence_votes: Optional[Dict[str, bool]] = None,
         context: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> str:
+        """Returns one of: 'created', 'cooldown', 'disabled', 'failed'."""
 
         if self.degraded or not getattr(cfg, "ENABLE_BRAIN", False):
-            return
+            return "disabled"
 
         _cd_hit = await self.in_trade_cooldown(pair, entry_ts)
         if _cd_hit is not None:
@@ -1463,7 +1463,7 @@ class RedisStateStore:
                 f"[{pair}] Cooldown after target (hit candle {_cd_hit}) — "
                 f"not shadowing {alert_key} @ {entry_ts}"
             )
-            return
+            return "cooldown"
 
         key = f"{RedisKeyPrefix.SHADOW_PENDING}{pair}:{alert_key}:{entry_ts}"
         try:
@@ -1480,7 +1480,7 @@ class RedisStateStore:
             logger.warning(
                 f"Failed to serialize shadow pending outcome for {pair}:{alert_key}: {e}"
             )
-            return
+            return "failed"
 
         ttl = max(
             (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60,
@@ -1492,10 +1492,16 @@ class RedisStateStore:
                 _rc(self._redis).set(key, payload, ex=ttl),
                 timeout=2.0,
             )
+            logger.info(
+                f"[{pair}] Shadow pending created: {alert_key} @ {entry_ts} → {key}"
+            )
+            return "created"
         except Exception as e:
             logger.warning(
                 f"Failed to record shadow pending outcome for {pair}:{alert_key}: {e}"
             )
+            return "failed"
+
     # ── Vote-count history (OOD gate) ────────────────────────────────────────
 
     async def record_vote_count(self, alert_key: str, votes: Dict[str, bool]) -> None:
@@ -2112,9 +2118,20 @@ class RedisStateStore:
             logger.warning(f"get_active_trade failed for {pair}: {e}")
             return None
 
-    async def in_trade_cooldown(self, pair: str, entry_ts: int) -> Optional[int]:
+    @staticmethod
+    def _cooldown_key(pair: str, source: str = "Recorded") -> str:
+        """Recorded and Shadowed trades keep separate cooldowns, so a shadow
+        (never-traded) target hit cannot put the live pair into cooldown.
+        The Recorded key is unchanged from before."""
+        if source == "Shadowed":
+            return f"{RedisKeyPrefix.TRADE_COOLDOWN}shadow:{pair}"
+        return f"{RedisKeyPrefix.TRADE_COOLDOWN}{pair}"
+
+    async def in_trade_cooldown(self, pair: str, entry_ts: int,
+                                source: str = "Recorded") -> Optional[int]:
         """Return the target-hit candle ts when `entry_ts` is inside the pair's
-        re-entry cooldown, else None. Fails open (Redis problem = no cooldown)."""
+        re-entry cooldown for `source` ('Recorded' or 'Shadowed'), else None.
+        Fails open (Redis problem = no cooldown)."""
         n = int(getattr(cfg, "TRADE_CLOSE_COOLDOWN_CANDLES", 0))
         if (
             n <= 0
@@ -2125,7 +2142,8 @@ class RedisStateStore:
             return None
         try:
             raw = await asyncio.wait_for(
-                _rc(self._redis).get(f"{RedisKeyPrefix.TRADE_COOLDOWN}{pair}"),
+                _rc(self._redis).get(self._cooldown_key(pair, source)),
+
                 timeout=2.0,
             )
             if raw is None:
@@ -2136,10 +2154,11 @@ class RedisStateStore:
         return hit_ts if int(entry_ts) <= hit_ts + n * 900 else None
 
     async def _start_trade_cooldown(self, pair: str, hit_ts: int,
-                                    logger_pair: logging.Logger) -> None:
+                                    logger_pair: logging.Logger,
+                                    source: str = "Recorded") -> None:
         if self.degraded or not self._redis:
             return
-        key = f"{RedisKeyPrefix.TRADE_COOLDOWN}{pair}"
+        key = self._cooldown_key(pair, source)
         ttl = int((int(cfg.TRADE_CLOSE_COOLDOWN_CANDLES) + 4) * 900)
         try:
             raw = await asyncio.wait_for(_rc(self._redis).get(key), timeout=2.0)
@@ -2147,6 +2166,7 @@ class RedisStateStore:
                 return  # never move the cooldown backwards
             await asyncio.wait_for(
                 _rc(self._redis).set(key, str(int(hit_ts)), ex=ttl), timeout=2.0
+
             )
         except Exception as e:
             logger_pair.warning(f"[{pair}] Could not start trade cooldown: {e}")
@@ -2189,8 +2209,7 @@ class RedisStateStore:
             if starts_cooldown and hit_ts is not None:
                 cooldown_hit_ts = max(int(hit_ts), cooldown_hit_ts or 0)
         if cooldown_hit_ts is not None and int(getattr(cfg, "TRADE_CLOSE_COOLDOWN_CANDLES", 0)) > 0:
-            await self._start_trade_cooldown(pair, cooldown_hit_ts, logger_pair)
-
+            await self._start_trade_cooldown(pair, cooldown_hit_ts, logger_pair, source)
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
                                        logger_pair: logging.Logger) -> None:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not self._redis:

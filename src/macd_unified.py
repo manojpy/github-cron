@@ -1329,8 +1329,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             win_rate = (targets / total * 100.0) if total else 0.0
             icon = "📝" if source == "Recorded" else "👁"
             logger_main.info(
-                f"{icon} {source} - {total}, Target Achieved - {targets}, "
-                f"Stop loss Hit - {stops}, Win Rate - {win_rate:.0f}%"
+                f"{icon} {source} - {total}, Wins - {targets}, "
+                f"Losses - {stops}, Win Rate - {win_rate:.0f}%"
             )
     except Exception as exc:
         logger_main.warning(f"Cumulative outcome stats log failed: {exc}")

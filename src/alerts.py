@@ -655,8 +655,6 @@ def _record_status_line(status: str, active: Optional[Dict[str, Any]]) -> str:
         side = "buy" if str(active.get("direction", "")).lower() in ("buy", "long") else "sell"
         since = format_ist_time(int(active["entry_ts"]), "%H:%M IST")
         return f"⏭ Ignored — {active.get('pair', '')} {side} trade open since {since}, not recorded"
-    if status == "SHADOWED":
-        return "👁 Shadowed — tracked for the Brain, not counted as a trade"
     if status == "COOLDOWN":
         resume = format_ist_time(int((active or {}).get("until_ts", 0)) + 900, "%H:%M IST")
         return f"⏸ Cooldown — target recently hit, not recorded or shadowed until the {resume} candle"
@@ -1235,12 +1233,12 @@ async def send_trade_close_notices(
             total = int(s.get("total", 0))
             if total == 0:
                 continue
-            targets = int(s.get("wins", 0))      # wins ≈ target achieved
-            stops = int(s.get("losses", 0))      # losses ≈ stop-loss hit
+            targets = int(s.get("wins", 0))      # wins: target hit first, or closed in profit on timeout
+            stops = int(s.get("losses", 0))      # losses: stop hit first, or closed at a loss on timeout
             win_rate = (targets / total * 100.0) if total else 0.0
             logger_run.info(
-                f"{source} - {total}, Target Achieved - {targets}, "
-                f"Stop loss Hit - {stops}, Win Rate - {win_rate:.0f}%"
+                f"{source} - {total}, Wins - {targets}, "
+                f"Losses - {stops}, Win Rate - {win_rate:.0f}%"
             )
     except Exception as exc:
         logger_run.warning(f"Cumulative outcome stats log failed: {exc}")
@@ -2456,6 +2454,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     req = req * macro_multiplier
                 return req
 
+            # Keep the alerts this gate rejects so the counterfactual recorder
+            # below can still shadow them after alerts_to_send is cleared.
+            _confluence_blocked_alerts: Optional[List[Tuple[str, str, str]]] = None
+
             if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
                 required = _required_confluence(confluence_total)
                 if macro_shadow is not None:
@@ -2466,6 +2468,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         f"weighted score (need {required:.1f}, abs_floor={abs_floor:.1f}, "
                         f"macro_mult={macro_multiplier if getattr(cfg, 'MACRO_CONTEXT_LIVE', False) else 1.0:.2f})"
                     )
+                    _confluence_blocked_alerts = list(alerts_to_send)
                     alerts_to_send = []
 
             # ── Correlation Cluster Penalty ("Beta Trap" filter) — LIVE ────────
@@ -2482,19 +2485,24 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         f"confluence score {raw_score:.1f} -> {confluence_score:.1f}"
                     )
 
-            if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
+            # Shadow-record whichever alerts the confluence gate rejected: the list
+            # captured by the first gate, or the live list if only the post-cluster
+            # re-check rejects them.
+            _to_record = _confluence_blocked_alerts if _confluence_blocked_alerts is not None else alerts_to_send
+            if _to_record and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
                 required = _required_confluence(confluence_total)
                 if macro_shadow is not None:
                     macro_shadow["would_block"] = confluence_score < required
                 if confluence_score < required:
-                    logger_pair.info(
-                        f"[{pair_name}] Confluence gate blocked dispatch: {confluence_score:.1f}/{confluence_total:.1f} weighted score (need {required:.1f}, abs_floor={abs_floor:.1f}, macro_mult={macro_multiplier if getattr(cfg, 'MACRO_CONTEXT_LIVE', False) else 1.0:.2f})"
-                    )
+                    if _confluence_blocked_alerts is None:
+                        logger_pair.info(
+                            f"[{pair_name}] Confluence gate blocked dispatch: {confluence_score:.1f}/{confluence_total:.1f} weighted score (need {required:.1f}, abs_floor={abs_floor:.1f}, macro_mult={macro_multiplier if getattr(cfg, 'MACRO_CONTEXT_LIVE', False) else 1.0:.2f})"
+                        )
                     await _record_counterfactual_block(
-                        sdb, pair_name, alerts_to_send, ts_curr, close_curr,
+                        sdb, pair_name, _to_record, ts_curr, close_curr,
                         block_reason="confluence_gate",
                         confluence_scores={
-                            ak: _confluence_for(ak) for _, _, ak in alerts_to_send
+                            ak: _confluence_for(ak) for _, _, ak in _to_record
                         },
                         macro_shadow=macro_shadow,
                         effective_score=confluence_score,
@@ -2882,13 +2890,16 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 }
 
                 if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
-                    await sdb.record_shadow_pending_outcome(
+                    shadow_status = await sdb.record_shadow_pending_outcome(
                         pair_name, alert_key, direction, ts_curr, close_curr,
                         confluence_score=alert_score, confluence_total=alert_total,
                         confluence_votes=alert_votes,
                         context=shadow_context,
                     )
-                    if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                    # Archive the signal-only row only when the Redis pending row
+                    # was really created, so the archive never claims a pending
+                    # trade that does not exist.
+                    if shadow_status == "created" and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                         from outcome_storage import append_outcome
                         await asyncio.to_thread(
                             append_outcome,
@@ -3030,9 +3041,18 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         clust_pen = cfg.CLUSTER_PENALTY_PCT
                 if clust_pen is not None and s is not None:
                     eff_score = s * (1 - clust_pen)
+
                 if t is not None and t > 0:
                     abs_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
+                    if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
+                        _pair_floor = (
+                            pair_thresholds.get(pair_name) if pair_thresholds is not None
+                            else await sdb.get_pair_threshold(pair_name)
+                        )
+                        if _pair_floor is not None:
+                            abs_floor = _pair_floor
                     pct_floor = t * (cfg.CONFLUENCE_MIN_PCT / 100.0)
+
                     eff_required = max(pct_floor, abs_floor)
                     if macro_mult is not None and getattr(cfg, "MACRO_CONTEXT_LIVE", False):
                         eff_required = eff_required * macro_mult
