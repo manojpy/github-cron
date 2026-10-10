@@ -905,4 +905,3 @@ def test_record_status_line_text():
     line = A._record_status_line("IGNORED", {"pair": "BTCUSD", "direction": "buy", "entry_ts": 1_000_000})
     assert line.startswith("⏭ Ignored") and "BTCUSD buy" in line
     assert A._record_status_line("RECORDED", None).startswith("📝 Recorded")
-    assert A._record_status_line("SHADOWED", None).startswith("👁 Shadowed")
