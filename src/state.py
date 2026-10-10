@@ -1472,18 +1472,18 @@ class RedisStateStore:
         confluence_votes: Optional[Dict[str, bool]] = None,
         context: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Returns one of: 'created', 'cooldown', 'disabled', 'failed'."""
+        """Returns one of: 'created', 'disabled', 'failed'.
 
+        Shadow trades are registered even while the pair is inside the live
+        cooldown; the row's context carries `cooldown_active` (and the hit
+        candle in `cooldown_hit_ts`) so reports can include or exclude them."""
         if self.degraded or not getattr(cfg, "ENABLE_BRAIN", False):
             return "disabled"
 
-        _cd_hit = await self.in_trade_cooldown(pair, entry_ts, "Shadowed")
-        if _cd_hit is not None:
-            logger.info(
-                f"[{pair}] Cooldown after target (hit candle {_cd_hit}) — "
-                f"not shadowing {alert_key} @ {entry_ts}"
-            )
-            return "cooldown"
+        # Live cooldown (Recorded trades only). It no longer blocks shadowing;
+        # it is only stored as a flag on the row.
+        _cd_hit = await self.in_trade_cooldown(pair, entry_ts)
+        cooldown_active = _cd_hit is not None
 
         key = f"{RedisKeyPrefix.SHADOW_PENDING}{pair}:{alert_key}:{entry_ts}"
         try:
@@ -1494,7 +1494,11 @@ class RedisStateStore:
                 "confluence_score": confluence_score,
                 "confluence_total": confluence_total,
                 "confluence_votes": confluence_votes,
-                "context": context,
+                "context": {
+                    **(context or {}),
+                    "cooldown_active": cooldown_active,
+                    "cooldown_hit_ts": _cd_hit,
+                },
             })
         except Exception as e:
             logger.warning(
@@ -1514,6 +1518,7 @@ class RedisStateStore:
             )
             logger.info(
                 f"[{pair}] Shadow pending created: {alert_key} @ {entry_ts} → {key}"
+                + (" (live cooldown active)" if cooldown_active else "")
             )
             return "created"
         except Exception as e:
@@ -2232,8 +2237,16 @@ class RedisStateStore:
             )
             if starts_cooldown and hit_ts is not None:
                 cooldown_hit_ts = max(int(hit_ts), cooldown_hit_ts or 0)
-        if cooldown_hit_ts is not None and int(getattr(cfg, "TRADE_CLOSE_COOLDOWN_CANDLES", 0)) > 0:
+
+        # Only real (Recorded) trades start the live cooldown; a shadow target hit
+        # never does, and shadow entries are no longer skipped during a cooldown.
+        if (
+            source == "Recorded"
+            and cooldown_hit_ts is not None
+            and int(getattr(cfg, "TRADE_CLOSE_COOLDOWN_CANDLES", 0)) > 0
+        ):
             await self._start_trade_cooldown(pair, cooldown_hit_ts, logger_pair, source)
+
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
                                        logger_pair: logging.Logger) -> None:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not self._redis:

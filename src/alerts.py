@@ -59,7 +59,7 @@ from fetcher import (
     detect_reversal_candle_pattern_with_context,
 )
 
-from state import RedisStateStore, TokenBucket, _rc, format_outcome_totals
+from state import RedisStateStore, TokenBucket, _rc
 
 from gates import GateResult, IndicatorCache
 import threshold_engine as engine
@@ -657,7 +657,8 @@ def _record_status_line(status: str, active: Optional[Dict[str, Any]]) -> str:
         return f"⏭ Ignored — {active.get('pair', '')} {side} trade open since {since}, not recorded"
     if status == "COOLDOWN":
         resume = format_ist_time(int((active or {}).get("until_ts", 0)) + 900, "%H:%M IST")
-        return f"⏸ Cooldown — target recently hit, not recorded or shadowed until the {resume} candle"
+
+        return f"⏸ Cooldown — target recently hit, not recorded until the {resume} candle"
     return "📝 Recorded as trade"
 
 def build_pair_msg_and_verdict(
@@ -1226,16 +1227,6 @@ async def send_trade_close_notices(
     sdb.trade_close_events.clear()
 
     # ── All-time close summary (from Redis stats, beginning of data collection) ──
-    try:
-        cum = await sdb.get_cumulative_outcome_stats()
-        for source in ("Recorded", "Shadowed"):
-            s = cum.get(source) or {}
-            if int(s.get("total", 0)) == 0:
-                continue
-            logger_run.info(format_outcome_totals(source, s))
-
-    except Exception as exc:
-        logger_run.warning(f"Cumulative outcome stats log failed: {exc}")
     label = {
         "target": "Target Done",
         "stop": "Stop Loss Hit",
