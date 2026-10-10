@@ -224,10 +224,10 @@ Every alert that passes the signal gates is still sent to Telegram. What differs
 |-------|---------|
 | 📝 **Recorded** | Counted as a trade. One recorded trade per pair per candle (the strongest edge). |
 | ⏭ **Ignored** | Sent, but not recorded because the pair already has an open recorded trade (`ENABLE_SINGLE_ACTIVE_TRADE`). Log line: `NOT RECORDED … trade already open`. |
-| ⏸ **Cooldown** | Sent, but not recorded or shadowed because a recorded target was hit within the last `TRADE_CLOSE_COOLDOWN_CANDLES` candles. |
+| ⏸ **Cooldown** | Sent, but not recorded because a recorded target was hit within the last `TRADE_CLOSE_COOLDOWN_CANDLES` candles. |
 | 👁 **Shadowed** | Alert was blocked by a gate (confluence, cluster penalty, win-rate, calibration, OOD, portfolio heat, brain-disabled). It is not sent, but it is tracked as a counterfactual trade for the Brain. |
 
-Recorded and Shadowed trades keep **separate cooldowns** (`trade_cooldown:{pair}` and `trade_cooldown:shadow:{pair}`), so a counterfactual target hit never puts the live pair into cooldown.
+The cooldown (`trade_cooldown:{pair}`) is started only by **Recorded** trades. Shadow trades neither start it nor are skipped by it: they are always registered, and each one stores `cooldown_active` (and `cooldown_hit_ts`) in its context so reports can include or exclude entries made during a live cooldown.
 
 ### Reading the totals line
 
@@ -334,7 +334,7 @@ docker run --rm \
 ❌ No gate blocked an alert (nothing to shadow), or shadows are still pending
 ✅ Look for "Shadow pending created" in the run log (one line per registration)
 ✅ Look for "Confluence gate blocked" lines: each should be followed by a registration
-✅ "Cooldown after target … not shadowing" means the shadow cooldown suppressed it
+✅ A shadow row with `cooldown_active: true` was registered during a live cooldown (it is kept, just flagged)
 ```
 
 ---
