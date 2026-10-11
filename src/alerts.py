@@ -2249,11 +2249,6 @@ async def _confirm_alert_candle_once(
     fetcher: DataFetcher, symbol: str, pair_name: str, ts_curr: int,
     cached_snapshot: CandleSnapshot, is_green: bool, is_red: bool,
     reference_time: int, logger_pair: logging.Logger,
-
-async def _confirm_alert_candle(
-    fetcher: DataFetcher, symbol: str, pair_name: str, ts_curr: int,
-    cached_snapshot: CandleSnapshot, is_green: bool, is_red: bool,
-    reference_time: int, logger_pair: logging.Logger,
 ) -> Tuple[Optional[bool], Optional[bool]]:
     """Run the candle re-confirmation and the mark-price check concurrently.
 
