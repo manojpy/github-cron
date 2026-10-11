@@ -760,8 +760,14 @@ def test_dlq_replay_applies_outcomes_and_state_after_delivery(monkeypatch):
             self.deleted.append(key)
             self.parked.pop(key, None)
 
+        async def dlq_save_entry(self, key, entry):
+            if key in self.parked:
+                self.parked[key] = entry
+            return True
+
         async def record_pending_outcome(self, **kw):
             self.outcomes.append(kw)
+            return True
 
     sdb = _DlqSdb()
     ts = int(time.time())
