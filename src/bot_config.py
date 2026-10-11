@@ -652,6 +652,12 @@ class BotConfig(BaseModel):
             if not (min_v <= val <= max_v):
                 errors.append(f'{name} must be {min_v}-{max_v}, got {val}')
 
+        if self.ENABLE_ALERT_COALESCING and self.COALESCE_DEDUP_WINDOW_SEC > 900:
+            warnings.append(
+                f'COALESCE_DEDUP_WINDOW_SEC={self.COALESCE_DEDUP_WINDOW_SEC} is longer than one 15m candle: '
+                f'a same-direction alert on the NEXT candle is suppressed. Use <= 900 to dedup within a candle only.'
+            )
+
         if self.MAX_ALERTS_PER_PAIR > 15:
             warnings.append(
                 f'MAX_ALERTS_PER_PAIR={self.MAX_ALERTS_PER_PAIR} is very high, may cause spam'

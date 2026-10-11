@@ -231,11 +231,13 @@ def main():
         print("Performing aggressive cleanup..." if not args.dry_run else "Previewing aggressive cleanup...")
         
         simulated_size = new_size
-        for label, pattern in (("outcomes", "*.jsonl*"), ("shadow", "*.jsonl*"), ("reports", "*.md")):
+        # Cheapest-to-lose first: reports are regenerated, shadow rows are the
+        # lowest-value data, real outcomes are the last thing to give up.
+        for label, pattern in (("reports", "*.md"), ("shadow", "*.jsonl*"), ("outcomes", "*.jsonl*")):
             label_dir = data_dir / label
             if not label_dir.exists():
                 continue
-            
+      
             files = sorted(label_dir.glob(pattern))
             for month_file in files:
                 current_check = simulated_size if args.dry_run else get_dir_size(data_dir)

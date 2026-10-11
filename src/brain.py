@@ -682,10 +682,17 @@ class BrainCore:
                 calibration_min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
                 calibration_slack=getattr(cfg, "CALIBRATION_SLACK", 0.05),
                 market_state_p_win=market_state_p_win,
+
                 use_market_state_live=getattr(cfg, "ENABLE_MARKET_STATE_LIVE_SCORE", False),
                 ml_calibration_curve=ml_calibration_curve,
             )
-        except Exception:
+        except Exception as e:
+            # Must not be silent: None means "no brain data", which the advisor
+            # treats as an unproven setup (and may still TAKE at high technicals).
+            logging.getLogger("macd_bot").error(
+                f"[{pair}] trade_quality_score failed for {alert_key}/{direction} — "
+                f"treated as 'no brain data': {e!r}"
+            )
             return None
 
         if getattr(cfg, "ENABLE_MAE_MFE_TRADE_PLAN", True) and result.get("verdict") != "BLOCKED":
