@@ -1324,6 +1324,10 @@ def _choch_poi_tap(o, h, l, c, br, sweep_idx, is_buy, cfg_obj):
             iob_showlast=10, ob_showlast=10,
         )
     except Exception:
+        logger.error(
+            f"[{PAIR_ID.get() or '?'}] CHoCH POI-tap check failed (treated as no tap)",
+            exc_info=True,
+        )
         return False
     for z in (active_obs + active_iobs):
         if z.is_demand != is_buy:
@@ -1635,8 +1639,7 @@ def _array_percentile_rank(arr: np.ndarray, i: int, lookback: int, min_history: 
     if start < 0:
         return None
 
-    current = arr[i]
-    cache_key = (arr.ctypes.data, i, lookback, min_history, allow_zero, current)
+    cache_key = (hash(arr[start:i + 1].tobytes()), i, lookback, min_history, allow_zero)
     cached = _pctl_rank_cache.get(cache_key, _PCTL_CACHE_MISS)
     if cached is not _PCTL_CACHE_MISS:
         _pctl_rank_cache.move_to_end(cache_key)
@@ -1698,9 +1701,8 @@ def get_adaptive_adx_threshold(adx_arr: np.ndarray, i15: int, cfg: BotConfig) ->
     start = i15 - lookback
     if start < 0:
         return cfg.ADX_ADAPTIVE_FALLBACK
-    current = adx_arr[i15] if i15 < len(adx_arr) else np.nan
-    cache_key = (adx_arr.ctypes.data, i15, lookback, cfg.ADX_ADAPTIVE_TARGET_PCTL,
-                 cfg.ADX_ADAPTIVE_BAND_WIDTH, current)
+    cache_key = (hash(adx_arr[start:i15].tobytes()), i15, lookback, cfg.ADX_ADAPTIVE_TARGET_PCTL,
+                 cfg.ADX_ADAPTIVE_BAND_WIDTH)
     cached = _adx_thresh_cache.get(cache_key, _ADX_CACHE_MISS)
     if cached is not _ADX_CACHE_MISS:
         _adx_thresh_cache.move_to_end(cache_key)

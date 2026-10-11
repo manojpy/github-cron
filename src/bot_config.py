@@ -698,6 +698,37 @@ class BotConfig(BaseModel):
         if self.MAX_CANDLE_STALENESS_SEC < 300:
             warnings.append(f'MAX_CANDLE_STALENESS_SEC very low ({self.MAX_CANDLE_STALENESS_SEC}s)')
 
+        # Every 15m indicator must produce a valid value at the last closed candle
+        # (index FETCH_LIMIT_15M - 2) inside the fetched window. Otherwise it is
+        # silently NaN and its gate evaluates False for every pair.
+        last_idx = Constants.FETCH_LIMIT_15M - 2
+        warmups = {
+            'ICHIMOKU cloud (SPANB+DISPLACEMENT-2)':
+                self.ICHIMOKU_SPANB_PERIODS + self.ICHIMOKU_DISPLACEMENT - 2
+                if self.ICHIMOKU_CLOUD_ENABLED else 0,
+            'ICHIMOKU TK guard (TK_BASE-1)':
+                self.ICHIMOKU_TK_BASE_PERIODS - 1 if self.ICHIMOKU_TK_GUARD_ENABLED else 0,
+            'BIAS_ICHIMOKU cloud (SPANB+DISPLACEMENT-2)':
+                self.BIAS_ICHIMOKU_SPANB_PERIODS + self.BIAS_ICHIMOKU_DISPLACEMENT - 2
+                if self.ENABLE_BIAS_HEADER else 0,
+            'RSI_GUARD (RSI+KALMAN+EMA lengths)':
+                self.RSI_GUARD_RSI_LEN + self.RSI_GUARD_KALMAN_LEN + self.RSI_GUARD_EMA_LEN
+                if self.RSI_GUARD_ENABLED else 0,
+            'DYNAMIC_FLOW_DIST_LENGTH':
+                self.DYNAMIC_FLOW_DIST_LENGTH if self.DYNAMIC_FLOW_RIBBON_ENABLED else 0,
+        }
+        for label, needed in warmups.items():
+            if needed > last_idx:
+                errors.append(
+                    f'{label} needs {needed} candles but only {Constants.FETCH_LIMIT_15M} 15m candles '
+                    f'are fetched (Constants.FETCH_LIMIT_15M); the gate would be permanently false'
+                )
+            elif needed > last_idx - 50:
+                warnings.append(
+                    f'{label} needs {needed} of {Constants.FETCH_LIMIT_15M} fetched 15m candles '
+                    f'(< 50 spare); raise Constants.FETCH_LIMIT_15M before lengthening it further'
+                )
+
         if errors:
             error_msg = 'Configuration validation failed:\n  ' + '\n  '.join(errors)
             raise ValueError(error_msg)

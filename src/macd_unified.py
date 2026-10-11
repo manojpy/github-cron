@@ -670,7 +670,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     logger_main.info(f"🔡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
-    limit_15m = 300
+    limit_15m = Constants.FETCH_LIMIT_15M
     limit_5m = max(
         Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER,
         cfg.RMA_200_PERIOD * 3 

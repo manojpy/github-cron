@@ -74,75 +74,85 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
 
     # ── Repair Ledger: close the loop on past repairs ────────────────
     try:
-        fresh = await evaluate_pending_repairs(
-            self.sdb, real_rows, horizon_hours=48, min_outcomes=30,
-        )
-        if fresh:
-            logger.info(f"📒 Repair ledger: evaluated {len(fresh)} pending repair(s)")
+        fresh: List[Dict[str, Any]] = []
+        try:
+            fresh = await evaluate_pending_repairs(
+                self.sdb, real_rows, horizon_hours=48, min_outcomes=30,
+            )
+            if fresh:
+                logger.info(f"📒 Repair ledger: evaluated {len(fresh)} pending repair(s)")
 
-        # ── Auto-rollback: clear dynamic weights if a weight repair hurt ──
-        if getattr(cfg, "BRAIN_AUTO_ROLLBACK_HURT", True) and fresh:
-            weight_categories = {
-                "weight_optimizer",
-                "dynamic_weights",
-                "confluence_weights",
-                "vote_weights",
-            }
-            hurt_weight_repairs = [
-                e for e in fresh
-                if e.get("verdict") == "hurt"
-                and (
-                    e.get("category") in weight_categories
-                    or e.get("type") in weight_categories
-                    or "weight" in str(e.get("type", "")).lower()
-                    or "weight" in str(e.get("category", "")).lower()
-                )
-            ]
-            if hurt_weight_repairs:
-                cleared = await self.sdb.clear_dynamic_weights()
-                ids = [
-                    e.get("id") or e.get("repair_id")
-                    for e in hurt_weight_repairs
+            # ── Auto-rollback: clear dynamic weights if a weight repair hurt ──
+            if getattr(cfg, "BRAIN_AUTO_ROLLBACK_HURT", True) and fresh:
+                weight_categories = {
+                    "weight_optimizer",
+                    "dynamic_weights",
+                    "confluence_weights",
+                    "vote_weights",
+                }
+                hurt_weight_repairs = [
+                    e for e in fresh
+                    if e.get("verdict") == "hurt"
+                    and (
+                        e.get("category") in weight_categories
+                        or e.get("type") in weight_categories
+                        or "weight" in str(e.get("type", "")).lower()
+                        or "weight" in str(e.get("category", "")).lower()
+                    )
                 ]
-                logger.warning(
-                    f"↩️ Auto-rollback: cleared dynamic_weights after "
-                    f"{len(hurt_weight_repairs)} hurt repair(s): {ids} "
-                    f"(cleared={cleared})"
-                )
-                for e in hurt_weight_repairs:
-                    e["auto_rolled_back"] = True
-                    e["rolled_back_at"] = int(time.time())
-                await self._record_plan_event(
-                    f"repair:{ids[0]}" if ids and ids[0] else "repair:unknown",
-                    "rolled_back",
-                    f"dynamic_weights cleared after hurt repair(s) {ids}",
-                )
+                if hurt_weight_repairs:
+                    cleared = await self.sdb.clear_dynamic_weights()
+                    ids = [
+                        e.get("id") or e.get("repair_id")
+                        for e in hurt_weight_repairs
+                    ]
+                    logger.warning(
+                        f"↩️ Auto-rollback: cleared dynamic_weights after "
+                        f"{len(hurt_weight_repairs)} hurt repair(s): {ids} "
+                        f"(cleared={cleared})"
+                    )
+                    for e in hurt_weight_repairs:
+                        e["auto_rolled_back"] = True
+                        e["rolled_back_at"] = int(time.time())
+                    await self._record_plan_event(
+                        f"repair:{ids[0]}" if ids and ids[0] else "repair:unknown",
+                        "rolled_back",
+                        f"dynamic_weights cleared after hurt repair(s) {ids}",
+                    )
+        except Exception as e:
+            audit.record_analysis_exception("repair_ledger_evaluate", e)
 
         # ── Objective post-apply harm monitor (roadmap #6) ──
-        _mon = await self.monitor_applied_plans(real_rows, logger)
-        if _mon:
-            ai_metrics["apply_monitor"] = _mon
-            for _ev in _mon:
-                if _ev["status"] == "rolled_back":
-                    _e = _ev["evidence"]
-                    recommendations.append({
-                        "type": "auto_rollback", "severity": "high",
-                        "message": (
-                            f"↩️ Auto-rolled back plan {_ev['plan_id']}: WR "
-                            f"{_e['wr_pre']:.0%}→{_e['wr_post']:.0%} after apply "
-                            f"(p={_e['p_value']}, n={_e['n_post']}/{_e['n_pre']})."
-                            + (" Config overrides need a restart to take effect."
-                               if _ev.get("needs_restart") else "")
-                        ),
-                    })
-                elif _ev["status"] == "rollback_withheld":
-                    recommendations.append({
-                        "type": "auto_rollback", "severity": "low",
-                        "message": (
-                            f"ℹ️ Plan {_ev['plan_id']} shows a post-apply WR drop but "
-                            f"auto-rollback was withheld: {_ev['reason']}."
-                        ),
-                    })
+        # Own try/except on both sides: a failure in the ledger evaluate/rollback
+        # steps above must not skip this safety monitor, and a monitor failure must
+        # not skip the steps below.
+        try:
+            _mon = await self.monitor_applied_plans(real_rows, logger)
+            if _mon:
+                ai_metrics["apply_monitor"] = _mon
+                for _ev in _mon:
+                    if _ev["status"] == "rolled_back":
+                        _e = _ev["evidence"]
+                        recommendations.append({
+                            "type": "auto_rollback", "severity": "high",
+                            "message": (
+                                f"↩️ Auto-rolled back plan {_ev['plan_id']}: WR "
+                                f"{_e['wr_pre']:.0%}→{_e['wr_post']:.0%} after apply "
+                                f"(p={_e['p_value']}, n={_e['n_post']}/{_e['n_pre']})."
+                                + (" Config overrides need a restart to take effect."
+                                   if _ev.get("needs_restart") else "")
+                            ),
+                        })
+                    elif _ev["status"] == "rollback_withheld":
+                        recommendations.append({
+                            "type": "auto_rollback", "severity": "low",
+                            "message": (
+                                f"ℹ️ Plan {_ev['plan_id']} shows a post-apply WR drop but "
+                                f"auto-rollback was withheld: {_ev['reason']}."
+                            ),
+                        })
+        except Exception as e:
+            audit.record_analysis_exception("apply_monitor", e)
 
         # ── Champion/challenger: periodic promotion check. force=False
         # always, so this stays a no-op reporting "shadow_only_requires_force"

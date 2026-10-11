@@ -520,8 +520,8 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                         "\nDiagnostic only — no threshold change applied yet."
                     ),
                 })
-
     # ── Hierarchical pair+direction+alert+regime analysis ──
+    hca: Dict[str, Any] = {"valid": False}
     if getattr(cfg, "ENABLE_HIERARCHICAL_COMBINATION_ANALYSIS", True):
         can_run_hca, hca_reason = audit.can_run("hierarchical")
         if can_run_hca:
@@ -1393,9 +1393,8 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                 "delta_ev": -fr.get("ev_overstated_pct_per_trade", 0.0),
             })
 
-    severity_order = {"high": 0, "medium": 1, "low": 2}
-    recommendations.sort(key=lambda x: severity_order.get(x["severity"], 3))
-
+    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    recommendations.sort(key=lambda x: severity_order.get(x["severity"], 4))
     return {
         "generated_at": int(time.time()),
         "real_sample_size": len(real_rows),
