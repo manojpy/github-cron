@@ -131,7 +131,7 @@ class TelegramQueue:
             ok = bool(
                 await asyncio.wait_for(
                     self._send_impl(message),
-                    timeout=45.0
+                    timeout=self._send_budget_sec(),
                 )
             )
             if ok:
@@ -148,6 +148,14 @@ class TelegramQueue:
                 raise
             return False
 
+    @staticmethod
+    def _send_budget_sec() -> float:
+        """Outer deadline for one send(). It must be longer than every attempt
+        _send_impl may make (20s each, plus backoff), otherwise the outer cancel
+        can fire while a request is in flight, report failure after Telegram has
+        actually delivered, and park a duplicate in the DLQ."""
+        return float(cfg.TELEGRAM_RETRIES) * 25.0 + 15.0
+
     async def _send_impl(self, message: str) -> bool:
         await self.token_bucket.acquire()
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
@@ -163,6 +171,15 @@ class TelegramQueue:
                         await asyncio.sleep(wait_sec + random.uniform(0.1, 0.5))
                         continue
                     if resp.status == 200:
+                        try:
+                            _body = await resp.json(content_type=None)
+                        except Exception:
+                            # 200 with an unreadable body: Telegram accepted it.
+                            # Retrying here would risk a duplicate message.
+                            return True
+                        if isinstance(_body, dict) and _body.get("ok") is False:
+                            logger.error(f"Telegram returned HTTP 200 with ok=false: {_body}")
+                            return False
                         return True
                     if resp.status in (400, 401, 403, 404):
                         response_text = await resp.text()
@@ -202,7 +219,8 @@ class TelegramQueue:
         Returns None on failure — treat the same as a failed send()."""
         try:
             return await asyncio.wait_for(
-                self._send_impl_with_markup(message, reply_markup), timeout=45.0
+                self._send_impl_with_markup(message, reply_markup),
+                timeout=self._send_budget_sec(),
             )
         except asyncio.CancelledError:
             raise
@@ -1150,12 +1168,23 @@ async def queue_failed_alert(
         log.error(f"[{pair_name}] Telegram send failed AND DLQ push failed — alert lost ({source})")
     return ok
 
+# Replay is a catch-up step in front of the main scan, so it gets a hard time
+# budget: a slow Telegram must not eat the 480s run deadline.
+DLQ_REPLAY_BUDGET_SEC = 60.0
+
 async def replay_telegram_dlq(
     sdb: Optional[RedisStateStore], telegram_queue: TelegramQueue, log: logging.Logger,
 ) -> None:
-    """Re-send parked alerts. Stale entries are dropped and abandoned entries
-    (too many failed attempts) are dropped; both release their dedup claims so
-    nothing stays suppressed. Stops at the first failed send (Telegram down)."""
+    """Re-send parked alerts. Stale and abandoned entries are dropped (their dedup
+    claims have long expired, so nothing needs releasing). Stops at the first
+    failed send (Telegram down) or when the time budget is spent.
+
+    Delivery and its side effects are tracked separately in the entry:
+      delivered=True   the message reached Telegram; it is never sent again.
+      outcomes_done    how many owed outcome rows are already recorded.
+      state_done       the owed state changes are already applied.
+    The entry is deleted only when every side effect has succeeded, so a Redis
+    failure after delivery is retried on the next run instead of being lost."""
     if not getattr(cfg, "ENABLE_TELEGRAM_DLQ", True) or cfg.DRY_RUN_MODE:
         return
     if sdb is None or sdb.degraded:
@@ -1163,51 +1192,96 @@ async def replay_telegram_dlq(
     entries = await sdb.dlq_list(limit=int(cfg.TELEGRAM_DLQ_MAX_ITEMS_PER_RUN))
     if not entries:
         return
+    started = time.monotonic()
     now = int(time.time())
     max_age = int(cfg.TELEGRAM_DLQ_MAX_AGE_SEC)
     max_attempts = int(cfg.TELEGRAM_DLQ_MAX_ATTEMPTS)
     prefix = escape_markdown_v2("⏳ Delayed alert — first send failed\n")
     for key, entry in entries:
         pair = str(entry.get("pair", ""))
-        claims = [str(k) for k in (entry.get("dedup_keys") or [])]
         attempts = int(entry.get("attempts") or 0)
         age = now - int(entry.get("ts") or 0)
-        if age > max_age:
-            for dk in claims:
-                await sdb.release_recent_alert(pair, dk)
-            await sdb.dlq_delete(key)
-            DLQ_STATS["expired"] += 1
-            log.warning(f"[{pair}] DLQ alert expired (candle {age}s old) — dropped")
-            continue
+        delivered = bool(entry.get("delivered"))
 
-        if await telegram_queue.send(prefix + str(entry["message"])):
-            # Delivered: now (and only now) apply what a normal send would have
-            # applied, so the Brain sees this trade and the pair state is ACTIVE.
-            for kw in (entry.get("outcomes") or []):
-                try:
-                    await sdb.record_pending_outcome(**kw)
-                except Exception as e:
-                    log.error(f"[{pair}] DLQ replay: outcome record failed: {e}")
-            _sc = [tuple(c) for c in (entry.get("state_changes") or [])]
-            if _sc:
-                try:
-                    await sdb.atomic_batch_update(_sc)
-                except Exception as e:
-                    log.error(f"[{pair}] DLQ replay: state update failed: {e}")
+        if not delivered:
+            if age > max_age:
+                await sdb.dlq_delete(key)
+                DLQ_STATS["expired"] += 1
+                log.warning(f"[{pair}] DLQ alert expired (candle {age}s old) — dropped")
+                continue
+            if time.monotonic() - started > DLQ_REPLAY_BUDGET_SEC:
+                log.warning(
+                    f"DLQ replay time budget ({DLQ_REPLAY_BUDGET_SEC:.0f}s) spent — "
+                    f"remaining entries wait for the next run"
+                )
+                break
+            if not await telegram_queue.send(prefix + str(entry["message"])):
+                DLQ_STATS["replayed_failed"] += 1
+                if attempts + 1 >= max_attempts:
+                    await sdb.dlq_delete(key)
+                    DLQ_STATS["abandoned"] += 1
+                    log.error(f"[{pair}] DLQ alert abandoned after {attempts + 1} failed attempts")
+                else:
+                    await sdb.dlq_set_attempts(key, entry, attempts + 1)
+                break   # Telegram is down: do not hammer it with the rest
+            # Delivered. Persist that fact BEFORE touching side effects, so a
+            # failure below can never cause a second send of the same alert.
+            entry = dict(entry, delivered=True, attempts=attempts + 1)
+            if not await sdb.dlq_save_entry(key, entry):
+                log.error(
+                    f"[{pair}] DLQ alert delivered but could not be marked delivered "
+                    f"(Redis) — it may be re-sent once"
+                )
+
+        # Side effects owed after a delivery (idempotent, resumable).
+        all_ok = True
+        outcomes = list(entry.get("outcomes") or [])
+        done = int(entry.get("outcomes_done") or 0)
+        for i in range(done, len(outcomes)):
+            try:
+                recorded = await sdb.record_pending_outcome(**outcomes[i])
+            except Exception as e:
+                log.error(f"[{pair}] DLQ replay: outcome record failed: {e}")
+                recorded = False
+            if recorded is False:
+                all_ok = False
+                break
+            done = i + 1
+        _sc = [tuple(c) for c in (entry.get("state_changes") or [])]
+        state_done = bool(entry.get("state_done"))
+        if all_ok and _sc and not state_done:
+            try:
+                state_done = bool(await sdb.atomic_batch_update(_sc))
+            except Exception as e:
+                log.error(f"[{pair}] DLQ replay: state update raised: {e}")
+                state_done = False
+            all_ok = state_done
+
+        if all_ok:
             await sdb.dlq_delete(key)
             DLQ_STATS["replayed_ok"] += 1
             log.info(f"[{pair}] DLQ alert delivered on retry (attempt {attempts + 1})")
             continue
-        DLQ_STATS["replayed_failed"] += 1
-        if attempts + 1 >= max_attempts:
-            for dk in claims:
-                await sdb.release_recent_alert(pair, dk)
+
+        # Delivered, but a side effect failed: keep the entry (marked delivered)
+        # and resume only the unfinished side effects next run, up to a limit.
+        side_tries = int(entry.get("side_tries") or 0) + 1
+        if side_tries >= max_attempts:
             await sdb.dlq_delete(key)
             DLQ_STATS["abandoned"] += 1
-            log.error(f"[{pair}] DLQ alert abandoned after {attempts + 1} failed attempts")
-        else:
-            await sdb.dlq_set_attempts(key, entry, attempts + 1)
-        break
+            log.error(
+                f"[{pair}] DLQ alert was delivered but its outcome/state side effects "
+                f"failed {side_tries} times — giving up (trade may be missing from the Brain)"
+            )
+            continue
+        await sdb.dlq_save_entry(
+            key, dict(entry, outcomes_done=done, state_done=state_done, side_tries=side_tries),
+        )
+        DLQ_STATS["replayed_failed"] += 1
+        log.warning(
+            f"[{pair}] DLQ alert delivered; side effects incomplete — will resume next run "
+            f"({side_tries}/{max_attempts})"
+        )
 
 def _buttons_on(queue: Any) -> bool:
     """Took/Skip buttons only when switched on AND the sender supports markup."""
@@ -1224,7 +1298,6 @@ async def send_trade_close_notices(
     events = list(getattr(sdb, "trade_close_events", None) or [])
     if not events or not getattr(cfg, "ENABLE_TRADE_CLOSE_NOTICE", True):
         return 0
-    sdb.trade_close_events.clear()
 
     # ── All-time close summary (from Redis stats, beginning of data collection) ──
     label = {
@@ -1250,20 +1323,29 @@ async def send_trade_close_notices(
         )
     if len(events) > 30:
         lines.append(f"… and {len(events) - 30} more")
-
     text = "\n".join(lines)
     if cfg.DRY_RUN_MODE:
         logger_run.info(f"[DRY RUN] Would send trade updates:\n{text}")
+        sdb.trade_close_events.clear()
         return len(events)
+    message = escape_markdown_v2(text)
     try:
-        ok = await telegram_queue.send(escape_markdown_v2(text))
+        ok = await telegram_queue.send(message)
     except Exception as e:
         logger_run.error(f"Trade-update notice failed to send: {e}")
-        return 0
-    if not ok:
-        logger_run.error("Trade-update notice was not delivered (Telegram send returned False)")
-        return 0
-    return len(events)
+        ok = False
+    if ok:
+        sdb.trade_close_events.clear()
+        return len(events)
+    # Not delivered. These closes are already resolved in Redis, so nothing will
+    # ever re-create them: park the notice in the DLQ (re-sent next run) and keep
+    # the in-memory events until it is safely stored.
+    logger_run.error("Trade-update notice was not delivered (Telegram send failed)")
+    if await queue_failed_alert(
+        sdb, "TRADE_CLOSE", message, int(time.time()), [], "trade_close", logger_run,
+    ):
+        sdb.trade_close_events.clear()
+    return 0
 
 async def dispatch_combined_alerts(
     payloads: List[AlertPayload],
@@ -1427,9 +1509,18 @@ async def dispatch_combined_alerts(
             combined_success = False
             break
 
+            break
+
     if sent_payloads:
-        if all_changes:
-            await sdb.atomic_batch_update(all_changes)
+        if all_changes and not await sdb.atomic_batch_update(all_changes):
+            # atomic_batch_update reports failure by returning False (it never
+            # raises). One retry, then say so loudly: the alerts ARE delivered,
+            # only the ACTIVE-state markers are missing.
+            if not await sdb.atomic_batch_update(all_changes):
+                logger_run.error(
+                    f"Combined dispatch: state update FAILED after delivery for "
+                    f"{[p.pair_name for p in sent_payloads]} — ACTIVE markers missing"
+                )
         async with alerts_sent_lock:
             alerts_sent_ref[0] += sum(p.budget_count for p in sent_payloads)
         for p in sent_payloads:
@@ -1451,8 +1542,8 @@ async def dispatch_combined_alerts(
         f"Combined dispatch failed part-way — falling back to individual sends "
         f"for {len(unsent)} unsent pair(s)"
     )
-
     fallback_sent = 0
+    telegram_down = False   # circuit breaker: after one failed send, park the rest at once
     for p in unsent:
         date_str_p = format_ist_time(p.ts, '%d-%m-%Y')
         time_str_p = format_ist_time(p.ts, '%H:%M IST')
@@ -1461,12 +1552,15 @@ async def dispatch_combined_alerts(
             f"📆  {escape_markdown_v2(date_str_p)}{spacing_p}⏰ {escape_markdown_v2(time_str_p)}"
         )
         full_msg = p.msg_body
+
         if cfg.ENABLE_BIAS_HEADER and bias_context is not None:
             full_msg += "\n" + DIVIDER + "\n" + _format_bias_header(bias_context)
         full_msg += "\n" + datetime_line_p
-        if await telegram_queue.send(full_msg):
-            if p.state_changes:
-                await sdb.atomic_batch_update(p.state_changes)
+        if not telegram_down and await telegram_queue.send(full_msg):
+            if p.state_changes and not await sdb.atomic_batch_update(p.state_changes):
+                logger_run.error(
+                    f"[{p.pair_name}] State update FAILED after delivery — ACTIVE marker missing"
+                )
             async with alerts_sent_lock:
                 alerts_sent_ref[0] += p.budget_count
 
@@ -1474,10 +1568,10 @@ async def dispatch_combined_alerts(
             await _record_auto_positions(sdb, [p])
             fallback_sent += p.budget_count
         else:
+            telegram_down = True
             # Send failed. Park the message in the Telegram DLQ: the DLQ now
             # owns delivery, so keep the dedup claims and mark the candle
             # processed (no duplicate re-fire). If it cannot be parked, release
-            # the claims so the alert can retry normally.
             _owed: List[Dict[str, Any]] = []
             if p.record_win_rate is not None:
                 try:
@@ -2151,6 +2245,11 @@ def rolling_correlation(alt_returns: np.ndarray, btc_returns: np.ndarray, window
         return float("nan")
     return float(np.corrcoef(a, b)[0, 1])
 
+async def _confirm_alert_candle_once(
+    fetcher: DataFetcher, symbol: str, pair_name: str, ts_curr: int,
+    cached_snapshot: CandleSnapshot, is_green: bool, is_red: bool,
+    reference_time: int, logger_pair: logging.Logger,
+
 async def _confirm_alert_candle(
     fetcher: DataFetcher, symbol: str, pair_name: str, ts_curr: int,
     cached_snapshot: CandleSnapshot, is_green: bool, is_red: bool,
@@ -2179,6 +2278,60 @@ async def _confirm_alert_candle(
     if isinstance(mark_agrees, BaseException):
         raise mark_agrees                      # old code raised when reconfirmed was True
     return reconfirmed, mark_agrees
+
+# An inconclusive confirmation (fetch error, candle not yet listed, mark price
+# unavailable) is retried inside the run. The bot evaluates each 15m candle
+# exactly once, so giving up on the first blip loses that signal for good.
+CONFIRM_RETRY_ATTEMPTS = 3
+CONFIRM_RETRY_DELAY_SEC = 3.0
+
+async def _confirm_alert_candle(
+    fetcher: DataFetcher, symbol: str, pair_name: str, ts_curr: int,
+    cached_snapshot: CandleSnapshot, is_green: bool, is_red: bool,
+    reference_time: int, logger_pair: logging.Logger,
+) -> Tuple[Optional[bool], Optional[bool]]:
+    """_confirm_alert_candle_once with bounded in-run retries. Only an
+    inconclusive result (None) is retried; True/False answers return at once."""
+    reconfirmed: Optional[bool] = None
+    mark_agrees: Optional[bool] = None
+    for attempt in range(1, CONFIRM_RETRY_ATTEMPTS + 1):
+        reconfirmed, mark_agrees = await _confirm_alert_candle_once(
+            fetcher, symbol, pair_name, ts_curr, cached_snapshot,
+            is_green, is_red, reference_time, logger_pair,
+        )
+        inconclusive = reconfirmed is None or (reconfirmed is True and mark_agrees is None)
+        if not inconclusive:
+            break
+        if attempt < CONFIRM_RETRY_ATTEMPTS:
+            logger_pair.warning(
+                f"[{pair_name}] Confirmation inconclusive (attempt {attempt}/"
+                f"{CONFIRM_RETRY_ATTEMPTS}) — retrying in "
+                f"{CONFIRM_RETRY_DELAY_SEC * attempt:.0f}s"
+            )
+            await asyncio.sleep(CONFIRM_RETRY_DELAY_SEC * attempt)
+    return reconfirmed, mark_agrees
+
+async def _notify_unconfirmed_signal(
+    telegram_queue: "TelegramQueue", pair_name: str, alerts_to_send: List[Tuple[str, str, str]],
+    ts_curr: int, reason: str, logger_pair: logging.Logger,
+) -> None:
+    """Tell the user a signal fired but could not be verified. This is NOT an
+    alert: it carries no entry, records no outcome, marks no ACTIVE state and
+    never feeds the heat gate. It exists so a signal lost to an exchange-data
+    outage is visible instead of silent."""
+    if cfg.DRY_RUN_MODE or not getattr(cfg, "ENABLE_UNCONFIRMED_SIGNAL_NOTICE", True):
+        return
+    side = "BUY" if alerts_to_send and alerts_to_send[0][2] in BUY_ALERT_KEYS else "SELL"
+    text = (
+        f"⚠️ UNCONFIRMED signal (not an alert, no trade recorded)\n"
+        f"{pair_name} {side} — candle {format_ist_time(ts_curr, '%H:%M')} IST\n"
+        f"Could not verify the candle ({reason}) after {CONFIRM_RETRY_ATTEMPTS} tries. "
+        f"Check the chart yourself before acting."
+    )
+    try:
+        await telegram_queue.send(escape_markdown_v2(text))
+    except Exception as e:
+        logger_pair.warning(f"[{pair_name}] Unconfirmed-signal notice failed: {e}")
 
 async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], conditional_states: Dict[str, bool],
     raw_alerts: List[Tuple[str, str, str]], sdb: RedisStateStore, telegram_queue: TelegramQueue,
@@ -2873,34 +3026,17 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     "ichimoku_gate_ok_buy": gr.ichimoku_gate_ok_buy,
                     "ichimoku_gate_ok_sell": gr.ichimoku_gate_ok_sell,
                 }
-
                 if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
-                    shadow_status = await sdb.record_shadow_pending_outcome(
+                    await sdb.record_shadow_pending_outcome(
                         pair_name, alert_key, direction, ts_curr, close_curr,
                         confluence_score=alert_score, confluence_total=alert_total,
                         confluence_votes=alert_votes,
                         context=shadow_context,
                     )
-                    # Archive the signal-only row only when the Redis pending row
-                    # was really created, so the archive never claims a pending
-                    # trade that does not exist.
-                    if shadow_status == "created" and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
-                        from outcome_storage import append_outcome
-                        await asyncio.to_thread(
-                            append_outcome,
-                            {
-                                "pair": pair_name,
-                                "alert_key": alert_key,
-                                "direction": direction,
-                                "entry_ts": ts_curr,
-                                "price": close_curr,
-                                "score": alert_score,
-                                "total": alert_total,
-                                "votes": alert_votes,
-                                "context": shadow_context,
-                            },
-                            True,
-                        )
+                    # No signal-only archive row is written here. Every reader
+                    # (archive_reader, load_recent_outcomes) drops rows without a
+                    # `win` field, and they inflate the Brain audit's "rejected"
+                    # count. The resolved shadow row is archived at resolution.
                 logger_pair.info(
                     f"[{pair_name}] Win-rate filter dropped {alert_key}: {fail_note}"
                 )
@@ -3073,14 +3209,14 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             _coalesce_window = await coalesce_window_for(
                 sdb, [ak for _, _, ak in alerts_to_send]
             )
-            claim = await sdb.claim_recent_alert(
+            claim = await sdb.claim_coalesced_alert(
                 pair_name, coalesced_dedup_key, ts_curr,
                 window_sec=_coalesce_window,
             )
             if claim is None and await sdb.maybe_recover_from_degraded():
                 # Redis is healthy again: retry the claim once instead of
                 # silencing this alert for the whole run.
-                claim = await sdb.claim_recent_alert(
+                claim = await sdb.claim_coalesced_alert(
                     pair_name, coalesced_dedup_key, ts_curr,
                     window_sec=_coalesce_window,
                 )
@@ -3256,10 +3392,15 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 )
                 if reconfirmed is None:
                     logger_pair.warning(
-                        f"[{pair_name}] Confirmation inconclusive — alert suppressed this run, "
-                        f"dedup key RELEASED so it can retry next run"
+                        f"[{pair_name}] Confirmation still inconclusive after "
+                        f"{CONFIRM_RETRY_ATTEMPTS} tries — NOT sent as an alert; dedup "
+                        f"claim released; separate 'unconfirmed' notice sent instead"
                     )
                     await _release_dedup_claims()
+                    await _notify_unconfirmed_signal(
+                        telegram_queue, pair_name, alerts_to_send, ts_curr,
+                        "candle data unavailable", logger_pair,
+                    )
                     return pair_name, {
                         "state": "SUPPRESSED_RECONFIRM_INCONCLUSIVE",
                         "ts": int(time.time()),
@@ -3267,15 +3408,16 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             "alerts": 0,
                             "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
                             "hist_rma": round(hist_curr, 4),
-                            "suppression": "Confirmation inconclusive — dedup released, will retry next run",
+                            "suppression": "Confirmation inconclusive after retries — unconfirmed notice sent, no alert",
                         },
                     }, None
                 elif reconfirmed is False:
                     logger_pair.warning(
                         f"[{pair_name}] 🔁 Confirmed repaint in send-queue window — "
-                        f"alert suppressed, dedup key KEPT to prevent duplicates"
+                        f"alert suppressed, dedup claim released (nothing was sent)"
                     )
                     DEDUP_STATS["kept_repaint"] += 1
+                    await _release_dedup_claims()
                     await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
 
                     return pair_name, {
@@ -3285,15 +3427,20 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             "alerts": 0,
                             "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
                             "hist_rma": round(hist_curr, 4),
-                            "suppression": "Confirmed candle repaint — dedup kept to prevent duplicates",
+                            "suppression": "Confirmed candle repaint — alert suppressed, claim released",
                         },
                     }, None
                 elif mark_agrees is None:
                     logger_pair.warning(
-                        f"[{pair_name}] Mark price check inconclusive — alert suppressed this run, "
-                        f"dedup key RELEASED so it can retry next run"
+                        f"[{pair_name}] Mark price check still inconclusive after "
+                        f"{CONFIRM_RETRY_ATTEMPTS} tries — NOT sent as an alert; dedup "
+                        f"claim released; separate 'unconfirmed' notice sent instead"
                     )
                     await _release_dedup_claims()
+                    await _notify_unconfirmed_signal(
+                        telegram_queue, pair_name, alerts_to_send, ts_curr,
+                        "mark price unavailable", logger_pair,
+                    )
                     return pair_name, {
                         "state": "SUPPRESSED_MARK_INCONCLUSIVE",
                         "ts": int(time.time()),
@@ -3301,16 +3448,17 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             "alerts": 0,
                             "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
                             "hist_rma": round(hist_curr, 4),
-                            "suppression": "Mark price check inconclusive — dedup released, will retry next run",
+                            "suppression": "Mark price check inconclusive after retries — unconfirmed notice sent, no alert",
                         },
                     }, None
 
                 elif mark_agrees is False:
                     logger_pair.warning(
                         f"[{pair_name}] Mark price disagreement confirmed — alert suppressed, "
-                        f"dedup key KEPT to prevent duplicates"
+                        f"dedup claim released (nothing was sent)"
                     )
                     DEDUP_STATS["kept_mark_disagree"] += 1
+                    await _release_dedup_claims()
                     await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
                     return pair_name, {
                         "state": "SUPPRESSED_MARK_DISAGREEMENT",
@@ -3319,7 +3467,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             "alerts": 0,
                             "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
                             "hist_rma": round(hist_curr, 4),
-                            "suppression": "Mark price disagreement confirmed — dedup kept to prevent duplicates",
+                            "suppression": "Mark price disagreement confirmed — alert suppressed, claim released",
                         },
                     }, None
 

@@ -46,7 +46,7 @@ from brain_engine import BrainEngine
 
 _ALERT_ONLY_MODE: bool = False
 
-from feedback import load_open_positions, poll_feedback
+from feedback import load_open_positions, poll_feedback, release_closed_auto_positions
 
 from alerts import (
     TelegramQueue, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
@@ -1311,6 +1311,22 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         )
         if sent:
             logger_main.info(f"🎯 Batch dispatch delivered {sent} alert(s)")
+    # A Recorded trade that hit target/stop is no longer an open position: free its
+    # heat-gate slot now instead of holding it for the full PORTFOLIO_POSITION_MAX_AGE_MIN.
+    # Must run BEFORE send_trade_close_notices, which clears trade_close_events.
+    if (cfg.ENABLE_PORTFOLIO_HEAT_GATE
+            and cfg.PORTFOLIO_POSITION_SOURCE in ("alerts", "both")
+            and not state_db.degraded):
+        _closed = [(e["pair"], int(e["entry_ts"])) for e in state_db.trade_close_events
+                   if e.get("source") == "Recorded"]
+        if _closed:
+            _freed = await release_closed_auto_positions(
+                state_db, _closed,
+                max_age_sec=float(cfg.PORTFOLIO_POSITION_MAX_AGE_MIN) * 60.0,
+            )
+            if _freed:
+                logger_main.info(f"🔓 Heat gate: freed {_freed} closed position(s)")
+    _totals_changed = bool(getattr(state_db, "_run_resolved_total", 0) or state_db.trade_close_events)
     try:
         announced = await send_trade_close_notices(state_db, telegram_queue, logger_main)
         if announced:
@@ -1318,15 +1334,18 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     except Exception as e:
         logger_main.warning(f"Trade-update notice failed (non-fatal): {e}")
 
-    # All-time Recorded / Shadowed totals (from beginning of data collection)
-    try:
-        cum = await state_db.get_cumulative_outcome_stats()
-        for source in ("Recorded", "Shadowed"):
-            icon = "📝" if source == "Recorded" else "👁"
-            logger_main.info(format_outcome_totals(source, cum.get(source), icon))
+    # All-time Recorded / Shadowed totals (from beginning of data collection).
+    # ~4 SCANs plus large pipelines just to print a log line, so only when a trade
+    # resolved or closed this run (otherwise the totals cannot have changed).
+    if _totals_changed:
+        try:
+            cum = await state_db.get_cumulative_outcome_stats()
+            for source in ("Recorded", "Shadowed"):
+                icon = "📝" if source == "Recorded" else "👁"
+                logger_main.info(format_outcome_totals(source, cum.get(source), icon))
 
-    except Exception as exc:
-        logger_main.warning(f"Cumulative outcome stats log failed: {exc}")
+        except Exception as exc:
+            logger_main.warning(f"Cumulative outcome stats log failed: {exc}")
 
     logger_main.debug(
         f"Results: {len(valid_results)} successful, {len(results) - len(valid_results)} failed"

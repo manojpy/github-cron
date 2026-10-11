@@ -103,6 +103,7 @@ class BotConfig(BaseModel):
     ADAPTIVE_DEDUP_MIN_SEC: int = Field(default=120, ge=0, le=3600, description="Hard lower bound for an adaptive window.")
     ADAPTIVE_DEDUP_MAX_SEC: int = Field(default=1800, ge=300, le=7200, description="Hard upper bound for an adaptive window.")
     COALESCE_DEDUP_WINDOW_SEC: int = Field(default=1800, ge=0)
+    ENABLE_UNCONFIRMED_SIGNAL_NOTICE: bool = Field(default=True, description="If True, a signal whose candle/mark-price confirmation stays inconclusive after in-run retries is reported as a clearly labelled UNCONFIRMED notice (never as an actionable alert, no trade recorded) instead of being dropped silently.")
     ENABLE_TELEGRAM_DLQ: bool = Field(default=True, description="If True, an alert whose Telegram send failed is parked in a Redis dead-letter queue and re-sent on the next run instead of being lost.")
     ENABLE_RUN_DIAGNOSTIC_TELEGRAM: bool = Field(default=False, description="If True, send one compact operator diagnostic (dedup claims, DLQ, stale candles) to Telegram at the end of a run that had any dedup/DLQ/stale activity.")
     TELEGRAM_DLQ_MAX_AGE_SEC: int = Field(default=1800, ge=300, le=86400, description="A parked alert whose candle is older than this is dropped (stale) and its dedup claim released.")

@@ -1204,6 +1204,55 @@ class RedisStateStore:
                 )
         return None
 
+    # Coalesce claim keyed on CANDLE time, not wall-clock. The stored value is the
+    # candle timestamp of the last alert; a new claim succeeds only when its
+    # candle is at least `window` seconds newer. Same candle (or an older one) is
+    # a duplicate; the next 15m candle is a new signal even if GitHub dispatched
+    # this run only a few minutes after the previous one. The key TTL is just
+    # garbage collection, so it is deliberately longer than the window.
+    COALESCE_CLAIM_LUA = """
+    local prev = redis.call("GET", KEYS[1])
+    if prev then
+        local p = tonumber(prev)
+        if p and (tonumber(ARGV[1]) - p) < tonumber(ARGV[3]) then
+            return 0
+        end
+    end
+    redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
+    return 1
+    """
+
+    async def claim_coalesced_alert(self, pair: str, alert_key: str, ts: int,
+                                    window_sec: int) -> Optional[bool]:
+        """Candle-aware version of claim_recent_alert for the coalesced bundle key.
+
+        True  = claim taken (this candle is new enough, safe to send)
+        False = same/older candle, or newer by less than the window (duplicate)
+        None  = Redis degraded or errored; outcome unknown (caller fails closed)
+        """
+        if self.degraded or not self._redis:
+            logger.error(
+                f"claim_coalesced_alert: Redis unavailable — failing closed for {pair}:{alert_key}"
+            )
+            return None
+        recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
+        window = int(window_sec)
+        for attempt in (1, 2):
+            try:
+                result = await asyncio.wait_for(
+                    cast(Awaitable[Any], self._redis.eval(
+                        self.COALESCE_CLAIM_LUA, 1, recent_key,
+                        str(int(ts)), str(window + 900), str(window),
+                    )),
+                    timeout=3.0,
+                )
+                return bool(int(result))
+            except Exception as e:
+                logger.error(
+                    f"Coalesce claim attempt {attempt}/2 FAILED for {pair}:{alert_key}: {e}"
+                )
+        return None
+
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int, window_sec: Optional[int] = None) -> bool:
         """Boolean wrapper kept for existing callers: True only when the claim was taken."""
         return (await self.claim_recent_alert(pair, alert_key, ts, window_sec)) is True
@@ -1346,6 +1395,18 @@ class RedisStateStore:
         )
         return bool(result)
 
+    async def dlq_save_entry(self, key: str, entry: Dict[str, Any]) -> bool:
+        """Persist a modified DLQ entry in place (keeps the remaining TTL, never
+        re-creates an entry that was already deleted). Used to record that a
+        parked alert HAS been delivered and which of its side effects are done."""
+        if self.degraded or not self._redis:
+            return False
+        result = await self._safe_redis_op(
+            lambda: _rc(self._redis).set(key, json_dumps(entry), xx=True, keepttl=True),
+            2.0, "dlq_save_entry",
+        )
+        return bool(result)
+
     async def dlq_delete(self, key: str) -> bool:
         if self.degraded or not self._redis:
             return False
@@ -1376,10 +1437,19 @@ class RedisStateStore:
         macro_multiplier: Optional[float] = None,
         cluster_penalty: Optional[float] = None,
         gate_passed: Optional[bool] = None,
-    ) -> None:
+    ) -> bool:
+        """Record a pending real outcome.
 
-        if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
-            return
+        True  = recorded, or intentionally not recorded (win-rate filter off,
+                post-target cooldown): nothing is owed.
+        False = a recording that SHOULD have happened failed (Redis degraded,
+                serialize or write error): the caller may retry; the write is a
+                plain SET on a deterministic key, so a retry is idempotent."""
+
+        if not cfg.ENABLE_WIN_RATE_FILTER:
+            return True
+        if self.degraded:
+            return False
 
         _cd_hit = await self.in_trade_cooldown(pair, entry_ts)
         if _cd_hit is not None:
@@ -1387,7 +1457,7 @@ class RedisStateStore:
                 f"[{pair}] Cooldown after target (hit candle {_cd_hit}) — "
                 f"not recording {alert_key} @ {entry_ts}"
             )
-            return
+            return True
 
         key = f"{RedisKeyPrefix.OUTCOME_PENDING}{pair}:{alert_key}:{entry_ts}"
         try:
@@ -1413,7 +1483,7 @@ class RedisStateStore:
             logger.warning(
                 f"Failed to serialize pending outcome for {pair}:{alert_key}: {e}"
             )
-            return
+            return False
         ttl = max(
             (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60,
             24 * 3600,
@@ -1427,9 +1497,10 @@ class RedisStateStore:
             logger.warning(
                 f"Failed to record pending outcome for {pair}:{alert_key}: {e}"
             )
-            return
+            return False
         if confluence_votes is not None:
             await self.record_vote_count(alert_key, confluence_votes)
+        return True
 
     async def cancel_pending_outcome(
         self,

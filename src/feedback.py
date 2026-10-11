@@ -309,6 +309,38 @@ async def record_auto_positions(
     except Exception:
         return
 
+async def release_closed_auto_positions(
+    sdb: Any, closed: Sequence[Tuple[str, int]], *, max_age_sec: float,
+) -> int:
+    """Drop auto positions whose trade has closed (target/stop hit).
+
+    `closed` is [(pair, entry_ts)] of Recorded trades that resolved. A position is
+    removed only if it is the one that closed (its candle ts <= entry_ts), so a
+    newer position on the same pair is never freed by mistake. One GET + one SET,
+    and only when something actually changes. Returns how many were released.
+    Never raises."""
+    if not closed:
+        return 0
+    try:
+        raw = await sdb.get_metadata(KEY_AUTO_POSITIONS, timeout=3.0)
+        if not raw:
+            return 0
+        cur: Dict[str, Any] = json.loads(raw)
+        released = 0
+        for pair, entry_ts in closed:
+            v = cur.get(pair)
+            if isinstance(v, dict) and int(v.get("ts", 0)) <= int(entry_ts):
+                del cur[pair]
+                released += 1
+        if released:
+            await sdb.set_metadata(
+                KEY_AUTO_POSITIONS, json.dumps(cur, separators=(",", ":")),
+                ttl=int(max_age_sec * 2) + 3600, timeout=3.0,
+            )
+        return released
+    except Exception:
+        return 0
+
 # ── Learner side: what did the decisions teach? ───────────────────────────
 def behaviour_report(
     log: Mapping[str, Any], rows: Sequence[Row], *, fixed: Mapping[str, float], cost_pct: float,
