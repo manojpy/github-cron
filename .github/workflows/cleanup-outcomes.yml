@@ -28,7 +28,7 @@ jobs:
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
-          git clone \
+          git clone --depth 1 \
             "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" \
             /tmp/data-repo
 

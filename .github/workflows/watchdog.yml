@@ -40,7 +40,7 @@ jobs:
 
           echo "Latest run → status=$LATEST_STATUS conclusion=$LATEST_CONCLUSION created=$LATEST_CREATED"
 
-          if ! SUCCESS_JSON=$(gh api "repos/${REPO}/actions/workflows/run-bot.yml/runs?conclusion=success&per_page=1"); then
+          if ! SUCCESS_JSON=$(gh api "repos/${REPO}/actions/workflows/run-bot.yml/runs?status=success&per_page=1"); then
             {
               echo "send_alert=true"
               echo "alert_msg<<EOF"

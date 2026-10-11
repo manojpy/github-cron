@@ -53,10 +53,11 @@ jobs:
       - name: Run audit
         env:
           REDIS_URL: ${{ secrets.REDIS_URL }}
-          FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings }}
+          FAIL_ON_FINDINGS: ${{ github.event_name == 'workflow_run' || inputs.fail_on_findings }}
           HEAL_DURABLE_TTL: ${{ inputs.heal_durable_ttl }}
           HEAL_TTL_LEAKS: ${{ inputs.heal_ttl_leaks }}
           HEAL_DRY_RUN: ${{ inputs.heal_dry_run }}
+
         run: |
           set -o pipefail
           ARGS=""
@@ -78,6 +79,24 @@ jobs:
             echo "## 🔎 Redis key & TTL audit"
             echo '```'
             cat audit.txt
+
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit $RC
+
+      - name: 📨 Notify Telegram on Redis audit failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MSG="🟠 Redis audit workflow FAILED"$'\n'"Run: ${RUN_URL}"
+          RESP=$(curl -sS --max-time 20 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" || true)
+          if echo "$RESP" | grep -q '"ok":true'; then
+            echo "Telegram notify delivered"
+          else
+            echo "::warning::Failure notice NOT delivered: ${RESP:0:200}"
+          fi

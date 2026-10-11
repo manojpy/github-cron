@@ -490,10 +490,14 @@ jobs:
 
           MSG="🔴 MACD Bot workflow FAILED"$'\n'"Status: ${STATUS}"$'\n'"Exit code: ${EXIT_CODE} | Duration: ${DURATION}s"$'\n'"Error: ${ERROR_MSG}"$'\n'"Run: ${RUN_URL}"
 
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          RESP=$(curl -sS --max-time 20 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=${MSG}" \
-            -o /dev/null -w "Telegram notify HTTP %{http_code}\n"
+            --data-urlencode "text=${MSG}" || true)
+          if echo "$RESP" | grep -q '"ok":true'; then
+            echo "Telegram notify delivered"
+          else
+            echo "::warning::Telegram failure notice NOT delivered: ${RESP:0:200}"
+          fi
 
       - name: 📤 Persist outcomes to data repo
         id: persist
@@ -505,7 +509,6 @@ jobs:
             echo "::warning::Data repo not present — outcomes NOT persisted this run"
             exit 0
           fi
-
           cd /tmp/data-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -587,8 +590,25 @@ jobs:
         with:
           name: unpushed-outcomes-${{ github.run_id }}
           path: |
-            /tmp/data-repo/outcomes
-            /tmp/data-repo/shadow
             /tmp/data-repo/brain_state.json
           retention-days: 7
           if-no-files-found: ignore
+
+      # The failure notice above runs BEFORE the persist step, so a persist
+      # failure (push retries exhausted) would otherwise never reach Telegram.
+      - name: 📨 Notify Telegram on persist failure
+        if: always() && steps.persist.outcome == 'failure'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MSG="🟠 MACD Bot: outcomes NOT persisted to the data repo"$'\n'"The un-pushed rows were saved as artifact unpushed-outcomes-${{ github.run_id }} (7 days)."$'\n'"Run: ${RUN_URL}"
+          RESP=$(curl -sS --max-time 20 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" || true)
+          if echo "$RESP" | grep -q '"ok":true'; then
+            echo "Telegram notify delivered"
+          else
+            echo "::warning::Persist-failure notice NOT delivered: ${RESP:0:200}"
+          fi
