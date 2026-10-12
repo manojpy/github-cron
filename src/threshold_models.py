@@ -25,12 +25,7 @@ from threshold_validation import (
     detect_feature_drift,
 )
 
-def _build_vote_dataset(
-    rows: List[Row],
-    vote_names: List[str],
-    use_pnl_weighting: bool = False,
-) -> Tuple[List[List[float]], List[float], List[float]]:
-    
+def _build_vote_dataset(rows: List[Row], vote_names: List[str], use_pnl_weighting: bool = False) -> Tuple[List[List[float]], List[float], List[float]]: 
     raw_weights = _pnl_sample_weights(rows) if use_pnl_weighting else None
 
     X: List[List[float]] = []
@@ -87,10 +82,7 @@ def _apply_scaler(X: List[List[float]], scaler: Optional[Dict[str, List[float]]]
         for row in X
     ]
 
-def build_market_state_features(
-    rows: List[Row],
-    feature_names: Optional[List[str]] = None,
-) -> Tuple[List[List[float]], List[float], List[str]]:
+def build_market_state_features(rows: List[Row], feature_names: Optional[List[str]] = None) -> Tuple[List[List[float]], List[float], List[str]]:
     """Extract full market-state feature matrix from rows.
 
     Features: votes + numeric context + session encoding + direction.
@@ -141,10 +133,7 @@ def build_market_state_features(
 
     return X, y, feature_names
 
-def _train_logistic(
-    X: List[List[float]], y: List[float], sample_weights: List[float],
-    max_iter: int = 2000, lr: float = 0.05, l2: float = 0.01,
-) -> List[float]:
+def _train_logistic(X: List[List[float]], y: List[float], sample_weights: List[float], max_iter: int = 2000, lr: float = 0.05, l2: float = 0.01) -> List[float]:
     """Gradient-descent logistic regression (numpy-vectorised, same maths as the
     earlier pure-Python loop: cosine-annealed step, L2 on every coefficient,
     intercept initialised to the base-rate log-odds). Returns beta vector."""
@@ -168,11 +157,7 @@ def _train_logistic(
         beta -= step * grad
     return [float(b) for b in beta]
 
-def _score_with_beta(
-    rows: List[Row], beta: List[float], vote_names: List[str],
-    threshold: float = 0.5,
-    target_wr: float = 0.55,
-) -> Tuple[float, int, float]:
+def _score_with_beta(rows: List[Row], beta: List[float], vote_names: List[str], threshold: float = 0.5, target_wr: float = 0.55) -> Tuple[float, int, float]:
     """Apply logistic beta to rows. Returns (net_ev, n_kept, wr) for
     predicted-positive rows. Net EV uses the same cost model as
     ev_first_objective so the WF veto is comparable to the optimizer's
@@ -192,12 +177,7 @@ def _score_with_beta(
     net_ev, _hk, wr = ev_and_kelly_for(kept)
     return net_ev, len(kept), wr
 
-def _map_coefficients_to_weights(
-    beta: List[float],
-    vote_names: List[str],
-    current_weights: Dict[str, float],
-    max_delta: float = 2.0,
-) -> Dict[str, float]:
+def _map_coefficients_to_weights(beta: List[float], vote_names: List[str], current_weights: Dict[str, float], max_delta: float = 2.0) -> Dict[str, float]:
     """Map logistic coefficients → confluence weights with delta limiting.
     
     KEY FIX: Instead of the old aggressive `3.0 * (coeff / avg)` formula,
@@ -237,17 +217,7 @@ def _map_coefficients_to_weights(
 
     return suggested
 
-def optimize_vote_weights(
-    rows: List[Row],
-    current_weights: Dict[str, float],
-    min_sample: int = 100,
-    max_iter: int = 2000,
-    lr: float = 0.05,
-    l2: float = 0.01,
-    walk_forward: bool = True,
-    max_weight_delta: float = 2.0,
-    wf_train_frac: float = 0.67,
-) -> Dict[str, Any]:
+def optimize_vote_weights(rows: List[Row], current_weights: Dict[str, float], min_sample: int = 100, max_iter: int = 2000, lr: float = 0.05, l2: float = 0.01, walk_forward: bool = True, max_weight_delta: float = 2.0, wf_train_frac: float = 0.67) -> Dict[str, Any]: 
     """Data-driven CONFLUENCE_WEIGHTS via logistic regression.
     
     v2 ENHANCEMENTS:
@@ -388,13 +358,7 @@ def optimize_vote_weights(
         "coeff_stability": coeff_stability,
     }
 
-def permutation_vote_importance(
-    rows: List[Row],
-    min_sample: int = 30,
-    n_permutations: int = 20,
-    seed: int = 42,
-    min_side: Optional[int] = None,
-) -> List[Dict[str, Any]]:
+def permutation_vote_importance(rows: List[Row], min_sample: int = 30, n_permutations: int = 20, seed: int = 42, min_side: Optional[int] = None) -> List[Dict[str, Any]]:
     """Per-vote information test: how much of the WR gap between rows where
     the vote fired and rows where it did not survives shuffling the vote?
 
@@ -455,13 +419,7 @@ def permutation_vote_importance(
     results.sort(key=lambda x: -abs(x["importance"]))
     return results
 
-def actionable_condition_ablation(
-    rows: List[Row],
-    min_sample: int = 40,
-    n_permutations: int = 15,
-    noise_threshold: float = 0.01,
-    edge_threshold: float = 0.03,
-) -> List[Dict[str, Any]]:
+def actionable_condition_ablation(rows: List[Row], min_sample: int = 40, n_permutations: int = 15, noise_threshold: float = 0.01, edge_threshold: float = 0.03) -> List[Dict[str, Any]]:
     """Turn permutation importance into concrete actions.
 
     Returns a list of dicts:
@@ -534,12 +492,7 @@ def actionable_condition_ablation(
             })
     return out
 
-def _pnl_sample_weights(
-    rows: List[Row],
-    fee_pct: float = 0.0006,
-    slippage_pct: float = 0.0003,
-    min_weight: float = 0.15,
-) -> List[float]:
+def _pnl_sample_weights(rows: List[Row], fee_pct: float = 0.0006, slippage_pct: float = 0.0003, min_weight: float = 0.15) -> List[float]:
     """Per-row training weights from actual net P&L magnitude (item #13):
     a trade that made/lost 2% should pull the fit harder than one that
     made/lost 0.05%, instead of every row counting as one classification
@@ -563,13 +516,7 @@ def _pnl_sample_weights(
         return [1.0] * len(rows)
     return [w / mean_w for w in raw]
 
-def oos_permutation_importance(
-    rows: List[Row],
-    min_sample: int = 30,
-    n_permutations: int = 15,
-    train_frac: float = 0.67,
-    seed: int = 42,
-) -> List[Dict[str, Any]]:
+def oos_permutation_importance(rows: List[Row], min_sample: int = 30, n_permutations: int = 15, train_frac: float = 0.67, seed: int = 42) -> List[Dict[str, Any]]:
     """OOS permutation importance using EV deterioration.
 
     Trains a logistic model on the train split, then measures
@@ -639,12 +586,7 @@ def oos_permutation_importance(
     results.sort(key=lambda x: -abs(float(x["importance_ev"])))
     return results
 
-def train_market_state_model(
-    rows: List[Row],
-    min_sample: int = 150,
-    train_frac: float = 0.67,
-    min_oos_p_ev_positive: float = 0.70,
-) -> Dict[str, Any]:
+def train_market_state_model(rows: List[Row], min_sample: int = 150, train_frac: float = 0.67, min_oos_p_ev_positive: float = 0.70) -> Dict[str, Any]:
     """Train the market-state logistic model (votes + numeric context +
     session + direction — Recommended.txt items #4/#9) on a purge/embargo
     -safe split, then decide whether to accept it purely on OOS
@@ -741,13 +683,7 @@ def train_market_state_model(
         "drift_check": drift_check,
     }
 
-def predict_market_state_proba(
-    model: Optional[Dict[str, Any]],
-    votes: Optional[Dict[str, bool]],
-    context: Optional[Dict[str, Any]],
-    session: str = "unknown",
-    direction: str = "buy",
-) -> Optional[float]:
+def predict_market_state_proba(model: Optional[Dict[str, Any]], votes: Optional[Dict[str, bool]], context: Optional[Dict[str, Any]], session: str = "unknown", direction: str = "buy") -> Optional[float]:
     """Score one live, prospective trade against a persisted
     train_market_state_model() fit — the piece that was missing for a
     true per-trade contextual prediction (item #12), as opposed to the
@@ -771,12 +707,7 @@ def predict_market_state_proba(
     z = sum(b * x for b, x in zip(beta, X[0]))
     return _sigmoid(z)
 
-def build_calibration_curves(
-    rows: List[Row],
-    bucket_pct: float = 5.0,
-    min_sample: int = 15,
-    shadow_rows: Optional[List[Row]] = None,
-) -> Dict[str, Any]:
+def build_calibration_curves(rows: List[Row], bucket_pct: float = 5.0, min_sample: int = 15, shadow_rows: Optional[List[Row]] = None) -> Dict[str, Any]:
     """Per-alert-key calibration: bucketed confluence % → observed win rate.
     A raw confluence score is a weighted vote total, not a probability.
     This maps what the score DISPLAYS (conf_pct, treated as the implied
@@ -871,11 +802,7 @@ def build_calibration_curves(
         "built_at": int(time.time()),
     }
 
-def fold_outcomes_into_calibration(
-    calib: Dict[str, Any],
-    rows: List[Row],
-    min_sample: int = 15,
-) -> int:
+def fold_outcomes_into_calibration(calib: Dict[str, Any], rows: List[Row], min_sample: int = 15) -> int:
     """Online update: fold newly resolved rows into EXISTING curve buckets.
 
     Mutates ``calib`` in place and returns how many rows were folded. Bucket
@@ -933,12 +860,7 @@ def fold_outcomes_into_calibration(
         calib["ece_mean"] = round(statistics.fmean(ece_values), 4) if ece_values else None
     return folded
 
-def build_ml_calibration_curve(
-    predictions: List[float],
-    labels: List[bool],
-    n_bins: int = 10,
-    min_sample: int = 15,
-) -> Dict[str, Any]:
+def build_ml_calibration_curve(predictions: List[float], labels: List[bool], n_bins: int = 10, min_sample: int = 15) -> Dict[str, Any]:
     """Calibration curve on model output: bins on raw P(profit), not conf_pct.
 
     predictions: OOS holdout p_win values in [0, 1]
@@ -986,13 +908,7 @@ def build_ml_calibration_curve(
         "built_at": int(time.time()),
     }
 
-def calibration_gate_decision(
-    curve: Dict[str, Any],
-    conf_pct: float,
-    target_wr: float,
-    min_sample: int = 15,
-    slack: float = 0.05,
-) -> Tuple[bool, Optional[float], str]:
+def calibration_gate_decision(curve: Dict[str, Any], conf_pct: float, target_wr: float, min_sample: int = 15, slack: float = 0.05) -> Tuple[bool, Optional[float], str]:
     """(pass, calibrated_wr, reason) for one alert at one conf_pct.
 
     Blocks only when the trusted bucket is CONFIDENTLY below target
@@ -1023,11 +939,7 @@ def calibration_gate_decision(
         )
     return True, cal_wr, "ok"
 
-def ml_calibration_lookup(
-    curve: Dict[str, Any],
-    p_win: float,
-    min_sample: int = 15,
-) -> Tuple[Optional[float], str]:
+def ml_calibration_lookup(curve: Dict[str, Any], p_win: float, min_sample: int = 15) -> Tuple[Optional[float], str]:
     """Return (calibrated_P, reason) for a raw model p_win.
     Returns (None, reason) for thin/untrusted buckets so the caller falls
     back to the RAW model prediction. A calibration layer must never

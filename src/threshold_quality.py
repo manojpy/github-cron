@@ -31,14 +31,7 @@ from threshold_validation import (
     _holdout_ev_check,
 )
 
-def mae_mfe_trade_plan(
-    rows: List[Row],
-    sl_percentile: float = 70.0,
-    tp1_percentile: float = 60.0,
-    tp2_percentile: float = 85.0,
-    sl_min_pct: float = 0.15,
-    sl_max_pct: float = 3.0,
-) -> Optional[Dict[str, Any]]:
+def mae_mfe_trade_plan(rows: List[Row], sl_percentile: float = 70.0, tp1_percentile: float = 60.0, tp2_percentile: float = 85.0, sl_min_pct: float = 0.15, sl_max_pct: float = 3.0) -> Optional[Dict[str, Any]]:
     """... (median MAE would be hit ~half the time; sl_percentile covers
     most of the historical adverse excursion, clamped to a safety range;
     TP1/TP2 from MFE percentiles; percentages, not fractions)"""
@@ -101,9 +94,7 @@ def lookup_mae_mfe_plan(profiles, pair, alert_key, direction):
             return plan
     return None
 
-def zone_replay_pnl(
-    row: Row, sl_pct: float, tp_pct: float, total_cost_pct: float,
-) -> Optional[float]:
+def zone_replay_pnl(row: Row, sl_pct: float, tp_pct: float, total_cost_pct: float) -> Optional[float]:
     """Net P&L (percent) the trade WOULD have produced with a different
     stop/target, from its recorded excursions. MAE/MFE are whole-window
     extremes with no ordering, so when BOTH levels were touched the trade is
@@ -253,11 +244,7 @@ def zone_candidates(
         cand["passed"] = not cand["reasons"]
     return {"median_adx": median_adx, "candidates": out}
 
-def zone_promote(
-    candidates: Dict[str, Dict[str, Any]],
-    prev_streaks: Dict[str, int],
-    required_passes: int = 2,
-) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
+def zone_promote(candidates: Dict[str, Dict[str, Any]], prev_streaks: Dict[str, int], required_passes: int = 2) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
     """Streak-based promotion. A passing candidate's streak increments, a
     failing or vanished one drops out (reset = demotion). A zone is promoted
     only once its streak reaches `required_passes`. Returns
@@ -273,10 +260,7 @@ def zone_promote(
             promoted[key] = dict(cand, streak=s)
     return promoted, streaks
 
-def zone_lookup(
-    blob: Optional[Dict[str, Any]], pair: str, alert_key: str, direction: str,
-    adx_val: Optional[float],
-) -> Optional[Dict[str, Any]]:
+def zone_lookup(blob: Optional[Dict[str, Any]], pair: str, alert_key: str, direction: str, adx_val: Optional[float]) -> Optional[Dict[str, Any]]:
     """Most specific PROMOTED zone for a prospective alert, else None.
     Order: pair+alert+dir+regime, alert+dir+regime, family+dir+regime,
     alert+dir, family+dir."""
@@ -299,14 +283,7 @@ def zone_lookup(
             return dict(z, bucket=k)
     return None
 
-def portfolio_heat_check(
-    open_positions: List[Dict[str, Any]],
-    new_pair: str,
-    new_direction: str,
-    max_concurrent: int = 6,
-    max_net_directional: int = 4,
-    max_same_direction_pct: float = 1.0,
-) -> Dict[str, Any]:
+def portfolio_heat_check(open_positions: List[Dict[str, Any]], new_pair: str, new_direction: str, max_concurrent: int = 6, max_net_directional: int = 4, max_same_direction_pct: float = 1.0) -> Dict[str, Any]:
     """Hard veto on total book exposure.
 
     ClusterContext penalizes a same-run correlated herd at the SCORE
@@ -365,15 +342,7 @@ class KillSwitch:
     notes). PnL convention mirrors ev_and_kelly_for exactly so the
     drawdown number agrees with the EV numbers in the report.
     """
-
-    def __init__(
-        self,
-        max_consecutive_losses: int = 6,
-        max_drawdown_pct: float = 3.0,
-        lookback_hours: int = 24,
-        fee_pct: float = 0.0006,
-        slippage_pct: float = 0.0003,
-    ):
+    def __init__(self, max_consecutive_losses: int = 6, max_drawdown_pct: float = 3.0, lookback_hours: int = 24, fee_pct: float = 0.0006, slippage_pct: float = 0.0003):
         self.max_consecutive_losses = max_consecutive_losses
         self.max_drawdown_pct = max_drawdown_pct
         self.lookback_hours = lookback_hours
@@ -432,14 +401,7 @@ class KillSwitch:
             result["reason"] = " and ".join(reasons)
         return result
 
-def fill_reconciliation(
-    rows: List[Row],
-    assumed_fee_pct: float = 0.0006,
-    assumed_slippage_pct: float = 0.0003,
-    rr_target: float = 2.0,
-    stop_pct: float = 0.5,
-    min_sample: int = 10,
-) -> Dict[str, Any]:
+def fill_reconciliation(rows: List[Row], assumed_fee_pct: float = 0.0006, assumed_slippage_pct: float = 0.0003, rr_target: float = 2.0, stop_pct: float = 0.5, min_sample: int = 10) -> Dict[str, Any]: 
     """Compare ASSUMED execution cost (the fixed fee+slippage baked into
     every EV/Kelly number) against REALIZED cost.
 
@@ -636,9 +598,7 @@ def regime_gate_analysis(
     out["valid"] = True
     return out
 
-def regime_gate_lookup(
-    blob: Optional[Dict[str, Any]], alert_key: str, direction: str, adx_val: Optional[float],
-) -> Optional[Dict[str, Any]]:
+def regime_gate_lookup(blob: Optional[Dict[str, Any]], alert_key: str, direction: str, adx_val: Optional[float]) -> Optional[Dict[str, Any]]:
     """Persisted segment for the CURRENT regime of a prospective alert, or None
     (unknown ADX, no blob, or no actionable segment)."""
     if not blob or not isinstance(blob, dict):
@@ -685,10 +645,7 @@ def apply_regime_gate(result: Dict[str, Any], seg: Optional[Dict[str, Any]], mod
         entry["applied"] = False
     result["regime_gate"] = entry
 
-def apply_ensemble_gate(
-    result: Dict[str, Any], mode: str, min_n: int, max_p: float,
-    n_oos: int, oos_validated: bool,
-) -> None:
+def apply_ensemble_gate(result: Dict[str, Any], mode: str, min_n: int, max_p: float, n_oos: int, oos_validated: bool) -> None:
     """Apply the ensemble probability to a trade-quality result IN PLACE.
 
     Restrict-only: when the gate is eligible (out-of-sample validated and at

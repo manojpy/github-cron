@@ -25,10 +25,7 @@ from threshold_stats import (
     wilson_ci,
 )
 
-def adaptive_dedup_windows(
-    rows: List[Row], *, min_gaps: int = 30, percentile: float = 10.0,
-    lo_sec: int = 120, hi_sec: int = 1800,
-) -> Dict[str, Dict[str, Any]]:
+def adaptive_dedup_windows(rows: List[Row], *, min_gaps: int = 30, percentile: float = 10.0, lo_sec: int = 120, hi_sec: int = 1800) -> Dict[str, Dict[str, Any]]:
     """Per-alert-key dedup window from historical same-pair inter-arrival times.
 
     For every (alert_key, pair) series the gaps between consecutive distinct
@@ -65,9 +62,7 @@ def build_buckets(rows: List[Row], bucket_size: float = 1.0) -> Dict[float, Dict
         buckets[b]["wins"] += row["win"]
     return buckets
 
-def detect_toxic_zones(
-    buckets: Dict[float, Dict[str, int]], bucket_size: float = 1.0, min_sample: int = 10,
-) -> List[Tuple[float, float, float, int]]:
+def detect_toxic_zones(buckets: Dict[float, Dict[str, int]], bucket_size: float = 1.0, min_sample: int = 10) -> List[Tuple[float, float, float, int]]:
     """Score buckets where even the Wilson UPPER bound is below 50% —
     informational. Callers should not use this as a hard floor on a
     recommendation: a toxic bucket sandwiched between two good ones just
@@ -84,10 +79,7 @@ def detect_toxic_zones(
             toxic.append((b, b + bucket_size, wr, d["n"]))
     return toxic
 
-def detect_anomalous_buckets(
-    buckets: Dict[float, Dict[str, int]], bucket_size: float = 1.0,
-    min_sample: int = 10, drop_pct: float = 0.15,
-) -> List[Tuple[float, float, float, float, float, int]]:
+def detect_anomalous_buckets(buckets: Dict[float, Dict[str, int]], bucket_size: float = 1.0, min_sample: int = 10, drop_pct: float = 0.15) -> List[Tuple[float, float, float, float, float, int]]:
     """A bucket whose WR sits well below BOTH immediate neighbors — a dip
     surrounded by strength, worth investigating rather than silently
     trusted (e.g. one bad alert-type polluting a single score band)."""
@@ -135,11 +127,7 @@ def build_caps_data(rows: List[Row], min_sample: int = 20) -> Tuple[List[float],
 
 _ALERT_FAMILY_PREFIXES: List[Tuple[str, str]] = []
 
-def alert_family_analysis(
-    rows: List[Row],
-    min_sample: int = 20,
-    shrinkage_k: float = 20.0,
-) -> Dict[str, Any]:
+def alert_family_analysis(rows: List[Row], min_sample: int = 20, shrinkage_k: float = 20.0) -> Dict[str, Any]:
     """Alert-family intelligence (roadmap item #9).
 
     Treats families as separate learning entities:
@@ -205,12 +193,7 @@ def alert_family_analysis(
     result["valid"] = any(f.get("valid") for f in families.values())
     return result
 
-def regime_transition_analysis(
-    rows: List[Row],
-    min_sample: int = 15,
-    lookback_stable: int = 4,
-    post_window_hours: int = 6,
-) -> Dict[str, Any]:
+def regime_transition_analysis(rows: List[Row], min_sample: int = 15, lookback_stable: int = 4, post_window_hours: int = 6) -> Dict[str, Any]:
     """Detect regime transitions and compare post-transition vs stable outcomes
     (roadmap item #15).
     """
@@ -313,11 +296,7 @@ def regime_transition_analysis(
         result["valid"] = True
     return result
 
-def strategy_vs_regime_attribution(
-    rows: List[Row],
-    min_sample: int = 30,
-    recent_fraction: float = 0.25,
-) -> Dict[str, Any]:
+def strategy_vs_regime_attribution(rows: List[Row], min_sample: int = 30, recent_fraction: float = 0.25) -> Dict[str, Any]:
     """Separate strategy degradation from market regime change (roadmap #17)."""
     result: Dict[str, Any] = {
         "valid": False, "n_total": len(rows),
@@ -429,15 +408,7 @@ def strategy_vs_regime_attribution(
     result["evidence_state"] = sample_evidence_state(len(rows))
     return result
 
-def ensemble_decision(
-    bayesian_p: Optional[float] = None,
-    ml_p: Optional[float] = None,
-    ev_p: Optional[float] = None,
-    recent_wr: Optional[float] = None,
-    weights: Optional[Dict[str, float]] = None,
-    n_evidence: int = 0,
-    oos_validated: bool = False,
-) -> Dict[str, Any]:
+def ensemble_decision(bayesian_p: Optional[float] = None, ml_p: Optional[float] = None, ev_p: Optional[float] = None, recent_wr: Optional[float] = None, weights: Optional[Dict[str, float]] = None, n_evidence: int = 0, oos_validated: bool = False) -> Dict[str, Any]:
     """Blend hierarchical Bayesian + ML + EV model + recent performance
     into one calibrated ensemble probability (roadmap item #22).
     """
@@ -533,12 +504,7 @@ def regime_breakdown(rows: List[Row], min_sample: int = 20) -> Dict[str, Any]:
         result["wr_gap"] = regimes["trending"]["wr"] - regimes["ranging"]["wr"]
     return result
 
-def layered_window_analysis(
-    recent_rows: List[Row],
-    medium_rows: List[Row],
-    long_rows: List[Row],
-    min_sample: int = 20,
-) -> Dict[str, Any]:
+def layered_window_analysis(recent_rows: List[Row], medium_rows: List[Row], long_rows: List[Row], min_sample: int = 20) -> Dict[str, Any]:
     """Per-alert-key comparison of recent vs medium vs long-history net EV,
     so the brain can tell 'this alert is historically good but currently
     in a weak patch' apart from 'this alert has always been weak' — the
@@ -596,12 +562,7 @@ def layered_window_analysis(
 
     return {"valid": bool(per_alert), "per_alert": per_alert}
 
-def hierarchical_combination_analysis(
-    rows: List[Row],
-    min_leaf_sample: int = 10,
-    shrinkage_k: float = 20.0,
-) -> Dict[str, Any]:
-   
+def hierarchical_combination_analysis(rows: List[Row], min_leaf_sample: int = 10, shrinkage_k: float = 20.0) -> Dict[str, Any]: 
     if not rows:
         return {"valid": False}
 
@@ -685,11 +646,7 @@ def hierarchical_combination_analysis(
 
     return {"valid": bool(leaves), "median_adx": median_adx, "leaves": leaves}
 
-def per_pair_thresholds(
-    rows: List[Row],
-    target_winrate: float = 0.55,
-    min_sample: int = 30,
-) -> Dict[str, Dict[str, Any]]:
+def per_pair_thresholds(rows: List[Row], target_winrate: float = 0.55, min_sample: int = 30) -> Dict[str, Dict[str, Any]]:
     """Per-pair analogue of recommend_threshold(): groups rows by pair and
     independently runs the same knee/EV/target-floor logic for each pair
     that clears min_sample. Returns {pair: recommend_threshold()-result}
@@ -774,13 +731,7 @@ def per_alert_breakdown(rows: List[Row], min_sample: int = 10):
     results.sort(key=lambda x: x[1])
     return results
 
-def outcome_attribution(
-    rows: List[Row],
-    weights: Dict[str, float],
-    threshold: float,
-    min_sample: int = 10,
-) -> List[Dict[str, Any]]:
- 
+def outcome_attribution(rows: List[Row], weights: Dict[str, float], threshold: float, min_sample: int = 10) -> List[Dict[str, Any]]:
     vote_names = set()
     for r in rows:
         if r.get("votes"):
@@ -865,17 +816,7 @@ def direction_split(rows: List[Row]) -> Tuple[Optional[float], int, Optional[flo
     sell_wr = sum(r["win"] for r in sells) / len(sells) if sells else None
     return buy_wr, len(buys), sell_wr, len(sells)
 
-def classify_strategy_state(
-    rows: List[Row],
-    recent_days: float = 14,
-    min_recent: int = 20,
-    min_older: int = 40,
-    min_regime_n: int = 15,
-    drop_threshold: float = 0.10,
-    alpha: float = 0.10,
-    trend_adx: float = 25.0,
-    degraded_alpha: float = 0.05,
-) -> Dict[str, Any]:
+def classify_strategy_state(rows: List[Row], recent_days: float = 14, min_recent: int = 20, min_older: int = 40, min_regime_n: int = 15, drop_threshold: float = 0.10, alpha: float = 0.10, trend_adx: float = 25.0, degraded_alpha: float = 0.05) -> Dict[str, Any]:
     """Is a recent win-rate drop 'the strategy broke' or 'we are in a regime
     the history barely covers'? (roadmap #17)
 
@@ -986,12 +927,7 @@ def classify_strategy_state(
         })
     return out
 
-def recommend_threshold(
-    rows: List[Row],
-    target_winrate: float = 0.55,
-    min_sample: int = 20,
-    bucket_size: float = 1.0,
-) -> Dict[str, Any]:
+def recommend_threshold(rows: List[Row], target_winrate: float = 0.55, min_sample: int = 20, bucket_size: float = 1.0) -> Dict[str, Any]:
     """
     Returns a dict. ALWAYS check result["valid"] before trusting
     result["recommended"] — an invalid result still returns a populated
@@ -1132,14 +1068,7 @@ def recommend_threshold(
     result["valid"] = True
     return result
 
-def parameter_autopsy(
-    rows: List[Row],
-    param_field: str,
-    target_winrate: float = 0.55,
-    min_sample: int = 30,
-    n_quantiles: int = 5,
-    higher_is_worse: bool = False,  # NEW: direction parameter
-) -> Dict[str, Any]:
+def parameter_autopsy(rows: List[Row], param_field: str, target_winrate: float = 0.55, min_sample: int = 30, n_quantiles: int = 5, higher_is_worse: bool = False) -> Dict[str, Any]: 
     valid = [r for r in rows if r.get("context") and r["context"].get(param_field) is not None]
     if len(valid) < min_sample:
         return {"valid": False, "error": f"insufficient_data: {len(valid)} < {min_sample}"}
@@ -1194,13 +1123,7 @@ def parameter_autopsy(
         "higher_is_worse": higher_is_worse,
     }
 
-def conditional_performance(
-    rows: List[Row],
-    alert_key: str,
-    condition_field: str,
-    condition_threshold: float,
-    min_sample: int = 15,
-) -> Dict[str, Any]:
+def conditional_performance(rows: List[Row], alert_key: str, condition_field: str, condition_threshold: float, min_sample: int = 15) -> Dict[str, Any]:
     subset = [
         r for r in rows
         if r.get("alert_key") == alert_key
@@ -1242,10 +1165,8 @@ def conditional_performance(
         "recommendation": recommendation,
     }
 
-def interaction_miner(
-    rows: List[Row],
-    min_sample: int = 20,
-) -> List[Dict[str, Any]]:
+
+def interaction_miner(rows: List[Row], min_sample: int = 20) -> List[Dict[str, Any]]:
     """Mine pairwise vote interactions (synergy + poison).
 
     Each emitted dict carries the raw counts (n_both, n_only_v1, n_only_v2,
@@ -1419,10 +1340,7 @@ def score_actionability(rec: Dict[str, Any]) -> float:
         effort = 2.0
     return impact * confidence / effort
 
-def learned_actionability(
-    rec: Dict[str, Any],
-    success_rates: Optional[Dict[str, Dict[str, float]]] = None,
-) -> float:
+def learned_actionability(rec: Dict[str, Any], success_rates: Optional[Dict[str, Dict[str, float]]] = None) -> float:
     """Hand-formula blended with two learned signals:
 
     1. Category-level help-rate from the repair ledger (per-category

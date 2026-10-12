@@ -127,9 +127,7 @@ async def _save_ledger(sdb, entries: List[dict]) -> None:
     await sdb.set_metadata(LEDGER_KEY, json_dumps(entries),
                             ttl=LEDGER_TTL_DAYS * 86400)
 
-async def record_repair_issued(sdb, rec: Dict[str, Any],
-                                snapshot: Dict[str, Any],
-                                real_rows: Optional[List[dict]] = None) -> Optional[str]:
+async def record_repair_issued(sdb, rec: Dict[str, Any], snapshot: Dict[str, Any], real_rows: Optional[List[dict]] = None) -> Optional[str]:
     """Call once per emitted repair. snapshot carries the pre-repair metrics
     the verdict will be measured against. When `real_rows` is supplied and
     the repair carries a `scope`, also stores scope_wr/scope_n — the WR of
@@ -195,9 +193,7 @@ async def mark_plan_applied(sdb, plan_ts: int) -> int:
         await _save_ledger(sdb, entries)
     return n
 
-async def evaluate_pending_repairs(sdb, current_rows: List[dict],
-                                    horizon_hours: int = 48,
-                                    min_outcomes: int = 30) -> List[dict]:
+async def evaluate_pending_repairs(sdb, current_rows: List[dict], horizon_hours: int = 48, min_outcomes: int = 30) -> List[dict]:
     """Called once per brain report. For each applied repair whose horizon
     has passed, compare post-application metrics against the pre-application
     snapshot using a Wilson band so a repair is only marked helped/hurt when

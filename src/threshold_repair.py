@@ -32,13 +32,7 @@ from threshold_validation import (
     find_wr_change_point,
 )
 
-def simulate_config_change(
-    rows: List[Row],
-    baseline_ev: float,
-    new_threshold: Optional[float] = None,
-    new_params: Optional[Dict[str, float]] = None,
-    params_direction: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
+def simulate_config_change(rows: List[Row], baseline_ev: float, new_threshold: Optional[float] = None, new_params: Optional[Dict[str, float]] = None, params_direction: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """params_direction: when set ("buy"/"sell"), new_params caps apply only to
     rows of that direction (e.g. an RSI *buy* cap must not remove SELL rows,
     which fire at high RSI). None keeps the old behaviour (all rows)."""
@@ -84,13 +78,7 @@ def simulate_config_change(
         "rr": rr,
     } 
 
-def regime_profile_optimizer(
-    rows: List[Row],
-    regime_field: str = "adx_val",
-    n_regimes: int = 3,
-    min_sample: int = 25,
-    target_winrate: float = 0.55,
-) -> Dict[str, Any]:
+def regime_profile_optimizer(rows: List[Row], regime_field: str = "adx_val", n_regimes: int = 3, min_sample: int = 25, target_winrate: float = 0.55) -> Dict[str, Any]:
     valid = [r for r in rows if r.get("context") and r["context"].get(regime_field) is not None]
     if len(valid) < min_sample * n_regimes:
         return {"valid": False, "error": "insufficient_data"}
@@ -123,10 +111,7 @@ def regime_profile_optimizer(
 # ══════════════════════════════════════════════════════════════════════
 #  RISK FLAGS — Config Version Hash & Actionability
 # ══════════════════════════════════════════════════════════════════════
-def compare_config_versions(
-    rows: List[Row],
-    min_sample: int = 20,
-) -> List[Dict[str, Any]]:
+def compare_config_versions(rows: List[Row], min_sample: int = 20) -> List[Dict[str, Any]]:
     """Group real outcome rows by their tagged config_version and compare
     WR across consecutive versions (ordered by first-seen entry_ts), so a
     config_patch that tanks WR gets flagged instead of going unnoticed."""
@@ -230,12 +215,7 @@ _STRUCTURAL_CONFIG_FIELDS: Tuple[str, ...] = (
     "CHOCH_REQUIRE_FVG", "CHOCH_CHECK_POI_TAP", "CHOCH_ALLOW_SAME_CANDLE_SWEEP",
 )
 
-def hash_config_state(
-    weights: Dict[str, float],
-    threshold: float,
-    min_pct: float,
-    extra_fields: Optional[Dict[str, Any]] = None,
-) -> str:
+def hash_config_state(weights: Dict[str, float], threshold: float, min_pct: float, extra_fields: Optional[Dict[str, Any]] = None) -> str:
     """Stable fingerprint of the config knobs that actually change the
     feature/outcome distribution.
 
@@ -335,13 +315,7 @@ def hash_config_state(
     )
     return hashlib.md5(payload.encode()).hexdigest()[:12] 
 
-def diagnose_root_cause(
-    rows: List[Row],
-    target_wr: float = 0.55,
-    min_segment: int = 15,
-    n_quantiles: int = 5,
-    top_k: int = 3,
-) -> Dict[str, Any]:
+def diagnose_root_cause(rows: List[Row], target_wr: float = 0.55, min_segment: int = 15, n_quantiles: int = 5, top_k: int = 3) -> Dict[str, Any]:
     """Decision-stump root-cause attribution.
 
     Scans every numeric context feature and boolean vote, finds the single
@@ -429,11 +403,7 @@ def diagnose_root_cause(
         "segments": deduped[:top_k],
     }
 
-def learn_repair_effectiveness(
-    ledger_records: List[Dict[str, Any]],
-    current_state: Dict[str, Any],
-    min_records: int = 100,
-) -> Dict[str, Any]:
+def learn_repair_effectiveness(ledger_records: List[Dict[str, Any]], current_state: Dict[str, Any], min_records: int = 100) -> Dict[str, Any]:
     """Trains on resolved repair-ledger entries (snapshot_before + verdict)
     and predicts, for the CURRENT system state, how likely each repair
     category is to actually help. Reuses the same pure-Python logistic
@@ -486,14 +456,7 @@ def learn_repair_effectiveness(
         "p_help_by_category": preds,
     }
 
-def repair_shop_diagnosis(
-    rows: List[Row],
-    drift_alerts: List[Dict[str, Any]],
-    config: Dict[str, Any],
-    target_wr: float = 0.55,
-    disable_wr: float = 0.40,
-    min_sample: int = 20,
-) -> List[Dict[str, Any]]:
+def repair_shop_diagnosis(rows: List[Row], drift_alerts: List[Dict[str, Any]], config: Dict[str, Any], target_wr: float = 0.55, disable_wr: float = 0.40, min_sample: int = 20) -> List[Dict[str, Any]]:
     """One-stop repair shop: diagnoses the system's health and produces
     prioritized, actionable fix recommendations. Each item has:
     • severity: critical / high / medium / low

@@ -24,14 +24,7 @@ from threshold_stats import (
     wilson_ci,
 )
 
-def validate_threshold_walk_forward(
-    rows: List[Row],
-    target_winrate: float = 0.55,
-    min_sample: int = 20,
-    bucket_size: float = 1.0,
-    train_frac: float = 0.67,
-    slack: float = 0.05,
-) -> Dict[str, Any]:
+def validate_threshold_walk_forward(rows: List[Row], target_winrate: float = 0.55, min_sample: int = 20, bucket_size: float = 1.0, train_frac: float = 0.67, slack: float = 0.05) -> Dict[str, Any]:
     result: Dict[str, Any] = {"valid": False}
     train_rows, holdout_rows = walk_forward_split(rows, train_frac)
     result["train_n"] = len(train_rows)
@@ -72,15 +65,7 @@ def validate_threshold_walk_forward(
     })
     return result
 
-def monte_carlo_walk_forward(
-    rows: List[Row],
-    n_simulations: int = 100,
-    train_frac: float = 0.7,
-    min_sample: int = 20,
-    target_winrate: float = 0.55,
-    bucket_size: float = 1.0,
-    seed: Optional[int] = None,
-) -> Dict[str, Any]:
+def monte_carlo_walk_forward(rows: List[Row], n_simulations: int = 100, train_frac: float = 0.7, min_sample: int = 20, target_winrate: float = 0.55, bucket_size: float = 1.0, seed: Optional[int] = None) -> Dict[str, Any]:
     """Offline-only robustness check — never touches live gating. Runs many
     walk-forward validations against block-bootstrap resamples of the same
     history, instead of trusting one chronological split. A single split can
@@ -169,15 +154,7 @@ def monte_carlo_walk_forward(
         ),
     }
 
-def rolling_walk_forward(
-    rows: List[Row],
-    n_folds: int = 5,
-    train_frac: float = 0.60,
-    min_sample: int = 20,
-    target_winrate: float = 0.55,
-    lookahead_sec: Optional[int] = None,
-    embargo_sec: int = 900,
-) -> Dict[str, Any]:
+def rolling_walk_forward(rows: List[Row], n_folds: int = 5, train_frac: float = 0.60, min_sample: int = 20, target_winrate: float = 0.55, lookahead_sec: Optional[int] = None, embargo_sec: int = 900) -> Dict[str, Any]:
     """Multi-fold chronological walk-forward.
 
     Splits the timeline into n_folds sequential windows.
@@ -285,11 +262,7 @@ def rolling_walk_forward(
         ),
     }
 
-def flag_anomalous_rows(
-    rows: List[Row],
-    mad_threshold: float = 6.0,
-    min_sample: int = 30,
-) -> Dict[str, Any]:
+def flag_anomalous_rows(rows: List[Row], mad_threshold: float = 6.0, min_sample: int = 30) -> Dict[str, Any]:
     valid_moves = [r for r in rows if r.get("pct_move") is not None]
     if len(valid_moves) < min_sample:
         return {"valid": False, "error": "insufficient_data", "n": len(valid_moves)}
@@ -325,12 +298,7 @@ def flag_anomalous_rows(
 class CUSUMDetector:
     """Page-Hinkley / CUSUM for binary outcomes. Online, O(1) memory."""
 
-    def __init__(
-        self,
-        target_wr: float = 0.55,
-        drift_delta: float = 0.10,
-        threshold: float = 2.0,
-    ):
+    def __init__(self, target_wr: float = 0.55, drift_delta: float = 0.10, threshold: float = 2.0):
         self.mu = target_wr
         self.delta = drift_delta
         self.h = threshold
@@ -379,9 +347,7 @@ class StabilityGate:
         self.min_history = min_history
         self.max_jump = max_jump
 
-    def approve(
-        self, proposed: float, history: List[float],
-    ) -> Tuple[bool, str]:
+    def approve(self, proposed: float, history: List[float]) -> Tuple[bool, str]:
         if len(history) < self.min_history:
             return True, "insufficient_history"
         median = statistics.median(history)
@@ -393,11 +359,7 @@ class StabilityGate:
             )
         return True, "ok"
 
-def is_vote_pattern_ood(
-    rows: List[Row],
-    current_votes: Dict[str, bool],
-    alert_key: str,
-) -> Tuple[bool, Dict[str, Any]]:
+def is_vote_pattern_ood(rows: List[Row], current_votes: Dict[str, bool], alert_key: str) -> Tuple[bool, Dict[str, Any]]:
     """Reject if vote count is outside historical 5th-95th percentile.
     Returns (is_ood, detail_dict)."""
     historical_counts: List[float] = []
@@ -421,15 +383,7 @@ def is_vote_pattern_ood(
         "n_history": len(historical_counts),
     }
 
-def is_vote_count_ood(
-    current_count: int,
-    historical_counts: List[int],
-    min_history: int = 10,
-    margin: int = 2,
-    p5: int = 5,
-    p95: int = 95,
-    relaxed_mode: bool = True,
-) -> Tuple[bool, Dict[str, Any]]:
+def is_vote_count_ood(current_count: int, historical_counts: List[int], min_history: int = 10, margin: int = 2, p5: int = 5, p95: int = 95, relaxed_mode: bool = True) -> Tuple[bool, Dict[str, Any]]:
     """Lightweight variant of is_vote_pattern_ood() for callers that only
     have a running list of past vote-counts (e.g. a capped Redis list per
     alert_key) rather than full Row objects. This is what the live
@@ -465,11 +419,7 @@ def is_vote_count_ood(
         "relaxed_mode": relaxed_mode,
     }
 
-def detect_feature_drift(
-    rows: List[Row],
-    recent_n: int = 100,
-    psi_threshold: float = 0.25,
-) -> Dict[str, Any]:
+def detect_feature_drift(rows: List[Row], recent_n: int = 100, psi_threshold: float = 0.25) -> Dict[str, Any]:
     """Compare context-feature distributions between the most recent
     `recent_n` rows and the older baseline. Large PSI = regime/feature
     drift — the market changed under the strategy's feet."""
@@ -490,11 +440,7 @@ def detect_feature_drift(
     drifted.sort(key=lambda d: -d["psi"])
     return {"valid": True, "drifted_features": drifted, "n_recent": recent_n}
 
-def find_wr_change_point(
-    rows: List[Row],
-    min_side: int = 25,
-    min_delta: float = 0.08,
-) -> Dict[str, Any]:
+def find_wr_change_point(rows: List[Row], min_side: int = 25, min_delta: float = 0.08) -> Dict[str, Any]:
     """Locate the timestamp where win rate shifted most, via an O(n)
     two-sample scan using prefix sums. Returns change point + before/after
     WR + the dominant config_version on each side, so a regression can be

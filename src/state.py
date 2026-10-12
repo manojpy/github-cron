@@ -90,9 +90,7 @@ async def _blanket_reset_pair(sdb: RedisStateStore, pair_name: str, logger_pair:
         )
     return len(resets)
 
-async def _redis_key_inventory(
-    sdb: "RedisStateStore", max_keys: int = 20000,
-) -> Dict[str, Dict[str, int]]:
+async def _redis_key_inventory(sdb: "RedisStateStore", max_keys: int = 20000) -> Dict[str, Dict[str, int]]:
     """Read-only Redis audit: key count and no-TTL key count per prefix
     (the text before the first ':'). Bounded by max_keys so it cannot
     run away on a large keyspace."""
@@ -126,20 +124,7 @@ async def _redis_key_inventory(
     await _flush()
     return inventory
 
-async def _clear_all_redis_states(
-    sdb: RedisStateStore,
-    pairs: List[str],
-    logger: logging.Logger,
-    *,
-    clear_active_states: bool = True,
-    clear_dedups: bool = True,
-    clear_pending_outcomes: bool = True,
-    clear_shadow_pending: bool = True,
-    clear_alert_stats: bool = False,
-    clear_shadow_stats: bool = False,
-    clear_outcome_streams: bool = False,
-    clear_daily_cache: bool = False,
-) -> Tuple[int, int, int, int, int, int, int, int, int]:
+async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger: logging.Logger, *, clear_active_states: bool = True, clear_dedups: bool = True, clear_pending_outcomes: bool = True, clear_shadow_pending: bool = True, clear_alert_stats: bool = False, clear_shadow_stats: bool = False, clear_outcome_streams: bool = False, clear_daily_cache: bool = False) -> Tuple[int, int, int, int, int, int, int, int, int]:
     if sdb.degraded or not sdb._redis:
         logger.warning("Redis degraded — skipping mass state purge")
         return 0, 0, 0, 0, 0, 0, 0, 0, 0
@@ -723,8 +708,7 @@ class RedisStateStore:
             parser=lambda r: r if r else None,
         )
 
-    async def set_metadata(self, key: str, value: str, timeout: float = 2.0,
-                         ttl: Optional[int] = None) -> None:
+    async def set_metadata(self, key: str, value: str, timeout: float = 2.0, ttl: Optional[int] = None) -> None:
         if ttl is None:
             ttl = (
                 DURABLE_METADATA_TTL_SEC
@@ -940,9 +924,7 @@ class RedisStateStore:
     # Only these callers may change live weights when ENFORCE_SINGLE_WEIGHT_PATH is on.
     _WEIGHT_WRITE_SOURCES: ClassVar[frozenset] = frozenset({"promotion", "rollback"})
 
-    async def set_dynamic_weights(
-        self, weights: Dict[str, float], ttl: int = 30 * 86400, *, source: str = "direct",
-    ) -> bool:
+    async def set_dynamic_weights(self, weights: Dict[str, float], ttl: int = 30 * 86400, *, source: str = "direct") -> bool:
         """Persist the Brain's optimized CONFLUENCE_WEIGHTS to Redis.
         TTL default 30 days — refresh on each Brain report.
 
@@ -964,10 +946,6 @@ class RedisStateStore:
             logger.warning(f"Failed to persist dynamic_weights: {e}")
             return False
 
-
-
-
-
     async def clear_dynamic_weights(self) -> bool:
         """Remove stored dynamic weights (revert to static CONFLUENCE_WEIGHTS)."""
         if self.degraded or not self._redis:
@@ -979,10 +957,7 @@ class RedisStateStore:
             logger.warning(f"Failed to clear dynamic_weights: {e}")
             return False
 
-    async def set_challenger_weights(
-        self, weights: Dict[str, float], meta: Optional[Dict[str, Any]] = None,
-        ttl: int = 30 * 86400,
-    ) -> bool:
+    async def set_challenger_weights(self, weights: Dict[str, float], meta: Optional[Dict[str, Any]] = None, ttl: int = 30 * 86400) -> bool:
         """Store challenger weights + metadata. Never used as live weights
         unless explicitly promoted."""
         if self.degraded or not self._redis:
@@ -1043,8 +1018,7 @@ class RedisStateStore:
             logger.error(f"batch_get_metadata failed for {len(keys)} keys: {e}")
             return {k: None for k in keys}
 
-    async def batch_set_metadata(self, items: Dict[str, str], timeout: float = 5.0,
-                                   ttl: Optional[int] = None) -> bool:
+    async def batch_set_metadata(self, items: Dict[str, str], timeout: float = 5.0, ttl: Optional[int] = None) -> bool:
         """Write many metadata keys in ONE Redis round-trip (pipeline)."""
         if not self._redis or self.degraded or not items:
             return True
@@ -1077,9 +1051,7 @@ class RedisStateStore:
         except (ValueError, TypeError):
             return None
 
-    async def get_last_processed_candle_ts_bulk(
-        self, pair_names: Sequence[str]
-    ) -> Dict[str, Optional[int]]:
+    async def get_last_processed_candle_ts_bulk(self, pair_names: Sequence[str]) -> Dict[str, Optional[int]]:
         """Load the last-processed candle timestamp for all requested pairs
         with one MGET, instead of one GET per pair."""
         if self.degraded or not self._redis or not pair_names:
@@ -1166,8 +1138,7 @@ class RedisStateStore:
         self._adaptive_dedup_cache = out
         return out
 
-    async def claim_recent_alert(self, pair: str, alert_key: str, ts: int,
-                                 window_sec: Optional[int] = None) -> Optional[bool]:
+    async def claim_recent_alert(self, pair: str, alert_key: str, ts: int, window_sec: Optional[int] = None) -> Optional[bool]:
         """Try to claim the dedup window for pair:alert_key.
 
         True  = claim taken (safe to send)
@@ -1221,9 +1192,7 @@ class RedisStateStore:
     redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
     return 1
     """
-
-    async def claim_coalesced_alert(self, pair: str, alert_key: str, ts: int,
-                                    window_sec: int) -> Optional[bool]:
+    async def claim_coalesced_alert(self, pair: str, alert_key: str, ts: int, window_sec: int) -> Optional[bool]:
         """Candle-aware version of claim_recent_alert for the coalesced bundle key.
 
         True  = claim taken (this candle is new enough, safe to send)
@@ -1257,9 +1226,7 @@ class RedisStateStore:
         """Boolean wrapper kept for existing callers: True only when the claim was taken."""
         return (await self.claim_recent_alert(pair, alert_key, ts, window_sec)) is True
 
-    async def batch_check_recent_alerts(self, pair: str, alert_keys: List[str], ts: int,
-                                          window_sec: Optional[int] = None,
-                                          windows: Optional[Dict[str, int]] = None) -> Dict[str, bool]:
+    async def batch_check_recent_alerts(self, pair: str, alert_keys: List[str], ts: int, window_sec: Optional[int] = None, windows: Optional[Dict[str, int]] = None) -> Dict[str, bool]:
         """Claim dedup windows for several alert keys on one pair in ONE Redis
         round-trip (pipeline). Each SET NX EX is still independently atomic —
         this only batches the network round-trip, not the semantics."""
@@ -1502,12 +1469,7 @@ class RedisStateStore:
             await self.record_vote_count(alert_key, confluence_votes)
         return True
 
-    async def cancel_pending_outcome(
-        self,
-        pair: str,
-        alert_key: str,
-        entry_ts: int,
-    ) -> bool:
+    async def cancel_pending_outcome(self, pair: str, alert_key: str, entry_ts: int) -> bool:
         """Remove a pending real outcome when the alert was never delivered.
 
         A coalesced alert must not remain in the real-outcome population,
@@ -1641,10 +1603,7 @@ class RedisStateStore:
         except Exception:
             return []
 
-    async def _fetch_pending_keys(
-        self, pair: str, precomputed_attr: str, key_prefix: str,
-        logger_pair: logging.Logger, label: str,
-    ) -> List[str]:
+    async def _fetch_pending_keys(self, pair: str, precomputed_attr: str, key_prefix: str, logger_pair: logging.Logger, label: str) -> List[str]:
         """Shared key-lookup for resolve_pending_outcomes / resolve_shadow_pending_outcomes:
         use the run-level pre-scan when available, else fall back to a per-pair scan."""
         precomputed = getattr(self, precomputed_attr, None)
@@ -1657,11 +1616,7 @@ class RedisStateStore:
             logger_pair.debug(f"Failed to scan {label} outcomes for {pair}: {e}")
             return []
 
-
-    def _parse_pending_outcome_row(
-        self, key: str, raw: Optional[str], data_15m: "PriceData", i15: int,
-        end_idx: Optional[int] = None,
-    ) -> Tuple[Optional[Dict[str, Any]], str]:
+    def _parse_pending_outcome_row(self, key: str, raw: Optional[str], data_15m: "PriceData", i15: int, end_idx: Optional[int] = None) -> Tuple[Optional[Dict[str, Any]], str]:
         if raw is None:
             return None, "raced"
         data = json_loads(raw)
@@ -2004,9 +1959,7 @@ class RedisStateStore:
         except Exception:
             return None
 
-    def _early_close_result(
-        self, key: str, closed_json: str, data_15m: "PriceData", i15: int,
-    ) -> Optional[Dict[str, Any]]:
+    def _early_close_result(self, key: str, closed_json: str, data_15m: "PriceData", i15: int) -> Optional[Dict[str, Any]]:
         """Final outcome of a trade whose target/stop has already been touched,
         graded on the path up to the hit candle only (same rules as the full
         12-candle grading, which cannot change a win/loss that is already
@@ -2026,10 +1979,7 @@ class RedisStateStore:
             return None
 
     @staticmethod
-    def _early_archive_row(
-        pair: str, result: Dict[str, Any], closed_json: str, shadow: bool,
-        final: bool = False,
-    ) -> Optional[Dict[str, Any]]:
+    def _early_archive_row(pair: str, result: Dict[str, Any], closed_json: str, shadow: bool, final: bool = False) -> Optional[Dict[str, Any]]:
         """Archive row for a trade that closed early. Win/loss, bracket P&L and
         conditions are final; anything that depends on the rest of the 12-candle
         path is left empty (never fabricated). The full row written at the
@@ -2100,9 +2050,7 @@ class RedisStateStore:
         return row
 
     @staticmethod
-    def _bonus_hit_idx(
-        closed: Dict[str, Any], data_15m: "PriceData", i15: int,
-    ) -> Optional[int]:
+    def _bonus_hit_idx(closed: Dict[str, Any], data_15m: "PriceData", i15: int) -> Optional[int]:
         """Absolute candle index where a trade first reached the bonus R:R
         (OUTCOME_BONUS_RR) on or after its fill candle and inside the outcome
         horizon; None if it has not reached it yet."""
@@ -2138,9 +2086,7 @@ class RedisStateStore:
         except Exception:
             return None
 
-    def _early_finalize_plan(
-        self, raw: Optional[str], data_15m: "PriceData", i15: int,
-    ) -> Tuple[Optional[int], Optional[str], bool]:
+    def _early_finalize_plan(self, raw: Optional[str], data_15m: "PriceData", i15: int) -> Tuple[Optional[int], Optional[str], bool]:
         """Decide whether a pending trade is already finished.
 
         Returns (end_idx, closed_json, newly_closed):
@@ -2223,8 +2169,7 @@ class RedisStateStore:
             return f"{RedisKeyPrefix.TRADE_COOLDOWN}shadow:{pair}"
         return f"{RedisKeyPrefix.TRADE_COOLDOWN}{pair}"
 
-    async def in_trade_cooldown(self, pair: str, entry_ts: int,
-                                source: str = "Recorded") -> Optional[int]:
+    async def in_trade_cooldown(self, pair: str, entry_ts: int, source: str = "Recorded") -> Optional[int]:
         """Return the target-hit candle ts when `entry_ts` is inside the pair's
         re-entry cooldown for `source` ('Recorded' or 'Shadowed'), else None.
         Fails open (Redis problem = no cooldown)."""
@@ -2249,9 +2194,7 @@ class RedisStateStore:
             return None
         return hit_ts if int(entry_ts) <= hit_ts + n * 900 else None
 
-    async def _start_trade_cooldown(self, pair: str, hit_ts: int,
-                                    logger_pair: logging.Logger,
-                                    source: str = "Recorded") -> None:
+    async def _start_trade_cooldown(self, pair: str, hit_ts: int, logger_pair: logging.Logger, source: str = "Recorded") -> None:
         if self.degraded or not self._redis:
             return
         key = self._cooldown_key(pair, source)
@@ -2267,8 +2210,7 @@ class RedisStateStore:
         except Exception as e:
             logger_pair.warning(f"[{pair}] Could not start trade cooldown: {e}")
 
-    async def _publish_close_events(self, pair: str, rows: List[Dict[str, Any]],
-                                    source: str, logger_pair: logging.Logger) -> None:
+    async def _publish_close_events(self, pair: str, rows: List[Dict[str, Any]], source: str, logger_pair: logging.Logger) -> None:
         """Queue 'Target Done / Stop Hit' notices for this run's Telegram update and
         start the re-entry cooldown. Call only AFTER the closed_ts write succeeded,
         so each trade is announced once. `source` is 'Recorded' or 'Shadowed'."""
@@ -2318,8 +2260,7 @@ class RedisStateStore:
         ):
             await self._start_trade_cooldown(pair, cooldown_hit_ts, logger_pair, source)
 
-    async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
-                                       logger_pair: logging.Logger) -> None:
+    async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int, logger_pair: logging.Logger) -> None:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not self._redis:
             return
 
@@ -2608,13 +2549,7 @@ class RedisStateStore:
                 "payload and were dropped this run (see prior debug lines for keys)"
             )
 
-    async def resolve_shadow_pending_outcomes(
-        self,
-        pair: str,
-        data_15m: "PriceData",
-        i15: int,
-        logger_pair: logging.Logger,
-    ) -> None:
+    async def resolve_shadow_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int, logger_pair: logging.Logger) -> None:
         """Twin of resolve_pending_outcomes for shadow (rejected) alerts. Same grading logic,
         writes to SHADOW_STATS/SHADOW_LOG_STREAM instead, and additionally pools outcomes whose
         confluence was in the 'rewardable' bucket into SHADOW_HICONF_STATS for override checks."""
@@ -3194,9 +3129,7 @@ class RedisStateStore:
         except Exception as e:
             logger.warning(f"CUSUM watermark save failed for '{alert_key}': {e}")
 
-    async def load_cusum_bulk(
-        self, alert_keys: List[str],
-    ) -> Optional[Dict[str, Tuple[int, Optional[Dict[str, Any]]]]]:
+    async def load_cusum_bulk(self, alert_keys: List[str]) -> Optional[Dict[str, Tuple[int, Optional[Dict[str, Any]]]]]:
         """(watermark, persisted_state) for every alert_key in ONE pipelined
         round-trip. Returns None when the read fails or Redis is degraded:
         callers must then skip the CUSUM update, because a fabricated 0
@@ -3228,9 +3161,7 @@ class RedisStateStore:
             out[ak] = (wm, st)
         return out
 
-    async def save_cusum_bulk(
-        self, items: List[Tuple[str, Dict[str, Any], int]],
-    ) -> bool:
+    async def save_cusum_bulk(self, items: List[Tuple[str, Dict[str, Any], int]]) -> bool:
         """Persist (alert_key, state, watermark) triples in ONE round-trip."""
         if not items or self.degraded or not self._redis:
             return False

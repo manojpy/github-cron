@@ -99,12 +99,7 @@ def enumerate_rules(atoms: Sequence[Atom], max_depth: int = 3) -> List[Rule]:
                 rules.append(tuple(combo))
     return rules
 
-
-def mine_rules(
-    items: Sequence[Tuple[Mapping[str, Any], float]], *, z: float, max_rules: int = 120,
-    min_train_n: int = 15, min_hold_n: int = 8, train_frac: float = 0.6, max_keep: int = 3,
-    max_hold_cover: float = 0.7, embargo_sec: int = 14 * _CANDLE_SEC,
-) -> Tuple[List[Dict[str, Any]], int]:
+def mine_rules(items: Sequence[Tuple[Mapping[str, Any], float]], *, z: float, max_rules: int = 120, min_train_n: int = 15, min_hold_n: int = 8, train_frac: float = 0.6, max_keep: int = 3, max_hold_cover: float = 0.7, embargo_sec: int = 14 * _CANDLE_SEC) -> Tuple[List[Dict[str, Any]], int]:
     """items = [(row, net_pnl_pct)] for ONE group under the plan being judged.
     Returns (rules, n_tested).  At most `max_rules` candidates are ever scored on
     the holdout, so the search space (and the multiple-testing price) is capped."""

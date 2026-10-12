@@ -120,12 +120,7 @@ def _ttl_stats(ttls: List[int]) -> Dict[str, Optional[float]]:
         return {"min": None, "median": None, "max": None}
     return {"min": min(live), "median": statistics.median(live), "max": max(live)}
 
-
-def summarize(
-    records: Iterable[Dict[str, Any]],
-    stream_lengths: Optional[Dict[str, int]] = None,
-    sample_examples: int = 5,
-) -> Dict[str, Any]:
+def summarize(records: Iterable[Dict[str, Any]], stream_lengths: Optional[Dict[str, int]] = None, sample_examples: int = 5) -> Dict[str, Any]:
     """Pure function: turn per-key records into the audit report.
 
     Each record: {"key": str, "type": str, "ttl": int, "bytes": Optional[int]}
@@ -221,14 +216,7 @@ def summarize(
         "findings": findings,
     }
 
-
-def collect(
-    client: Any,
-    max_keys: int = 200_000,
-    scan_count: int = 500,
-    sample_bytes: int = 25,
-    match: str = "*",
-) -> Tuple[List[Dict[str, Any]], Dict[str, int], bool]:
+def collect(client: Any, max_keys: int = 200_000, scan_count: int = 500, sample_bytes: int = 25, match: str = "*") -> Tuple[List[Dict[str, Any]], Dict[str, int], bool]:
     """Read-only scan. Returns (records, stream_lengths, truncated)."""
     keys: List[str] = []
     truncated = False
@@ -274,7 +262,6 @@ def collect(
             pass
     return records, streams, truncated
 
-
 def collect_heal_candidates(client: Any) -> List[Dict[str, Any]]:
     """Look up the TTL of each healable key directly by name (one pipelined
     round trip). Unlike the SCAN this cannot be cut short by --max-keys."""
@@ -285,11 +272,7 @@ def collect_heal_candidates(client: Any) -> List[Dict[str, Any]]:
     res = pipe.execute()
     return [{"key": k, "ttl": int(t)} for k, t in zip(keys, res)]
 
-
-def plan_durable_ttl_heal(
-    records: Iterable[Dict[str, Any]],
-    target_ttl: int = HEAL_TARGET_TTL_SEC,
-) -> List[Dict[str, Any]]:
+def plan_durable_ttl_heal(records: Iterable[Dict[str, Any]], target_ttl: int = HEAL_TARGET_TTL_SEC) -> List[Dict[str, Any]]:
     """Pure: which keys would be raised. Only an exact 'metadata:<name>' key
     from HEAL_METADATA with a finite, positive TTL below target is planned.
     Absent keys (-2), no-expiry keys (-1) and keys already at/above target are
@@ -316,10 +299,7 @@ def _raise_ttl(client: Any, key: str, target: int) -> bool:
             return bool(client.expire(key, target))
         return False
 
-
-def apply_durable_ttl_heal(
-    client: Any, plan: List[Dict[str, Any]], dry_run: bool = False,
-) -> Dict[str, Any]:
+def apply_durable_ttl_heal(client: Any, plan: List[Dict[str, Any]], dry_run: bool = False) -> Dict[str, Any]:
     """Execute (or, with dry_run, only describe) the plan, then re-read each
     TTL so the report shows the verified 'after' value."""
     rows: List[Dict[str, Any]] = []
@@ -334,10 +314,7 @@ def apply_durable_ttl_heal(
         rows.append(row)
     return {"target_days": HEAL_TARGET_TTL_SEC / 86400.0, "dry_run": dry_run, "keys": rows}
 
-def plan_ttl_leak_heal(
-    records: Iterable[Dict[str, Any]],
-    target_ttl: int = LEAK_HEAL_TTL_SEC,
-) -> List[Dict[str, Any]]:
+def plan_ttl_leak_heal(records: Iterable[Dict[str, Any]], target_ttl: int = LEAK_HEAL_TTL_SEC) -> List[Dict[str, Any]]:
     """Pure: keys that are NO_TTL_LEAK *and* belong to an allow-listed family.
 
     Only families in LEAK_HEAL_FAMILIES are healed automatically.
@@ -360,7 +337,6 @@ def plan_ttl_leak_heal(
         })
     return sorted(plan, key=lambda p: p["key"])
 
-
 def _set_ttl_only_if_missing(client: Any, key: str, target_ttl: int) -> bool:
     """Set TTL only if the key currently has no TTL.
 
@@ -377,12 +353,7 @@ def _set_ttl_only_if_missing(client: Any, key: str, target_ttl: int) -> bool:
             return False
         return False
 
-
-def apply_ttl_leak_heal(
-    client: Any,
-    plan: List[Dict[str, Any]],
-    dry_run: bool = False,
-) -> Dict[str, Any]:
+def apply_ttl_leak_heal(client: Any, plan: List[Dict[str, Any]], dry_run: bool = False) -> Dict[str, Any]: 
     """Execute or describe the leak-heal plan, then re-read each TTL."""
     rows: List[Dict[str, Any]] = []
     for p in plan:

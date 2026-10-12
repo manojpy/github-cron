@@ -17,9 +17,7 @@ CapRow = Tuple[float, int, float, float]  # (cap, n, wr, wilson_lower_bound)
 
 _EV_FIRST_CACHE: Dict[Tuple[int, Any, Any, int, int, float, float], Dict[str, Any]] = {}
 
-def _ev_first_cache_key(
-    rows: List[Row], min_sample: int, fee_pct: float, slippage_pct: float,
-) -> Tuple[int, Any, Any, int, int, float, float]:
+def _ev_first_cache_key(rows: List[Row], min_sample: int, fee_pct: float, slippage_pct: float) -> Tuple[int, Any, Any, int, int, float, float]:
     n = len(rows)
     first_ts = rows[0].get("entry_ts", 0) if n else 0
     last_ts = rows[-1].get("entry_ts", 0) if n else 0
@@ -185,9 +183,7 @@ def recency_weight(entry_ts: Optional[float], now_ts: float, decay_days: float =
     age_days = max(0.0, (now_ts - float(entry_ts)) / 86400.0)
     return math.exp(-age_days / decay_days)
 
-def weighted_win_rate(
-    rows: List[Row], now_ts: Optional[float] = None, decay_days: float = 7.0,
-) -> Tuple[Optional[float], float, float, float]:
+def weighted_win_rate(rows: List[Row], now_ts: Optional[float] = None, decay_days: float = 7.0) -> Tuple[Optional[float], float, float, float]:
     """Recency-weighted win rate + a weighted Wilson-CI band. Plain recency
     weighting only — every win counts as exactly 1.0 regardless of size.
     For bonus-adjusted weighting (overshoot wins count for more), use
@@ -213,13 +209,7 @@ def weighted_win_rate(
     lo, hi, _ = wilson_ci(round(weighted_wr * n_eff), max(1, round(n_eff)))
     return weighted_wr, n_eff, lo, hi
 
-def weighted_win_rate_with_bonus(
-    rows: List[Row],
-    now_ts: Optional[float] = None,
-    decay_days: float = 7.0,
-    n_boot: int = 400,
-    seed: int = 42,
-) -> Tuple[Optional[float], float, float, float]:
+def weighted_win_rate_with_bonus(rows: List[Row], now_ts: Optional[float] = None, decay_days: float = 7.0, n_boot: int = 400, seed: int = 42) -> Tuple[Optional[float], float, float, float]:
     """Win rate where bonus wins (exceeded 1:2 target) count for more,
     with a proper bootstrap CI instead of a re-parameterized Wilson.
 
@@ -376,12 +366,7 @@ def smooth(values: List[float], window: int = 3) -> List[float]:
         out.append(sum(values[lo:hi]) / (hi - lo))
     return out
 
-def walk_forward_split(
-    rows: List[Row],
-    train_frac: float = 0.67,
-    lookahead_sec: Optional[int] = None,   # None → (fill delay + lookahead + 1) candles * 900
-    embargo_sec: int = 900,          # one candle of buffer
-) -> Tuple[List[Row], List[Row]]:
+def walk_forward_split(rows: List[Row], train_frac: float = 0.67, lookahead_sec: Optional[int] = None, embargo_sec: int = 900) -> Tuple[List[Row], List[Row]]:
     """Chronological split by entry_ts with purge + embargo.
 
     A row at entry_ts=T has its forward outcome window extend to T+lookahead_sec.
@@ -440,13 +425,7 @@ def confidence_label(n: int, wilson_lo: float, wilson_hi: float) -> str:
         return "HIGH"
     return "VERY HIGH"
 
-def sample_evidence_state(
-    n: int,
-    oos_validated: bool = False,
-    insufficient_n: int = 15,
-    shadow_n: int = 50,
-    eligible_n: int = 100,
-) -> str:
+def sample_evidence_state(n: int, oos_validated: bool = False, insufficient_n: int = 15, shadow_n: int = 50, eligible_n: int = 100) -> str:
     """Explicit sample-aware learning states (roadmap item #24).
 
     n < insufficient_n          → INSUFFICIENT  (no adjustment)
@@ -545,11 +524,7 @@ def detect_temporal_drift(rows: List[Row], window_days: int = 14):
 # ══════════════════════════════════════════════════════════════════════
 #  NEW: Cost-Aware EV + Kelly Sizing  (Recommended.txt §5)
 # ══════════════════════════════════════════════════════════════════════
-def ev_and_kelly_for(
-    rows: List[Row],
-    fee_pct: float = 0.0006,
-    slippage_pct: float = 0.0003,
-) -> Tuple[float, float, float]:
+def ev_and_kelly_for(rows: List[Row], fee_pct: float = 0.0006, slippage_pct: float = 0.0003) -> Tuple[float, float, float]:
     """Net EV after round-trip fees + slippage, plus Half-Kelly fraction.
     Returns (net_ev_pct, half_kelly_fraction, win_rate).
 
@@ -577,14 +552,10 @@ def ev_and_kelly_for(
     half_kelly = max(0.0, min(full_kelly * 0.5, 0.25))  # cap 25 %
     return ev, half_kelly, wr
 
-# ════════════════════════════════════════════════════════════════════���══
+# ══════════════════════════════════════════════════════════════════════
 #  FIXED: Brier Score & Calibration Curve  (Recommended.txt §2)
 # ═══════════════════════════════════════════════════════════════════════
-def brier_score_and_calibration(
-    rows: List[Row],
-    bucket_size: float = 1.0,
-    train_frac: float = 0.67,
-) -> Tuple[float, List[Dict[str, Any]]]:
+def brier_score_and_calibration(rows: List[Row], bucket_size: float = 1.0, train_frac: float = 0.67) -> Tuple[float, List[Dict[str, Any]]]: 
     """Brier score (0 = perfect, 0.25 = coin-flip) + calibration curve.
     Uses a train/holdout split to provide a true out-of-sample calibration check."""
     if not rows:
@@ -672,11 +643,7 @@ def brier_score_and_calibration(
         brier = (total_brier / count) if count > 0 else 0.5
         return brier, curve
 
-def calibration_alert(
-    rows: List[Row],
-    bucket_size: float = 1.0,
-    max_divergence: float = 0.10,
-) -> List[Dict[str, Any]]:
+def calibration_alert(rows: List[Row], bucket_size: float = 1.0, max_divergence: float = 0.10) -> List[Dict[str, Any]]:
     """Return buckets where predicted vs observed WR diverges > max_divergence."""
     _brier, curve = brier_score_and_calibration(rows, bucket_size)
     alerts: List[Dict[str, Any]] = []
@@ -712,12 +679,7 @@ def _percentile(data: List[float], p: float) -> float:
         return s[f]
     return s[f] * (c - k) + s[c] * (k - f)
 
-def bootstrap_ev_ci(
-    rows: List[Row],
-    n_sims: int = 1000,
-    block_size: int = 20,
-    seed: Optional[int] = None,
-) -> Dict[str, Any]:
+def bootstrap_ev_ci(rows: List[Row], n_sims: int = 1000, block_size: int = 20, seed: Optional[int] = None) -> Dict[str, Any]:
     """Block-bootstrap EV distribution. Returns mean / p5 / p95 EV."""
     if len(rows) < block_size * 3:
         return {"valid": False, "error": "insufficient_data"}
@@ -758,8 +720,7 @@ def _sigmoid(z: float) -> float:
     ez = math.exp(z)
     return ez / (1.0 + ez)
 
-def _prob_edge_broken(wins: int, n: int, target_wr: float,
-                       prior_strength: float = 10.0) -> float:
+def _prob_edge_broken(wins: int, n: int, target_wr: float, prior_strength: float = 10.0) -> float:
     """Bayesian P(true_wr < target_wr) under a Beta posterior.
 
     Replaces point-estimate triggers like `wr < disable_wr` with a
@@ -804,12 +765,7 @@ def _prob_ev_positive(ev_mean: float, ev_std: float) -> float:
     z = ev_mean / ev_std
     return 0.5 * math.erfc(-z / math.sqrt(2.0))
 
-def ev_first_objective(
-    rows: List[Row],
-    min_sample: int = 20,
-    fee_pct: float = 0.0006,
-    slippage_pct: float = 0.0003,
-) -> Dict[str, Any]:
+def ev_first_objective(rows: List[Row], min_sample: int = 20, fee_pct: float = 0.0006, slippage_pct: float = 0.0003) -> Dict[str, Any]:
     """Unified profitability assessment. Replaces WR-first gating.
 
     Returns the full evidence stack:
@@ -888,14 +844,7 @@ def ev_first_objective(
     _EV_FIRST_CACHE[_cache_key] = _result
     return dict(_result)
 
-def per_trade_ev(
-    calibrated_p: float,
-    reward_r: float,          # e.g. R:R = 2.0 → reward_r = 2.0
-    risk_r: float = 1.0,      # stop-loss in R units (usually 1.0)
-    fee_pct: float = 0.0006,
-    slippage_pct: float = 0.0003,
-    sl_pct: Optional[float] = None,  # if known, convert costs into R
-) -> Dict[str, Any]:
+def per_trade_ev(calibrated_p: float, reward_r: float, risk_r: float = 1.0, fee_pct: float = 0.0006, slippage_pct: float = 0.0003, sl_pct: Optional[float] = None) -> Dict[str, Any]:
     """Per-trade EV from a calibrated probability (future pipeline).
 
     EV = p * reward_r − (1−p) * risk_r − costs_in_R
@@ -952,12 +901,7 @@ def _flatten_row_features(row: Row) -> Dict[str, float]:
                 feats[f"ctx:{k}"] = float(v)
     return feats
 
-def population_stability_index(
-    baseline: List[float],
-    recent: List[float],
-    bins: int = 10,
-    eps: float = 1e-4,
-) -> Optional[float]:
+def population_stability_index(baseline: List[float], recent: List[float], bins: int = 10, eps: float = 1e-4) -> Optional[float]:
     """PSI between two samples. <0.1 stable, 0.1-0.25 moderate shift,
     >0.25 large shift. The classic 'why did my model stop working' metric."""
     if len(baseline) < 30 or len(recent) < 30:

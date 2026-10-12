@@ -57,16 +57,10 @@ def _pool(items: List[Tuple[Row, float, float]]) -> Dict[str, Any]:
         "p_profit": sum(1 for p in pn if p > 0) / n,
     }
 
-
 def _crit(cid: str, label: str, value: Any, target: str, passed: bool) -> Dict[str, Any]:
     return {"id": cid, "label": label, "value": value, "target": target, "pass": bool(passed)}
 
-
-def build_scoreboard(
-    blob: Mapping[str, Any], rows: Sequence[Row], *, cost_pct: float, fixed: Mapping[str, float],
-    criteria: Optional[Mapping[str, Any]] = None, family_fn: Optional[Callable[[str], str]] = None,
-    family_pool: bool = True,
-) -> Dict[str, Any]:
+def build_scoreboard(blob: Mapping[str, Any], rows: Sequence[Row], *, cost_pct: float, fixed: Mapping[str, float], criteria: Optional[Mapping[str, Any]] = None, family_fn: Optional[Callable[[str], str]] = None, family_pool: bool = True) -> Dict[str, Any]:
     C = dict(default_criteria())
     C.update(criteria or {})
     groups = group_rows(rows, family_fn, family_pool)

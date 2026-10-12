@@ -54,8 +54,7 @@ def format_size(bytes: int) -> str:
         bytes /= 1024.0
     return f"{bytes:.2f} TB"
 
-def cleanup_by_age(data_dir: Path, max_age_days: int, dry_run: bool = False,
-                   reports_max_age_days: int = 7) -> int:
+def cleanup_by_age(data_dir: Path, max_age_days: int, dry_run: bool = False, reports_max_age_days: int = 7) -> int:
     """Remove files older than max_age_days (reports/*.md use their own,
     shorter reports_max_age_days)."""
     removed = 0
@@ -81,8 +80,7 @@ def cleanup_by_age(data_dir: Path, max_age_days: int, dry_run: bool = False,
     
     return removed
 
-def compress_large_files(data_dir: Path, max_size_mb: int, dry_run: bool = False,
-                         no_compress_within_days: int = 0) -> int:
+def compress_large_files(data_dir: Path, max_size_mb: int, dry_run: bool = False, no_compress_within_days: int = 0) -> int:
     compressed = 0
     max_size_bytes = max_size_mb * 1024 * 1024
     cutoff = datetime.now(timezone.utc) - timedelta(days=no_compress_within_days)
