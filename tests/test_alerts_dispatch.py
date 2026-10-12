@@ -448,6 +448,61 @@ def test_post_send_hook_error_still_marks_candle_processed():
     assert sdb.processed == [("ETHUSD", 1_700_000_000)]
 
 
+# ── Correction 1: pipeline result inspection ──
+
+def test_atomic_batch_update_rejects_per_command_error():
+    import state as S
+    sdb = object.__new__(S.RedisStateStore)
+    sdb.degraded = False
+    sdb.expiry_seconds = 0
+    sdb.state_prefix = "pair_state:"
+
+    class _Pipe:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        def hset(self, *a, **k): return None
+        async def execute(self):
+            return [1, RuntimeError("WRONGTYPE")]
+
+    class _R:
+        def pipeline(self): return _Pipe()
+
+    sdb._redis = _R()
+    ok = asyncio.run(sdb.atomic_batch_update(
+        updates=[("ETHUSD:a", "ACTIVE", None), ("ETHUSD:b", "ACTIVE", None)],
+    ))
+    assert ok is False
+
+
+def test_atomic_batch_update_groups_hdel_count():
+    import state as S
+    sdb = object.__new__(S.RedisStateStore)
+    sdb.degraded = False
+    sdb.expiry_seconds = 0
+    sdb.state_prefix = "pair_state:"
+
+    class _Pipe:
+        def __init__(self): self.queued = []
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        def __getattr__(self, name):
+            def _rec(*a, **k): self.queued.append((name, a))
+            return _rec
+        async def execute(self):
+            return [1] * len(self.queued)
+
+    class _R:
+        def __init__(self, p): self._p = p
+        def pipeline(self): return self._p
+
+    pipe = _Pipe()
+    sdb._redis = _R(pipe)
+    ok = asyncio.run(sdb.atomic_batch_update(
+        updates=[], deletes=["ETHUSD:a", "ETHUSD:b", "ETHUSD:c"],
+    ))
+    assert ok is True
+    assert sum(1 for n, _ in pipe.queued if n == "hdel") == 1
+
 # ======================================================================
 # from test_resolution_archive_ordering.py
 # ======================================================================
@@ -837,6 +892,46 @@ def test_dlq_replay_applies_outcomes_and_state_after_delivery(monkeypatch):
     assert sdb.state_batches == [[("ETHUSD:state", "ACTIVE", None)]]
     assert sdb.parked == {}
 
+
+# ── Correction 2: NEEDS_REPAIR save failure stops the pass ──
+
+def test_replay_stops_when_repair_marker_write_fails(monkeypatch, caplog):
+    import alerts as A
+    monkeypatch.setattr(cfg, "ENABLE_TELEGRAM_DLQ", True, raising=False)
+    monkeypatch.setattr(cfg, "DRY_RUN_MODE", False, raising=False)
+    monkeypatch.setattr(cfg, "TELEGRAM_DLQ_MAX_ITEMS_PER_RUN", 10, raising=False)
+    monkeypatch.setattr(cfg, "TELEGRAM_DLQ_MAX_ATTEMPTS", 1, raising=False)
+
+    class _Sdb:
+        degraded = False
+        def __init__(self):
+            self.parked = {
+                "k:AAAUSD": {
+                    "pair": "AAAUSD", "ts": 0, "message": "m", "delivered": True,
+                    "state_changes": [["AAAUSD:s", "ACTIVE", None]],
+                    "outcomes": [], "attempts": 1, "side_tries": 1,
+                },
+                "k:BBBUSD": {
+                    "pair": "BBBUSD", "ts": 0, "message": "m", "delivered": True,
+                    "state_changes": [["BBBUSD:s", "ACTIVE", None]],
+                    "outcomes": [], "attempts": 1, "side_tries": 1,
+                },
+            }
+            self.sent = []
+        async def dlq_list(self, limit=10): return list(self.parked.items())
+        async def dlq_save_entry(self, key, entry): return False
+        async def dlq_delete(self, key): return True
+        async def record_pending_outcome(self, **kw): return True
+        async def atomic_batch_update(self, *a, **k): return False
+
+    class _Tg:
+        async def send(self, msg): return True
+
+    sdb = _Sdb()
+    asyncio.run(A.replay_telegram_dlq(sdb, _Tg(), logging.getLogger("t")))
+    # Second entry must not have been processed at all.
+    assert "BBBUSD" not in "\n".join(r.message for r in caplog.records)
+    assert sdb.parked["k:BBBUSD"]["side_tries"] == 1   # untouched
 
 def test_auto_open_positions_count_only_delivered_takes():
     class _Meta:
