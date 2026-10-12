@@ -684,16 +684,19 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
         ]
         if rsi_cap_ok:
             specs.append({"label": "RSI buy cap -3",
-                          "new_threshold": None, "new_params": {"rsi_curr": rsi_cap}})
+                          "new_threshold": None, "new_params": {"rsi_curr": rsi_cap},
+                          "params_direction": "buy"})
             specs.append({"label": "Threshold +1 + RSI cap -3",
                           "new_threshold": cfg.CONFLUENCE_MIN_ABS_SCORE + 1.0,
-                          "new_params": {"rsi_curr": rsi_cap}})
+                          "new_params": {"rsi_curr": rsi_cap},
+                          "params_direction": "buy"})
 
         scenarios: List[Dict[str, Any]] = []
         for spec in specs:
             real_sim = simulate_config_change(
                 real_rows, baseline_ev,
                 new_threshold=spec["new_threshold"], new_params=spec["new_params"],
+                params_direction=spec.get("params_direction"),
             )
             if not real_sim:
                 continue
@@ -703,6 +706,7 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
                 shadow_sim = simulate_config_change(
                     shadow_rows, shadow_baseline_ev,
                     new_threshold=spec["new_threshold"], new_params=spec["new_params"],
+                    params_direction=spec.get("params_direction"),
                 )
                 if shadow_sim and shadow_sim["n"] >= 5:
                     scenario["shadow_n"] = shadow_sim["n"]
@@ -939,7 +943,7 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
                     "type": "condition_ablation",
                     "severity": "medium",
                     "message": (
-                        "Conditions adding little information (candidate weight cuts): "
+                        "Conditions adding little information or hurting win rate (candidate weight cuts): "
                         + ", ".join(parts)
                     ),
                     "ablation": noise_votes[:5],

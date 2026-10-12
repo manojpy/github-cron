@@ -37,12 +37,19 @@ def simulate_config_change(
     baseline_ev: float,
     new_threshold: Optional[float] = None,
     new_params: Optional[Dict[str, float]] = None,
+    params_direction: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    """params_direction: when set ("buy"/"sell"), new_params caps apply only to
+    rows of that direction (e.g. an RSI *buy* cap must not remove SELL rows,
+    which fire at high RSI). None keeps the old behaviour (all rows)."""
     simulated: List[Row] = []
     for r in rows:
         if new_threshold is not None and r["score"] < new_threshold:
             continue
-        if new_params and r.get("context"):
+        if (
+            new_params and r.get("context")
+            and (params_direction is None or r.get("direction") == params_direction)
+        ):
             blocked = False
             for param, max_val in new_params.items():
                 if r["context"].get(param) is not None and r["context"][param] > max_val:
@@ -297,6 +304,9 @@ def hash_config_state(
         "BRAIN_AUDIT_ENABLED",
         "BRAIN_AUDIT_MIN_ROWS_FOR_RECOMMENDATION",
         "BRAIN_AUDIT_MIN_HISTORY_RATIO",
+        "ENABLE_UNCONFIRMED_SIGNAL_NOTICE",
+    })
+
     })
     try:
         for field_name in type(cfg).model_fields:
@@ -808,5 +818,10 @@ def repair_shop_diagnosis(
     repairs.sort(key=lambda x: severity_order.get(x["severity"], 4))
     shop_max = getattr(cfg, "BRAIN_REPAIR_SHOP_MAX", 3)
     if len(repairs) > shop_max:
-        repairs = repairs[:shop_max]
+        # The cap must not silently drop the two categories that drive automatic
+        # follow-ups (revert-patch proposal and root-cause weight cut).
+        _must_keep = {"config_regression_pinpoint", "root_cause"}
+        kept = repairs[:shop_max]
+        kept += [r for r in repairs[shop_max:] if r.get("category") in _must_keep]
+        repairs = kept
     return repairs

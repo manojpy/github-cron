@@ -7,6 +7,7 @@ import math
 import time
 import random
 import statistics
+import numpy as np
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 from bot_config import cfg
@@ -48,6 +49,44 @@ def _build_vote_dataset(
             sw.append(r.get("win_weight", 1.0) if r["win"] else 1.0)
     return X, y, sw
 
+
+# Absolute price levels. Their magnitude is the pair's price scale (BTC ~1e4-1e5,
+# DOGE ~1e-1), so pooled across pairs they carry no information and, unscaled,
+# make the gradient-descent fit diverge. Excluded from auto-discovered features.
+_PRICE_LEVEL_CTX = frozenset({
+    "close_curr", "close_prev", "vwap_curr", "vwap_prev",
+    "rma50_15_val", "rma200_5_val", "rma_cloud_fast_curr", "rma_cloud_slow_curr",
+    "tk_conversion_curr", "tk_conversion_prev", "tk_base_curr", "tk_base_prev",
+    "equilibrium_curr", "equilibrium_prev",
+    "cloud_upper_curr", "cloud_upper_prev", "cloud_lower_curr", "cloud_lower_prev",
+})
+
+def _fit_scaler(X: List[List[float]], feature_names: List[str]) -> Dict[str, List[float]]:
+    """Z-score parameters for the numeric context columns only (column 0 is the
+    intercept; votes, session and direction are already 0/1). JSON-friendly."""
+    n_cols = len(X[0]) if X else 0
+    mean = [0.0] * n_cols
+    std = [1.0] * n_cols
+    for k, fname in enumerate(feature_names):
+        if not fname.startswith("ctx:"):
+            continue
+        j = k + 1
+        col = [row[j] for row in X]
+        m = statistics.fmean(col)
+        sd = statistics.pstdev(col)
+        mean[j] = m
+        std[j] = sd if sd > 1e-12 else 1.0
+    return {"mean": mean, "std": std}
+
+def _apply_scaler(X: List[List[float]], scaler: Optional[Dict[str, List[float]]]) -> List[List[float]]:
+    if not scaler:
+        return X
+    mean, std = scaler.get("mean") or [], scaler.get("std") or []
+    return [
+        [(v - mean[j]) / std[j] if j < len(mean) and j < len(std) else v for j, v in enumerate(row)]
+        for row in X
+    ]
+
 def build_market_state_features(
     rows: List[Row],
     feature_names: Optional[List[str]] = None,
@@ -64,7 +103,7 @@ def build_market_state_features(
                 all_features.update(f"vote:{k}" for k in r["votes"])
             if r.get("context"):
                 for k, v in r["context"].items():
-                    if isinstance(v, (int, float)):
+                    if isinstance(v, (int, float)) and k not in _PRICE_LEVEL_CTX:
                         all_features.add(f"ctx:{k}")
         feature_names = sorted(all_features)
 
@@ -83,7 +122,11 @@ def build_market_state_features(
             elif fname.startswith("ctx:"):
                 cname = fname[4:]
                 val = ctx.get(cname)
-                vec.append(float(val) if isinstance(val, (int, float)) else 0.0)
+                vec.append(
+                    float(val)
+                    if isinstance(val, (int, float)) and math.isfinite(float(val))
+                    else 0.0
+                )
 
         # Session encoding
         session = r.get("session", "unknown")
@@ -102,30 +145,28 @@ def _train_logistic(
     X: List[List[float]], y: List[float], sample_weights: List[float],
     max_iter: int = 2000, lr: float = 0.05, l2: float = 0.01,
 ) -> List[float]:
-    """Pure gradient-descent logistic regression. Returns beta vector."""
+    """Gradient-descent logistic regression (numpy-vectorised, same maths as the
+    earlier pure-Python loop: cosine-annealed step, L2 on every coefficient,
+    intercept initialised to the base-rate log-odds). Returns beta vector."""
     n = len(X)
     if n == 0:
         return []
-    n_features = len(X[0])
-    win_rate = sum(y) / n
-    beta = [0.0] * n_features
+    Xa = np.asarray(X, dtype=np.float64)
+    ya = np.asarray(y, dtype=np.float64)
+    wa = np.asarray(sample_weights, dtype=np.float64)
+    win_rate = float(ya.sum()) / n
+    beta = np.zeros(Xa.shape[1], dtype=np.float64)
     beta[0] = math.log(win_rate / (1 - win_rate)) if 0 < win_rate < 1 else 0.0
-    total_sw = sum(sample_weights) or 1.0
+    total_sw = float(wa.sum()) or 1.0
+    Xw = Xa * wa[:, None]
 
     for iteration in range(max_iter):
-        grad = [0.0] * n_features
-        for i in range(n):
-            z = sum(beta[j] * X[i][j] for j in range(n_features))
-            p = _sigmoid(z)
-            error = p - y[i]
-            w = sample_weights[i]
-            for j in range(n_features):
-                grad[j] += error * X[i][j] * w
+        z = np.clip(Xa @ beta, -500.0, 500.0)
+        p = 1.0 / (1.0 + np.exp(-z))
+        grad = (Xw.T @ (p - ya)) / total_sw + l2 * beta
         step = lr * (0.5 * (1 + math.cos(math.pi * iteration / max_iter)))
-        for j in range(n_features):
-            grad[j] = grad[j] / total_sw + l2 * beta[j]
-            beta[j] -= step * grad[j]
-    return beta
+        beta -= step * grad
+    return [float(b) for b in beta]
 
 def _score_with_beta(
     rows: List[Row], beta: List[float], vote_names: List[str],
@@ -457,6 +498,19 @@ def actionable_condition_ablation(
                     f"condition adds almost no information once others are present"
                 ),
             })
+        elif imp >= edge_threshold and p_val <= 0.10 and item.get("direction") == "negative":
+            # Informative but in the WRONG direction: WR is lower when this vote fires.
+            out.append({
+                "vote": vote,
+                "importance": imp,
+                "direction": "harmful",
+                "action": "reduce_weight",
+                "suggested_weight_factor": 0.5,
+                "reason": (
+                    f"Permutation importance {imp:+.3f} with a NEGATIVE gap — "
+                    f"win rate is lower when this vote fires"
+                ),
+            })
         elif imp >= edge_threshold and p_val <= 0.10:
             out.append({
                 "vote": vote,
@@ -525,8 +579,9 @@ def oos_permutation_importance(
     if len(train_rows) < min_sample or len(holdout_rows) < min_sample:
         return []
 
-    X_train, y_train, feat_names = build_market_state_features(train_rows)
-    X_hold, y_hold, _ = build_market_state_features(holdout_rows, feat_names)
+    scaler = _fit_scaler(X_train, feat_names)
+    X_train = _apply_scaler(X_train, scaler)
+    X_hold = _apply_scaler(X_hold, scaler)
     sw_train = (
         _pnl_sample_weights(train_rows)
         if getattr(cfg, "ENABLE_PNL_WEIGHTED_TRAINING", True)
@@ -656,6 +711,7 @@ def train_market_state_model(
         "valid": True,
         "beta": beta,
         "feature_names": feat_names,
+        "scaler": scaler,
         "n_train": len(train_rows),
         "n_holdout": len(holdout_rows),
         "n_kept_at_decision": len(kept),
@@ -692,6 +748,7 @@ def predict_market_state_proba(
     X, _, _ = build_market_state_features([row], feat_names)
     if not X:
         return None
+    X = _apply_scaler(X, model.get("scaler"))
     z = sum(b * x for b, x in zip(beta, X[0]))
     return _sigmoid(z)
 
@@ -738,8 +795,19 @@ def build_calibration_curves(
         ordered = sorted(ak_rows, key=lambda r: r["conf_pct"])
         n_bins = max(1, min(target_bins, len(ordered) // min_sample))
         chunk_size = math.ceil(len(ordered) / n_bins)
-        chunks = [ordered[i:i + chunk_size] for i in range(0, len(ordered), chunk_size)]
-        chunks = [c for c in chunks if c]
+
+        chunks = []
+        _start = 0
+        while _start < len(ordered):
+            _end = min(_start + chunk_size, len(ordered))
+            # Never split rows that share the same conf_pct across two buckets:
+            # conf_pct is a ratio of a few discrete weights, so ties are common
+            # (esp. piled up at the confluence floor). A split leaves zero-width
+            # buckets and makes live lookups see only part of the tied rows.
+            while _end < len(ordered) and ordered[_end]["conf_pct"] == ordered[_end - 1]["conf_pct"]:
+                _end += 1
+            chunks.append(ordered[_start:_end])
+            _start = _end
 
         # Contiguous 0-100 coverage: each boundary sits halfway between one
         # chunk's max conf_pct and the next chunk's min, so a live conf_pct

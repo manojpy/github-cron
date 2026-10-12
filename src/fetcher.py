@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections import deque
-from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, TYPE_CHECKING, cast
+from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, TYPE_CHECKING, Union, cast
 import ssl
 import aiohttp
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
@@ -164,7 +164,7 @@ def compute_backoff(base: float, attempt: int, cap: float = 30.0, jitter_range: 
     jitter = base_delay * random.uniform(*jitter_range)
     return base_delay + jitter
 
-async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, retries: int = 3, backoff: float = 1.5, timeout: int = 15) -> Optional[Dict[str, Any]]:   
+async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, retries: int = 3, backoff: float = 1.5, timeout: int = 15) -> Union[Dict[str, Any], bool, None]:
     session = await SessionManager.get_session()    
     retry_stats = {
         RetryCategory.NETWORK: 0,
@@ -196,9 +196,9 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
                         f"Rate limited (429) | URL: {url[:80]} | "
                         f"Retry-After: {retry_after}s | Waiting: {total_wait:.2f}s | "
                         f"Attempt: {attempt}/{retries}"
-                    )
-                    
-                    await asyncio.sleep(total_wait)
+                    )                 
+                    if attempt < retries:   # no point sleeping after the final attempt
+                        await asyncio.sleep(total_wait)
                     continue
                 
                 if resp.status >= 500:
@@ -217,7 +217,7 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
                         f"Client error {resp.status} for {url[:80]} | "
                         f"This usually indicates invalid request - not retrying"
                     )
-                    return None
+                    return False    # distinct from None: callers must not count a 4xx against the circuit breaker
                 try:
                     data = await resp.json(loads=json_loads)
                 except (JSONDecodeError, TypeError, ValueError) as e:
@@ -368,7 +368,16 @@ class APICircuitBreaker:
             self.failures += 1
             self.last_failure_time = time.time()
 
-            if self.failures >= self.failure_threshold and self.state == "CLOSED":
+            if self.state == "HALF_OPEN":
+                # A failed recovery probe must re-open the breaker, otherwise
+                # HALF_OPEN lets every request through for the rest of the outage.
+                logger.warning(
+                    f"⚠️ Circuit breaker: probe failed in HALF_OPEN, re-OPENED. "
+                    f"Blocking requests for {self.recovery_timeout}s"
+                )
+                self.state = "OPEN"
+                self.success_count = 0
+            elif self.failures >= self.failure_threshold and self.state == "CLOSED":
                 logger.warning(
                     f"⚠️ Circuit breaker: OPENED after {self.failures} failures. "
                     f"Blocking requests for {self.recovery_timeout}s"
@@ -1338,7 +1347,7 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
 
     next_idx = last_closed_idx + 1
     if next_idx >= ts_normalized.size or abs(int(ts_normalized[next_idx]) - actual_close) > 1:
-        logger.debug(
+        logger.info(
             "[%s] Candle %dm at %s NOT exchange-confirmed closed: next candle open %s missing from feed. Skipping.",
             pair_name or "?", int(interval_minutes),
             format_ist_time(actual_candle_open), format_ist_time(actual_close),
