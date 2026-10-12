@@ -213,13 +213,7 @@ def direction_of(key: str) -> Optional[str]:
     return spec.direction if spec else None
 
 
-def keys_for(
-    *,
-    kind: Optional[str] = None,
-    family: Optional[str] = None,
-    direction: Optional[str] = None,
-    config_flag: Optional[str] = None,
-) -> List[str]:
+def keys_for(*, kind: Optional[str] = None, family: Optional[str] = None, direction: Optional[str] = None, config_flag: Optional[str] = None) -> List[str]:
     out: List[str] = []
     for k, s in REGISTRY.items():
         if kind is not None and s.kind != kind:

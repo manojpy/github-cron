@@ -352,11 +352,7 @@ def _fmt_score(score: Optional[float], total: Optional[float] = None) -> str:
 
 DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-def _disabled_hits_passing_confluence(
-    hits: List[Tuple[str, str, str]],
-    confluence_for: Callable[[str], Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]],
-    abs_floor: float,
-) -> List[Tuple[str, str, str]]:
+def _disabled_hits_passing_confluence(hits: List[Tuple[str, str, str]], confluence_for: Callable[[str], Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]], abs_floor: float) -> List[Tuple[str, str, str]]:
     """Keep only brain-disabled alert hits that would have cleared the base
     confluence gate (same pct/abs-floor rule as live dispatch, without the
     macro/cluster adjustments). Real alerts are judged after that gate, so the
@@ -374,17 +370,8 @@ def _disabled_hits_passing_confluence(
             kept.append(hit)
     return kept
 
-def build_survival_checklist(
-    *,
-    score: Optional[float],
-    total: Optional[float],
-    required: Optional[float],
-    win_rate: Optional[float],
-    win_sample: int,
-    cal_wr: Optional[float],
-    cal_reason: Optional[str],
-    tq: Optional[Dict[str, Any]],
-) -> str:
+
+def build_survival_checklist(*, score: Optional[float], total: Optional[float], required: Optional[float], win_rate: Optional[float], win_sample: int, cal_wr: Optional[float], cal_reason: Optional[str], tq: Optional[Dict[str, Any]]) -> str:
     """Compact one-line 'why this alert survived' checklist (roadmap #25).
 
     ✓ = passed on evidence, ○ = not evaluated / fail-open, ⚠ = passed with a warning.
@@ -416,16 +403,7 @@ def build_survival_checklist(
             bits.append(f"⚠ regime gate: {tq['regime_gate']['note']}")
     return " · ".join(bits)
 
-def build_brain_filter_message(
-    *,
-    pair: str,
-    alert_key: str,
-    gate: str,
-    lines: List[str],
-    tq: Optional[Dict[str, Any]] = None,
-    score: Optional[float] = None,
-    total: Optional[float] = None,
-) -> str:
+def build_brain_filter_message(*, pair: str, alert_key: str, gate: str, lines: List[str], tq: Optional[Dict[str, Any]] = None, score: Optional[float] = None, total: Optional[float] = None) -> str:
     """MarkdownV2 'BRAIN FILTER' rejection message (roadmap #26)."""
     e = escape_markdown_v2
     out = [f"🧠 *BRAIN FILTER* \\- *{e(pair)}* {e(alert_key)}"]
@@ -461,19 +439,7 @@ def build_brain_filter_message(
     out.append(e("Not sent as a trade alert; shadow-logged for review."))
     return "\n".join(out)
 
-async def _notify_brain_filter(
-    telegram_queue: "TelegramQueue",
-    sdb: "RedisStateStore",
-    *,
-    pair_name: str,
-    alert_key: str,
-    gate: str,
-    lines: List[str],
-    tq: Optional[Dict[str, Any]] = None,
-    score: Optional[float] = None,
-    total: Optional[float] = None,
-    logger_pair: Optional[logging.Logger] = None,
-) -> bool:
+async def _notify_brain_filter(telegram_queue: "TelegramQueue", sdb: "RedisStateStore", *, pair_name: str, alert_key: str, gate: str, lines: List[str], tq: Optional[Dict[str, Any]] = None, score: Optional[float] = None, total: Optional[float] = None, logger_pair: Optional[logging.Logger] = None) -> bool:
     """Send a BRAIN FILTER Telegram message, rate-limited. Never raises.
 
     Off unless ENABLE_BRAIN_FILTER_TELEGRAM. Capped per run, de-duplicated per
@@ -508,23 +474,8 @@ async def _notify_brain_filter(
             logger_pair.debug(f"BRAIN FILTER Telegram failed for {alert_key}: {e}")
         return False
 
-async def _record_counterfactual_block(
-    sdb: "RedisStateStore",
-    pair_name: str,
-    alerts_to_send: List[Tuple[str, str, str]],
-    ts_curr: int,
-    close_curr: float,
-    block_reason: str,
-    *,
-    confluence_scores: Optional[Dict[str, Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]]] = None,
-    macro_shadow: Optional[Dict[str, Any]] = None,
-    cluster_penalty: Optional[float] = None,
-    effective_score: Optional[float] = None,
-    effective_required: Optional[float] = None,
-    gr: Optional[GateResult] = None,
-    context: Optional[Dict[str, Any]] = None,
-    logger_pair: Optional[logging.Logger] = None,
-) -> None:
+
+async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, alerts_to_send: List[Tuple[str, str, str]], ts_curr: int, close_curr: float, block_reason: str, *, confluence_scores: Optional[Dict[str, Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]]] = None, macro_shadow: Optional[Dict[str, Any]] = None, cluster_penalty: Optional[float] = None, effective_score: Optional[float] = None, effective_required: Optional[float] = None, gr: Optional[GateResult] = None, context: Optional[Dict[str, Any]] = None, logger_pair: Optional[logging.Logger] = None) -> None:
     """Shadow-log every alert that reached the dispatch stage but was then
     blocked by a non-win-rate gate (OOD, calibration, confluence, macro,
     cluster, portfolio-heat). The win-rate path already has its own shadow
@@ -615,19 +566,8 @@ async def _record_counterfactual_block(
         except Exception as e:
             logger_pair.debug(f"Why-rejected log failed ({block_reason}): {e}")
 
-def build_rich_pair_msg(
-    *,
-    pair: str,
-    direction: str,
-    price: Any,
-    ts: int,
-    score: Optional[float],
-    total: Optional[float],
-    setup_line: str,
-    advice: PairAdvice,
-    primary_emoji: Optional[str] = None,
-    record_line: Optional[str] = None,
-) -> str:
+
+def build_rich_pair_msg(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], setup_line: str, advice: PairAdvice, primary_emoji: Optional[str] = None, record_line: Optional[str] = None) -> str:
     """Structured Telegram body (MarkdownV2-escaped) WITHOUT bias/datetime footer."""
     side_word = "BUY" if direction.lower() == "buy" else "SELL"
     header_emoji = (primary_emoji or "").strip() or ("🟢" if side_word == "BUY" else "🔴")
@@ -648,11 +588,8 @@ def build_rich_pair_msg(
         lines.append(record_line)
     return "\n".join(escape_markdown_v2(x) for x in lines)
 
-def _bias_alignment(
-    direction: str, bias_context: Optional[BiasContext], min_edge: float = 0.10,
-) -> str:
+def _bias_alignment(direction: str, bias_context: Optional[BiasContext], min_edge: float = 0.10) -> str:
     """'with' / 'against' / 'neutral' relative to the pair-universe bias.
-
     Mirrors the bias header: the dominant bucket (up / down / neutral) decides.
     If Neutral dominates, or the dominant side leads the opposite side by less
     than ``min_edge`` (fraction of pairs), the market gives no direction, so the
@@ -679,25 +616,7 @@ def _record_status_line(status: str, active: Optional[Dict[str, Any]]) -> str:
         return f"⏸ Cooldown — target recently hit, not recorded until the {resume} candle"
     return "📝 Recorded as trade"
 
-def build_pair_msg_and_verdict(
-    *,
-    pair: str,
-    direction: str,
-    price: Any,
-    ts: int,
-    score: Optional[float],
-    total: Optional[float],
-    items: List[Tuple[str, str]],
-    keys: List[str],
-    tq_by_key: Dict[str, Optional[Dict[str, Any]]],
-    votes: Optional[Dict[str, bool]],
-    required: Optional[float],
-    bias_context: Optional[BiasContext],
-    logger_pair: logging.Logger,
-    pb_by_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
-    adx_val: Optional[float] = None,
-    record_line: Optional[str] = None,
-) -> Tuple[str, Optional[str]]:
+def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], items: List[Tuple[str, str]], keys: List[str], tq_by_key: Dict[str, Optional[Dict[str, Any]]], votes: Optional[Dict[str, bool]], required: Optional[float], bias_context: Optional[BiasContext], logger_pair: logging.Logger, pb_by_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None, adx_val: Optional[float] = None, record_line: Optional[str] = None) -> Tuple[str, Optional[str]]:
     """Build the rich body for one pair/direction and return (body, verdict).
     Never raises: any failure degrades to a plain header + setup line (verdict
     None) so an alert is never lost to a formatting bug."""
@@ -1096,8 +1015,7 @@ def resolve_alert_config_path(alert_key: str) -> Optional[str]:
     """Resolve alert_key → config enable flag. Single registry used by Brain."""
     return _registry_resolve_config_path(alert_key)
 
-async def _run_post_send_hooks(p: AlertPayload, sdb: RedisStateStore,
-                               logger_run: logging.Logger) -> None:
+async def _run_post_send_hooks(p: AlertPayload, sdb: RedisStateStore, logger_run: logging.Logger) -> None:
     """Post-delivery bookkeeping for one payload. Each step is isolated so a
     Redis/outcome error on one pair cannot skip the candle-processed marker
     (which would allow a duplicate Telegram alert next run) or abort the
@@ -1140,12 +1058,7 @@ async def coalesce_window_for(sdb: RedisStateStore, alert_keys: List[str]) -> in
     adaptive = max((windows.get(k, 0) for k in alert_keys), default=0)
     return max(base, min(adaptive, int(cfg.ADAPTIVE_DEDUP_MAX_SEC)))
 
-async def queue_failed_alert(
-    sdb: RedisStateStore, pair_name: str, message: str, ts: int,
-    dedup_keys: List[str], source: str, log: logging.Logger,
-    state_changes: Optional[List[Any]] = None,
-    outcomes: Optional[List[Dict[str, Any]]] = None,
-) -> bool:
+async def queue_failed_alert(sdb: RedisStateStore, pair_name: str, message: str, ts: int, dedup_keys: List[str], source: str, log: logging.Logger, state_changes: Optional[List[Any]] = None, outcomes: Optional[List[Dict[str, Any]]] = None) -> bool:
     """Park an alert whose Telegram send failed so the next run re-sends it.
     state_changes / outcomes are the side effects that normally follow a
     successful send; they are stored with the entry and applied on replay.
@@ -1172,9 +1085,7 @@ async def queue_failed_alert(
 # budget: a slow Telegram must not eat the 480s run deadline.
 DLQ_REPLAY_BUDGET_SEC = 60.0
 
-async def replay_telegram_dlq(
-    sdb: Optional[RedisStateStore], telegram_queue: TelegramQueue, log: logging.Logger,
-) -> None:
+async def replay_telegram_dlq(sdb: Optional[RedisStateStore], telegram_queue: TelegramQueue, log: logging.Logger) -> None:
     """Re-send parked alerts. Stale and abandoned entries are dropped (their dedup
     claims have long expired, so nothing needs releasing). Stops at the first
     failed send (Telegram down) or when the time budget is spent.
@@ -1288,11 +1199,7 @@ def _buttons_on(queue: Any) -> bool:
     return (getattr(cfg, "ENABLE_TAKE_SKIP_BUTTONS", False) is True
             and callable(getattr(queue, "send_with_markup", None)))
 
-async def send_trade_close_notices(
-    sdb: RedisStateStore,
-    telegram_queue: TelegramQueue,
-    logger_run: logging.Logger,
-) -> int:
+async def send_trade_close_notices(sdb: RedisStateStore, telegram_queue: TelegramQueue, logger_run: logging.Logger) -> int:
     """One Telegram message for every Recorded/Shadowed trade that touched its
     target or stop since the last run. Returns the number of trades announced."""
     events = list(getattr(sdb, "trade_close_events", None) or [])
@@ -1347,16 +1254,7 @@ async def send_trade_close_notices(
         sdb.trade_close_events.clear()
     return 0
 
-async def dispatch_combined_alerts(
-    payloads: List[AlertPayload],
-    telegram_queue: TelegramQueue,
-    bias_context: Optional[BiasContext],
-    sdb: RedisStateStore,
-    alerts_sent_ref: List[int],
-    alerts_sent_lock: asyncio.Lock,
-    max_alerts_per_run: int,
-    logger_run: logging.Logger,
-) -> int:
+async def dispatch_combined_alerts(payloads: List[AlertPayload], telegram_queue: TelegramQueue, bias_context: Optional[BiasContext], sdb: RedisStateStore, alerts_sent_ref: List[int], alerts_sent_lock: asyncio.Lock, max_alerts_per_run: int, logger_run: logging.Logger) -> int:
     """Assemble payloads into one (or split) combined message(s), send, and
     handle fallback to individual messages on failure."""
     if not payloads:
@@ -2245,11 +2143,7 @@ def rolling_correlation(alt_returns: np.ndarray, btc_returns: np.ndarray, window
         return float("nan")
     return float(np.corrcoef(a, b)[0, 1])
 
-async def _confirm_alert_candle_once(
-    fetcher: DataFetcher, symbol: str, pair_name: str, ts_curr: int,
-    cached_snapshot: CandleSnapshot, is_green: bool, is_red: bool,
-    reference_time: int, logger_pair: logging.Logger,
-) -> Tuple[Optional[bool], Optional[bool]]:
+async def _confirm_alert_candle_once(fetcher: DataFetcher, symbol: str, pair_name: str, ts_curr: int, cached_snapshot: CandleSnapshot, is_green: bool, is_red: bool, reference_time: int, logger_pair: logging.Logger) -> Tuple[Optional[bool], Optional[bool]]:
     """Run the candle re-confirmation and the mark-price check concurrently.
 
     Returns (reconfirmed, mark_agrees) with the same meaning the two sequential
@@ -2280,11 +2174,7 @@ async def _confirm_alert_candle_once(
 CONFIRM_RETRY_ATTEMPTS = 3
 CONFIRM_RETRY_DELAY_SEC = 3.0
 
-async def _confirm_alert_candle(
-    fetcher: DataFetcher, symbol: str, pair_name: str, ts_curr: int,
-    cached_snapshot: CandleSnapshot, is_green: bool, is_red: bool,
-    reference_time: int, logger_pair: logging.Logger,
-) -> Tuple[Optional[bool], Optional[bool]]:
+async def _confirm_alert_candle(fetcher: DataFetcher, symbol: str, pair_name: str, ts_curr: int, cached_snapshot: CandleSnapshot, is_green: bool, is_red: bool, reference_time: int, logger_pair: logging.Logger) -> Tuple[Optional[bool], Optional[bool]]:
     """_confirm_alert_candle_once with bounded in-run retries. Only an
     inconclusive result (None) is retried; True/False answers return at once."""
     reconfirmed: Optional[bool] = None
@@ -2306,10 +2196,7 @@ async def _confirm_alert_candle(
             await asyncio.sleep(CONFIRM_RETRY_DELAY_SEC * attempt)
     return reconfirmed, mark_agrees
 
-async def _notify_unconfirmed_signal(
-    telegram_queue: "TelegramQueue", pair_name: str, alerts_to_send: List[Tuple[str, str, str]],
-    ts_curr: int, reason: str, logger_pair: logging.Logger,
-) -> None:
+async def _notify_unconfirmed_signal(telegram_queue: "TelegramQueue", pair_name: str, alerts_to_send: List[Tuple[str, str, str]], ts_curr: int, reason: str, logger_pair: logging.Logger) -> None:
     """Tell the user a signal fired but could not be verified. This is NOT an
     alert: it carries no entry, records no outcome, marks no ACTIVE state and
     never feeds the heat gate. It exists so a signal lost to an exchange-data

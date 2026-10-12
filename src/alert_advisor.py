@@ -155,8 +155,8 @@ def _level(price: float, direction: Optional[str], pct: float, favourable: bool)
     sign = 1.0 if (str(direction).lower() == "buy") == favourable else -1.0
     return price * (1.0 + sign * float(pct) / 100.0)
 
-def _plan_line(plan: Optional[Dict[str, float]], default_sl: float, rr: float,
-               direction: Optional[str] = None, price: Optional[float] = None) -> str:
+
+def _plan_line(plan: Optional[Dict[str, float]], default_sl: float, rr: float, direction: Optional[str] = None, price: Optional[float] = None) -> str:
     use_px = isinstance(price, (int, float)) and price > 0 and direction in ("buy", "sell")
     # Narrow for mypy: use_px already guarantees a positive numeric price.
     px: float = float(price) if (use_px and price is not None) else 0.0
@@ -177,8 +177,8 @@ def _plan_line(plan: Optional[Dict[str, float]], default_sl: float, rr: float,
     return (f"🛡 SL -{default_sl:.2f}% | TP +{default_sl * rr:.2f}% "
             f"({rr:.1f}R) · default plan, no history")
 
-def _support_labels(votes: Optional[Dict[str, bool]], weights: Optional[Dict[str, float]],
-                    passing: bool, limit: int) -> List[str]:
+
+def _support_labels(votes: Optional[Dict[str, bool]], weights: Optional[Dict[str, float]], passing: bool, limit: int) -> List[str]:
     if not votes:
         return []
     w = weights or {}
@@ -186,8 +186,7 @@ def _support_labels(votes: Optional[Dict[str, bool]], weights: Optional[Dict[str
     names.sort(key=lambda n: (-float(w.get(n, 0.0)), n))
     return [VOTE_LABELS.get(n, n.replace("_", " ")) for n in names[:limit]]
 
-def _support_text(votes: Optional[Dict[str, bool]], weights: Optional[Dict[str, float]],
-                  support: List[str]) -> str:
+def _support_text(votes: Optional[Dict[str, bool]], weights: Optional[Dict[str, float]], support: List[str]) -> str:
     """Informative support wording. When every high-weight check passes say so
     (the top-3 list was identical for nearly every alert and told nothing)."""
     if not votes:
@@ -198,26 +197,8 @@ def _support_text(votes: Optional[Dict[str, bool]], weights: Optional[Dict[str, 
         return " All high-weight checks pass."
     return f" Supported by {', '.join(support)}." if support else ""
 
-def _advise_pair_core(
-    *,
-    direction: str,
-    score: Optional[float],
-    total: Optional[float],
-    required: Optional[float],
-    votes: Optional[Dict[str, bool]],
-    tqs: Sequence[Optional[Dict[str, Any]]],
-    bias: str,                         # "with" | "against" | "neutral"
-    conflicting: bool = False,
-    take_min: float = 70.0,
-    watch_min: float = 50.0,
-    shadow_cap: float = 55.0,
-    default_sl_pct: float = 0.5,
-    default_rr: float = 2.0,
-    vote_weights: Optional[Dict[str, float]] = None,
-    unproven_take_min_pct: Optional[float] = None,   # 0-100; None = feature off
-    unproven_size: float = 0.25,
-    price: Optional[float] = None,
-) -> PairAdvice:
+
+def _advise_pair_core(*, direction: str, score: Optional[float], total: Optional[float], required: Optional[float], votes: Optional[Dict[str, bool]], tqs: Sequence[Optional[Dict[str, Any]]], bias: str, conflicting: bool = False, take_min: float = 70.0, watch_min: float = 50.0, shadow_cap: float = 55.0, default_sl_pct: float = 0.5, default_rr: float = 2.0, vote_weights: Optional[Dict[str, float]] = None, unproven_take_min_pct: Optional[float] = None, unproven_size: float = 0.25, price: Optional[float] = None) -> PairAdvice:
     data = [t for t in tqs if isinstance(t, dict) and _num(t.get("net_ev")) is not None]
     blocked = any(isinstance(t, dict) and str(t.get("verdict")) == "BLOCKED" for t in tqs)
     pct = (score / total) if (score is not None and total) else None
@@ -416,8 +397,7 @@ def _advise_pair_core(
 # ── Playbook overlay (learner output; restrict-only by default) ───────────
 _PB_NEGATIVE = ("NO_EDGE", "FAILED_OOS", "DEMOTED", "EXPIRED")
 
-def _pb_plan_text(p: Dict[str, Any], direction: Optional[str] = None,
-                  price: Optional[float] = None) -> str:
+def _pb_plan_text(p: Dict[str, Any], direction: Optional[str] = None, price: Optional[float] = None) -> str:
     if isinstance(price, (int, float)) and price > 0 and direction in ("buy", "sell"):
         txt = (f"SL {_px(_level(price, direction, float(p['sl']), False))} | "
                f"TP {_px(_level(price, direction, float(p['tp']), True))} | "
@@ -441,16 +421,8 @@ def _pb_rule_hit(playbook: Dict[str, Any], ctx: Optional[Dict[str, Any]]) -> Opt
             return r
     return None
 
-def advise_pair(
-    *,
-    playbook: Optional[Dict[str, Any]] = None,
-    playbook_mode: str = "off",          # off | shadow | live
-    playbook_allow_upgrade: bool = False,
-    playbook_ctx: Optional[Dict[str, Any]] = None,   # {"session", "conf", "adx"} of THIS alert
-    **kwargs: Any,
-) -> PairAdvice:
+def advise_pair(*, playbook: Optional[Dict[str, Any]] = None, playbook_mode: str = "off", playbook_allow_upgrade: bool = False, playbook_ctx: Optional[Dict[str, Any]] = None, **kwargs: Any) -> PairAdvice:
     """Core advice, optionally overlaid with the learner's validated playbook entry.
-
     off / shadow : the advice is byte-for-byte the core advice (shadow only records).
     live         : RESTRICT-ONLY.
         * a served champion plan replaces the displayed SL/TP (and size, from the EV lower bound);
