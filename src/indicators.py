@@ -443,7 +443,8 @@ def calculate_ichimoku_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarra
             'lead_line2': np.full(n, np.nan, dtype=np.float64),
         }
 
-    def calculate_dynamic_flow_ribbon_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, factor: float, basis_length: int, dist_length: int) -> Tuple[np.ndarray, np.ndarray]:
+def calculate_dynamic_flow_ribbon_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, factor: float, basis_length: int, dist_length: int) -> Tuple[np.ndarray, np.ndarray]:
+    try:
         n = len(close)
         if n == 0:
             raise ValueError("Empty input arrays")
