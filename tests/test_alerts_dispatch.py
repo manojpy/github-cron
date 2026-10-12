@@ -144,15 +144,17 @@ def _msg(**over):
     # Unescape MarkdownV2 backslashes so assertions can match plain text
     return re.sub(r'\\(.)', r'\1', raw)
 
+# tests/test_alerts_dispatch.py
 
-def test_message_shape_header_conviction_and_no_votes():
-    m = _msg().split("\n")
-    assert m[0] == "🟣▼ LABUSD — SELL | $0.0462 - (24/27) 89%"
-    assert m[1].startswith("🎯 Conviction") and m[1].endswith("| ⛔ AVOID")
-    assert m[2] == "VWAP Cross, Dynamic Flow Cross SELL"
-    assert [x.split("  ")[0] for x in m[3:8]] == ["🧠", "📊", "💡", "⚠️", "🛡"]
-    assert "Votes" not in "\n".join(m)
-
+ def test_message_shape_header_conviction_and_no_votes():
+     m = _msg().split("\n")
+     assert m[0] == "🟣▼ LABUSD — SELL | $0.0462 - (24/27) 89%"
+     assert m[1].startswith("🎯 Conviction") and m[1].endswith("| ⛔ AVOID")
+     assert m[2] == "VWAP Cross, Dynamic Flow Cross SELL"
+    # Single-space delimiter (emoji is the leading token, e.g. "🧠 Brain: ...").
+    # split(" ") also keeps working if the format later becomes "emoji  text".
+    assert [x.split(" ")[0] for x in m[3:8]] == ["🧠", "📊", "💡", "⚠️", "🛡"]
+     assert "Votes" not in "\n".join(m)
 
 def test_mixed_direction_pair_flags_conflict_and_only_lists_matching_side():
     m = _msg(direction="buy", items=[("🟢🔄 Strong Reversal BUY", ""), ("🔴🌀 Fib Pivot Reversal SELL", "")],
@@ -403,6 +405,16 @@ def test_send_success_records_and_activates_once():
     assert n == 1
     assert calls == ["ETHUSD"]
     assert sdb.state_batches == [[("ETHUSD:state", "ACTIVE", None)]]
+    assert sdb.processed == [("ETHUSD", 1_700_000_000)]
+
+ def test_send_failure_creates_no_phantom_trade():
+     calls, sdb = [], FakeSdb()
+     n = _run([_payload("ETHUSD", calls)], FakeTelegram([False, False]), sdb)
+     assert n == 0
+    # No phantom trade: the failed send must not record an outcome or
+    # activate any ACTIVE state.
+     assert calls == []
+     assert sdb.state_batches == []
     assert sdb.processed == [("ETHUSD", 1_700_000_000)]
 
 
