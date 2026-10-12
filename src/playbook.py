@@ -83,10 +83,8 @@ def default_params() -> Dict[str, Any]:
         "dd_haircut_r": 8.0,         # holdout drawdown (in stops) above which size is halved
     }
 
-
 # ── No-alert control (built from raw candles) ─────────────────────────────
-def _exit_vec(fav: np.ndarray, adv: np.ndarray, cls_h: np.ndarray, sl: float, tp: float,
-              h: int, be: float, trail: float) -> np.ndarray:
+def _exit_vec(fav: np.ndarray, adv: np.ndarray, cls_h: np.ndarray, sl: float, tp: float, h: int, be: float, trail: float) -> np.ndarray:
     """Vectorised twin of plan_replay.replay_exit: gross P&L % per path (rows x candles)."""
     n = fav.shape[0]
     stop = np.full(n, -sl)
@@ -142,8 +140,7 @@ class ControlModel:
     LOOK_VOL = 24
     LOOK_MOM = 8
 
-    def __init__(self, candles: Mapping[str, Tuple[Any, Any, Any, Any, Any]], *,
-                 max_h: int = 12, session_fn: Callable[[Any], str], min_rows: int = 30) -> None:
+    def __init__(self, candles: Mapping[str, Tuple[Any, Any, Any, Any, Any]], *, max_h: int = 12, session_fn: Callable[[Any], str], min_rows: int = 30) -> None:
         from numpy.lib.stride_tricks import sliding_window_view as swv
         self.max_h = int(max_h)
         self._min_rows = int(min_rows)
@@ -207,9 +204,7 @@ class ControlModel:
         vb, mb = int(d["vb"][i]), int(d["mb"][i])
         return (vb if vb >= 0 else None), (mb if mb >= 0 else None)
 
-    def expected_gross(self, pair: str, side: str, session: Optional[str], sl: float, tp: float, h: int,
-                       be: float = 0.0, trail: float = 0.0,
-                       vb: Optional[int] = None, mb: Optional[int] = None) -> Optional[Tuple[float, int, int]]:
+    def expected_gross(self, pair: str, side: str, session: Optional[str], sl: float, tp: float, h: int, be: float = 0.0, trail: float = 0.0, vb: Optional[int] = None, mb: Optional[int] = None) -> Optional[Tuple[float, int, int]]:
         """(mean gross P&L %, n, match_level) of the plan over comparable no-alert
         entries.  match_level 3 = session+vol+momentum, 2 = session+vol, 1 = session,
         0 = pair/direction only."""
@@ -239,21 +234,15 @@ class ControlModel:
         self._cache[key] = out
         return out
 
-
 def _pt(plan: Mapping[str, Any]) -> Tuple[float, float, int, float, float]:
     return (float(plan["sl"]), float(plan["tp"]), int(plan["h"]),
             float(plan.get("be") or 0.0), float(plan.get("trail") or 0.0))
-
 
 def _ev(rows: Sequence[Row], plan: Mapping[str, Any], cost: float) -> Optional[Dict[str, Any]]:
     sl, tp, h, be, tr = _pt(plan)
     return evaluate_plan(rows, sl, tp, h, cost, be, tr)
 
-
-def alpha_vs_control(
-    rows: Sequence[Row], plan: Mapping[str, Any], control: Optional[ControlModel],
-    default_cost_pct: float, z: float = 1.645,
-) -> Optional[Dict[str, Any]]:
+def alpha_vs_control(rows: Sequence[Row], plan: Mapping[str, Any], control: Optional[ControlModel], default_cost_pct: float, z: float = 1.645) -> Optional[Dict[str, Any]]:
     """Paired difference  (alert P&L) - (matched no-alert control P&L) under the
     SAME plan and cost, with time-clustered standard errors."""
     if control is None:
@@ -684,10 +673,8 @@ def matching_rule(entry: Optional[Mapping[str, Any]], ctx: Mapping[str, Any]) ->
             return r
     return None
 
-
 # ── Human-readable summary (plain text; the caller escapes for Telegram) ──
-def format_summary(blob: Mapping[str, Any], changes: Sequence[Mapping[str, Any]],
-                   name_fn: Callable[[str], str] = str, max_lines: int = 14) -> str:
+def format_summary(blob: Mapping[str, Any], changes: Sequence[Mapping[str, Any]], name_fn: Callable[[str], str] = str, max_lines: int = 14) -> str:
     def nm(key: str) -> str:
         fam = key.startswith("fam:")
         body = key[4:] if fam else key

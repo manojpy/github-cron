@@ -28,12 +28,7 @@ _ROUND = 4
 def cache_key(pair: Any, direction: Any, entry_ts: Any) -> str:
     return f"{pair}|{str(direction).lower()}|{int(entry_ts)}"
 
-
-def recon_path(
-    ts: np.ndarray, o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray, *,
-    entry_ts: int, direction: str, fill_price: Optional[float],
-    fill_delay: int, lookahead: int, tol: float = FILL_TOL,
-) -> Optional[Dict[str, Any]]:
+def recon_path(ts: np.ndarray, o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray, *, entry_ts: int, direction: str, fill_price: Optional[float], fill_delay: int, lookahead: int, tol: float = FILL_TOL) -> Optional[Dict[str, Any]]:
     """{'f','a','c', fav/adv/close lists + mfe_candle/mae_candle} or None."""
     d = str(direction).lower()
     if d not in ("buy", "sell", "long", "short") or not fill_price or fill_price <= 0:

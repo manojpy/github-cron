@@ -124,11 +124,7 @@ def coerce_path_fields(raw: Mapping[str, Any]) -> Dict[str, Any]:
 def has_path(row: Mapping[str, Any]) -> bool:
     return bool(row.get("path_fav")) and bool(row.get("path_adv")) and bool(row.get("path_close"))
 
-
-def replay_exit(
-    fav: Sequence[float], adv: Sequence[float], cls: Sequence[float],
-    sl: float, tp: float, horizon: int, be: float = 0.0, trail: float = 0.0,
-) -> Optional[Tuple[str, float]]:
+def replay_exit(fav: Sequence[float], adv: Sequence[float], cls: Sequence[float], sl: float, tp: float, horizon: int, be: float = 0.0, trail: float = 0.0) -> Optional[Tuple[str, float]]:
     """Exact replay of a bracket that may also move its stop.
 
     be     once a candle's best move reaches +be% the stop moves to breakeven (0 = off)
@@ -164,11 +160,7 @@ def replay_exit(
             stop = lvl
     return "timeout", float(cls[horizon])
 
-
-def replay_plan(
-    row: Mapping[str, Any], sl_pct: float, tp_pct: float, horizon: int, default_cost_pct: float,
-    be: float = 0.0, trail: float = 0.0,
-) -> Optional[Tuple[str, float]]:
+def replay_plan(row: Mapping[str, Any], sl_pct: float, tp_pct: float, horizon: int, default_cost_pct: float, be: float = 0.0, trail: float = 0.0) -> Optional[Tuple[str, float]]:
     """(outcome_class, net_pnl_pct) this trade WOULD have produced under the
     given plan, or None if the row has no path / too few candles."""
     if not has_path(row) or sl_pct <= 0 or tp_pct <= 0 or horizon < 0:
@@ -226,11 +218,7 @@ def max_drawdown(pnls: Sequence[float]) -> float:
         dd = max(dd, peak - cum)
     return dd
 
-
-def evaluate_plan(
-    rows: Sequence[Row], sl_pct: float, tp_pct: float, horizon: int, default_cost_pct: float,
-    be: float = 0.0, trail: float = 0.0,
-) -> Optional[Dict[str, Any]]:
+def evaluate_plan(rows: Sequence[Row], sl_pct: float, tp_pct: float, horizon: int, default_cost_pct: float, be: float = 0.0, trail: float = 0.0) -> Optional[Dict[str, Any]]:
     pnls: List[float] = []
     stamps: List[Optional[float]] = []
     counts = {"tp": 0, "sl": 0, "timeout": 0}
@@ -259,13 +247,7 @@ def evaluate_plan(
         "max_dd": max_drawdown(pnls), "half_min": half_min,
     }
 
-
-def grid_search(
-    rows: Sequence[Row], default_cost_pct: float,
-    sl_grid: Sequence[float] = DEFAULT_SL_GRID,
-    tp_grid: Sequence[float] = DEFAULT_TP_GRID,
-    horizons: Sequence[int] = DEFAULT_HORIZONS,
-) -> List[Dict[str, Any]]:
+def grid_search(rows: Sequence[Row], default_cost_pct: float, sl_grid: Sequence[float] = DEFAULT_SL_GRID, tp_grid: Sequence[float] = DEFAULT_TP_GRID, horizons: Sequence[int] = DEFAULT_HORIZONS) -> List[Dict[str, Any]]:
     out = []
     for h in horizons:
         for sl in sl_grid:
@@ -274,7 +256,6 @@ def grid_search(
                 if e:
                     out.append(e)
     return out
-
 
 def exit_variants(plan_sl: float, plan_tp: float) -> List[Tuple[float, float]]:
     """(be, trail) pairs worth testing around a chosen bracket (breakeven must be
@@ -289,12 +270,7 @@ def exit_variants(plan_sl: float, plan_tp: float) -> List[Tuple[float, float]]:
             out.append((be, tr))
     return out
 
-
-def select_plan(
-    rows: Sequence[Row], default_cost_pct: float, fixed_sl: float, fixed_tp: float, fixed_h: int,
-    *, min_n: int = 40, min_holdout: int = 15, train_frac: float = 0.6, z: float = 1.645,
-    test_exits: bool = True, min_exit_lift: float = 0.03,
-) -> Dict[str, Any]:
+def select_plan(rows: Sequence[Row], default_cost_pct: float, fixed_sl: float, fixed_tp: float, fixed_h: int, *, min_n: int = 40, min_holdout: int = 15, train_frac: float = 0.6, z: float = 1.645, test_exits: bool = True, min_exit_lift: float = 0.03) -> Dict[str, Any]:
     """Pick the best plan on the chronological TRAIN split, then judge it on the
     untouched HOLDOUT (train rows too close to the split are embargoed).
 
@@ -408,10 +384,7 @@ def plan_exit_suffix(p: Mapping[str, Any]) -> str:
 
 
 # ── Report text ───────────────────────────────────────────────────────────
-def build_plan_lab(
-    rows: Sequence[Row], *, sl_pct: float, tp_pct: float, horizon: int, cost_pct: float,
-    name_fn: Callable[[str], str] = str, min_n: int = 40, max_groups: int = 6,
-) -> Tuple[Optional[str], Dict[str, Any]]:
+def build_plan_lab(rows: Sequence[Row], *, sl_pct: float, tp_pct: float, horizon: int, cost_pct: float, name_fn: Callable[[str], str] = str, min_n: int = 40, max_groups: int = 6) -> Tuple[Optional[str], Dict[str, Any]]:
     """Plain-text 'Trade-plan lab' block for the Brain report + machine facts."""
     if not rows:
         return None, {}

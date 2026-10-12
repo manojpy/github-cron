@@ -142,8 +142,7 @@ def append_outcome_batch(records: List[Dict[str, Any]], shadow: bool = False) ->
             for record in records:
                 f.write(json.dumps(_stamp_schema(record), default=str) + "\n")
 
-def load_recent_outcomes(days: int = 30, shadow: bool = False,
-                          hours: Optional[int] = None) -> List[Dict[str, Any]]:
+def load_recent_outcomes(days: int = 30, shadow: bool = False, hours: Optional[int] = None) -> List[Dict[str, Any]]:
     """Read last N days (or N hours) of RESOLVED outcome lines (newest first).
 
     Filters out signal-only rows — the pre-resolution records written by
