@@ -351,6 +351,7 @@ class RedisStateStore:
         self._recovery_lock = asyncio.Lock()
         self.recovery_attempts: int = 0
         self.recovery_successes: int = 0
+        self._claim_token: str = uuid.uuid4().hex[:12]
 
         if cfg.DEBUG_MODE and logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -1161,8 +1162,10 @@ class RedisStateStore:
         effective_window = window_sec if window_sec is not None else cfg.ALERT_DEDUP_WINDOW_SEC
         for attempt in (1, 2):
             try:
+                # Value is "ts:token" so a later release can verify ownership.
+                claim_value = f"{ts}:{self._claim_token}"
                 result = await asyncio.wait_for(
-                    self._redis.set(recent_key, str(ts), nx=True, ex=effective_window),
+                    self._redis.set(recent_key, claim_value, nx=True, ex=effective_window),
                     timeout=3.0
                 )
                 should_send = bool(result)
@@ -1176,16 +1179,15 @@ class RedisStateStore:
         return None
 
     # Coalesce claim keyed on CANDLE time, not wall-clock. The stored value is the
-    # candle timestamp of the last alert; a new claim succeeds only when its
-    # candle is at least `window` seconds newer. Same candle (or an older one) is
-    # a duplicate; the next 15m candle is a new signal even if GitHub dispatched
-    # this run only a few minutes after the previous one. The key TTL is just
-    # garbage collection, so it is deliberately longer than the window.
+    
     COALESCE_CLAIM_LUA = """
     local prev = redis.call("GET", KEYS[1])
     if prev then
-        local p = tonumber(prev)
-        if p and (tonumber(ARGV[1]) - p) < tonumber(ARGV[3]) then
+        local prev_sep = string.find(prev, ":", 1, true)
+        local prev_ts = tonumber(prev_sep and string.sub(prev, 1, prev_sep - 1) or prev)
+        local arg_sep = string.find(ARGV[1], ":", 1, true)
+        local curr_ts = tonumber(arg_sep and string.sub(ARGV[1], 1, arg_sep - 1) or ARGV[1])
+        if prev_ts and curr_ts and (curr_ts - prev_ts) < tonumber(ARGV[3]) then
             return 0
         end
     end
@@ -1206,12 +1208,13 @@ class RedisStateStore:
             return None
         recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
         window = int(window_sec)
+        claim_value = f"{int(ts)}:{self._claim_token}"
         for attempt in (1, 2):
             try:
                 result = await asyncio.wait_for(
                     cast(Awaitable[Any], self._redis.eval(
                         self.COALESCE_CLAIM_LUA, 1, recent_key,
-                        str(int(ts)), str(window + 900), str(window),
+                        claim_value, str(window + 900), str(window),
                     )),
                     timeout=3.0,
                 )
@@ -1246,29 +1249,80 @@ class RedisStateStore:
             return {k: False for k in alert_keys}
         effective_window = window_sec if window_sec is not None else cfg.ALERT_DEDUP_WINDOW_SEC
         try:
+            claim_value = f"{ts}:{self._claim_token}"
             async with self._redis.pipeline() as pipe:
                 for alert_key in alert_keys:
                     recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
                     pipe.set(
-                        recent_key, str(ts), nx=True,
+                        recent_key, claim_value, nx=True,
                         ex=int((windows or {}).get(alert_key, effective_window)),
                     )
                 results = await asyncio.wait_for(_execute_pipeline(pipe), timeout=3.0)
             return {k: bool(r) for k, r in zip(alert_keys, results)}
         except Exception as e:
             logger.error(f"batch_check_recent_alerts FAILED for {pair} ({alert_keys}): {e}")
-            return {k: False for k in alert_keys}  # fail-closed, same policy as check_recent_alert
+            # Partial pipeline success is possible. Recover by releasing only
+            # the claims that belong to THIS run (matched by token).
+            await self._release_own_claims(pair, alert_keys)
+            return {k: False for k in alert_keys}  # fail-closed after cleanup
 
     async def release_recent_alert(self, pair: str, alert_key: str) -> None:
-        """Undo a dedup claim if the message didn't actually get delivered."""
-        if self.degraded:
+        """Undo a dedup claim if the message didn't actually get delivered.
+        Only deletes the key when the stored value still belongs to this run.
+        """
+        if self.degraded or not self._redis:
             return
         recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
         try:
+            raw = await asyncio.wait_for(_rc(self._redis).get(recent_key), timeout=1.0)
+            if raw is None:
+                return
+            val = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
+            # Two stored formats are accepted:
+            #   "{ts}:{token}"  — written by this version; release only when
+            #                     the token matches this run.
+            #   "{ts}"          — legacy value written before tokens existed.
+            #                     Ownership cannot be proven either way, so we
+            #                     take the conservative interpretation for a
+            #                     one-candle migration window: this run created
+            #                     the only entry that could match, therefore
+            #                     releasing it is correct. Remove this branch
+            #                     once all state stores are known to hold
+            #                     only token-bearing values.
+            if ":" in val:
+                _, token = val.rsplit(":", 1)
+                if token != self._claim_token:
+                    return  # belongs to another run — leave it alone
             await asyncio.wait_for(_rc(self._redis).delete(recent_key), timeout=1.0)
         except Exception as e:
-            
             logger.warning(f"Failed to release dedup claim for {pair}:{alert_key}: {e}")
+
+    async def _release_own_claims(self, pair: str, alert_keys: List[str]) -> None:
+        """Best-effort cleanup after a failed batch claim. Only removes keys
+        whose value ends with this instance's claim token."""
+        if self.degraded or not self._redis or not alert_keys:
+            return
+        try:
+            async with self._redis.pipeline() as pipe:
+                for alert_key in alert_keys:
+                    recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
+                    pipe.get(recent_key)
+                values = await asyncio.wait_for(_execute_pipeline(pipe), timeout=2.0)
+            to_delete: List[str] = []
+            for alert_key, raw in zip(alert_keys, values or []):
+                if raw is None:
+                    continue
+                val = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
+                if val.endswith(f":{self._claim_token}"):
+                    to_delete.append(f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}")
+            if to_delete:
+                await asyncio.wait_for(_rc(self._redis).delete(*to_delete), timeout=2.0)
+                logger.info(
+                    f"Released {len(to_delete)} partial claim(s) for {pair} "
+                    f"after batch failure (token={self._claim_token})"
+                )
+        except Exception as e:
+            logger.warning(f"_release_own_claims failed for {pair}: {e}")
 
     # ── Telegram dead-letter queue ───────────────────────────────────────
     # One Redis key per parked alert: telegram_dlq:{pair}:{candle_ts}:{digest}.
@@ -1301,6 +1355,21 @@ class RedisStateStore:
             2.0, f"dlq_push:{pair}",
         )
         if result:
+            # Keep a cheap ordered index so list/count never SCAN the whole
+            # keyspace. If indexing fails, roll the SET NX back so the DLQ
+            # never holds a data row its readers cannot see; the caller
+            # treats this as a push failure and can retry / release claims.
+            index_key = f"{RedisKeyPrefix.TELEGRAM_DLQ}index"
+            indexed = await self._safe_redis_op(
+                lambda: _rc(self._redis).zadd(index_key, {key: int(ts)}),
+                1.5, f"dlq_index_add:{pair}",
+            )
+            if not indexed:
+                await self._safe_redis_op(
+                    lambda: _rc(self._redis).delete(key),
+                    1.5, f"dlq_push_rollback:{pair}",
+                )
+                return False
             return True
         # NX failed: either the identical entry is already parked (fine) or Redis failed.
         exists = await self._safe_redis_op(
@@ -1309,24 +1378,38 @@ class RedisStateStore:
         return bool(exists)
 
     async def dlq_list(self, limit: int = 10) -> List[Tuple[str, Dict[str, Any]]]:
-        """Oldest-first parked alerts as (redis_key, entry)."""
+        """Oldest-first parked alerts as (redis_key, entry), sourced from the
+        secondary ZSET index rather than a keyspace SCAN.
+
+        Index scope: the index only contains entries written by this version
+        of the code. Any pre-existing `telegram_dlq:*` keys created before
+        the index existed are NOT returned here and will be reaped by their
+        TTL without being replayed. This is deliberate — a one-time SCAN at
+        startup would be needed if those entries must be recovered.
+        """
         if self.degraded or not self._redis:
             return []
-        pattern = f"{RedisKeyPrefix.TELEGRAM_DLQ}*"
-
-        async def _scan() -> List[str]:
-            return [k async for k in _rc(self._redis).scan_iter(match=pattern, count=2000)]
-
-        keys = await self._safe_redis_op(_scan, 3.0, "dlq_scan")
+        index_key = f"{RedisKeyPrefix.TELEGRAM_DLQ}index"
+        # Oldest first, limited to the number we will actually replay.
+        keys = await self._safe_redis_op(
+            lambda: _rc(self._redis).zrange(index_key, 0, max(0, int(limit) - 1)),
+            2.0, "dlq_list_zrange",
+        )
         if not keys:
             self._dlq_empty_at_start = True
             return []
+        # keys may be bytes when decode_responses is False on some paths
+        keys = [k.decode() if isinstance(k, (bytes, bytearray)) else k for k in keys]
         raw_values = await self._safe_redis_op(
             lambda: _rc(self._redis).mget(keys), 3.0, "dlq_mget",
         )
         out: List[Tuple[str, Dict[str, Any]]] = []
         for k, raw in zip(keys, raw_values or []):
             if not raw:
+                # Stale index entry — clean it up opportunistically
+                await self._safe_redis_op(
+                    lambda: _rc(self._redis).zrem(index_key, k), 1.0, "dlq_index_gc",
+                )
                 continue
             try:
                 entry = json_loads(raw)
@@ -1334,22 +1417,19 @@ class RedisStateStore:
                 continue
             if isinstance(entry, dict) and entry.get("message"):
                 out.append((k, entry))
-        out.sort(key=lambda kv: int(kv[1].get("ts") or 0))
-        return out[: max(1, int(limit))]
+        return out  # already ordered by the ZSET
 
     async def dlq_count(self) -> int:
         """Number of parked alerts (0 if Redis is unavailable)."""
         if self.degraded or not self._redis:
             return 0
         if getattr(self, "_dlq_empty_at_start", False) and not getattr(self, "_dlq_pushed_this_run", False):
-            return 0  # list was empty at run start and nothing was parked since: skip the SCAN
-        pattern = f"{RedisKeyPrefix.TELEGRAM_DLQ}*"
-
-        async def _scan() -> List[str]:
-            return [k async for k in _rc(self._redis).scan_iter(match=pattern, count=2000)]
-
-        keys = await self._safe_redis_op(_scan, 3.0, "dlq_count")
-        return len(keys or [])
+            return 0  # list was empty at run start and nothing was parked since: skip the index
+        index_key = f"{RedisKeyPrefix.TELEGRAM_DLQ}index"
+        count = await self._safe_redis_op(
+            lambda: _rc(self._redis).zcard(index_key), 1.5, "dlq_count_zcard",
+        )
+        return int(count or 0)
 
     async def dlq_set_attempts(self, key: str, entry: Dict[str, Any], attempts: int) -> bool:
         """Persist an incremented attempt counter (keeps the remaining TTL)."""
@@ -1380,7 +1460,17 @@ class RedisStateStore:
         result = await self._safe_redis_op(
             lambda: _rc(self._redis).delete(key), 2.0, "dlq_delete",
         )
-        return bool(result)
+        deleted = bool(result)
+        if deleted:
+            # Keep the secondary index in sync. ZREM is idempotent, so a
+            # later failure here only leaves a stale index entry that
+            # dlq_list already GCs opportunistically.
+            index_key = f"{RedisKeyPrefix.TELEGRAM_DLQ}index"
+            await self._safe_redis_op(
+                lambda: _rc(self._redis).zrem(index_key, key),
+                1.5, "dlq_index_rem",
+            )
+        return deleted
 
     VOTE_COUNT_HISTORY_MAX = 500
 
@@ -3073,7 +3163,48 @@ class RedisStateStore:
                 if self.expiry_seconds > 0:
                     for hash_key in touched_hashes:
                         pipe.expire(hash_key, self.expiry_seconds)
-                await asyncio.wait_for(pipe.execute(), timeout=timeout)
+
+                # Expected result count is derived from the actual queued
+                # commands, NOT from len(validated_deletes): N fields on the
+                # same pair state hash collapse into ONE HDEL, and every
+                # touched hash gets exactly one EXPIRE.
+                expected_total = len(validated_updates) + len(hash_deletes)
+                if self.expiry_seconds > 0:
+                    expected_total += len(touched_hashes)
+
+                results = await asyncio.wait_for(pipe.execute(), timeout=timeout)
+
+            # (a) count check — a truncated response means part of the batch
+            #     did not reach Redis.
+            if not isinstance(results, (list, tuple)):
+                logger.error(
+                    "atomic_batch_update: pipeline returned %r (not a list) — treating as FAILURE",
+                    type(results).__name__,
+                )
+                return False
+            if len(results) != expected_total:
+                logger.error(
+                    "atomic_batch_update: pipeline returned %d results, expected %d "
+                    "(hset=%d hdel_grouped=%d expire=%d) — treating as FAILURE",
+                    len(results), expected_total,
+                    len(validated_updates), len(hash_deletes),
+                    len(touched_hashes) if self.expiry_seconds > 0 else 0,
+                )
+                return False
+
+            # (b) per-command error scan — a full-length result list can still
+            #     contain a Redis error object for a single command (WRONGTYPE,
+            #     a per-command OOM reject, …). The length check above would
+            #     not catch it.
+            for i, r in enumerate(results):
+                if isinstance(r, BaseException):
+                    logger.error(
+                        "atomic_batch_update: command %d/%d returned error %r — "
+                        "treating the batch as FAILURE",
+                        i + 1, expected_total, r,
+                    )
+                    return False
+
             return True
         except asyncio.TimeoutError as e:
             if not _retried:

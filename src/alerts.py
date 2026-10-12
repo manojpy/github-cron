@@ -1209,10 +1209,14 @@ async def replay_telegram_dlq(sdb: Optional[RedisStateStore], telegram_queue: Te
             if saved:
                 DLQ_STATS["needs_repair"] = DLQ_STATS.get("needs_repair", 0) + 1
                 log.critical("[%s] DLQ side effects remain incomplete after %s attempts. Entry retained for repair: %s", pair, side_tries, key)
-            else:
-                DLQ_STATS["repair_marker_write_failed"] = DLQ_STATS.get("repair_marker_write_failed", 0) + 1
-                log.critical("[%s] DLQ side effects remain incomplete and NEEDS_REPAIR could not be persisted: %s", pair, key)
-            continue
+                continue
+            # If we cannot persist the terminal repair marker, stop the pass:
+            # every subsequent entry would be processed against a store that
+            # just failed a write.
+            DLQ_STATS["repair_marker_write_failed"] = DLQ_STATS.get("repair_marker_write_failed", 0) + 1
+            log.critical("[%s] DLQ side effects remain incomplete and NEEDS_REPAIR could not be persisted: %s — stopping replay pass", pair, key)
+            break
+
         saved = await sdb.dlq_save_entry(key, dict(entry, outcomes_done=done, state_done=state_done, side_tries=side_tries))
         if not saved:
             log.critical("[%s] Failed to persist DLQ side-effect progress for %s; the next replay may repeat work.", pair, key)
@@ -1324,6 +1328,7 @@ async def dispatch_combined_alerts(payloads: List[AlertPayload], telegram_queue:
                     # Release dedup claims for dropped payloads
                     for dk in p.dedup_keys:
                         await sdb.release_recent_alert(p.pair_name, dk)
+
             ordered = kept
             logger_run.warning(
                 f"Combined dispatch truncated to fit global limit "
@@ -2791,7 +2796,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             else:
                                 pass
 
-                        # ── ML-EV shadow / hard qualification ──
+                        # ── ML-EV shadow / hard qualification ���─
                         if (
                             (getattr(cfg, "ENABLE_ML_EV_SHADOW", False)
                              or getattr(cfg, "ENABLE_ML_EV_GATE", False))
