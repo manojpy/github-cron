@@ -578,8 +578,7 @@ class DataFetcher:
 
         return None
 
-    async def fetch_daily_and_cache(self, sdb: "RedisStateStore", symbol: str, limit: int,
-                                   reference_time: int, allow_cache_write: bool = True) -> Optional[Dict[str, Any]]:
+    async def fetch_daily_and_cache(self, sdb: "RedisStateStore", symbol: str, limit: int, reference_time: int, allow_cache_write: bool = True) -> Optional[Dict[str, Any]]:
         day_key = get_utc_date_key(reference_time)
         cache_key = f"daily_cache:{symbol}:{day_key}"
 
@@ -1026,10 +1025,7 @@ def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool,
 
     return False, False, ""
 
-def detect_reversal_candle_pattern_with_context(
-    data_15m: "PriceData",
-    i: int,
-) -> Tuple[bool, bool, str, int]:
+def detect_reversal_candle_pattern_with_context(data_15m: "PriceData", i: int) -> Tuple[bool, bool, str, int]:
     """
     Pattern-aware reversal detection that also exposes the exact prior-leg
     direction used by detect_reversal_candle_pattern().
@@ -1277,9 +1273,7 @@ def candle_is_stable(ts_open: int, reference_time: int, interval_minutes: int = 
         and age_from_open >= Constants.MIN_CANDLE_AGE_FROM_OPEN
     )
 
-def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, 
-                                     reference_time: int, 
-                                     pair_name: Optional[str] = None) -> Optional[int]:
+def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, reference_time: int, pair_name: Optional[str] = None) -> Optional[int]:
     if timestamps is None or timestamps.size < 1:
         return None
     reference_time = normalize_timestamp(reference_time)
@@ -1406,8 +1400,7 @@ class PriceData:
     def __len__(self) -> int:
         return len(self.ts)
 
-async def verify_mark_price_agrees(fetcher: DataFetcher, pair_name: str, ts_curr: int,
-    is_green: bool, is_red: bool, reference_time: int, logger_pair: logging.Logger) -> Optional[bool]:
+async def verify_mark_price_agrees(fetcher: DataFetcher, pair_name: str, ts_curr: int, is_green: bool, is_red: bool, reference_time: int, logger_pair: logging.Logger) -> Optional[bool]:
     try:
         raw = await fetcher.fetch_candles(
             f"MARK:{pair_name}",
@@ -1487,8 +1480,7 @@ async def verify_mark_price_agrees(fetcher: DataFetcher, pair_name: str, ts_curr
         )
         return None
 
-async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name: str,
-    ts_curr: int, cached: CandleSnapshot, reference_time: int, logger_pair: logging.Logger) -> Optional[bool]:
+async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name: str, ts_curr: int, cached: CandleSnapshot, reference_time: int, logger_pair: logging.Logger) -> Optional[bool]:
     """Returns True=unchanged, False=confirmed repaint/mismatch, None=inconclusive (fetch/network failure)."""
     try:
         raw = await fetcher.fetch_candles(symbol, "15", 5, reference_time, for_confirmation=True) 
@@ -1548,8 +1540,7 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
         logger_pair.warning(f"[{pair_name}] Confirmation check errored: {e} — inconclusive, releasing dedup claim")
         return None
 
-def cross_check_15m_against_5m(data_5m: PriceData, ts_curr: int, cached: CandleSnapshot,
-                               pair_name: str, logger_pair) -> Optional[bool]:
+def cross_check_15m_against_5m(data_5m: PriceData, ts_curr: int, cached: CandleSnapshot, pair_name: str, logger_pair) -> Optional[bool]:
     mask = (data_5m.ts >= ts_curr) & (data_5m.ts < ts_curr + 900)
     idx = np.flatnonzero(mask)
     if len(idx) < 3:

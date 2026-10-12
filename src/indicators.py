@@ -15,8 +15,7 @@ from aot_bridge import (
     calculate_adx_core, percentile_rank_numba, dynamic_flow_direction_loop,
 )
 
-def validate_indicator_array(arr: Optional[np.ndarray], name: str, 
-                            min_valid_values: int = 1) -> Tuple[bool, Optional[str]]:    
+def validate_indicator_array(arr: Optional[np.ndarray], name: str, min_valid_values: int = 1) -> Tuple[bool, Optional[str]]:
     if arr is None:
         return False, f"{name} is None"
     
@@ -139,8 +138,7 @@ def _find_closed_daily_candle(data_daily: Dict[str, np.ndarray], reference_time:
 
     return d_high, d_low, d_close, candle_ts
 
-def validate_conversion_cross(close_prev: float, close_curr: float,
-    conv_prev: float, conv_curr: float, is_buy: bool) -> Tuple[bool, Optional[str]]:
+def validate_conversion_cross(close_prev: float, close_curr: float, conv_prev: float, conv_curr: float, is_buy: bool) -> Tuple[bool, Optional[str]]:
     vals = [close_prev, close_curr, conv_prev, conv_curr]
     if any(np.isnan(v) for v in vals):
         return False, "NaN in inputs"
@@ -158,9 +156,7 @@ def validate_conversion_cross(close_prev: float, close_curr: float,
             return False, "No bearish conversion-line cross"
         return True, None
 
-def validate_equilibrium_cross(close_prev: float, close_curr: float,
-                              eq_prev: float, eq_curr: float, is_buy: bool,
-                              min_deviation: float = 0.001) -> Tuple[bool, Optional[str]]:
+def validate_equilibrium_cross(close_prev: float, close_curr: float, eq_prev: float, eq_curr: float, is_buy: bool, min_deviation: float = 0.001) -> Tuple[bool, Optional[str]]:
     vals = [close_prev, close_curr, eq_prev, eq_curr]
     if any(np.isnan(v) for v in vals):
         return False, "NaN in inputs"
@@ -183,10 +179,7 @@ def validate_equilibrium_cross(close_prev: float, close_curr: float,
             return False, f"Separation {sep*100:.3f}% < {min_deviation*100:.1f}% — still hugging equilibrium"
         return True, None
 
-def validate_cloud_cross(close_prev: float, close_curr: float,
-    cloud_upper_prev: float, cloud_upper_curr: float,
-    cloud_lower_prev: float, cloud_lower_curr: float, is_buy: bool) -> Tuple[bool, Optional[str]]:
-
+def validate_cloud_cross(close_prev: float, close_curr: float, cloud_upper_prev: float, cloud_upper_curr: float, cloud_lower_prev: float, cloud_lower_curr: float, is_buy: bool) -> Tuple[bool, Optional[str]]:
     vals = [close_prev, close_curr, cloud_upper_prev, cloud_upper_curr, cloud_lower_prev, cloud_lower_curr]
     if any(np.isnan(v) for v in vals):
         return False, "NaN in inputs"
@@ -204,9 +197,7 @@ def validate_cloud_cross(close_prev: float, close_curr: float,
             return False, "No bearish cloud cross"
         return True, None
 
-def validate_vwap_cross(close_prev: float, close_curr: float, vwap_prev: float, vwap_curr: float, is_buy: bool,
-    min_deviation: float = 0.001, max_deviation_pct: float = Constants.VWAP_MAX_DISTANCE_PCT) -> Tuple[bool, Optional[str]]:
- 
+def validate_vwap_cross(close_prev: float, close_curr: float, vwap_prev: float, vwap_curr: float, is_buy: bool, min_deviation: float = 0.001, max_deviation_pct: float = Constants.VWAP_MAX_DISTANCE_PCT) -> Tuple[bool, Optional[str]]:
     vals = [close_prev, close_curr, vwap_prev, vwap_curr]
     
     if any(np.isnan(v) for v in vals):
@@ -243,8 +234,7 @@ def get_utc_date_key(timestamp: int) -> str:
     utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
     return utc_dt.date().isoformat()
 
-def should_reset_daily_state(current_timestamp: int, 
-                             last_reset_timestamp_str: Optional[str]) -> bool:
+def should_reset_daily_state(current_timestamp: int, last_reset_timestamp_str: Optional[str]) -> bool:
     current_date_str = get_utc_date_key(current_timestamp)
     
     if not last_reset_timestamp_str:
@@ -453,9 +443,7 @@ def calculate_ichimoku_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarra
             'lead_line2': np.full(n, np.nan, dtype=np.float64),
         }
 
-def calculate_dynamic_flow_ribbon_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray,
-                                      factor: float, basis_length: int, dist_length: int) -> Tuple[np.ndarray, np.ndarray]:
-    try:
+def calculate_dynamic_flow_ribbon_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, factor: float, basis_length: int, dist_length: int) -> Tuple[np.ndarray, np.ndarray]:
         n = len(close)
         if n == 0:
             raise ValueError("Empty input arrays")
@@ -1539,9 +1527,7 @@ def _oi_price_divergence_reason(oi_now: float, oi_history: List[List[float]], pr
         )
     return None
 
-def _oi_funding_gate_reason(oi_now: Optional[float], oi_history: List[List[float]], funding: Optional[float], funding_history: List[List[float]], is_buy: bool,
-    oi_usd_now: Optional[float] = None,
-    price_now: Optional[float] = None, price_history: Optional[List[List[float]]] = None) -> Optional[str]:
+def _oi_funding_gate_reason(oi_now: Optional[float], oi_history: List[List[float]], funding: Optional[float], funding_history: List[List[float]], is_buy: bool, oi_usd_now: Optional[float] = None, price_now: Optional[float] = None, price_history: Optional[List[List[float]]] = None) -> Optional[str]:
     if oi_now is None:
         return None
     if cfg.MIN_OI_USD > 0 and (oi_usd_now is None or oi_usd_now < cfg.MIN_OI_USD):
@@ -1593,8 +1579,7 @@ def _oi_funding_gate_reason(oi_now: Optional[float], oi_history: List[List[float
         f"| funding {funding:.4f} self-pctile={fp_str} (crowded vs own history)"
     )
 
-def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray], 
-                         expected_len: int) -> Tuple[bool, Optional[str]]:  
+def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray], expected_len: int) -> Tuple[bool, Optional[str]]:
     required_keys = ["open", "high", "low", "close"]    
     for key in required_keys:
         if key not in data_15m:
@@ -1633,8 +1618,7 @@ _PCTL_RANK_CACHE_MAXSIZE = 256
 _pctl_rank_cache: "OrderedDict[tuple, Optional[float]]" = OrderedDict()
 _PCTL_CACHE_MISS = object()
 
-def _array_percentile_rank(arr: np.ndarray, i: int, lookback: int, min_history: int,
-                             allow_zero: bool = False) -> Optional[float]:
+def _array_percentile_rank(arr: np.ndarray, i: int, lookback: int, min_history: int, allow_zero: bool = False) -> Optional[float]:
     start = i - lookback
     if start < 0:
         return None
@@ -1675,8 +1659,7 @@ def _scale_by_pctl(pctl: Optional[float], calm: float, volatile: float, fallback
     lo, hi = min(calm, volatile), max(calm, volatile)
     return max(lo, min(hi, val))
 
-def get_adaptive_rvol_threshold(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig,
-                                 pctl: Optional[float] = None) -> Optional[float]:
+def get_adaptive_rvol_threshold(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig, pctl: Optional[float] = None) -> Optional[float]:
     if not cfg.ATR_ADAPTIVE_ENABLED:
         return None
     if pctl is None:
@@ -1749,8 +1732,7 @@ def get_adaptive_adx_threshold_smoothed(adx_arr: np.ndarray, i15: int, cfg: BotC
 def _get_smoothed_pctl(atr_long_arr, i15, cfg) -> Optional[float]:
     return get_atr_percentile_smoothed(atr_long_arr, i15, cfg) if cfg.ATR_ADAPTIVE_ENABLED else None
 
-def get_adaptive_threshold(atr_long_arr, i15, cfg, calm_attr: str, volatile_attr: str,
-                            pctl: Optional[float] = None) -> float:
+def get_adaptive_threshold(atr_long_arr, i15, cfg, calm_attr: str, volatile_attr: str, pctl: Optional[float] = None) -> float:
     if pctl is None:
         pctl = _get_smoothed_pctl(atr_long_arr, i15, cfg)
     return _scale_by_pctl(pctl, getattr(cfg, calm_attr), getattr(cfg, volatile_attr))
@@ -1758,8 +1740,7 @@ def get_adaptive_threshold(atr_long_arr, i15, cfg, calm_attr: str, volatile_attr
 def get_adaptive_ppo_threshold(atr_long_arr, i15, cfg, pctl: Optional[float] = None) -> float:
     return get_adaptive_threshold(atr_long_arr, i15, cfg, "PPO_ADAPTIVE_CALM", "PPO_ADAPTIVE_VOLATILE", pctl=pctl)
 
-def get_adaptive_rsi_thresholds(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig,
-                                 pctl: Optional[float] = None) -> Tuple[float, float]:
+def get_adaptive_rsi_thresholds(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig, pctl: Optional[float] = None) -> Tuple[float, float]:
     if pctl is None:
         pctl = _get_smoothed_pctl(atr_long_arr, i15, cfg)
     buy = _scale_by_pctl(pctl, cfg.RSI_ADAPTIVE_BUY_CALM, cfg.RSI_ADAPTIVE_BUY_VOLATILE)
@@ -1769,8 +1750,7 @@ def get_adaptive_rsi_thresholds(atr_long_arr: np.ndarray, i15: int, cfg: BotConf
 def get_adaptive_cpr_threshold(atr_long_arr, i15, cfg, pctl: Optional[float] = None) -> float:
     return get_adaptive_threshold(atr_long_arr, i15, cfg, "CPR_ADAPTIVE_CALM", "CPR_ADAPTIVE_VOLATILE", pctl=pctl)
 
-def _validate_atr_arrays(atr_short: np.ndarray, atr_long: np.ndarray, 
-                        expected_len: int) -> Tuple[bool, Optional[str]]:   
+def _validate_atr_arrays(atr_short: np.ndarray, atr_long: np.ndarray, expected_len: int) -> Tuple[bool, Optional[str]]:
     if atr_short is None or atr_long is None:
         return False, "ATR arrays are None"
     
@@ -1785,8 +1765,7 @@ def _validate_atr_arrays(atr_short: np.ndarray, atr_long: np.ndarray,
     
     return True, None
 
-def _prior_leg_direction(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray,
-                         end_idx: int, lookback: int) -> int:
+def _prior_leg_direction(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray, end_idx: int, lookback: int) -> int:
     first = end_idx - lookback
     if end_idx < 0 or first < 0 or end_idx >= len(closes):
         return 0
@@ -1891,10 +1870,7 @@ def _fib_reversal_swing_info(h: np.ndarray, l: np.ndarray, c: np.ndarray, i15: i
 
     return True, anchor_k, anchor_price, prior_pivot
 
-def _fib_reversal_divergence(prior_pivot: Optional[Tuple[int, float, int]], anchor_k: Optional[int],
-                              anchor_price: Optional[float], rsi_arr: Optional[np.ndarray],
-                              ppo_arr: Optional[np.ndarray], is_buy: bool, cfg_obj) -> bool:
-  
+def _fib_reversal_divergence(prior_pivot: Optional[Tuple[int, float, int]], anchor_k: Optional[int], anchor_price: Optional[float], rsi_arr: Optional[np.ndarray], ppo_arr: Optional[np.ndarray], is_buy: bool, cfg_obj) -> bool:
     if prior_pivot is None or anchor_k is None or anchor_price is None:
         return False
     _, prior_price, prior_k = prior_pivot
@@ -1917,8 +1893,7 @@ def _fib_reversal_divergence(prior_pivot: Optional[Tuple[int, float, int]], anch
             return True
     return False
 
-def _fib_reversal_volume_exhaustion(volume: Optional[np.ndarray], volume_ema: Optional[np.ndarray],
-                                     i15: int, cfg_obj) -> bool:
+def _fib_reversal_volume_exhaustion(volume: Optional[np.ndarray], volume_ema: Optional[np.ndarray], i15: int, cfg_obj) -> bool:
     if volume is None or volume_ema is None:
         return False
     n_lb = cfg_obj.FIB_REVERSAL_VOL_DRYUP_LOOKBACK
@@ -1939,10 +1914,7 @@ def _fib_reversal_volume_exhaustion(volume: Optional[np.ndarray], volume_ema: Op
 
     return dryup_ok and spike_ok
 
-def _fib_reversal_confluence_vote(h: np.ndarray, l: np.ndarray, c: np.ndarray, volume: Optional[np.ndarray],
-                                   volume_ema: Optional[np.ndarray], rsi_arr: Optional[np.ndarray],
-                                   ppo_arr: Optional[np.ndarray], i15: int, is_buy: bool, cfg_obj,
-                                   wick_or_pattern_ok: bool) -> Tuple[bool, int, Dict[str, bool]]:
+def _fib_reversal_confluence_vote(h: np.ndarray, l: np.ndarray, c: np.ndarray, volume: Optional[np.ndarray], volume_ema: Optional[np.ndarray], rsi_arr: Optional[np.ndarray], ppo_arr: Optional[np.ndarray], i15: int, is_buy: bool, cfg_obj, wick_or_pattern_ok: bool) -> Tuple[bool, int, Dict[str, bool]]:
     fib_ok, anchor_k, anchor_price, prior_pivot = _fib_reversal_swing_info(h, l, c, i15, is_buy, cfg_obj)
     divergence_ok = (
         _fib_reversal_divergence(prior_pivot, anchor_k, anchor_price, rsi_arr, ppo_arr, is_buy, cfg_obj)

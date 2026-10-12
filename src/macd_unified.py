@@ -59,10 +59,7 @@ _pair_eval_counter = 0
 _CLUSTER_CACHE_MISS = object()
 LAST_CANDLE_OK_THIS_RUN: Dict[str, int] = {}
 
-def build_candle_freshness(
-    pairs: Sequence[str], merged: Dict[str, int], this_run: Dict[str, int],
-    now: int, stale_after_sec: int,
-) -> Dict[str, Any]:
+def build_candle_freshness(pairs: Sequence[str], merged: Dict[str, int], this_run: Dict[str, int], now: int, stale_after_sec: int) -> Dict[str, Any]:
     """Per-pair last-successful-candle block for the structured run summary."""
     out: Dict[str, Any] = {}
     stale: List[str] = []
@@ -415,12 +412,7 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
     finally:
         pass
 
-async def _compute_directional_cluster(
-    prepared_tasks: List[Tuple[str, str, Dict[str, Any]]],
-    state_db: RedisStateStore, correlation_id: str, reference_time: int,
-    oi_gate_data: Optional[Dict[str, Dict[str, Any]]],
-    parsed_cache: Optional[Dict[str, Any]] = None,
-) -> Tuple[Optional[ClusterContext], Dict[str, Any]]:
+async def _compute_directional_cluster(prepared_tasks: List[Tuple[str, str, Dict[str, Any]]], state_db: RedisStateStore, correlation_id: str, reference_time: int, oi_gate_data: Optional[Dict[str, Dict[str, Any]]], parsed_cache: Optional[Dict[str, Any]] = None) -> Tuple[Optional[ClusterContext], Dict[str, Any]]:
     """Pre-pass that returns both a ClusterContext and a gate cache mapping
     pair_name -> the full _eval_gate return value (GateResult | tuple | None)
     for every pair whose pre-pass ran cleanly. Phase 3 reuses the cache instead
@@ -472,11 +464,7 @@ async def _compute_directional_cluster(
         buy_pct=buy_count / total, sell_pct=sell_count / total,
     ), gate_cache
 
-async def compute_bias_context(
-    prepared_tasks: List[Tuple[str, str, Dict[str, Any]]],
-    reference_time: int,
-    parsed_cache: Optional[Dict[str, Any]] = None,
-) -> Optional[BiasContext]:
+async def compute_bias_context(prepared_tasks: List[Tuple[str, str, Dict[str, Any]]], reference_time: int, parsed_cache: Optional[Dict[str, Any]] = None) -> Optional[BiasContext]:
     """Pair-universe Ichimoku directional-bias pre-pass (23/65/130/65 on 15m
     by default — see cfg.BIAS_ICHIMOKU*). Cosmetic only: feeds the header
     line prepended to every outgoing alert this run (cfg.ENABLE_BIAS_HEADER);
@@ -2168,7 +2156,7 @@ if __name__ == "__main__":
     try:
         success = asyncio.run(main_with_cleanup())
         if success is None:
-            logger.info("ℹ️ Run skipped (another instance already running) — not a failure")
+            logger.info(" Run skipped (another instance already running) — not a failure")
             sys.exit(0)
         elif success:
             sys.exit(0)

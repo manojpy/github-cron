@@ -52,11 +52,7 @@ def outcome_data_status(outcome_dir: Optional[str], now: float) -> Dict[str, Any
         "newest_file_age_min": round((now - newest) / 60, 1) if newest else None,
     }
 
-
-def build_health(
-    summary: Optional[Dict[str, Any]], now: float, max_age_sec: int,
-    outcome_dir: Optional[str] = None,
-) -> Tuple[int, Dict[str, Any]]:
+def build_health(summary: Optional[Dict[str, Any]], now: float, max_age_sec: int, outcome_dir: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
     """Return (http_status, body)."""
     if summary is None:
         return 503, {"status": "no_summary", "reason": "run summary missing or unreadable"}

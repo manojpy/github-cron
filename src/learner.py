@@ -154,10 +154,7 @@ async def fetch_control_candles(days: int) -> Tuple[Dict[str, Tuple[Any, Any, An
         return {}, f"only {len(out)}/{len(cfg.PAIRS)} pairs returned candles"
     return out, f"{len(out)}/{len(cfg.PAIRS)} pairs, {days}d"
 
-
-async def recover_paths(
-    rows: List[Dict[str, Any]], sdb: Any, max_calls: int, dry_run: bool,
-) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+async def recover_paths(rows: List[Dict[str, Any]], sdb: Any, max_calls: int, dry_run: bool) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Give REAL archived alerts that have no stored candle path one, rebuilt from the
     exchange's candle history (see pathrecon.py).  Results are cached in Redis so each
     row is fetched once.  Never raises: on any problem the rows are returned as they were."""

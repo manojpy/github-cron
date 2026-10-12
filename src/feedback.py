@@ -96,10 +96,7 @@ def parse_fill_reply(text: str, pairs: Sequence[str]) -> Optional[Dict[str, Any]
         return None
     return {"pair": pair, "entry": float(m.group(2)) if m.group(2) else None, "exit": float(m.group(3))}
 
-
-def apply_updates(
-    log: Dict[str, Any], updates: Sequence[Mapping[str, Any]], *, chat_id: str, pairs: Sequence[str], now: float,
-) -> Tuple[List[Dict[str, Any]], int]:
+def apply_updates(log: Dict[str, Any], updates: Sequence[Mapping[str, Any]], *, chat_id: str, pairs: Sequence[str], now: float) -> Tuple[List[Dict[str, Any]], int]:
     """Pure: fold Telegram updates into `log`.  Returns (callback actions to answer, n_changes)."""
     actions: List[Dict[str, Any]] = []
     changes = 0
@@ -141,7 +138,6 @@ def apply_updates(
                     changes += 1
     return actions, changes
 
-
 async def _tg_call(token: str, method: str, params: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     import aiohttp
     url = f"https://api.telegram.org/bot{token}/{method}"
@@ -155,12 +151,7 @@ async def _tg_call(token: str, method: str, params: Mapping[str, Any]) -> Option
     except Exception:
         return None
 
-
-async def poll_feedback(
-    sdb: Any, token: str, chat_id: str, pairs: Sequence[str], *,
-    call: Optional[Callable[[str, Mapping[str, Any]], Awaitable[Optional[Dict[str, Any]]]]] = None,
-    now: Optional[float] = None,
-) -> int:
+async def poll_feedback(sdb: Any, token: str, chat_id: str, pairs: Sequence[str], *, call: Optional[Callable[[str, Mapping[str, Any]], Awaitable[Optional[Dict[str, Any]]]]] = None, now: Optional[float] = None) -> int:
     """Drain pending Telegram updates once.  Returns the number of recorded changes.
     Never raises."""
     try:
@@ -201,9 +192,7 @@ async def poll_feedback(
 
 
 # ── Open positions for the portfolio heat gate ────────────────────────────
-def open_positions_from_log(
-    log: Mapping[str, Any], *, now: float, max_age_sec: float,
-) -> List[Dict[str, Any]]:
+def open_positions_from_log(log: Mapping[str, Any], *, now: float, max_age_sec: float) -> List[Dict[str, Any]]:
     """Pure: the trades you tapped "Took" that are still assumed open.
 
     A position is open from its alert candle until you reply with an exit price
@@ -225,9 +214,7 @@ def open_positions_from_log(
             newest[pair] = {"pair": pair, "direction": direction, "ts": ts}
     return sorted(newest.values(), key=lambda p: p["ts"])
 
-def open_positions_from_auto(
-    auto: Mapping[str, Any], *, now: float, max_age_sec: float,
-) -> List[Dict[str, Any]]:
+def open_positions_from_auto(auto: Mapping[str, Any], *, now: float, max_age_sec: float) -> List[Dict[str, Any]]:
     """Pure: positions inferred from delivered alerts (no Telegram taps needed).
 
     `auto` is {pair: {"d": "buy"|"sell", "ts": candle_ts}}.  A position is assumed
@@ -255,10 +242,7 @@ def merge_open_positions(*lists: Sequence[Mapping[str, Any]]) -> List[Dict[str, 
                 newest[str(p["pair"])] = dict(p)
     return sorted(newest.values(), key=lambda p: p["ts"])
 
-
-async def load_open_positions(
-    sdb: Any, max_age_sec: float, now: Optional[float] = None, source: str = "taps",
-) -> List[Dict[str, Any]]:
+async def load_open_positions(sdb: Any, max_age_sec: float, now: Optional[float] = None, source: str = "taps") -> List[Dict[str, Any]]:
     """Open positions for the heat gate.  Never raises; [] when unknown.
 
     source "taps"   -> trades you tapped Took on (feedback_log)
@@ -281,11 +265,7 @@ async def load_open_positions(
         auto = []
     return merge_open_positions(taps, auto) if source == "both" else (auto if source == "alerts" else taps)
 
-
-async def record_auto_positions(
-    sdb: Any, delivered: Sequence[Tuple[str, str, int, Optional[str]]], *,
-    verdicts: Sequence[str], max_age_sec: float, now: Optional[float] = None,
-) -> None:
+async def record_auto_positions(sdb: Any, delivered: Sequence[Tuple[str, str, int, Optional[str]]], *, verdicts: Sequence[str], max_age_sec: float, now: Optional[float] = None) -> None:
     """Remember delivered alerts whose verdict is in `verdicts` as open positions.
 
     `delivered` is [(pair, direction, candle_ts, verdict)].  One GET + one SET per
@@ -309,9 +289,7 @@ async def record_auto_positions(
     except Exception:
         return
 
-async def release_closed_auto_positions(
-    sdb: Any, closed: Sequence[Tuple[str, int]], *, max_age_sec: float,
-) -> int:
+async def release_closed_auto_positions(sdb: Any, closed: Sequence[Tuple[str, int]], *, max_age_sec: float) -> int:
     """Drop auto positions whose trade has closed (target/stop hit).
 
     `closed` is [(pair, entry_ts)] of Recorded trades that resolved. A position is
@@ -342,9 +320,7 @@ async def release_closed_auto_positions(
         return 0
 
 # ── Learner side: what did the decisions teach? ───────────────────────────
-def behaviour_report(
-    log: Mapping[str, Any], rows: Sequence[Row], *, fixed: Mapping[str, float], cost_pct: float,
-) -> Dict[str, Any]:
+def behaviour_report(log: Mapping[str, Any], rows: Sequence[Row], *, fixed: Mapping[str, float], cost_pct: float) -> Dict[str, Any]:
     """Taken vs skipped outcomes under the fixed plan, plus real-fill gaps.
     Rows are matched on (pair, direction, entry_ts); unmatched decisions are counted, never guessed."""
     idx: Dict[str, Row] = {}
@@ -403,15 +379,12 @@ def _plan_pnls(rows: Sequence[Row], fixed: Mapping[str, float], cost_pct: float)
             out.append(res[1])
     return out
 
-
 def _pnl_stat(x: Sequence[float]) -> Dict[str, Any]:
     return {"n": len(x), "ev": statistics.fmean(x) if x else None,
             "win": (sum(1 for p in x if p > 0) / len(x)) if x else None}
 
-
 def _fmt_stat(s: Mapping[str, Any]) -> str:
     return "n=0" if not s["n"] else f"n={s['n']}, EV {s['ev']:+.2f}%, wins {s['win']:.0%}"
-
 
 def heat_gate_report(rows: Sequence[Row], *, fixed: Mapping[str, float], cost_pct: float) -> Dict[str, Any]:
     """Alerts the portfolio heat gate held back (shadow rows) vs alerts that went out (live rows),
@@ -421,7 +394,6 @@ def heat_gate_report(rows: Sequence[Row], *, fixed: Mapping[str, float], cost_pc
     return {"blocked": _pnl_stat(_plan_pnls(blocked, fixed, cost_pct)),
             "sent": _pnl_stat(_plan_pnls(live, fixed, cost_pct)),
             "blocked_rows": len(blocked)}
-
 
 def format_heat_gate(h: Mapping[str, Any], min_n: int = 20) -> str:
     b, s = h["blocked"], h["sent"]
@@ -434,11 +406,7 @@ def format_heat_gate(h: Mapping[str, Any], min_n: int = 20) -> str:
         out.append("  ⚠ the alerts it held back did as well or better than the ones sent, so it is costing edge")
     return "\n".join(out)
 
-
-def margin_report(
-    rows: Sequence[Row], *, fixed: Mapping[str, float], cost_pct: float,
-    thin: float = 0.10, strong: float = 0.30,
-) -> Dict[str, Any]:
+def margin_report(rows: Sequence[Row], *, fixed: Mapping[str, float], cost_pct: float, thin: float = 0.10, strong: float = 0.30) -> Dict[str, Any]: 
     """Live alerts bucketed by how far their effective confluence score cleared the required score."""
     buckets: Dict[str, List[Row]] = {"thin": [], "mid": [], "strong": []}
     for r in rows:
