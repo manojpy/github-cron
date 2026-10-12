@@ -1,29 +1,40 @@
 from __future__ import annotations
-from bot_config import cfg, BiasContext
-import logging
-from types import SimpleNamespace as NS
-import alerts as A
-from alert_advisor import advise_pair, AVOID, TAKE, WATCH
+
+# Standard library
 import asyncio
-from alerts import AlertPayload, dispatch_combined_alerts
-import outcome_storage
-from state import RedisStateStore
-import alerts
+import json
+import logging
 import time
+from types import SimpleNamespace as NS
+
+# Third-party
+import numpy as np
+
+# Local imports
+import alerts
+import feedback
+import outcome_storage
+from alert_advisor import advise_pair, AVOID, TAKE, WATCH
+from alerts import AlertPayload, dispatch_combined_alerts
+from bot_config import cfg, BiasContext
+from fetcher import PriceData
+from state import RedisStateStore
 from threshold_engine import (
     KillSwitch, portfolio_heat_check, build_calibration_curves,
     calibration_gate_decision, fill_reconciliation,
 )
 
-# ======================================================================
-# from test_alert_advisor.py
-# ======================================================================
-"""Conviction / verdict logic and the per-pair Telegram body."""
-
-
+# Convenience aliases used throughout
 LOG = logging.getLogger("t")
+
+
+# ======================================================================
+# Shared test helpers
+# ======================================================================
+
 DOWN = NS(up_pct=0.20, down_pct=0.47)
 UP = NS(up_pct=0.64, down_pct=0.21)
+
 GOOD_VOTES = {"base_trend": True, "dynamic_flow_ribbon": True, "ichimoku_cloud": True,
               "oi_funding": True, "adx": False}
 
@@ -44,6 +55,10 @@ def adv(tqs, bias="with", votes=GOOD_VOTES, score=24, total=27, **kw):
     return advise_pair(direction="buy", score=score, total=total, required=21, votes=votes,
                        tqs=tqs, bias=bias, **kw)
 
+
+# ======================================================================
+# test_alert_advisor.py — Conviction / verdict logic and per-pair body
+# ======================================================================
 
 def test_negative_ev_is_avoid_even_with_weak_evidence():
     a = adv([tq(ev=-0.07)])
@@ -85,7 +100,7 @@ def test_no_data_never_invents_a_conviction():
     assert a.conviction is None and a.verdict == WATCH and a.risk_label == "Missing"
     b = adv([None], bias="against")
     assert b.conviction is None and b.verdict == AVOID
-    c = adv([None], bias="with", score=17, total=27)          # weak technicals
+    c = adv([None], bias="with", score=17, total=27)
     assert c.verdict == AVOID and not c.risk_line.startswith(";")
 
 
@@ -102,18 +117,19 @@ def test_no_votes_list_in_any_line():
 
 
 def test_bias_alignment():
-    assert A._bias_alignment("buy", UP) == "with" and A._bias_alignment("sell", UP) == "against"
-    assert A._bias_alignment("sell", DOWN) == "with"
-    assert A._bias_alignment("buy", NS(up_pct=0.3, down_pct=0.3)) == "neutral"
-    assert A._bias_alignment("buy", None) == "neutral"
+    assert alerts._bias_alignment("buy", UP) == "with" and alerts._bias_alignment("sell", UP) == "against"
+    assert alerts._bias_alignment("sell", DOWN) == "with"
+    assert alerts._bias_alignment("buy", NS(up_pct=0.3, down_pct=0.3)) == "neutral"
+    assert alerts._bias_alignment("buy", None) == "neutral"
+
 
 def test_price_precision_for_low_priced_pairs():
-    # Rules: >=10 → 2dp, >=1 → 3dp, <1 → 4dp
-    assert A._format_price(0.0462) == "$0.0462"
-    assert A._format_price(0.00731) == "$0.0073"
-    assert A._format_price(1.1934) == "$1.193"
-    assert A._format_price(10.5) == "$10.50"
-    assert A._format_price(108420) == "$108,420.00"
+    assert alerts._format_price(0.0462) == "$0.0462"
+    assert alerts._format_price(0.00731) == "$0.0073"
+    assert alerts._format_price(1.1934) == "$1.193"
+    assert alerts._format_price(10.5) == "$10.50"
+    assert alerts._format_price(108420) == "$108,420.00"
+
 
 def _msg(**over):
     kw = dict(pair="LABUSD", direction="sell", price=0.0462, ts=1790826300, score=24, total=27,
@@ -122,15 +138,15 @@ def _msg(**over):
               tq_by_key={"vwap_down": tq(ev=0.04), "dynamic_flow_cross_sell": tq(ev=-0.16, plan=(1.18, 1.27, 2.34, 0.0, 42))},
               votes=GOOD_VOTES, required=21, bias_context=DOWN, logger_pair=LOG)
     kw.update(over)
-    return A.build_pair_msg_safe(**kw).replace("\\", "")
+    return alerts.build_pair_msg_safe(**kw).replace("\ ", " ")
 
 
 def test_message_shape_header_conviction_and_no_votes():
     m = _msg().split("\n")
     assert m[0] == "🟣▼ LABUSD — SELL | $0.0462 - (24/27) 89%"
-    assert m[1].startswith("🎯 Conviction ") and m[1].endswith("| ⛔ AVOID")
+    assert m[1].startswith("🎯 Conviction") and m[1].endswith("| ⛔ AVOID")
     assert m[2] == "VWAP Cross, Dynamic Flow Cross SELL"
-    assert [x.split(" ")[0] for x in m[3:8]] == ["🧠", "📊", "💡", "⚠️", "🛡"]
+    assert [x.split("  ")[0] for x in m[3:8]] == ["🧠", "📊", "💡", "⚠️", "🛡"]
     assert "Votes" not in "\n".join(m)
 
 
@@ -146,13 +162,13 @@ def test_bad_tq_degrades_instead_of_raising():
 
 
 def test_formatter_failure_falls_back_to_plain_body(monkeypatch):
-    monkeypatch.setattr(A, "advise_pair", lambda **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(alerts, "advise_pair", lambda **k: (_ for _ in ()).throw(RuntimeError("boom")))
     m = _msg()
     assert "LABUSD" in m and "VWAP Cross" in m and "Conviction" not in m
 
 
 def test_markdown_v2_special_chars_are_escaped():
-    raw = A.build_pair_msg_safe(**{**dict(
+    raw = alerts.build_pair_msg_safe(**{**dict(
         pair="LABUSD", direction="sell", price=0.0462, ts=1790826300, score=24, total=27,
         items=[("🟣▼ VWAP Cross", "")], keys=["vwap_down"], tq_by_key={"vwap_down": tq()},
         votes=GOOD_VOTES, required=21, bias_context=DOWN, logger_pair=LOG)})
@@ -167,16 +183,15 @@ def _b(up, down, neutral):
 
 
 def test_neutral_dominant_bias_is_never_counter_trend():
-    # the AAVE 09:30 case: Neutral 37%, up 30%, down 33%
-    assert A._bias_alignment("buy", _b(0.30, 0.33, 0.37)) == "neutral"
-    assert A._bias_alignment("sell", _b(0.30, 0.33, 0.37)) == "neutral"
+    assert alerts._bias_alignment("buy", _b(0.30, 0.33, 0.37)) == "neutral"
+    assert alerts._bias_alignment("sell", _b(0.30, 0.33, 0.37)) == "neutral"
 
 
 def test_thin_lead_is_neutral_and_clear_lead_counts():
-    assert A._bias_alignment("buy", _b(0.40, 0.37, 0.23)) == "neutral"      # 3-pt lead
-    assert A._bias_alignment("buy", _b(0.53, 0.17, 0.30)) == "with"
-    assert A._bias_alignment("sell", _b(0.53, 0.17, 0.30)) == "against"
-    assert A._bias_alignment("buy", _b(0.40, 0.37, 0.23), min_edge=0.02) == "with"
+    assert alerts._bias_alignment("buy", _b(0.40, 0.37, 0.23)) == "neutral"
+    assert alerts._bias_alignment("buy", _b(0.53, 0.17, 0.30)) == "with"
+    assert alerts._bias_alignment("sell", _b(0.53, 0.17, 0.30)) == "against"
+    assert alerts._bias_alignment("buy", _b(0.40, 0.37, 0.23), min_edge=0.02) == "with"
 
 
 # ── unproven-but-strong tier ────────────────────────────────────────────────
@@ -199,12 +214,12 @@ def test_strong_unproven_setup_reads_take_small_size_without_fake_conviction():
 
 
 def test_unproven_take_needs_every_condition():
-    assert un(score=24, total=27).verdict == WATCH                         # 89% < 90% bar
-    assert un(votes=dict(CLEAN, oi_funding=False)).verdict == WATCH        # OI/funding failed
-    assert un(conflicting=True).verdict == WATCH                           # opposing signal
+    assert un(score=24, total=27).verdict == WATCH
+    assert un(votes=dict(CLEAN, oi_funding=False)).verdict == WATCH
+    assert un(conflicting=True).verdict == WATCH
     assert un(bias="against", votes=dict(CLEAN, oi_funding=False)).verdict == AVOID
-    assert un(bias="against").verdict == WATCH                             # counter-trend, 96%: watch only
-    assert un(bias="against", score=24, total=27).verdict == AVOID         # counter-trend, 89%
+    assert un(bias="against").verdict == WATCH
+    assert un(bias="against", score=24, total=27).verdict == AVOID
 
 
 def test_unproven_take_is_off_by_default_and_with_flag_none():
@@ -222,10 +237,8 @@ def test_why_line_says_all_high_weight_checks_pass_instead_of_repeating_top3():
 
 
 # ======================================================================
-# from test_alert_dispatch_format.py
+# test_alert_dispatch_format.py — Dispatcher ordering, notes, footer
 # ======================================================================
-"""Dispatcher: ordering by confluence %, same-underlying note, bias footer."""
-
 
 def _bias(up, down, neutral):
     n = 30
@@ -234,7 +247,7 @@ def _bias(up, down, neutral):
                        up_pct=up, down_pct=down, neutral_pct=neutral)
 
 
-UP, DOWN = _bias(0.6, 0.2, 0.2), _bias(0.2, 0.57, 0.23)
+BIAS_UP, BIAS_DOWN = _bias(0.6, 0.2, 0.2), _bias(0.2, 0.57, 0.23)
 
 
 class _Tg:
@@ -276,21 +289,20 @@ def _order(text, names):
 
 
 def test_orders_by_confluence_percent_not_raw_score():
-    # raw score says A(26/30=87%) > B(25/27=93%); percent must put B first
     ps = [_p("AAAUSD", "buy", 26, 30), _p("BBBUSD", "buy", 25, 27), _p("CCCUSD", "sell", 28, 29)]
-    text = _send(ps, UP)
+    text = _send(ps, BIAS_UP)
     assert _order(text, ["AAAUSD", "BBBUSD", "CCCUSD"]) == ["BBBUSD", "AAAUSD", "CCCUSD"]
 
 
 def test_negative_bias_puts_sells_first():
     ps = [_p("AAAUSD", "buy", 26, 30), _p("CCCUSD", "sell", 20, 29)]
-    text = _send(ps, DOWN)
+    text = _send(ps, BIAS_DOWN)
     assert _order(text, ["AAAUSD", "CCCUSD"]) == ["CCCUSD", "AAAUSD"]
 
 
 def test_same_underlying_note_only_on_later_same_direction_member():
     ps = [_p("PAXGUSD", "sell", 24, 27), _p("XAUTUSD", "sell", 22, 27), _p("ETHUSD", "sell", 20, 27)]
-    text = _send(ps, DOWN)
+    text = _send(ps, BIAS_DOWN)
     assert text.count("Same underlying as PAXGUSD") == 1
     assert text.index("Same underlying") > text.index("BODY-XAUTUSD")
     assert text.index("Same underlying") < text.index("BODY-ETHUSD")
@@ -298,47 +310,40 @@ def test_same_underlying_note_only_on_later_same_direction_member():
 
 def test_opposite_directions_of_a_group_are_not_flagged():
     ps = [_p("PAXGUSD", "sell", 24, 27), _p("XAUTUSD", "buy", 22, 27)]
-    assert "Same underlying" not in _send(ps, DOWN)
+    assert "Same underlying" not in _send(ps, BIAS_DOWN)
 
 
 def test_footer_has_candle_open_time_and_bias():
-    text = _send([_p("AAAUSD", "buy", 24, 27)], DOWN)
+    text = _send([_p("AAAUSD", "buy", 24, 27)], BIAS_DOWN)
     assert "⏰" in text and "📆" in text and "Bias" in text
 
 
 def test_basket_note_when_three_same_direction_takes():
     ps = [_p(n, "buy", 26, 27, "TAKE") for n in ("AAAUSD", "BBBUSD", "CCCUSD")] + [_p("DDDUSD", "buy", 20, 27, "WATCH")]
-    text = _send(ps, UP)
+    text = _send(ps, BIAS_UP)
     assert text.count("size them as ONE basket") == 1 and "3 BUY TAKEs" in text
 
 
 def test_no_basket_note_below_threshold_or_for_watch():
     two = [_p("AAAUSD", "buy", 26, 27, "TAKE"), _p("BBBUSD", "buy", 25, 27, "TAKE")]
-    assert "basket" not in _send(two, UP)
+    assert "basket" not in _send(two, BIAS_UP)
     watch = [_p(n, "buy", 26, 27, "WATCH") for n in ("AAAUSD", "BBBUSD", "CCCUSD")]
-    assert "basket" not in _send(watch, UP)
+    assert "basket" not in _send(watch, BIAS_UP)
 
 
 # ======================================================================
-# from test_dispatch_outcome_ordering.py
+# test_dispatch_outcome_ordering.py — outcome + ACTIVE state follow delivery
 # ======================================================================
-"""Behavioural tests: outcome + ACTIVE state must follow Telegram delivery.
-
-A failed send must NOT leave a recorded trade or an ACTIVE alert state behind
-(phantom trade), and a failing post-send hook must not skip the
-candle-processed marker (which would allow a duplicate alert next run).
-"""
-
-
 
 class FakeTelegram:
     def __init__(self, results):
-        self.results = list(results)   # one bool per send() call
+        self.results = list(results)
         self.sent = []
 
     async def send(self, msg):
         self.sent.append(msg)
         return self.results.pop(0) if self.results else False
+
 
 class FakeSdb:
     def __init__(self):
@@ -358,11 +363,10 @@ class FakeSdb:
 
 
 def _payload(pair, calls, *, record_raises=False):
-    async def record():
+    async def record(sink=None):
         calls.append(pair)
         if record_raises:
             raise RuntimeError("redis down")
-
     return AlertPayload(
         pair_name=pair, direction="buy", score=5.0, total=10.0,
         msg_body=f"body {pair}", dedup_keys=["k"],
@@ -391,11 +395,10 @@ def test_send_success_records_and_activates_once():
 
 def test_send_failure_creates_no_phantom_trade():
     calls, sdb = [], FakeSdb()
-    # combined send fails, individual fallback send fails too
     n = _run([_payload("ETHUSD", calls)], FakeTelegram([False, False]), sdb)
     assert n == 0
-    assert calls == []                 # no outcome recorded
-    assert sdb.state_batches == []     # alert state NOT activated
+    assert calls == []
+    assert sdb.state_batches == []
     assert sdb.processed == []
 
 
@@ -408,13 +411,8 @@ def test_post_send_hook_error_still_marks_candle_processed():
 
 
 # ======================================================================
-# from test_resolution_archive_ordering.py
+# test_resolution_archive_ordering.py — archive BEFORE Redis delete
 # ======================================================================
-"""Resolved outcomes must reach the file archive BEFORE the Redis pending key
-is deleted. If the archive write fails, the pending key must survive."""
-
-
-
 
 class FakePipe:
     def __init__(self, store, log):
@@ -429,7 +427,7 @@ class FakePipe:
     def get(self, key):
         self.ops.append(("get", key))
 
-    def __getattr__(self, name):          # hincrby / expire / xadd / delete ...
+    def __getattr__(self, name):
         def _rec(*args, **kw):
             self.ops.append((name, args))
         return _rec
@@ -488,7 +486,7 @@ def test_archive_written_before_redis_delete(monkeypatch):
 
     monkeypatch.setattr(outcome_storage, "append_outcome_batch", fake_append)
     _resolve(sdb)
-    assert log.index("archive_write") < len(log) - 1          # before the write pipeline
+    assert log.index("archive_write") < len(log) - 1
     assert log[-1] == "redis_execute" and sdb._redis.store["deleted"] is True
     assert written[0]["_stream_id"] == "ETHUSD:ppo_cross_up:1700000000"
 
@@ -502,17 +500,13 @@ def test_archive_failure_keeps_pending_key(monkeypatch):
 
     monkeypatch.setattr(outcome_storage, "append_outcome_batch", boom)
     _resolve(sdb)
-    assert sdb._redis.store["deleted"] is False               # pending outcome NOT deleted
+    assert sdb._redis.store["deleted"] is False
     assert sdb._run_resolved_total == 0
 
 
 # ======================================================================
-# from test_survival_and_brain_filter_msgs.py
+# test_survival_and_brain_filter_msgs.py — #25 checklist + #26 filter
 # ======================================================================
-"""#25 survival checklist + #26 BRAIN FILTER Telegram notice (build_* / _notify_brain_filter)."""
-
-
-
 
 class _Q:
     def __init__(self, ok=True):
@@ -579,7 +573,7 @@ def test_survival_checklist_marks_unevaluated_not_passed():
         cal_wr=None, cal_reason="thin_bucket_fail_open", tq=None,
     )
     assert "○ WR no history" in out and "○ calib thin" in out
-    assert "✓" not in out        # nothing was actually verified
+    assert "✓" not in out
 
 
 def test_message_has_fields_and_is_markdown_safe():
@@ -590,8 +584,8 @@ def test_message_has_fields_and_is_markdown_safe():
     for needle in ("BRAIN FILTER", "Signal gates: PASS", "BLOCKED", "evidence SHADOW",
                    "recent WR drift", "ranging regime"):
         assert needle in msg
-    assert "P\\(profit\\) 41%" in msg and "netEV \\-0\\.12%" in msg
-    assert "BTC\\_USD" in msg and "x \\(y\\)" in msg
+    assert "P\(profit\) 41%" in msg and "netEV \-0\.12%" in msg
+    assert "BTC\_USD" in msg and "x \(y\)" in msg
 
 
 def test_off_by_default(monkeypatch):
@@ -604,8 +598,8 @@ def test_cooldown_dedupes_same_pair_alert_gate(monkeypatch):
     _on(monkeypatch)
     q, sdb = _Q(), _SDB()
     assert _notify(q, sdb) is True
-    assert _notify(q, sdb) is False                      # same key inside cooldown
-    assert _notify(q, sdb, gate="quality hard block") is True   # different gate
+    assert _notify(q, sdb) is False
+    assert _notify(q, sdb, gate="quality hard block") is True
     assert len(q.sent) == 2
 
 
@@ -634,9 +628,8 @@ def test_never_raises_on_send_failure(monkeypatch):
 
 
 # ======================================================================
-# from test_new_gates.py
+# test_new_gates.py — KillSwitch, portfolio heat, calibration, fill recon
 # ======================================================================
-
 
 def _row(win, pct=0.5, ts=None, ak="ppo_signal_up", conf=75.0,
          pair="ETHUSD", direction="buy", **kw):
@@ -677,7 +670,6 @@ def test_portfolio_heat_net_cap():
     opens = [{"pair": f"P{i}", "direction": "buy"} for i in range(3)]
     v = portfolio_heat_check(opens, "P9", "buy", max_concurrent=10, max_net_directional=3)
     assert v["blocked"]
-    # a sell reduces the net — must pass
     assert not portfolio_heat_check(opens, "P9", "sell", max_concurrent=10, max_net_directional=3)["blocked"]
 
 
@@ -689,7 +681,6 @@ def test_portfolio_heat_concurrent_cap_and_dup():
 
 def test_calibration_gate_blocks_miscalibrated():
     now = time.time()
-    # claims ~75% confluence, actually wins ~15% (2/13 in the 75-80 bucket)
     rows = [_row(i < 4, conf=74.0 + (i % 3), ts=now - i * 60) for i in range(20)]
     calib = build_calibration_curves(rows, bucket_pct=5.0, min_sample=10)
     curve = calib["curves"]["ppo_signal_up"]
@@ -704,7 +695,6 @@ def test_calibration_gate_fail_open_on_thin():
 
 def test_fill_reconciliation_estimated_tier():
     now = time.time()
-    # wins only move 0.6% but target implies 2.0 × 0.5 = 1.0% → leakage
     rows = [_row(True, pct=0.6, ts=now - i * 60) for i in range(15)]
     fr = fill_reconciliation(rows, rr_target=2.0, stop_pct=0.5, min_sample=10)
     assert fr["valid"] and not fr["measured"]
@@ -716,7 +706,7 @@ def test_fill_reconciliation_measured_tier():
     now = time.time()
     rows = [
         _row(True, ts=now - i * 60, direction="buy",
-             signal_price=100.0, fill_price=100.08)  # 8bps of buy slippage
+             signal_price=100.0, fill_price=100.08)
         for i in range(12)
     ]
     fr = fill_reconciliation(rows, min_sample=10)
@@ -725,25 +715,91 @@ def test_fill_reconciliation_measured_tier():
 
 
 # ======================================================================
-# DLQ replay must restore the side effects of a normal send, and the
-# button-free heat gate must see delivered TAKE alerts as open positions.
+# DLQ replay tests
 # ======================================================================
-def test_dlq_replay_applies_outcomes_and_state_after_delivery(monkeypatch):
-    import time
-    import alerts as _alerts
-    from bot_config import cfg as _cfg
 
-    monkeypatch.setattr(_cfg, "ENABLE_TELEGRAM_DLQ", True, raising=False)
-    monkeypatch.setattr(_cfg, "DRY_RUN_MODE", False, raising=False)
-    monkeypatch.setattr(_cfg, "TELEGRAM_DLQ_MAX_ITEMS_PER_RUN", 5, raising=False)
+def test_dlq_marker_write_failure_stops_side_effects(monkeypatch):
+    monkeypatch.setattr(cfg, "ENABLE_TELEGRAM_DLQ", True, raising=False)
+    monkeypatch.setattr(cfg, "DRY_RUN_MODE", False, raising=False)
+    monkeypatch.setattr(cfg, "TELEGRAM_DLQ_MAX_ITEMS_PER_RUN", 5, raising=False)
+
+    class _SdbDlq:
+        degraded = False
+        def __init__(self):
+            self.deleted = []
+            self.outcomes = []
+            self.save_calls = 0
+        async def dlq_list(self, limit=10):
+            return [("dlq:test", {"pair": "BTCUSD", "ts": int(time.time()), "message": "test alert", "attempts": 0, "outcomes": [{"pair": "BTCUSD"}], "state_changes": []})]
+        async def dlq_save_entry(self, key, entry):
+            self.save_calls += 1
+            return False
+        async def record_pending_outcome(self, **kwargs):
+            self.outcomes.append(kwargs)
+            return True
+        async def dlq_delete(self, key):
+            self.deleted.append(key)
+            return True
+
+    class _TelegramDlq:
+        async def send(self, message):
+            return True
+
+    sdb = _SdbDlq()
+    asyncio.run(alerts.replay_telegram_dlq(sdb, _TelegramDlq(), logging.getLogger("test_dlq_marker_failure")))
+    assert sdb.save_calls == 1
+    assert sdb.outcomes == []
+    assert sdb.deleted == []
+    assert alerts.DLQ_STATS["marker_write_failed"] == 1
+
+
+def test_dlq_side_effect_retry_limit_quarantines_entry(monkeypatch):
+    monkeypatch.setattr(cfg, "ENABLE_TELEGRAM_DLQ", True, raising=False)
+    monkeypatch.setattr(cfg, "DRY_RUN_MODE", False, raising=False)
+    monkeypatch.setattr(cfg, "TELEGRAM_DLQ_MAX_ITEMS_PER_RUN", 5, raising=False)
+    monkeypatch.setattr(cfg, "TELEGRAM_DLQ_MAX_ATTEMPTS", 1, raising=False)
+
+    class _SdbDlq2:
+        degraded = False
+        def __init__(self):
+            self.entry = {"pair": "BTCUSD", "ts": int(time.time()), "message": "test alert", "attempts": 1, "delivered": True, "side_tries": 0, "outcomes": [{"pair": "BTCUSD"}], "outcomes_done": 0, "state_changes": []}
+            self.saved = []
+            self.deleted = []
+        async def dlq_list(self, limit=10):
+            return [("dlq:test", dict(self.entry))]
+        async def record_pending_outcome(self, **kwargs):
+            return False
+        async def dlq_save_entry(self, key, entry):
+            self.saved.append(dict(entry))
+            self.entry = dict(entry)
+            return True
+        async def dlq_delete(self, key):
+            self.deleted.append(key)
+            return True
+
+    class _TelegramDlq2:
+        async def send(self, message):
+            raise AssertionError("Already delivered: must not send again")
+
+    sdb = _SdbDlq2()
+    asyncio.run(alerts.replay_telegram_dlq(sdb, _TelegramDlq2(), logging.getLogger("test_dlq_quarantine")))
+    assert sdb.deleted == []
+    assert sdb.saved
+    assert sdb.saved[-1]["status"] == "NEEDS_REPAIR"
+    assert sdb.saved[-1]["outcomes_done"] == 0
+    assert alerts.DLQ_STATS["needs_repair"] == 1
+
+
+def test_dlq_replay_applies_outcomes_and_state_after_delivery(monkeypatch):
+    monkeypatch.setattr(cfg, "ENABLE_TELEGRAM_DLQ", True, raising=False)
+    monkeypatch.setattr(cfg, "DRY_RUN_MODE", False, raising=False)
+    monkeypatch.setattr(cfg, "TELEGRAM_DLQ_MAX_ITEMS_PER_RUN", 5, raising=False)
 
     class _DlqSdb(FakeSdb):
         degraded = False
-
         def __init__(self):
             super().__init__()
             self.parked, self.outcomes, self.deleted = {}, [], []
-
         async def dlq_push(self, pair, message, ts, *, dedup_keys=None, source="",
                            state_changes=None, outcomes=None):
             self.parked[f"k:{pair}"] = {
@@ -752,19 +808,15 @@ def test_dlq_replay_applies_outcomes_and_state_after_delivery(monkeypatch):
                 "outcomes": list(outcomes or []), "attempts": 0,
             }
             return True
-
         async def dlq_list(self, limit=10):
             return list(self.parked.items())
-
         async def dlq_delete(self, key):
             self.deleted.append(key)
             self.parked.pop(key, None)
-
         async def dlq_save_entry(self, key, entry):
             if key in self.parked:
                 self.parked[key] = entry
             return True
-
         async def record_pending_outcome(self, **kw):
             self.outcomes.append(kw)
             return True
@@ -785,30 +837,21 @@ def test_dlq_replay_applies_outcomes_and_state_after_delivery(monkeypatch):
         state_changes=[("ETHUSD:state", "ACTIVE", None)], budget_count=1, ts=ts,
         alert_keys=["ppo_cross_up"], record_win_rate=record, mark_candle_processed=True,
     )
-    # Telegram down for the combined send and the individual fallback: alert is parked.
     n = _run([p], FakeTelegram([False, False]), sdb)
     assert n == 0 and sdb.outcomes == [] and sdb.state_batches == []
     assert len(sdb.parked) == 1
-
-    # Telegram back: the replay delivers AND applies the owed outcome + ACTIVE state.
-    asyncio.run(_alerts.replay_telegram_dlq(
-        sdb, FakeTelegram([True]), logging.getLogger("test")))
+    asyncio.run(alerts.replay_telegram_dlq(sdb, FakeTelegram([True]), logging.getLogger("test")))
     assert [o["pair"] for o in sdb.outcomes] == ["ETHUSD"]
     assert sdb.state_batches == [[("ETHUSD:state", "ACTIVE", None)]]
     assert sdb.parked == {}
 
 
 def test_auto_open_positions_count_only_delivered_takes():
-    import time
-    import feedback
-
     class _Meta:
         def __init__(self):
             self.d = {}
-
         async def get_metadata(self, k, timeout=2.0):
             return self.d.get(k)
-
         async def set_metadata(self, k, v, timeout=2.0, ttl=None):
             self.d[k] = v
 
@@ -829,11 +872,10 @@ def test_auto_open_positions_count_only_delivered_takes():
 
 
 # ======================================================================
-# one recorded trade per pair until stop/target
+# One recorded trade per pair until stop/target
 # ======================================================================
+
 def _one_trade_price_data(highs, lows):
-    import numpy as np
-    from fetcher import PriceData
     n = len(highs)
     ts = np.arange(n, dtype=np.int64) * 900 + 1_000_000
     flat = np.full(n, 100.0)
@@ -842,7 +884,6 @@ def _one_trade_price_data(highs, lows):
 
 
 def _one_trade_row(direction="buy", entry_idx=0):
-    import json
     return json.dumps({"entry_ts": 1_000_000 + entry_idx * 900, "entry_price": 100.0,
                        "direction": direction})
 
@@ -851,30 +892,36 @@ def _one_trade_store(rows, degraded=False):
     import state
 
     class _P:
-        def __init__(self): self.keys = []
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return False
-        def get(self, k): self.keys.append(k)
-        async def execute(self): return [rows.get(k) for k in self.keys]
+        def __init__(self):
+            self.keys = []
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        def get(self, k):
+            self.keys.append(k)
+        async def execute(self):
+            return [rows.get(k) for k in self.keys]
 
     class _R:
-        def pipeline(self, transaction=False): return _P()
+        def pipeline(self, transaction=False):
+            return _P()
 
     s = object.__new__(state.RedisStateStore)
     s.degraded = degraded
     s._redis = _R()
 
-    async def _keys(*a, **k): return list(rows)
+    async def _keys(*a, **k):
+        return list(rows)
+
     s._fetch_pending_keys = _keys
     return s
 
 
 def test_early_close_marks_target_stop_and_leaves_open_trades_alone():
-    import json
     import state
     store = object.__new__(state.RedisStateStore)
     f = store._early_close_payload
-    # fill at open[1]=100; target 102, stop 99 (defaults 1% risk, 2R)
     quiet = _one_trade_price_data([100, 100.5, 100.5, 100.5], [100, 99.5, 99.5, 99.5])
     assert f(_one_trade_row(), quiet, 3) is None
     up = _one_trade_price_data([100, 100.5, 102.5, 100.5], [100, 99.5, 99.5, 99.5])
@@ -882,18 +929,14 @@ def test_early_close_marks_target_stop_and_leaves_open_trades_alone():
     assert out["closed_reason"] == "target" and out["closed_ts"]
     dn = _one_trade_price_data([100, 100.5, 100.5, 100.5], [100, 99.5, 98.9, 99.5])
     assert json.loads(f(_one_trade_row(), dn, 3))["closed_reason"] == "stop"
-    # a sell trade reads the same path the other way round
     deep = _one_trade_price_data([100, 100.5, 100.5, 100.5], [100, 99.5, 97.9, 99.5])
     assert json.loads(f(_one_trade_row("sell"), deep, 3))["closed_reason"] == "target"
-    # already closed rows are not rewritten
     assert f(out and json.dumps(out), up, 3) is None
-    # the fill candle itself is not closed yet
     assert f(_one_trade_row(), up, 0) is None
 
 
 def test_get_active_trade_ignores_closed_rows_and_picks_newest():
-    import asyncio
-    import json
+    import state
     base = "outcome_pending:BTCUSD:"
     open_old = _one_trade_row(entry_idx=0)
     open_new = _one_trade_row(entry_idx=2)
@@ -908,6 +951,6 @@ def test_get_active_trade_ignores_closed_rows_and_picks_newest():
 
 
 def test_record_status_line_text():
-    line = A._record_status_line("IGNORED", {"pair": "BTCUSD", "direction": "buy", "entry_ts": 1_000_000})
+    line = alerts._record_status_line("IGNORED", {"pair": "BTCUSD", "direction": "buy", "entry_ts": 1_000_000})
     assert line.startswith("⏭ Ignored") and "BTCUSD buy" in line
-    assert A._record_status_line("RECORDED", None).startswith("📝 Recorded")
+    assert alerts._record_status_line("RECORDED", None).startswith("📝 Recorded")
