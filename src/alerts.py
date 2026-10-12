@@ -109,8 +109,9 @@ DLQ_STATS: Dict[str, int] = {
     "queued": 0, "queue_failed": 0,
     "replayed_ok": 0, "replayed_failed": 0,
     "expired": 0, "abandoned": 0,
+    "marker_write_failed": 0, "repair_marker_write_failed": 0,
+    "needs_repair": 0,
 }
-
 def reset_dlq_stats() -> None:
     for _k in DLQ_STATS:
         DLQ_STATS[_k] = 0
@@ -1108,11 +1109,20 @@ async def replay_telegram_dlq(sdb: Optional[RedisStateStore], telegram_queue: Te
     max_age = int(cfg.TELEGRAM_DLQ_MAX_AGE_SEC)
     max_attempts = int(cfg.TELEGRAM_DLQ_MAX_ATTEMPTS)
     prefix = escape_markdown_v2("⏳ Delayed alert — first send failed\n")
+
     for key, entry in entries:
         pair = str(entry.get("pair", ""))
         attempts = int(entry.get("attempts") or 0)
         age = now - int(entry.get("ts") or 0)
         delivered = bool(entry.get("delivered"))
+
+        # Terminal repair records require explicit reconciliation.
+        # Never automatically resend or repeat their side effects.
+        if entry.get("status") == "NEEDS_REPAIR":
+            DLQ_STATS["needs_repair"] = (
+                DLQ_STATS.get("needs_repair", 0) + 1
+            )
+            continue
 
         if not delivered:
             if age > max_age:
@@ -1135,16 +1145,32 @@ async def replay_telegram_dlq(sdb: Optional[RedisStateStore], telegram_queue: Te
                 else:
                     await sdb.dlq_set_attempts(key, entry, attempts + 1)
                 break   # Telegram is down: do not hammer it with the rest
-            # Delivered. Persist that fact BEFORE touching side effects, so a
-            # failure below can never cause a second send of the same alert.
-            entry = dict(entry, delivered=True, attempts=attempts + 1)
+            # Telegram accepted the message. Persist delivery status before
+            # attempting any outcome or state side effects.
+            entry = dict(
+                entry,
+                delivered=True,
+                attempts=attempts + 1,
+            )
+
             if not await sdb.dlq_save_entry(key, entry):
-                log.error(
-                    f"[{pair}] DLQ alert delivered but could not be marked delivered "
-                    f"(Redis) — it may be re-sent once"
+                DLQ_STATS["marker_write_failed"] = (
+                    DLQ_STATS.get("marker_write_failed", 0) + 1
                 )
 
-        # Side effects owed after a delivery (idempotent, resumable).
+                log.critical(
+                    "[%s] Telegram accepted DLQ message, but "
+                    "the delivered marker could not be persisted. "
+                    "Stopping replay to avoid further inconsistent "
+                    "side effects; duplicate delivery remains possible.",
+                    pair,
+                )
+
+                # Do not execute outcome/state side effects using an
+                # entry whose delivered status was not persisted.
+                # Stop processing further entries in this replay pass.
+                break
+
         all_ok = True
         outcomes = list(entry.get("outcomes") or [])
         done = int(entry.get("outcomes_done") or 0)
@@ -1178,16 +1204,19 @@ async def replay_telegram_dlq(sdb: Optional[RedisStateStore], telegram_queue: Te
         # and resume only the unfinished side effects next run, up to a limit.
         side_tries = int(entry.get("side_tries") or 0) + 1
         if side_tries >= max_attempts:
-            await sdb.dlq_delete(key)
-            DLQ_STATS["abandoned"] += 1
-            log.error(
-                f"[{pair}] DLQ alert was delivered but its outcome/state side effects "
-                f"failed {side_tries} times — giving up (trade may be missing from the Brain)"
-            )
+            repair_entry = dict(entry, outcomes_done=done, state_done=state_done, side_tries=side_tries, status="NEEDS_REPAIR", repair_reason="side_effect_retry_limit")
+            saved = await sdb.dlq_save_entry(key, repair_entry)
+            if saved:
+                DLQ_STATS["needs_repair"] = DLQ_STATS.get("needs_repair", 0) + 1
+                log.critical("[%s] DLQ side effects remain incomplete after %s attempts. Entry retained for repair: %s", pair, side_tries, key)
+            else:
+                DLQ_STATS["repair_marker_write_failed"] = DLQ_STATS.get("repair_marker_write_failed", 0) + 1
+                log.critical("[%s] DLQ side effects remain incomplete and NEEDS_REPAIR could not be persisted: %s", pair, key)
             continue
-        await sdb.dlq_save_entry(
-            key, dict(entry, outcomes_done=done, state_done=state_done, side_tries=side_tries),
-        )
+        saved = await sdb.dlq_save_entry(key, dict(entry, outcomes_done=done, state_done=state_done, side_tries=side_tries))
+        if not saved:
+            log.critical("[%s] Failed to persist DLQ side-effect progress for %s; the next replay may repeat work.", pair, key)
+            break
         DLQ_STATS["replayed_failed"] += 1
         log.warning(
             f"[{pair}] DLQ alert delivered; side effects incomplete — will resume next run "

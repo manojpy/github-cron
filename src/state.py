@@ -3007,67 +3007,77 @@ class RedisStateStore:
     async def atomic_batch_update(self, updates: Sequence[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0, _retried: bool = False) -> bool:
         if self.degraded or not self._redis:
             return False
-
         if not updates and not deletes:
             return True
-
         try:
+            now = int(time.time())
+
+            # Validate and serialize every update before queuing any Redis command.
+            validated_updates: List[Tuple[str, str, str]] = []
+            update_fields: Set[Tuple[str, str]] = set()
+            for key, state, custom_ts in (updates or []):
+                if not isinstance(key, str):
+                    logger.error("Invalid state update key type: %r", key)
+                    return False
+                pair, sep, field = key.partition(":")
+                if not sep or not pair or not field:
+                    logger.error("Invalid state update key: %r", key)
+                    return False
+                hash_key = f"{self.state_prefix}{pair}"
+                ts = custom_ts if custom_ts is not None else now
+                try:
+                    data = json_dumps({"state": state, "ts": ts})
+                except Exception:
+                    logger.exception("Failed to serialize state for %r", key)
+                    return False
+                validated_updates.append((hash_key, field, data))
+                update_fields.add((hash_key, field))
+
+            # Validate every delete before queuing any Redis command.
+            validated_deletes: List[Tuple[str, str]] = []
+            delete_fields: Set[Tuple[str, str]] = set()
+            for key in (deletes or []):
+                if not isinstance(key, str):
+                    logger.error("Invalid state delete key type: %r", key)
+                    return False
+                if not key:
+                    logger.error("Empty state delete key is invalid")
+                    return False
+                raw_key = key[len(self.state_prefix):] if key.startswith(self.state_prefix) else key
+                pair, sep, field = raw_key.partition(":")
+                if not sep or not pair or not field:
+                    logger.error("Invalid state delete key: %r", key)
+                    return False
+                hash_key = f"{self.state_prefix}{pair}"
+                validated_deletes.append((hash_key, field))
+                delete_fields.add((hash_key, field))
+
+            # Reject requests that update and delete the same field.
+            conflicts = update_fields.intersection(delete_fields)
+            if conflicts:
+                logger.error("Conflicting state updates and deletes: %r", sorted(conflicts))
+                return False
+
+            # All validation complete. Only now queue Redis commands.
             async with self._redis.pipeline() as pipe:
-                now = int(time.time())
                 touched_hashes: Set[str] = set()
-
-                hash_writes: Dict[str, Dict[str, str]] = {}
-                for key, state, custom_ts in (updates or []):
-                    pair, sep, field = key.partition(":")
-                    if not sep:
-                        logger.error(
-                            f"Skipping malformed state key (expected 'pair:field'): {key}"
-                        )
-                        continue
-                    ts = custom_ts if custom_ts is not None else now
-                    try:
-                        data = json_dumps({"state": state, "ts": ts})
-                    except Exception as e:
-                        logger.error(f"Failed to serialize state for {key}: {e}")
-                        continue
-                    hash_key = f"{self.state_prefix}{pair}"
-                    hash_writes.setdefault(hash_key, {})[field] = data
-
-                for hash_key, mapping in hash_writes.items():
-                    pipe.hset(hash_key, mapping=mapping)
+                for hash_key, field, data in validated_updates:
+                    pipe.hset(hash_key, field, data)
                     touched_hashes.add(hash_key)
-
                 hash_deletes: Dict[str, List[str]] = {}
-                for key in (deletes or []):
-                    if not key:
-                        continue
-                    raw_key = (
-                        key[len(self.state_prefix) :]
-                        if key.startswith(self.state_prefix)
-                        else key
-                    )
-                    pair, sep, field = raw_key.partition(":")
-                    if not sep:
-                        logger.error(
-                            f"Skipping malformed delete key (expected 'pair:field'): {key}"
-                        )
-                        continue
-                    hash_key = f"{self.state_prefix}{pair}"
+                for hash_key, field in validated_deletes:
                     hash_deletes.setdefault(hash_key, []).append(field)
-
                 for hash_key, fields in hash_deletes.items():
                     pipe.hdel(hash_key, *fields)
                     touched_hashes.add(hash_key)
-
                 if self.expiry_seconds > 0:
                     for hash_key in touched_hashes:
                         pipe.expire(hash_key, self.expiry_seconds)
-
                 await asyncio.wait_for(pipe.execute(), timeout=timeout)
             return True
         except asyncio.TimeoutError as e:
             if not _retried:
-                logger.warning("atomic_batch_update timed out — retrying once before degrading")
+                logger.warning("atomic_batch_update timed out; Redis execution status may be unknown. Retrying once under the existing policy.")
                 return await self.atomic_batch_update(updates, deletes, timeout, _retried=True)
             await self._record_redis_failure("atomic_batch_update", e)
             return False
