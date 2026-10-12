@@ -306,8 +306,6 @@ def hash_config_state(
         "BRAIN_AUDIT_MIN_HISTORY_RATIO",
         "ENABLE_UNCONFIRMED_SIGNAL_NOTICE",
     })
-
-    })
     try:
         for field_name in type(cfg).model_fields:
             if field_name in _NON_BEHAVIORAL_FIELDS:
