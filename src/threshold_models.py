@@ -579,6 +579,16 @@ def oos_permutation_importance(
     if len(train_rows) < min_sample or len(holdout_rows) < min_sample:
         return []
 
+    # ── Build feature matrices on a SHARED feat_names so holdout columns
+    #    line up with train columns; otherwise the feat_idx+1 shuffle index
+    #    below would point at different features in the two splits. ──
+    X_train, y_train, feat_names = build_market_state_features(train_rows)
+    X_hold, y_hold, _ = build_market_state_features(holdout_rows, feat_names)
+    if not feat_names:
+        return []
+
+    # ── Fit z-score params on TRAIN only, apply to both splits. Using
+    #    train-only stats on the holdout prevents eval→fit leakage. ──
     scaler = _fit_scaler(X_train, feat_names)
     X_train = _apply_scaler(X_train, scaler)
     X_hold = _apply_scaler(X_hold, scaler)
