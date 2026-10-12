@@ -582,6 +582,7 @@ def oos_permutation_importance(
     # ── Build feature matrices on a SHARED feat_names so holdout columns
     #    line up with train columns; otherwise the feat_idx+1 shuffle index
     #    below would point at different features in the two splits. ──
+
     X_train, y_train, feat_names = build_market_state_features(train_rows)
     X_hold, y_hold, _ = build_market_state_features(holdout_rows, feat_names)
     if not feat_names:
@@ -672,6 +673,14 @@ def train_market_state_model(
 
     X_train, y_train, feat_names = build_market_state_features(train_rows)
     X_hold, y_hold, _ = build_market_state_features(holdout_rows, feat_names)
+
+    # ── Fit on TRAIN, apply to both. The scaler is returned below and
+    #    re-applied by predict_market_state_proba at serve time — so the
+    #    live feature distribution matches the one the coefficients saw. ──
+    scaler = _fit_scaler(X_train, feat_names)
+    X_train = _apply_scaler(X_train, scaler)
+    X_hold = _apply_scaler(X_hold, scaler)
+
     sw_train = (
         _pnl_sample_weights(train_rows)
         if getattr(cfg, "ENABLE_PNL_WEIGHTED_TRAINING", True)
