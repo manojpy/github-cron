@@ -301,13 +301,7 @@ class BrainAuditLayer:
         _EV_FIRST_CACHE.clear()
 
     # ── Data Population ───────────────────────────────────────────────
-
-    def set_history_coverage(
-        self,
-        rows: List[Dict[str, Any]],
-        requested_days: Optional[int] = None,
-        analysis_rows: Optional[List[Dict[str, Any]]] = None,
-    ) -> HistoryCoverage:
+    def set_history_coverage(self, rows: List[Dict[str, Any]], requested_days: Optional[int] = None, analysis_rows: Optional[List[Dict[str, Any]]] = None) -> HistoryCoverage:
         """Compute and store history coverage from loaded rows.
 
         `rows` = long-window rows (used for the history SPAN).
@@ -386,16 +380,7 @@ class BrainAuditLayer:
         )
         return self._history
 
-    def set_reconciliation(
-        self,
-        pending_count: Optional[int] = None,
-        resolved_this_run: Optional[int] = None,
-        archived_this_run: Optional[int] = None,
-        total_archived: Optional[int] = None,
-        loaded_by_brain: int = 0,
-        shadow_loaded: int = 0,
-        archive_stats: Optional[Dict[str, int]] = None,
-    ) -> OutcomeReconciliation:
+    def set_reconciliation(self, pending_count: Optional[int] = None, resolved_this_run: Optional[int] = None, archived_this_run: Optional[int] = None, total_archived: Optional[int] = None, loaded_by_brain: int = 0, shadow_loaded: int = 0, archive_stats: Optional[Dict[str, int]] = None) -> OutcomeReconciliation:
         """Record outcome reconciliation data."""
         self._n_shadow_rows = shadow_loaded
         self._archive_stats = archive_stats
@@ -538,16 +523,8 @@ class BrainAuditLayer:
             return RecommendationTier.CANDIDATE
         return RecommendationTier.DESCRIPTIVE
 
-    # ── Analysis Health Recording ────────────────────────────────────��
-
-    def record_analysis(
-        self,
-        name: str,
-        status: HealthStatus,
-        detail: str = "",
-        error: Optional[str] = None,
-        duration_ms: float = 0.0,
-    ) -> None:
+    # ── Analysis Health Recording ────────────────────────────────────
+    def record_analysis(self, name: str, status: HealthStatus, detail: str = "", error: Optional[str] = None, duration_ms: float = 0.0) -> None:
         """Record the health outcome of an analytical component."""
         self._analysis_health[name] = AnalysisHealthEntry(
             name=name,
@@ -567,9 +544,7 @@ class BrainAuditLayer:
                     f"Brain audit: analysis '{name}' FAILED: {error or detail}"
                 )
 
-    def record_analysis_exception(
-        self, name: str, exc: Exception
-    ) -> None:
+    def record_analysis_exception(self, name: str, exc: Exception) -> None:
         """Record a silent-failure path that was caught by try/except."""
         self.record_analysis(
             name,
@@ -579,15 +554,7 @@ class BrainAuditLayer:
         )
 
     # ── CUSUM Watermark Diagnostics ───────────────────────────────────
-
-    def validate_cusum_watermark(
-        self,
-        alert_key: str,
-        watermark: int,
-        newest_row_ts: int,
-        rows_consumed: int,
-        state_n: int = 0,
-    ) -> Optional[str]:
+    def validate_cusum_watermark(self, alert_key: str, watermark: int, newest_row_ts: int, rows_consumed: int, state_n: int = 0) -> Optional[str]:
         """Sanity-check a CUSUM watermark against the data actually loaded.
         (Comparing old vs new watermark is vacuous: new rows are already
         filtered to entry_ts > watermark.) Returns a warning or None."""
@@ -610,7 +577,6 @@ class BrainAuditLayer:
         return msg
 
     # ── Report Generation ─────────────────────────────────────────────
-
     def build_data_quality_header(self) -> List[str]:
         """Build the 📊 BRAIN DATA QUALITY section for the report."""
         lines: List[str] = []
@@ -660,9 +626,7 @@ class BrainAuditLayer:
         lines.append("")
         return lines
 
-    def build_action_gate_summary(
-        self, action_gate: Dict[str, Any]
-    ) -> List[str]:
+    def build_action_gate_summary(self, action_gate: Dict[str, Any]) -> List[str]:
         """Build explicit action gate status for the report."""
         lines: List[str] = []
         actionable = action_gate.get("actionable", False)
@@ -695,7 +659,6 @@ class BrainAuditLayer:
         return lines
 
     # ── Read-only accessors used by the layered Brain report ─────────
-
     def history_span(self) -> Optional[Tuple[float, int]]:
         """(days of history actually loaded, days requested), or None if the
         history coverage has not been computed yet."""
@@ -760,13 +723,7 @@ class BrainAuditLayer:
             )
         return f"{metric_name}: {value_str} (historical estimate)"
 
-    def qualify_verdict(
-        self,
-        net_ev: float,
-        wr: float,
-        n: int,
-        p_ev_positive: float = 0.0,
-    ) -> str:
+    def qualify_verdict(self, net_ev: float, wr: float, n: int, p_ev_positive: float = 0.0) -> str:
         """Statistically disciplined verdict instead of absolute claims."""
         confidence = self.statistical_confidence_label()
 
@@ -837,15 +794,7 @@ class BrainAuditLayer:
             )
 
     # ── Schema Migration Advisory ─────────────────────────────────────
-
-    def schema_migration_advisory(
-        self,
-        current_version: int,
-        stale_count: int,
-        migrated_count: int,
-        unmigratable_count: int,
-        total_archive_rows: int,
-    ) -> Optional[str]:
+    def schema_migration_advisory(self, current_version: int, stale_count: int, migrated_count: int, unmigratable_count: int, total_archive_rows: int) -> Optional[str]:
         """Advise on schema migration health. With the migration layer active,
         stale rows are mapped forward rather than dropped. This advisory now
         reports migration success and flags genuinely lost rows."""

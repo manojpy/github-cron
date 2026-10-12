@@ -229,14 +229,7 @@ def _opt_fill_price(v: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
-def load_archived_outcomes(
-    data_dir: str,
-    window_days: int = 30,
-    shadow: bool = False,
-    *,
-    drop_stale_schema: bool = True,
-    return_stats: bool = False,
-):
+def load_archived_outcomes(data_dir: str, window_days: int = 30, shadow: bool = False, *, drop_stale_schema: bool = True, return_stats: bool = False):
     """Load outcomes from archived JSONL files (newest first).
 
     Rows are filtered on three axes:

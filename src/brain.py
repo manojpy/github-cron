@@ -68,12 +68,7 @@ class BrainCore:
         self._playbook_cache: Optional[Dict[str, Any]] = None
         self._playbook_cache_ts = 0.0
 
-    async def check_rewardable_override(
-        self,
-        alert_key: str,
-        confluence_score: Optional[float],
-        confluence_total: Optional[float],
-    ) -> Optional[str]:
+    async def check_rewardable_override(self, alert_key: str, confluence_score: Optional[float], confluence_total: Optional[float]) -> Optional[str]:
         """Returns a short reason string if a win-rate-rejected alert should be
         let through anyway, else None. Conservative by design: requires both a
         high confluence score on THIS alert and a proven shadow win rate for
@@ -189,9 +184,7 @@ class BrainCore:
             tips[kind] = str(entries[0][0]) if entries else "0-0"
         return tips
 
-    async def _fold_new_outcomes_into_calibration(
-        self, calib: Dict[str, Any], logger_run: logging.Logger,
-    ) -> None:
+    async def _fold_new_outcomes_into_calibration(self, calib: Dict[str, Any], logger_run: logging.Logger) -> None:
         """Fold outcomes appended to the streams since the last fold/rebuild
         into the existing buckets, then re-persist.
 
@@ -384,7 +377,6 @@ class BrainCore:
                 f"(gate continues on previous curve if present): {e}"
             )
     
-
     async def _load_calibration_curve(self, alert_key: str) -> Optional[Dict[str, Any]]:
         now = time.time()
         if self._calib_cache is None or now - self._calib_cache_ts > 300:
@@ -493,9 +485,7 @@ class BrainCore:
             self._ml_calib_cache_ts = now
         return self._ml_calib_cache
 
-    async def check_calibration_gate(
-        self, alert_key: str, conf_pct: float,
-    ) -> Tuple[bool, Optional[float]]:
+    async def check_calibration_gate(self, alert_key: str, conf_pct: float) -> Tuple[bool, Optional[float]]:
         """Dispatch hook: (pass, calibrated_wr). Fail-open on any
         missing/thin data — this gate blocks on evidence of
         miscalibration, never on its own absence."""
@@ -578,17 +568,7 @@ class BrainCore:
             logging.getLogger("macd_bot").debug(f"playbook lookup failed: {e}")
             return None
 
-    async def get_trade_quality(
-        self,
-        pair: str,
-        alert_key: str,
-        direction: str,
-        conf_pct: float,
-        adx_val: Optional[float] = None,
-        live_context: Optional[Dict[str, Any]] = None,
-        votes: Optional[Dict[str, bool]] = None,
-        session: str = "unknown",
-    ) -> Optional[Dict[str, Any]]:
+    async def get_trade_quality(self, pair: str, alert_key: str, direction: str, conf_pct: float, adx_val: Optional[float] = None, live_context: Optional[Dict[str, Any]] = None, votes: Optional[Dict[str, bool]] = None, session: str = "unknown") -> Optional[Dict[str, Any]]:
         """Dispatch hook: report-only trade-quality verdict for one
         prospective alert, from the per-alert EV/regime evidence the last
         brain report persisted, optionally blended with a live per-trade
@@ -740,7 +720,7 @@ class BrainCore:
         except Exception:
             return False
 
-    # ── Stream reading helpers ────────���──────────────────────────�����─────────
+    # ── Stream reading helpers ─────────────────────────────────�����─────────
 
     async def _read_stream(self, stream_key: str, count: int) -> List[Dict[str, str]]:
         """Read the most recent `count` entries from an outcome stream."""
@@ -884,9 +864,7 @@ class BrainCore:
 
         return real_rows, shadow_rows
 
-    async def _get_layered_window_rows(
-        self,
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    async def _get_layered_window_rows(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Real-outcome rows for the recent/medium/long-history comparison
         (layered_window_analysis). Medium and long are chronological
         supersets of recent, not separate populations, so this re-filters
@@ -930,9 +908,7 @@ class BrainCore:
         self._cusum_detectors[alert_key] = det
         return det
 
-    async def _check_cusum_drift(
-        self, real_rows: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
+    async def _check_cusum_drift(self, real_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Run CUSUM over rows per alert_key, but only the ones not already
         fed in a previous report cycle — real_rows is a rolling window read
         fresh every run, so without a watermark the same trades would be
@@ -1021,12 +997,7 @@ class BrainCore:
         return drift_alerts
 
     @staticmethod
-    def _reenable_evidence(
-        alert_key: str,
-        shadow_rows: List[Dict[str, Any]],
-        disabled_at: Optional[float],
-        now_ts: float,
-    ) -> Tuple[bool, Dict[str, Any]]:
+    def _reenable_evidence(alert_key: str, shadow_rows: List[Dict[str, Any]], disabled_at: Optional[float], now_ts: float) -> Tuple[bool, Dict[str, Any]]:
         """Decide whether a brain-disabled alert key has earned re-enabling.
 
         Evidence must be FRESH: shadow outcomes tagged "brain_disabled",
@@ -1154,12 +1125,7 @@ class BrainCore:
             f"\n… (truncated, {cut_chars} more characters)"
         )
         
-    async def maybe_generate_report(
-        self,
-        pairs: List[str],
-        telegram_queue: Any,
-        logger_run: logging.Logger,
-    ) -> None:
+    async def maybe_generate_report(self, pairs: List[str], telegram_queue: Any, logger_run: logging.Logger) -> None:
         """Increment the persisted run counter; if the report interval has
         elapsed, generate and send the analysis report."""
         # FIX #4: guard against zero/negative interval

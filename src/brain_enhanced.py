@@ -90,10 +90,7 @@ class BrainEngineV2(BrainCore):
         ]] = None
 
     @staticmethod
-    def _shadow_weight_check(
-        shadow_rows, current_weights, suggested_weights,
-        min_n=15, max_wr_drop=0.05,
-    ):
+    def _shadow_weight_check(shadow_rows, current_weights, suggested_weights, min_n=15, max_wr_drop=0.05):
         """Out-of-sample veto on proposed weight changes.
 
         FIX (Priority 4): Reproduces the ACTUAL live confluence gate:
@@ -146,12 +143,7 @@ class BrainEngineV2(BrainCore):
         return True, f"shadow WR stable {cur_wr:.0%}→{new_wr:.0%}, EV {cur_ev:+.3f}%→{new_ev:+.3f}% (n={new_n})"
 
     @staticmethod
-    def _action_gate_check(
-        real_rows: List[Dict[str, Any]],
-        min_sample: int = 20,
-        recommendations: Optional[List[Dict[str, Any]]] = None,
-        active_drift_keys: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
+    def _action_gate_check(real_rows: List[Dict[str, Any]], min_sample: int = 20, recommendations: Optional[List[Dict[str, Any]]] = None, active_drift_keys: Optional[List[str]] = None) -> Dict[str, Any]:
         """Six-layer confirmation gate. Returns which patches are actionable.
 
         `active_drift_keys` is the persisted CUSUM alarm set (s_neg > h),
@@ -431,9 +423,7 @@ class BrainEngineV2(BrainCore):
         base["_shadow_rows"] = shadow_rows
         return base
 
-    async def _record_plan_event(
-        self, plan_id: Optional[str], status: str, note: Optional[str] = None,
-    ) -> None:
+    async def _record_plan_event(self, plan_id: Optional[str], status: str, note: Optional[str] = None) -> None:
         """Append one lifecycle event (blocked/pending/superseded/applied/
         rolled_back/monitor_cleared) to the capped Brain plan audit trail and
         persist it as the current plan state (PLAN_STATE_KEY). Each event records
@@ -955,11 +945,7 @@ class BrainEngineV2(BrainCore):
             logging.getLogger("macd_bot").debug(f"Apply-snapshot write failed (non-fatal): {e}")
             return False
 
-    async def _save_apply_snapshot(
-        self, plan_id: Optional[str],
-        overrides: Dict[str, Any], disabled: Dict[str, Any],
-        weights: Optional[Dict[str, Any]],
-    ) -> None:
+    async def _save_apply_snapshot(self, plan_id: Optional[str], overrides: Dict[str, Any], disabled: Dict[str, Any], weights: Optional[Dict[str, Any]]) -> None:
         """Remember how to undo an applied plan. Best-effort; never raises."""
         if not (overrides or disabled or weights):
             return
@@ -1025,9 +1011,7 @@ class BrainEngineV2(BrainCore):
                 (out["reverted"] if ok else out["failed"]).append("dynamic_weights")
         return out
 
-    async def monitor_applied_plans(
-        self, rows: List[Dict[str, Any]], logger_run: logging.Logger,
-    ) -> List[Dict[str, Any]]:
+    async def monitor_applied_plans(self, rows: List[Dict[str, Any]], logger_run: logging.Logger) -> List[Dict[str, Any]]:
         """Objective post-apply harm check with automatic revert (roadmap #6).
 
         For each active snapshot older than BRAIN_ROLLBACK_MIN_HOURS, compare
