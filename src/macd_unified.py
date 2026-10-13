@@ -1323,17 +1323,15 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         logger_main.warning(f"Trade-update notice failed (non-fatal): {e}")
 
     # All-time Recorded / Shadowed totals (from beginning of data collection).
-    # ~4 SCANs plus large pipelines just to print a log line, so only when a trade
-    # resolved or closed this run (otherwise the totals cannot have changed).
-    if _totals_changed:
-        try:
-            cum = await state_db.get_cumulative_outcome_stats()
-            for source in ("Recorded", "Shadowed"):
-                icon = "📝" if source == "Recorded" else "👁"
-                logger_main.info(format_outcome_totals(source, cum.get(source), icon))
-
-        except Exception as exc:
-            logger_main.warning(f"Cumulative outcome stats log failed: {exc}")
+    # Always log on every run so operators see the current win-rate snapshot
+    # even when no trade resolved this cycle.
+    try:
+        cum = await state_db.get_cumulative_outcome_stats()
+        for source in ("Recorded", "Shadowed"):
+            icon = "📝" if source == "Recorded" else "👁"
+            logger_main.info(format_outcome_totals(source, cum.get(source), icon))
+    except Exception as exc:
+        logger_main.warning(f"Cumulative outcome stats log failed: {exc}")
 
     logger_main.debug(
         f"Results: {len(valid_results)} successful, {len(results) - len(valid_results)} failed"
