@@ -1247,6 +1247,14 @@ async def send_trade_close_notices(sdb: RedisStateStore, telegram_queue: Telegra
     }
     icon = {"target": "✅", "stop": "🛑", "both": "⚠️"}
     events.sort(key=lambda e: (e["source"] != "Recorded", e["pair"], e["entry_ts"]))
+    # A pair/candle can hold a Recorded row (alert A passed) and a Shadowed row
+    # (alert B on the same candle was filtered). Same entry, same bracket, so they
+    # close together: announce the trade once, as Recorded.
+    _recorded = {(e["pair"], e["direction"], e["entry_ts"]) for e in events if e["source"] == "Recorded"}
+    events = [
+        e for e in events
+        if e["source"] == "Recorded" or (e["pair"], e["direction"], e["entry_ts"]) not in _recorded
+    ]
 
     lines = ["🎯 Trade updates"]
     for e in events[:30]:

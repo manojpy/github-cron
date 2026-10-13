@@ -203,7 +203,9 @@ def regime_transition_analysis(rows: List[Row], min_sample: int = 15, lookback_s
     }
     with_adx = [
         r for r in rows
-        if r.get("adx_val") is not None and r.get("ts") is not None
+        if r.get("adx_val") is not None and r.get("entry_ts") is not None
+
+
     ]
     if len(with_adx) < min_sample * 2:
         result["error"] = "insufficient_adx_tagged_rows"
@@ -232,7 +234,7 @@ def regime_transition_analysis(rows: List[Row], min_sample: int = 15, lookback_s
             stable_streak += 1
         else:
             if stable_streak >= lookback_stable:
-                ts = int(with_adx[i]["ts"])
+                ts = int(with_adx[i]["entry_ts"])
                 transition_events.append({
                     "ts": ts,
                     "from": prev_reg,
@@ -253,7 +255,9 @@ def regime_transition_analysis(rows: List[Row], min_sample: int = 15, lookback_s
 
     for i, r in enumerate(with_adx):
         cur_reg = _reg(r)
-        ts = int(r["ts"])
+        ts = int(r["entry_ts"])
+
+
         if i > 0 and cur_reg != prev_reg:
             if stable_streak >= lookback_stable:
                 active_post_until = ts + post_window_sec
@@ -308,8 +312,9 @@ def strategy_vs_regime_attribution(rows: List[Row], min_sample: int = 30, recent
         return result
 
     sorted_rows = sorted(
-        [r for r in rows if r.get("ts") is not None],
-        key=lambda r: int(r["ts"]),
+        [r for r in rows if r.get("entry_ts") is not None],
+        key=lambda r: int(r["entry_ts"])
+
     )
     if len(sorted_rows) < min_sample:
         result["error"] = "insufficient_timestamped"
@@ -899,9 +904,15 @@ def classify_strategy_state(rows: List[Row], recent_days: float = 14, min_recent
         })
         return out
 
-    expected = sum(
-        g["recent_share"] * g["older_wr"] for g in regimes.values() if g["older_wr"] is not None
+    # Renormalise over regimes that have a historical WR: a recent regime with no
+    # history (but too small to trip the thin-regime check) must not drag the
+    # expected WR toward zero and turn a real decline into "REGIME_SHIFT".
+    _w = sum(g["recent_share"] for g in regimes.values() if g["older_wr"] is not None)
+    expected = (
+        sum(g["recent_share"] * g["older_wr"] for g in regimes.values() if g["older_wr"] is not None) / _w
+        if _w > 0 else r_wr
     )
+
     mix_adj = expected - r_wr
     out["expected_recent_wr"] = round(expected, 4)
     out["mix_adjusted_drop"] = round(mix_adj, 4)
@@ -911,7 +922,7 @@ def classify_strategy_state(rows: List[Row], recent_days: float = 14, min_recent
     var_expected = sum(
         (g["recent_share"] ** 2) * (g["older_wr"] * (1 - g["older_wr"])) / g["older_n"]
         for g in regimes.values() if g["older_wr"] is not None and g["older_n"] > 0
-    )
+    ) / (_w ** 2 if _w > 0 else 1.0)
     se_mix = math.sqrt(var_recent + var_expected)
     mix_p = 0.5 * math.erfc((mix_adj / se_mix) / math.sqrt(2)) if se_mix > 0 else 1.0
     out["mix_adjusted_p_value"] = round(mix_p, 4)
@@ -1233,20 +1244,19 @@ def interaction_miner(rows: List[Row], min_sample: int = 20) -> List[Dict[str, A
             # Baseline = the strongest of whichever comparison arms have
             # sufficient data. v1-alone always qualifies (outer gate), so
             # valid_baselines is never empty.
-            valid_baselines = [wr_only_v1]
+            _arms = [(wr_only_v1, wins_only_v1, n_only_v1)]
             if wr_only_v2 is not None:
-                valid_baselines.append(wr_only_v2)
+                _arms.append((wr_only_v2, sum(r["win"] for r in only_v2), n_only_v2))
             if wr_neither is not None:
-                valid_baselines.append(wr_neither)
-            synergy_baseline = max(valid_baselines)
+                _arms.append((wr_neither, sum(r["win"] for r in neither), n_neither))
+            synergy_baseline, _bw, _bn = max(_arms, key=lambda a: a[0])
 
             synergy = wr_both - synergy_baseline
             if synergy > 0.10:
-                # Significance test: together vs v1-alone. v1-alone is the
-                # one arm guaranteed valid by the outer gate, so the test
-                # is always computable.
+                # Significance test: together vs the arm that SET the baseline
+                # (always computable: every arm in _arms cleared min_sample).
                 p = two_proportion_p_value(
-                    wins_both, n_both, wins_only_v1, n_only_v1
+                    wins_both, n_both, _bw, _bn
                 )
                 entry: Dict[str, Any] = {
                     "pair": (v1, v2),

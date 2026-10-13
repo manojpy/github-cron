@@ -164,6 +164,10 @@ def _plan_line(plan: Optional[Dict[str, float]], default_sl: float, rr: float, d
     if plan:
         r1, r2 = plan["tp1"] / plan["sl"], plan["tp2"] / plan["sl"]
         tag = " · validated zone" if plan.get("validated") else ""
+        # The recorded trade is graded on the fixed config bracket (SL / TP =
+        # SL x RR from the next candle's open), not on this learned plan. Say so,
+        # otherwise the SL shown here is read as the level that closes the trade.
+        tag += f" · scored SL {default_sl:.2f}% / TP {default_sl * rr:.2f}%"
         if use_px:
             return (f"🛡 SL {_px(_level(px, direction, plan['sl'], False))}"
                     f" | TP1 {_px(_level(px, direction, plan['tp1'], True))} ({r1:.1f}R)"
@@ -221,7 +225,7 @@ def _advise_pair_core(*, direction: str, score: Optional[float], total: Optional
     weak = _support_labels(votes, vote_weights, False, 2)
     support_txt = _support_text(votes, vote_weights, support)
 
-    # ═════════ no brain data at all ═════════
+    # ═════════ no brain data at all ═══��═════
     if not data:
         strong_bar = (unproven_take_min_pct if unproven_take_min_pct is not None else 90.0) / 100.0
         qualifier = ""

@@ -1364,7 +1364,9 @@ class RedisStateStore:
                 lambda: _rc(self._redis).zadd(index_key, {key: int(ts)}),
                 1.5, f"dlq_index_add:{pair}",
             )
-            if not indexed:
+            # ZADD returns 0 for a member already in the index (stale entry from an
+            # identical earlier push), which is still a success; only None = failure.
+            if indexed is None:
                 await self._safe_redis_op(
                     lambda: _rc(self._redis).delete(key),
                     1.5, f"dlq_push_rollback:{pair}",
