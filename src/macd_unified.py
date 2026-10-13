@@ -1314,7 +1314,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             )
             if _freed:
                 logger_main.info(f"🔓 Heat gate: freed {_freed} closed position(s)")
-    _totals_changed = bool(getattr(state_db, "_run_resolved_total", 0) or state_db.trade_close_events)
     try:
         announced = await send_trade_close_notices(state_db, telegram_queue, logger_main)
         if announced:
