@@ -660,8 +660,8 @@ class BrainEngineV2(BrainCore):
                 for p in config_patches:
                     param_diffs.append({
                         "field": p.get("field") or p.get("path"),
-                        "old": p.get("old_value") or p.get("old"),
-                        "new": p.get("new_value") or p.get("new") or p.get("value"),
+                        "old": p.get("current"),
+                        "new": p.get("suggested"),
                         "reason": p.get("reason") or p.get("source"),
                     })
                 for w in weight_adjustments:
