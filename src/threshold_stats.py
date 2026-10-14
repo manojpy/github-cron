@@ -531,7 +531,7 @@ def _resolve_costs(fee_pct: Optional[float], slippage_pct: Optional[float]) -> T
     slip = float(getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003)) if slippage_pct is None else float(slippage_pct)
     return fee, slip
 
-def ev_and_kelly_for(rows: List[Row], fee_pct: float = 0.0006, slippage_pct: float = 0.0003) -> Tuple[float, float, float]:
+def ev_and_kelly_for(rows: List[Row], fee_pct: Optional[float] = None, slippage_pct: Optional[float] = None) -> Tuple[float, float, float]:
     """Net EV after round-trip fees + slippage, plus Half-Kelly fraction.
     Returns (net_ev_pct, half_kelly_fraction, win_rate).
 
