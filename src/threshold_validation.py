@@ -492,7 +492,7 @@ def find_wr_change_point(rows: List[Row], min_side: int = 25, min_delta: float =
     best["valid"] = True
     return best
 
-def _holdout_ev_check(rows: List[Row], fee_pct: Optional[float] = None, and slippage_pct: Optional[float] = None) -> Optional[Dict[str, float]]:
+def _holdout_ev_check(rows: List[Row], fee_pct: Optional[float] = None, slippage_pct: Optional[float] = None) -> Optional[Dict[str, float]]:
     """Net EV and P(true mean P&L > 0) for a SMALL holdout, without the block
     bootstrap (which needs >= 60 rows and so can never confirm a 20-59 row
     holdout). Uses the per-trade net P&L (same bracket model as everywhere
