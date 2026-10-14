@@ -127,145 +127,14 @@ class TelegramQueue:
         self.sent_ok = 0
         self.sent_failed = 0
 
-    @staticmethod
-    def _send_budget_sec() -> float:
-        """Outer deadline for one send().
-
-        Must exceed worst-case work inside _send_core:
-          - HTTP timeout 20s per attempt
-          - 429 sleep up to CIRCUIT_BREAKER_MAX_WAIT + jitter per attempt
-          - inter-attempt compute_backoff for non-429 failures
-        Plus a small margin so the outer wait_for does not cancel an in-flight
-        POST that Telegram may already have accepted (duplicate via DLQ).
-        """
-        http_timeout = 20.0
-        max_429 = float(Constants.CIRCUIT_BREAKER_MAX_WAIT) + 0.5
-        per_attempt = http_timeout + max_429
-        between = sum(
-            compute_backoff(1.0, a) for a in range(1, max(cfg.TELEGRAM_RETRIES, 1))
-        )
-        return float(cfg.TELEGRAM_RETRIES) * per_attempt + between + 15.0
-
-    async def _send_core(
-        self,
-        message: str,
-        reply_markup: Optional[Dict[str, Any]] = None,
-    ) -> Optional[int]:
-        """Single send implementation.
-
-        Returns:
-          - True-equivalent path: returns a truthy int message_id when markup
-            was requested, or 1 when plain send succeeded (caller maps to bool).
-          - None / falsy on failure.
-
-        Delivery rules:
-          - HTTP 200 with unreadable body → treat as delivered (avoid duplicate).
-          - HTTP 429 does not consume a retry slot; loop is still bounded by
-            the outer asyncio.wait_for deadline in send() / send_with_markup().
-          - parse-entities 400 → one plain-text retry (same as before).
-        """
-        await self.token_bucket.acquire()
-        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-        params: Dict[str, Any] = {
-            "chat_id": self.chat_id,
-            "text": message,
-            "parse_mode": "MarkdownV2",
-        }
-        if reply_markup is not None:
-            params["reply_markup"] = json_dumps(reply_markup)
-
-        session = await SessionManager.get_session()
-        attempts_used = 0
-        t0 = time.monotonic()
-        budget = self._send_budget_sec()
-
-        while attempts_used < cfg.TELEGRAM_RETRIES:
-            if shutdown_event.is_set():
-                return None
-            if time.monotonic() - t0 > budget:
-                logger.warning("Telegram send budget exhausted before next attempt")
-                return None
-
-            attempts_used += 1
-            try:
-                async with session.post(
-                    url, data=params, timeout=aiohttp.ClientTimeout(total=20)
-                ) as resp:
-                    if resp.status == 429:
-                        wait_sec = min(
-                            int(resp.headers.get("Retry-After", 1)),
-                            Constants.CIRCUIT_BREAKER_MAX_WAIT,
-                        )
-                        # Backpressure is not a failed delivery — refund the attempt.
-                        attempts_used -= 1
-                        await asyncio.sleep(wait_sec + random.uniform(0.1, 0.5))
-                        continue
-
-                    if resp.status == 200:
-                        try:
-                            body = await resp.json(content_type=None)
-                        except Exception:
-                            # 200 with unreadable body: Telegram accepted it.
-                            # Retrying would risk a duplicate.
-                            return 1 if reply_markup is None else None  # id unknown
-                        if isinstance(body, dict) and body.get("ok") is False:
-                            logger.error(
-                                f"Telegram returned HTTP 200 with ok=false: {body}"
-                            )
-                            return None
-                        if reply_markup is not None:
-                            return (body or {}).get("result", {}).get("message_id")
-                        return 1
-
-                    if resp.status in (400, 401, 403, 404):
-                        response_text = await resp.text()
-                        try:
-                            response_json = json.loads(response_text)
-                            description = response_json.get(
-                                "description", response_text
-                            )
-                        except Exception:
-                            description = response_text
-                        logger.error(
-                            f"Telegram API error {resp.status}: {description} | "
-                            f"chat_id={getattr(self, 'chat_id', '?')}"
-                        )
-                        if (
-                            resp.status == 400
-                            and "parse entities" in str(description).lower()
-                            and params.get("parse_mode")
-                        ):
-                            params.pop("parse_mode", None)
-                            params["text"] = re.sub(
-                                r"\\(.)", r"\1", str(params["text"])
-                            )
-                            attempts_used -= 1  # formatting retry is free
-                            continue
-                        return None
-
-                    raise Exception(f"Telegram API error {resp.status}")
-
-            except Exception as e:
-                logger.warning(
-                    f"Telegram send attempt {attempts_used} failed: {e}"
-                )
-                if attempts_used < cfg.TELEGRAM_RETRIES:
-                    delay = compute_backoff(1.0, attempts_used)
-                    logger.debug(
-                        f"Retrying Telegram request in {delay:.1f}s "
-                        f"(attempt {attempts_used})..."
-                    )
-                    await asyncio.sleep(delay)
-
-        return None
-
     async def send(self, message: str, priority: str = "normal") -> bool:
         try:
-            result = await asyncio.wait_for(
-                self._send_core(message),
-                timeout=self._send_budget_sec(),
+            ok = bool(
+                await asyncio.wait_for(
+                    self._send_impl(message),
+                    timeout=self._send_budget_sec(),
+                )
             )
-            ok = bool(result)
             if ok:
                 self.sent_ok += 1
             else:
@@ -280,15 +149,78 @@ class TelegramQueue:
                 raise
             return False
 
-    async def send_with_markup(
-        self, message: str, reply_markup: Dict[str, Any]
-    ) -> Optional[int]:
+    @staticmethod
+    def _send_budget_sec() -> float:
+        """Outer deadline for one send(). It must be longer than every attempt
+        _send_impl may make (20s each, plus backoff), otherwise the outer cancel
+        can fire while a request is in flight, report failure after Telegram has
+        actually delivered, and park a duplicate in the DLQ."""
+        return float(cfg.TELEGRAM_RETRIES) * 25.0 + 15.0
+
+    async def _send_impl(self, message: str) -> bool:
+        await self.token_bucket.acquire()
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        params = {"chat_id": self.chat_id, "text": message, "parse_mode": "MarkdownV2"}
+        session = await SessionManager.get_session()
+        for attempt in range(1, cfg.TELEGRAM_RETRIES + 1):
+            if shutdown_event.is_set():
+                return False
+            try:
+                async with session.post(url, data=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    if resp.status == 429:
+                        wait_sec = min(int(resp.headers.get("Retry-After", 1)), Constants.CIRCUIT_BREAKER_MAX_WAIT)
+                        await asyncio.sleep(wait_sec + random.uniform(0.1, 0.5))
+                        continue
+                    if resp.status == 200:
+                        try:
+                            _body = await resp.json(content_type=None)
+                        except Exception:
+                            # 200 with an unreadable body: Telegram accepted it.
+                            # Retrying here would risk a duplicate message.
+                            return True
+                        if isinstance(_body, dict) and _body.get("ok") is False:
+                            logger.error(f"Telegram returned HTTP 200 with ok=false: {_body}")
+                            return False
+                        return True
+                    if resp.status in (400, 401, 403, 404):
+                        response_text = await resp.text()
+                        try:
+                            response_json = json.loads(response_text)
+                            description = response_json.get("description", response_text)
+                        except Exception:
+                            description = response_text
+                        logger.error(
+                            f"Telegram API error {resp.status}: {description} | "
+                            f"chat_id={getattr(self, 'chat_id', '?')}"
+                        )
+                        if (resp.status == 400 and "parse entities" in str(description).lower()
+                                and params.get("parse_mode")):
+                            # A formatting bug must not lose the alert: resend once as
+                            # plain text (escape backslashes removed) instead of parking
+                            # a message that can never parse.
+                            params.pop("parse_mode", None)
+                            params["text"] = re.sub(r"\\(.)", r"\1", str(params["text"]))
+                            continue
+                        return False
+                    raise Exception(f"Telegram API error {resp.status}")
+
+            except Exception as e:
+                logger.warning(f"Telegram send attempt {attempt} failed: {e}")
+                if attempt < cfg.TELEGRAM_RETRIES:
+                    delay = compute_backoff(1.0, attempt)
+                    logger.debug(f"Retrying Telegram request in {delay:.1f}s (attempt {attempt})...")
+                    await asyncio.sleep(delay)
+        return False
+
+    async def send_with_markup(self, message: str, reply_markup: Dict[str, Any]) -> Optional[int]:
         """Like send(), but attaches an inline keyboard and returns the sent
         message_id (needed later to edit the buttons off) instead of a bool.
+        Kept as a separate method rather than changing send()'s return type,
+        since every existing call site depends on send() returning bool.
         Returns None on failure — treat the same as a failed send()."""
         try:
             return await asyncio.wait_for(
-                self._send_core(message, reply_markup=reply_markup),
+                self._send_impl_with_markup(message, reply_markup),
                 timeout=self._send_budget_sec(),
             )
         except asyncio.CancelledError:
@@ -298,6 +230,57 @@ class TelegramQueue:
             if cfg.FAIL_ON_TELEGRAM_DOWN:
                 raise
             return None
+
+    async def _send_impl_with_markup(self, message: str, reply_markup: Dict[str, Any]) -> Optional[int]:
+        await self.token_bucket.acquire()
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        params = {
+            "chat_id": self.chat_id, "text": message, "parse_mode": "MarkdownV2",
+            "reply_markup": json_dumps(reply_markup),
+        }
+        session = await SessionManager.get_session()
+        for attempt in range(1, cfg.TELEGRAM_RETRIES + 1):
+            if shutdown_event.is_set():
+                return None
+            try:
+                async with session.post(url, data=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    if resp.status == 429:
+                        wait_sec = min(int(resp.headers.get("Retry-After", 1)), Constants.CIRCUIT_BREAKER_MAX_WAIT)
+                        await asyncio.sleep(wait_sec + random.uniform(0.1, 0.5))
+                        continue
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("result", {}).get("message_id")
+                    
+                    if resp.status in (400, 401, 403, 404):
+                        response_text = await resp.text()
+                        try:
+                            response_json = json.loads(response_text)
+                            description = response_json.get("description", response_text)
+                        except Exception:
+                            description = response_text
+                        
+                        logger.error(
+                            f"Telegram API error {resp.status}: {description} | "
+                            f"chat_id={getattr(self, 'chat_id', '?')}"
+                        )
+                        if (resp.status == 400 and "parse entities" in str(description).lower()
+                                and params.get("parse_mode")):
+                            # Same safeguard as _send_impl: resend once as plain text
+                            # instead of losing an alert over a formatting bug.
+                            params.pop("parse_mode", None)
+                            params["text"] = re.sub(r"\\(.)", r"\1", str(params["text"]))
+                            continue
+                        return None
+                    raise Exception(f"Telegram API error {resp.status}")
+
+            except Exception as e:
+                logger.warning(f"Telegram send_with_markup attempt {attempt} failed: {e}")
+                if attempt < cfg.TELEGRAM_RETRIES:
+                    delay = compute_backoff(1.0, attempt)
+                    logger.debug(f"Retrying Telegram request in {delay:.1f}s (attempt {attempt})...")
+                    await asyncio.sleep(delay)
+        return None
 
 def _clean_extra_text(extra: Optional[str]) -> str:
     """Helper to strip emojis, OHLC data, and technical metadata."""
@@ -1065,18 +1048,15 @@ async def _record_auto_positions(sdb: RedisStateStore, payloads: List[AlertPaylo
         max_age_sec=float(cfg.PORTFOLIO_POSITION_MAX_AGE_MIN) * 60.0,
     )
 
-def coalesce_window_for(adaptive_windows: Optional[Dict[str, int]], alert_keys: List[str]) -> int:
+async def coalesce_window_for(sdb: RedisStateStore, alert_keys: List[str]) -> int:
     """Coalesce window for a pair+direction bundle. Fixed unless adaptive windows
     are enabled, in which case it can only be LENGTHENED (never below the
-    configured COALESCE_DEDUP_WINDOW_SEC) up to ADAPTIVE_DEDUP_MAX_SEC.
-
-    adaptive_windows must be fetched once per run and passed in — do not call
-    Redis from here.
-    """
+    configured COALESCE_DEDUP_WINDOW_SEC) up to ADAPTIVE_DEDUP_MAX_SEC."""
     base = int(cfg.COALESCE_DEDUP_WINDOW_SEC)
-    if not adaptive_windows:
+    windows = await sdb.get_adaptive_dedup_windows()
+    if not windows:
         return base
-    adaptive = max((adaptive_windows.get(k, 0) for k in alert_keys), default=0)
+    adaptive = max((windows.get(k, 0) for k in alert_keys), default=0)
     return max(base, min(adaptive, int(cfg.ADAPTIVE_DEDUP_MAX_SEC)))
 
 async def queue_failed_alert(sdb: RedisStateStore, pair_name: str, message: str, ts: int, dedup_keys: List[str], source: str, log: logging.Logger, state_changes: Optional[List[Any]] = None, outcomes: Optional[List[Dict[str, Any]]] = None) -> bool:
@@ -2299,7 +2279,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     open_positions_run: Union[List[Dict[str, Any]], None, object] = _SENTINEL_UNSET,
     last_processed: Union[int, None, object] = _SENTINEL_UNSET,
     kill_switch_active_run: Union[bool, object] = _SENTINEL_UNSET,
-    adaptive_windows: Optional[Dict[str, int]] = None,
 ) -> Optional[Tuple[str, Dict[str, Any], Optional[AlertPayload]]]:
     def _confluence_for(alert_key: str) -> Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]:
         if alert_key in BUY_ALERT_KEYS:
@@ -3152,8 +3131,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             direction = "MIXED" if (buy_present and sell_present) else ("BUY" if buy_present else "SELL")
             coalesced_dedup_key = f"coalesced_{direction}"
 
-            _coalesce_window = coalesce_window_for(
-                adaptive_windows, [ak for _, _, ak in alerts_to_send]
+            _coalesce_window = await coalesce_window_for(
+                sdb, [ak for _, _, ak in alerts_to_send]
             )
             claim = await sdb.claim_coalesced_alert(
                 pair_name, coalesced_dedup_key, ts_curr,
@@ -3239,8 +3218,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     f"[{pair_name}] Redis recovered mid-run — dedup claims proceed"
                 )
             claim_results = await sdb.batch_check_recent_alerts(
+
                 pair_name, keys_to_check, ts_curr,
-                windows=adaptive_windows,
+                windows=await sdb.get_adaptive_dedup_windows(),
             )
             deduped_alerts = []
             for alert_title, alert_extra, alert_key in alerts_to_send:
