@@ -91,6 +91,7 @@ jobs:
           [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
           [ -z "${{ secrets.REDIS_URL }}" ] && MISSING+=("REDIS_URL")
           [ -z "${{ secrets.DELTA_API_BASE }}" ] && MISSING+=("DELTA_API_BASE")
+          [ -z "${{ secrets.DATA_REPO_TOKEN }}" ] && MISSING+=("DATA_REPO_TOKEN")
 
           if [ ${#MISSING[@]} -gt 0 ]; then
             echo "❌ Missing secrets: ${MISSING[*]}"
@@ -338,7 +339,16 @@ jobs:
           if [ "$AGE_AT_START" -gt "$LATE_LIMIT" ]; then
             echo "::warning::Started ${AGE_AT_START}s after the 15m close (limit ${LATE_LIMIT}s) — this run will skip every pair as stale"
             echo "## ⚠️ Late start: ${AGE_AT_START}s after close (limit ${LATE_LIMIT}s) — all pairs skipped as stale" >> "$GITHUB_STEP_SUMMARY"
-          fi
+            # Cron-triggered late runs: exit without API/Redis/Telegram work.
+            # workflow_dispatch (manual) still proceeds so operators can force a run.
+            if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+              echo "::notice::Skipping stale cron run — no API calls, no Redis writes"
+              echo "execution_time=0" >> "$GITHUB_OUTPUT"
+              echo "exit_code=0" >> "$GITHUB_OUTPUT"
+              echo "outcome_rows=0" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi  
 
           ENV_FILE="$(pwd)/.bot_env"
           trap 'rm -f "$ENV_FILE"' EXIT
@@ -601,6 +611,9 @@ jobs:
           name: unpushed-outcomes-${{ github.run_id }}
           path: |
             /tmp/data-repo/brain_state.json
+            /tmp/data-repo/outcomes/*.jsonl
+            /tmp/data-repo/shadow/*.jsonl
+            /tmp/data-repo/reports/**
           retention-days: 7
           if-no-files-found: ignore
 
