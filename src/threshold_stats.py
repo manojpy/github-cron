@@ -773,7 +773,7 @@ def _prob_ev_positive(ev_mean: float, ev_std: float) -> float:
     z = ev_mean / ev_std
     return 0.5 * math.erfc(-z / math.sqrt(2.0))
 
-def ev_first_objective(rows: List[Row], min_sample: int = 20, fee_pct: Optional[float] = None, and slippage_pct: Optional[float] = None) -> Dict[str, Any]:
+def ev_first_objective(rows: List[Row], min_sample: int = 20, fee_pct: Optional[float] = None, slippage_pct: Optional[float] = None) -> Dict[str, Any]:
     """Unified profitability assessment. Replaces WR-first gating.
 
     Returns the full evidence stack:
@@ -853,7 +853,7 @@ def ev_first_objective(rows: List[Row], min_sample: int = 20, fee_pct: Optional[
     _EV_FIRST_CACHE[_cache_key] = _result
     return dict(_result)
 
-def per_trade_ev(calibrated_p: float, reward_r: float, risk_r: float = 1.0, fee_pct: Optional[float] = None, and slippage_pct: Optional[float] = None, sl_pct: Optional[float] = None) -> Dict[str, Any]:
+def per_trade_ev(calibrated_p: float, reward_r: float, risk_r: float = 1.0, fee_pct: Optional[float] = None, slippage_pct: Optional[float] = None, sl_pct: Optional[float] = None) -> Dict[str, Any]:
     """Per-trade EV from a calibrated probability (future pipeline).
 
     EV = p * reward_r − (1−p) * risk_r − costs_in_R
