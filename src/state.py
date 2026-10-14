@@ -330,9 +330,9 @@ class RedisStateStore:
         self.state_prefix = RedisKeyPrefix.PAIR_STATE
         self.meta_prefix = RedisKeyPrefix.METADATA
         self.alert_prefix = RedisKeyPrefix.ALERT
-
-        self.expiry_seconds = max(cfg.STATE_EXPIRY_DAYS * 86400 if cfg.STATE_EXPIRY_DAYS > 0 else 0, 7 * 86400)
-        self.alert_expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
+        days = max(int(cfg.STATE_EXPIRY_DAYS), 0)
+        self.expiry_seconds = max(days * 86400, 7 * 86400)
+        self.alert_expiry_seconds = days * 86400 if days > 0 else None
         self.metadata_expiry_seconds = 7 * 86400
         self._pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None
         self._shadow_pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None

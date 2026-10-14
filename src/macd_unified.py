@@ -147,8 +147,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     open_positions_run: Optional[List[Dict[str, Any]]] = None,
     kill_switch_active_run: bool = False,
     last_processed_candles_run: Optional[Dict[str, Optional[int]]] = None,
+    adaptive_windows: Optional[Dict[str, int]] = None,
 ) -> Optional[Tuple[str, Dict[str, Any], Optional[Any]]]:
-
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     pair_oi = (oi_gate_data or {}).get(pair_name)
     PAIR_ID.set(pair_name)
@@ -334,7 +334,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             open_positions_run=open_positions_run,
             last_processed=last_processed,
             kill_switch_active_run=kill_switch_active_run,
-        )       
+            adaptive_windows=adaptive_windows,
+        )
     finally:
         PAIR_ID.set("")
         global _pair_eval_counter
@@ -367,7 +368,8 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
                        pair_thresholds_run: Optional[Dict[str, float]] = None,
                        open_positions_run: Optional[List[Dict[str, Any]]] = None,
                        kill_switch_active_run: bool = False,
-                       last_processed_candles_run: Optional[Dict[str, Optional[int]]] = None):
+                       last_processed_candles_run: Optional[Dict[str, Optional[int]]] = None,
+                       adaptive_windows: Optional[Dict[str, int]] = None):
     p_name, symbol, candles = task_data                 
     try:
         pd_15m, pd_5m, data_daily = (parsed_cache or {}).get(p_name, (None, None, None))
@@ -401,6 +403,7 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
             open_positions_run=open_positions_run,
             kill_switch_active_run=kill_switch_active_run,
             last_processed_candles_run=last_processed_candles_run,
+            adaptive_windows=adaptive_windows,
         )
         return result
     except asyncio.CancelledError:
@@ -651,6 +654,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             preloads.start("kill_switch", _kill_switch_flag)
         preloads.start("last_processed",
                        lambda: state_db.get_last_processed_candle_ts_bulk(pairs_to_process))
+        preloads.start("adaptive_windows", state_db.get_adaptive_dedup_windows)
         if cfg.ENABLE_OI_FUNDING_FILTER:
             preloads.start("oi_hist", lambda: state_db.batch_get_metadata(_oi_hist_keys()))
 
@@ -1010,7 +1014,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     # ── Last-processed candle timestamps: load ONCE per run ──
     # One MGET replaces one GET per pair during evaluation.
-
     last_processed_candles_run: Dict[str, Optional[int]] = {}
     if state_db and not state_db.degraded:
         try:
@@ -1021,6 +1024,17 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         except Exception as e:
             logger_main.warning(f"Last-processed-candle bulk pre-load failed (fail-open): {e}")
             last_processed_candles_run = {}
+
+    adaptive_windows: Optional[Dict[str, int]] = None
+    if state_db and not state_db.degraded:
+        try:
+            adaptive_windows = await preloads.take(
+                "adaptive_windows",
+                state_db.get_adaptive_dedup_windows,
+            )
+        except Exception as e:
+            logger_main.warning(f"Adaptive-dedup-windows pre-load failed (fail-open): {e}")
+            adaptive_windows = None
 
     preloads.cancel_all()   # anything started but not needed (flag flipped mid-run)
 
@@ -1207,6 +1221,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 open_positions_run=open_positions_run,
                 kill_switch_active_run=kill_switch_active_run,
                 last_processed_candles_run=last_processed_candles_run,
+                adaptive_windows=adaptive_windows,
             )
     results = await asyncio.gather(
         *[_bounded_eval(t) for t in prepared_tasks],
