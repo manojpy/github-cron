@@ -91,6 +91,7 @@ jobs:
           [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
           [ -z "${{ secrets.REDIS_URL }}" ] && MISSING+=("REDIS_URL")
           [ -z "${{ secrets.DELTA_API_BASE }}" ] && MISSING+=("DELTA_API_BASE")
+          [ -z "${{ secrets.DATA_REPO_TOKEN }}" ] && MISSING+=("DATA_REPO_TOKEN")
 
           if [ ${#MISSING[@]} -gt 0 ]; then
             echo "❌ Missing secrets: ${MISSING[*]}"
@@ -601,6 +602,9 @@ jobs:
           name: unpushed-outcomes-${{ github.run_id }}
           path: |
             /tmp/data-repo/brain_state.json
+            /tmp/data-repo/outcomes/*.jsonl
+            /tmp/data-repo/shadow/*.jsonl
+            /tmp/data-repo/reports/*.md
           retention-days: 7
           if-no-files-found: ignore
 
