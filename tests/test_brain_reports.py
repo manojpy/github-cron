@@ -461,21 +461,21 @@ def test_dedup_stats_reset():
     alerts.reset_dedup_stats()
     assert all(v == 0 for v in alerts.DEDUP_STATS.values())
 
+
 def test_telegram_counters(monkeypatch):
     q = object.__new__(alerts.TelegramQueue)
     q.sent_ok = 0
     q.sent_failed = 0
-    # _send_core returns Optional[int]: truthy (e.g. 1) = delivered, None = failed.
-    # send() maps that with bool(result).
-    results = iter([1, None])
+    results = iter([True, False])
 
-    async def fake_core(self, message, reply_markup=None):
+    async def fake_impl(self, message):
         return next(results)
 
-    monkeypatch.setattr(alerts.TelegramQueue, "_send_core", fake_core)
+    monkeypatch.setattr(alerts.TelegramQueue, "_send_impl", fake_impl)
     assert asyncio.run(q.send("a")) is True
     assert asyncio.run(q.send("b")) is False
     assert (q.sent_ok, q.sent_failed) == (1, 1)
+
 
 def test_jsonl_round_trip_filters_signal_only_rows(tmp_path, monkeypatch):
     for sub in ("outcomes", "shadow"):
