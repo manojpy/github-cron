@@ -150,25 +150,38 @@ class TelegramQueue:
             return False
 
     @staticmethod
-    def _send_budget_sec() -> float:
-        """Outer deadline for one send(). It must be longer than every attempt
-        _send_impl may make (20s each, plus backoff), otherwise the outer cancel
-        can fire while a request is in flight, report failure after Telegram has
-        actually delivered, and park a duplicate in the DLQ."""
+    def _send_deadline_sec() -> float:
+        """No NEW attempt may start after this many seconds. Checked inside the
+        send loops, so a request is never cancelled while in flight."""
         return float(cfg.TELEGRAM_RETRIES) * 25.0 + 15.0
+
+    @classmethod
+    def _send_budget_sec(cls) -> float:
+        """Outer hard backstop for asyncio.wait_for: the deadline plus one full
+        attempt (20s POST timeout + margin). The loops stop on their own first."""
+        return cls._send_deadline_sec() + 25.0
 
     async def _send_impl(self, message: str) -> bool:
         await self.token_bucket.acquire()
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         params = {"chat_id": self.chat_id, "text": message, "parse_mode": "MarkdownV2"}
         session = await SessionManager.get_session()
+        deadline = time.monotonic() + self._send_deadline_sec()
         for attempt in range(1, cfg.TELEGRAM_RETRIES + 1):
             if shutdown_event.is_set():
+                return False
+            if time.monotonic() >= deadline:
+                logger.warning("Telegram send deadline reached before attempt — parking via caller")
                 return False
             try:
                 async with session.post(url, data=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                     if resp.status == 429:
                         wait_sec = min(int(resp.headers.get("Retry-After", 1)), Constants.CIRCUIT_BREAKER_MAX_WAIT)
+                        if time.monotonic() + wait_sec >= deadline:
+                            # 429 = Telegram rejected the request, nothing was delivered,
+                            # so failing into the DLQ here cannot create a duplicate.
+                            logger.warning(f"Telegram 429 Retry-After={wait_sec}s exceeds send deadline")
+                            return False
                         await asyncio.sleep(wait_sec + random.uniform(0.1, 0.5))
                         continue
                     if resp.status == 200:
@@ -239,19 +252,36 @@ class TelegramQueue:
             "reply_markup": json_dumps(reply_markup),
         }
         session = await SessionManager.get_session()
+        deadline = time.monotonic() + self._send_deadline_sec()
         for attempt in range(1, cfg.TELEGRAM_RETRIES + 1):
             if shutdown_event.is_set():
+                return None
+            if time.monotonic() >= deadline:
+                logger.warning("Telegram send_with_markup deadline reached before attempt")
                 return None
             try:
                 async with session.post(url, data=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                     if resp.status == 429:
                         wait_sec = min(int(resp.headers.get("Retry-After", 1)), Constants.CIRCUIT_BREAKER_MAX_WAIT)
+                        if time.monotonic() + wait_sec >= deadline:
+                            logger.warning(f"Telegram 429 Retry-After={wait_sec}s exceeds send deadline")
+                            return None
                         await asyncio.sleep(wait_sec + random.uniform(0.1, 0.5))
                         continue
                     if resp.status == 200:
-                        data = await resp.json()
-                        return data.get("result", {}).get("message_id")
-                    
+                        try:
+                            data = await resp.json(content_type=None)
+                        except Exception:
+                            # 200 with an unreadable body: Telegram accepted it. Retrying
+                            # would duplicate the message. 0 = delivered, id unknown
+                            # (callers only test `is not None`).
+                            return 0
+                        if isinstance(data, dict) and data.get("ok") is False:
+                            logger.error(f"Telegram returned HTTP 200 with ok=false: {data}")
+                            return None
+                        if isinstance(data, dict):
+                            return (data.get("result") or {}).get("message_id")
+                        return 0             
                     if resp.status in (400, 401, 403, 404):
                         response_text = await resp.text()
                         try:

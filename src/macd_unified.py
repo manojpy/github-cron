@@ -1613,22 +1613,35 @@ async def run_once() -> Optional[bool]:
                             if redis_key:
                                 all_delete_keys.append(f"{pair}:{redis_key}")
    
+                reset_deleted_ok = True
                 if all_delete_keys:
                     try:
-                        await sdb.atomic_batch_update([], deletes=all_delete_keys)
-                        logger_run.info(
-                            f"✅ Cleared {len(all_delete_keys)} daily alert keys "
-                            f"from {len(pairs_to_process)} pairs"
+                        # atomic_batch_update reports failure by returning False,
+                        # it does not raise; check it so a failed delete is not
+                        # recorded as a completed daily reset.
+                        reset_deleted_ok = bool(
+                            await sdb.atomic_batch_update([], deletes=all_delete_keys)
                         )
                     except Exception as e:
                         logger_run.error(f"❌ Failed to delete daily reset keys: {e}")
                         raise
-    
-                try:
-                    await sdb.set_metadata(day_tracker_key, current_date_str)
-                    logger_run.info(f"✅ Daily reset complete ({current_date_str})")
-                except Exception as e:
-                    logger_run.error(f"❌Failed to save reset date: {e}")
+                    if reset_deleted_ok:
+                        logger_run.info(
+                            f"✅ Cleared {len(all_delete_keys)} daily alert keys "
+                            f"from {len(pairs_to_process)} pairs"
+                        )
+                    else:
+                        logger_run.error(
+                            "❌ Daily reset delete did not complete — NOT marking the day as reset; "
+                            "it will be retried on the next run"
+                        )
+
+                if reset_deleted_ok:
+                    try:
+                        await sdb.set_metadata(day_tracker_key, current_date_str)
+                        logger_run.info(f"✅ Daily reset complete ({current_date_str})")
+                    except Exception as e:
+                        logger_run.error(f"❌Failed to save reset date: {e}")
             else:
                 logger_run.debug(f"No daily reset needed (last reset: {last_reset_date_str})")
 

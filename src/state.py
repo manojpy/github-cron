@@ -330,9 +330,7 @@ class RedisStateStore:
         self.state_prefix = RedisKeyPrefix.PAIR_STATE
         self.meta_prefix = RedisKeyPrefix.METADATA
         self.alert_prefix = RedisKeyPrefix.ALERT
-
         self.expiry_seconds = max(cfg.STATE_EXPIRY_DAYS * 86400 if cfg.STATE_EXPIRY_DAYS > 0 else 0, 7 * 86400)
-        self.alert_expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
         self.metadata_expiry_seconds = 7 * 86400
         self._pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None
         self._shadow_pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None
@@ -357,10 +355,8 @@ class RedisStateStore:
             logger.debug(
                 f"RedisStateStore initialized | "
                 f"State TTL: {cfg.STATE_EXPIRY_DAYS}d | "
-                f"Alert TTL: {cfg.STATE_EXPIRY_DAYS}d | "
                 f"Metadata TTL: 7d"
             )
-
     async def _record_redis_failure(self, operation: str, exc: Exception) -> None:
         logger.error(f"Redis operation '{operation}' failed: {exc}")
         if _is_quota_exceeded_error(exc):
