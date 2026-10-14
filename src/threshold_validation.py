@@ -21,6 +21,7 @@ from threshold_stats import (
     row_net_pnl_pct,
     two_proportion_p_value,
     walk_forward_split,
+    _resolve_costs, 
     wilson_ci,
 )
 
@@ -491,7 +492,7 @@ def find_wr_change_point(rows: List[Row], min_side: int = 25, min_delta: float =
     best["valid"] = True
     return best
 
-def _holdout_ev_check(rows: List[Row], fee_pct: float = 0.0006, slippage_pct: float = 0.0003) -> Optional[Dict[str, float]]:
+def _holdout_ev_check(rows: List[Row], fee_pct: Optional[float] = None, and slippage_pct: Optional[float] = None) -> Optional[Dict[str, float]]:
     """Net EV and P(true mean P&L > 0) for a SMALL holdout, without the block
     bootstrap (which needs >= 60 rows and so can never confirm a 20-59 row
     holdout). Uses the per-trade net P&L (same bracket model as everywhere
@@ -500,6 +501,7 @@ def _holdout_ev_check(rows: List[Row], fee_pct: float = 0.0006, slippage_pct: fl
     n = len(rows)
     if n < 2:
         return None
+    fee_pct, slippage_pct = _resolve_costs(fee_pct, slippage_pct)
     total_cost = (fee_pct * 2 + slippage_pct * 2) * 100
     pnls = [row_net_pnl_pct(r, total_cost) for r in rows]
     mean = statistics.fmean(pnls)

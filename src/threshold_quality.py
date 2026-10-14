@@ -26,6 +26,7 @@ from threshold_stats import (
     sample_evidence_state,
     two_proportion_p_value,
     walk_forward_split,
+    _resolve_costs, 
 )
 from threshold_validation import (
     _holdout_ev_check,
@@ -149,8 +150,8 @@ def zone_candidates(
     tp2_percentile: float = 85.0,
     sl_min_pct: float = 0.15,
     sl_max_pct: float = 3.0,
-    fee_pct: float = 0.0006,
-    slippage_pct: float = 0.0003,
+    fee_pct: Optional[float] = None, 
+    slippage_pct: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Build and VALIDATE a TP/SL zone per bucket (pair+alert+dir+regime,
     alert+dir+regime, family+dir+regime, alert+dir, family+dir).
@@ -169,6 +170,7 @@ def zone_candidates(
     Pure and deterministic. Returns {"median_adx", "candidates": {key: {...}}}."""
     usable = [r for r in rows if r.get("mae") is not None and r.get("mfe") is not None]
     median_adx = _zone_median_adx(usable)
+    fee_pct, slippage_pct = _resolve_costs(fee_pct, slippage_pct)
     total_cost = (fee_pct * 2 + slippage_pct * 2) * 100
     fixed_sl = float(cfg.OUTCOME_MAE_LOSS_PCT)
     fixed_tp = fixed_sl * float(cfg.OUTCOME_RR_TARGET)

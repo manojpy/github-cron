@@ -538,7 +538,8 @@ class BrainAuditLayer:
             HealthStatus.INSUFFICIENT_DATA,
             HealthStatus.UNAVAILABLE,
         ):
-            self._suppressed_analyses.append(name)
+            if name not in self._suppressed_analyses:
+                self._suppressed_analyses.append(name)
             if status == HealthStatus.FAILED:
                 _log.warning(
                     f"Brain audit: analysis '{name}' FAILED: {error or detail}"

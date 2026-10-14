@@ -524,6 +524,13 @@ def detect_temporal_drift(rows: List[Row], window_days: int = 14):
 # ══════════════════════════════════════════════════════════════════════
 #  NEW: Cost-Aware EV + Kelly Sizing  (Recommended.txt §5)
 # ══════════════════════════════════════════════════════════════════════
+
+def _resolve_costs(fee_pct: Optional[float], slippage_pct: Optional[float]) -> Tuple[float, float]:
+    """None means "use the configured BRAIN_FEE_PCT / BRAIN_SLIPPAGE_PCT"."""
+    fee = float(getattr(cfg, "BRAIN_FEE_PCT", 0.0006)) if fee_pct is None else float(fee_pct)
+    slip = float(getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003)) if slippage_pct is None else float(slippage_pct)
+    return fee, slip
+
 def ev_and_kelly_for(rows: List[Row], fee_pct: float = 0.0006, slippage_pct: float = 0.0003) -> Tuple[float, float, float]:
     """Net EV after round-trip fees + slippage, plus Half-Kelly fraction.
     Returns (net_ev_pct, half_kelly_fraction, win_rate).
@@ -534,6 +541,7 @@ def ev_and_kelly_for(rows: List[Row], fee_pct: float = 0.0006, slippage_pct: flo
     win/loss label does. Timeouts keep their close-based net_pnl_pct."""
     if not rows:
         return 0.0, 0.0, 0.0
+    fee_pct, slippage_pct = _resolve_costs(fee_pct, slippage_pct)
     # entry + exit for both fee and slippage; fee_pct/slippage_pct are
     # fractions (e.g. 0.0006 = 0.06%) so this must be *100 to land in the
     # same percentage-point units as pct_move (price_diff/price * 100).
@@ -765,7 +773,7 @@ def _prob_ev_positive(ev_mean: float, ev_std: float) -> float:
     z = ev_mean / ev_std
     return 0.5 * math.erfc(-z / math.sqrt(2.0))
 
-def ev_first_objective(rows: List[Row], min_sample: int = 20, fee_pct: float = 0.0006, slippage_pct: float = 0.0003) -> Dict[str, Any]:
+def ev_first_objective(rows: List[Row], min_sample: int = 20, fee_pct: Optional[float] = None, and slippage_pct: Optional[float] = None) -> Dict[str, Any]:
     """Unified profitability assessment. Replaces WR-first gating.
 
     Returns the full evidence stack:
@@ -779,6 +787,7 @@ def ev_first_objective(rows: List[Row], min_sample: int = 20, fee_pct: float = 0
     """
     if len(rows) < min_sample:
         return {"valid": False, "error": "insufficient_data", "n": len(rows)}
+    fee_pct, slippage_pct = _resolve_costs(fee_pct, slippage_pct)
 
     _cache_key = _ev_first_cache_key(rows, min_sample, fee_pct, slippage_pct)
     _cached = _EV_FIRST_CACHE.get(_cache_key)
@@ -844,7 +853,7 @@ def ev_first_objective(rows: List[Row], min_sample: int = 20, fee_pct: float = 0
     _EV_FIRST_CACHE[_cache_key] = _result
     return dict(_result)
 
-def per_trade_ev(calibrated_p: float, reward_r: float, risk_r: float = 1.0, fee_pct: float = 0.0006, slippage_pct: float = 0.0003, sl_pct: Optional[float] = None) -> Dict[str, Any]:
+def per_trade_ev(calibrated_p: float, reward_r: float, risk_r: float = 1.0, fee_pct: Optional[float] = None, and slippage_pct: Optional[float] = None, sl_pct: Optional[float] = None) -> Dict[str, Any]:
     """Per-trade EV from a calibrated probability (future pipeline).
 
     EV = p * reward_r − (1−p) * risk_r − costs_in_R
@@ -856,6 +865,7 @@ def per_trade_ev(calibrated_p: float, reward_r: float, risk_r: float = 1.0, fee_
     # Round-trip cost, matching ev_and_kelly_for / ev_first_objective.
     # fee_pct/slippage_pct are fractions (0.0006 = 0.06%), so *100 puts
     # the value in percentage points.
+    fee_pct, slippage_pct = _resolve_costs(fee_pct, slippage_pct)
     costs_pct = ((fee_pct * 2) + (slippage_pct * 2)) * 100.0
     if sl_pct and sl_pct > 0:
         # sl_pct arrives as a fraction (0.005 = 0.5%). Convert to percent

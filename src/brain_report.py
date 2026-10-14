@@ -570,7 +570,7 @@ def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
         text = (
             "The system is producing poor results and the history is long enough for this to be "
             "taken seriously.\n\n"
-            "➡️ Current priority: FIX THE WEAKEST PARTS (see sections 04 and 12)\n"
+            "➡️ Current priority: FIX THE WEAKEST PARTS (see sections 04 and 05)\n"
             + ("➡️ The action gate is still blocked: changes need evidence first."
                if not F["gate_ok"] else "➡️ The action gate is open for validated changes.")
         )
@@ -783,7 +783,7 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
     out.append(_p(f"🧠 What this means:\n\n{meaning}"))
     out.append(_c("\n".join(_kv_table([
         ("Confidence in the RESULT", _conf_status(F['conf'])),
-        ("Confidence in the DATA PIPELINE", '🟢 GOOD' if recon_ok else '🟡 CHECK SECTION 14'),
+        ("Confidence in the DATA PIPELINE", '🟢 GOOD' if recon_ok else '🟡 CHECK OUTCOME RECORDING (section 02)'),
     ]))))
     if F["anatomy_text"]:
         _anat_title = ("🎲 WHY THE WIN RATE LOOKS LOW" if (be is not None and wr < be)
@@ -814,7 +814,7 @@ def _sec_loss(F: Dict[str, Any], cfg) -> List[_Piece]:
     out.append(_p("🔴 CURRENTLY WEAK ALERT FAMILIES (worst total loss first)"))
     out.extend(_alert_table(weak, 8))
     if len(weak) > 8:
-        out.append(_p(f"…and {len(weak) - 8} more (full list in section 16)."))
+        out.append(_p(f"…and {len(weak) - 8} more (full list in the archived report)."))
     ready = [a for a in weak if a["n"] >= 30 and a["rank"] >= 2]
     if ready and not F["low_trust"]:
         text = ("Alerts with enough evidence to consider disabling: "
@@ -1057,7 +1057,7 @@ def _sec_reasoning_chain(F: Dict[str, Any], cfg) -> List[_Piece]:
             decision = "APPROVED — evidence supports limited parameter change (still via shadow/plan)"
         elif F.get("gate_ok"):
             decision = "MONITOR — gate open but edge not strong enough to change live rules"
-        elif n < int(getattr(cfg, "ACTION_GATE_MIN_ROWS", 100)):
+        elif n < int(getattr(cfg, "BRAIN_AUDIT_MIN_ROWS_FOR_RECOMMENDATION", 100)):
             decision = "BLOCKED — insufficient sample for any live change"
         elif not gate.get("stability"):
             decision = "BLOCKED — drift detected; freeze parameter changes"

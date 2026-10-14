@@ -184,9 +184,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         if isinstance(gr_result, tuple):
             pair_n, summary = cast(Tuple[str, Dict[str, Any]], gr_result)
             return pair_n, summary, None
+        gr = cast(GateResult, gr_result)
 
     reversal_eligible = (
-        (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE)
+        (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT
+         or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT)
         and (gr.buy_trend_common_relaxed or gr.sell_trend_common_relaxed)
     )
     gate_passed = gr.buy_common or gr.sell_common or reversal_eligible
@@ -1100,6 +1102,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                     else:
                         btc_gr = await _eval_gate(
                             ref_pair, btc_15m, btc_5m, btc_daily, state_db, correlation_id, reference_time, btc_oi,
+                            resolve_outcomes=False,
                         )
                     if btc_gr is not None and not isinstance(btc_gr, tuple):
                         btc_context = BtcMacroContext(
@@ -1399,7 +1402,7 @@ async def run_once() -> Optional[bool]:
         f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
     )
     logger_run.debug(
-        f"Momentum gate active (all alerts) | 3-of-5 vote | "
+        f"Momentum gate active (all alerts) | 3-of-6 vote | "
         f"body_ratio_min={cfg.CPR_MOMENTUM_BODY_RATIO_MIN}"
     )
     if cfg.ENABLE_CPR:
