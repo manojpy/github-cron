@@ -42,7 +42,8 @@ def update_experiment_ledger(prev: Optional[Dict[str, Any]], trials: Dict[str, i
     `cum` counts repeated looks at the same data since `since_ts` and is only
     a measure of how much has been tried, not of independent hypotheses."""
     prev = prev if isinstance(prev, dict) else {}
-    cum_prev = prev.get("cum") if isinstance(prev.get("cum"), dict) else {}
+    cum_prev_raw = prev.get("cum")
+    cum_prev: Dict[str, Any] = cum_prev_raw if isinstance(cum_prev_raw, dict) else {}
     cum = {k: int(cum_prev.get(k, 0)) + int(v) for k, v in trials.items()}
     return {
         "since_ts": int(prev.get("since_ts") or now),

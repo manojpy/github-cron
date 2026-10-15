@@ -674,7 +674,7 @@ def _replay_text(s: Dict[str, Any]) -> str:
         "likely_harmful": "🔴 replay says it would have lost money",
         "not_distinguishable": "🟡 change not distinguishable from zero",
         "insufficient": "🟡 too few changed trades to judge",
-    }.get(rp.get("verdict"), "")
+    }.get(str(rp.get("verdict") or ""), "")
     ci = "" if dl.get("lcb") is None else f" (90% range {dl['lcb']:+.1f} to {dl['ucb']:+.1f})"
     return (f"\n   Replay: {dl['total_pnl_pct']:+.1f} pts total P&L{ci}, "
             f"trades -{rp.get('trades_removed', 0)}/+{rp.get('trades_added', 0)}, "
