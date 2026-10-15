@@ -9,6 +9,9 @@ from bot_config import cfg, json_dumps, json_loads, CONFLUENCE_WEIGHTS
 from state import _rc
 import threshold_engine as engine
 from threshold_quality import gate_shadow_comparison, prediction_track_record
+from feature_store import build_point_in_time_dataset, dataset_coverage
+
+
 from brain_audit import get_audit, HealthStatus
 from brain_helpers import (
     KILL_SWITCH_KEY, _resolve_config_path,
@@ -801,7 +804,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             ),
         })
 
-    # ── R:R and Bonus Analysis ──
+    # ── R:R and Bonus Analysis ─��
     if real_rows:
         bonus_wins = sum(1 for r in real_rows if r.get("bonus_win"))
         total_wins = sum(1 for r in real_rows if r["win"])
@@ -1140,6 +1143,17 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             )
     except Exception as e:
         audit.record_analysis_exception("prediction_track_record", e)
+
+    # ── Data foundation: versioned point-in-time features + multi-horizon
+    # labels. Counts only; nothing here changes a decision. ──
+    try:
+        _ds = build_point_in_time_dataset(
+            list(real_rows),
+            default_cost_pct=(float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100,
+        )
+        ai_metrics["data_foundation"] = dataset_coverage(_ds)
+    except Exception as e:
+        audit.record_analysis_exception("data_foundation", e)
 
     # ── Validated TP/SL zones: sample-gated, OOS-replayed, streak-promoted.
     # Only PROMOTED zones are persisted for dispatch; candidates and the

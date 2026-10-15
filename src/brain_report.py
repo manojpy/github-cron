@@ -695,7 +695,7 @@ def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
         do_now.append(f"Investigate the very low {wr:.0%} win rate (see section 04).")
     if F["gate"].get("stability") is False or F["gate"].get("risk") is False:
         do_now.append("Monitor active drift/drawdown warnings.")
-    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"• {x}" for x in do_now)))
+    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"�� {x}" for x in do_now)))
 
     watch: List[str] = []
     seen = set()
@@ -1067,7 +1067,12 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     if _acct_lines:
         out.append(_p("RECOMMENDATION ACCOUNTABILITY — did past changes help?"))
         out.extend(_c_split(_acct_lines))
+    _df_lines = _data_foundation_lines((F.get("ai") or {}).get("data_foundation"))
+    if _df_lines:
+        out.append(_p("DATA FOUNDATION — is the evidence base consistent?"))
+        out.extend(_c_split(_df_lines))
     _exp_lines = _experiment_lines((F.get("ai") or {}).get("experiment_ledger"))
+
     if _exp_lines:
         out.append(_p("EXPERIMENT LEDGER — how much was tried to find these results?"))
         out.extend(_c_split(_exp_lines))
@@ -1227,6 +1232,30 @@ def _accountability_lines(acct: Optional[Dict[str, Any]], mode: str) -> List[str
         )
     lines.append("")
     lines.append("Counts only changes that were applied and later measured; families with no measured changes do not appear.")
+    return lines
+
+def _data_foundation_lines(cov: Optional[Dict[str, Any]]) -> List[str]:
+    """Plain-text lines for the point-in-time dataset coverage (empty when none)."""
+    if not cov or not cov.get("n"):
+        return []
+    lines = [
+        f"{cov['n']} resolved alerts, {cov.get('n_features', 0)} features "
+        f"(feature set {cov.get('current_version')}: {cov.get('current_version_share', 0):.0%} of rows)"
+    ]
+    hz = cov.get("horizons") or {}
+    parts = []
+    for h in sorted(hz):
+        m = hz[h].get("mean_net")
+        parts.append(f"{h} candles: {hz[h]['frac']:.0%} labelled" + (f", avg {m:+.2f}%" if m is not None else ""))
+    if parts:
+        lines.append("Outcome horizons — " + "; ".join(parts))
+    if cov.get("mixed_versions"):
+        lines.append("Warning: rows from different feature-set versions are mixed; compare models only within one version.")
+    if cov.get("leaked_keys"):
+        lines.append(f"Warning: {cov['leaked_keys']} post-outcome fields were found among the features and removed.")
+    weak = cov.get("mostly_empty_features") or []
+    if weak:
+        lines.append("Mostly-empty features: " + ", ".join(f"{n} ({z:.0%})" for n, z in weak))
     return lines
 
 def _experiment_lines(led: Optional[Dict[str, Any]]) -> List[str]:

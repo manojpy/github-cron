@@ -70,6 +70,7 @@ from indicators import (
     _fib_reversal_confluence_vote,
 )
 from threshold_engine import hash_config_state
+from feature_store import FEATURE_SET_VERSION
 
 # Distinguishes "caller didn't pass this" from "caller passed None on purpose"
 # (None is a legitimate value for e.g. last_processed — no candle seen yet).
@@ -3083,6 +3084,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     "config_version": hash_config_state(
                         CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
                     ),
+                    "feature_version": FEATURE_SET_VERSION,
                     "macro_correlation": macro_shadow.get("correlation") if macro_shadow else None,
                     "macro_relative_strength": macro_shadow.get("relative_strength") if macro_shadow else None,
                     "macro_multiplier": macro_shadow.get("multiplier") if macro_shadow else None,
