@@ -660,7 +660,23 @@ def train_market_state_model(rows: List[Row], min_sample: int = 150, train_frac:
         _sigmoid(sum(b * x for b, x in zip(beta, X_hold[i])))
         for i in range(len(holdout_rows))
     ]
+
     holdout_labels = [bool(r["win"]) for r in holdout_rows]
+
+    # ── Baseline check: does the model beat "always predict the training win
+    #    rate" on data it never saw? Brier skill > 0 means it does. ──
+    base_rate = sum(y_train) / len(y_train)
+    brier_model = sum((p - float(l)) ** 2 for p, l in zip(holdout_preds, holdout_labels)) / len(holdout_preds)
+    brier_base = sum((base_rate - float(l)) ** 2 for l in holdout_labels) / len(holdout_labels)
+    brier_skill = (1.0 - brier_model / brier_base) if brier_base > 1e-12 else None
+    if getattr(cfg, "MARKET_STATE_REQUIRE_BASELINE_SKILL", False) and (brier_skill is None or brier_skill <= 0.0):
+        return {
+            "valid": False, "error": "no_skill_vs_base_rate",
+            "holdout_brier": round(brier_model, 5),
+            "holdout_brier_baseline": round(brier_base, 5),
+            "brier_skill": None if brier_skill is None else round(brier_skill, 4),
+            "drift_check": drift_check,
+        }
     ml_calib = build_ml_calibration_curve(
         holdout_preds,
         holdout_labels,
@@ -679,6 +695,10 @@ def train_market_state_model(rows: List[Row], min_sample: int = 150, train_frac:
         "holdout_ev": holdout_ev_obj,
         "ml_calibration": ml_calib,
         "ml_ece": ml_calib.get("ece"),
+        "baseline_base_rate": round(base_rate, 4),
+        "holdout_brier": round(brier_model, 5),
+        "holdout_brier_baseline": round(brier_base, 5),
+        "brier_skill": None if brier_skill is None else round(brier_skill, 4),
         "trained_at": int(time.time()),
         "drift_check": drift_check,
     }
@@ -706,6 +726,57 @@ def predict_market_state_proba(model: Optional[Dict[str, Any]], votes: Optional[
     X = _apply_scaler(X, model.get("scaler"))
     z = sum(b * x for b, x in zip(beta, X[0]))
     return _sigmoid(z)
+
+def market_state_novelty(model: Optional[Dict[str, Any]], votes: Optional[Dict[str, bool]], context: Optional[Dict[str, Any]], z_limit: float = 4.0, max_extreme: int = 2, max_missing_frac: float = 0.34) -> Optional[Dict[str, Any]]:
+    """How unfamiliar is this live input compared with what the model was
+    trained on? Epistemic (model-ignorance) signal, separate from market noise.
+
+    Looks only at the numeric context columns the scaler knows: counts those
+    further than z_limit training standard deviations from the training mean,
+    and those missing at decision time. Boolean values are skipped (their
+    training spread is tiny, so a z-score on them would flag ordinary values).
+    Returns None (never raises) when there is no valid model or nothing to test."""
+    if not model or not model.get("valid"):
+        return None
+    feat_names = model.get("feature_names") or []
+    scaler = model.get("scaler") or {}
+    mean, std = scaler.get("mean") or [], scaler.get("std") or []
+    ctx = context or {}
+    n_testable = 0
+    n_missing = 0
+    n_extreme = 0
+    worst_name: Optional[str] = None
+    worst_z = 0.0
+    for k, fname in enumerate(feat_names):
+        if not fname.startswith("ctx:"):
+            continue
+        j = k + 1
+        if j >= len(mean) or j >= len(std):
+            continue
+        val = ctx.get(fname[4:])
+        if isinstance(val, bool):
+            continue
+        n_testable += 1
+        if not isinstance(val, (int, float)) or not math.isfinite(float(val)):
+            n_missing += 1
+            continue
+        z = abs((float(val) - mean[j]) / (std[j] if std[j] > 1e-12 else 1.0))
+        if z > z_limit:
+            n_extreme += 1
+        if z > worst_z:
+            worst_z, worst_name = z, fname[4:]
+    if n_testable == 0:
+        return None
+    missing_frac = n_missing / n_testable
+    return {
+        "n_testable": n_testable,
+        "n_missing": n_missing,
+        "missing_frac": round(missing_frac, 3),
+        "n_extreme": n_extreme,
+        "max_abs_z": round(worst_z, 2),
+        "worst_feature": worst_name,
+        "novel": bool(n_extreme >= max_extreme or missing_frac > max_missing_frac),
+    }
 
 def build_calibration_curves(rows: List[Row], bucket_pct: float = 5.0, min_sample: int = 15, shadow_rows: Optional[List[Row]] = None) -> Dict[str, Any]:
     """Per-alert-key calibration: bucketed confluence % → observed win rate.

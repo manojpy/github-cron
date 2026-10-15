@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from bot_config import cfg, json_dumps, json_loads, CONFLUENCE_WEIGHTS
 from state import _rc
 import threshold_engine as engine
-from threshold_quality import gate_shadow_comparison
+from threshold_quality import gate_shadow_comparison, prediction_track_record
 from brain_audit import get_audit, HealthStatus
 from brain_helpers import KILL_SWITCH_KEY, _resolve_config_path
 
@@ -1121,6 +1121,22 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                 logging.getLogger("macd_bot").info(f"🧪 Gate shadow audit | {_g['text']}")
     except Exception as e:
         audit.record_analysis_exception("gate_shadow_comparison", e)
+
+    # ── Prediction track record: did the probabilities stated at alert time
+    # match what happened, and do they beat the plain base rate? ──
+    try:
+        _ptr = prediction_track_record(
+            list(real_rows), min_n=int(getattr(cfg, "PREDICTION_AUDIT_MIN_N", 30)),
+        )
+        ai_metrics["prediction_track_record"] = _ptr
+        for _f, _p in (_ptr.get("predictors") or {}).items():
+            logging.getLogger("macd_bot").info(
+                f"🎯 Prediction audit | {_f}: n={_p['n']} brier={_p['brier']:.4f} "
+                f"vs base {_p['brier_baseline']:.4f} skill={_p['brier_skill']} "
+                f"ece={_p['ece']:.3f} -> {_p['status']}"
+            )
+    except Exception as e:
+        audit.record_analysis_exception("prediction_track_record", e)
 
     # ── Validated TP/SL zones: sample-gated, OOS-replayed, streak-promoted.
     # Only PROMOTED zones are persisted for dispatch; candidates and the

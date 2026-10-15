@@ -1038,7 +1038,49 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     _lifecycle = _plan_lifecycle_text(F.get("plan_lifecycle") or {})
     if _lifecycle:
         out.append(_p(_lifecycle))
+    _ptr_lines = _prediction_track_lines((F.get("ai") or {}).get("prediction_track_record"))
+    if _ptr_lines:
+        out.append(_p("PREDICTION TRACK RECORD — did the Brain's stated odds match reality?"))
+        out.extend(_c_split(_ptr_lines))
     return out
+
+def _prediction_track_lines(ptr: Optional[Dict[str, Any]]) -> List[str]:
+    """Plain-text lines for the prediction track record (empty when there is nothing to show)."""
+    if not ptr or not ptr.get("valid") or not ptr.get("n_with_prediction"):
+        return []
+    labels = {"ensemble_p": "Ensemble", "market_state_p_win": "ML model", "p_ev_positive": "EV model"}
+    status_text = {
+        "insufficient": "🟡 too few trades to judge",
+        "no_skill": "🔴 no better than the average win rate",
+        "skilful_but_miscalibrated": "🟡 beats the average, odds are off",
+        "skilful": "🟢 beats the average win rate",
+    }
+    lines = [f"Alerts with a stored prediction: {ptr['n_with_prediction']} of {ptr['n_rows']}"]
+    rows: List[Tuple[str, ...]] = []
+    for f, p in (ptr.get("predictors") or {}).items():
+        skill = p.get("brier_skill")
+        rows.append((
+            labels.get(f, f), f"n={p['n']}",
+            "skill n/a" if skill is None else f"skill {skill:+.2f}",
+            f"calib err {p['ece']:.0%}", status_text.get(p.get("status"), str(p.get("status"))),
+        ))
+    if rows:
+        lines.extend(_table(rows, "lllll"))
+    bv = ptr.get("by_verdict") or {}
+    if bv:
+        lines.append("")
+        lines.append("Realised results by verdict at alert time:")
+        vrows: List[Tuple[str, ...]] = []
+        for v in ("HIGH", "MEDIUM", "LOW"):
+            if v in bv:
+                e = bv[v]
+                vrows.append((v, f"n={e['n']}", f"WR {e['wr']:.0%}",
+                              "EV n/a" if e.get("net_ev") is None else f"EV {e['net_ev']:+.2f}%"))
+        if vrows:
+            lines.extend(_table(vrows, "llll"))
+    lines.append("")
+    lines.append("Covers alerts that fired only; past accuracy is not a forecast.")
+    return lines
 
 def _sec_reasoning_chain(F: Dict[str, Any], cfg) -> List[_Piece]:
     """Roadmap #19 — explicit Brain decision narrative. Trade counts, session,

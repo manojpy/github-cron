@@ -677,6 +677,106 @@ def apply_ensemble_gate(result: Dict[str, Any], mode: str, min_n: int, max_p: fl
     entry["applied"] = True
     result["ensemble_gate"] = entry
 
+def apply_epistemic_gate(result: Dict[str, Any], novelty: Optional[Dict[str, Any]], mode: str) -> None:
+    """Lower the verdict one step when the live input is unfamiliar to the model.
+
+    Restrict-only: HIGH -> MEDIUM, MEDIUM -> LOW. LOW/BLOCKED are never changed
+    and nothing is ever raised. mode 'shadow' only annotates; 'off' does nothing."""
+    if mode == "off" or not novelty or not novelty.get("novel"):
+        return
+    before = result.get("verdict")
+    if before not in ("HIGH", "MEDIUM"):
+        return
+    target = "MEDIUM" if before == "HIGH" else "LOW"
+    entry = {
+        "from": before, "to": target,
+        "n_extreme": novelty.get("n_extreme"), "max_abs_z": novelty.get("max_abs_z"),
+        "worst_feature": novelty.get("worst_feature"), "missing_frac": novelty.get("missing_frac"),
+    }
+    if mode != "live":
+        result["epistemic_gate_shadow"] = entry
+        return
+    result["verdict_before_epistemic_gate"] = before
+    result["verdict"] = target
+    entry["applied"] = True
+    result["epistemic_gate"] = entry
+
+_PREDICTION_FIELDS = ("ensemble_p", "market_state_p_win", "p_ev_positive")
+
+def prediction_track_record(rows: List[Row], min_n: int = 30, n_bins: int = 5, min_skill: float = 0.02, max_ece: float = 0.10) -> Dict[str, Any]:
+    """Did the probabilities the Brain stated AT ALERT TIME match what happened?
+
+    Reads context["prediction_seen"] (stored when the alert fired, before the
+    outcome was known) from resolved rows. For each predictor: Brier score vs
+    the plain base-rate baseline (skill > 0 = better than guessing the average
+    win rate), expected calibration error and a reliability table. Also shows
+    realised win rate / net EV by the verdict the alert carried.
+
+    Only alerts that actually fired are scored, so this measures quality among
+    fired alerts, not among every candidate. Purely diagnostic."""
+    out: Dict[str, Any] = {"valid": True, "n_rows": len(rows), "n_with_prediction": 0, "predictors": {}, "by_verdict": {}}
+    seen_rows: List[Tuple[Dict[str, Any], Row]] = []
+    for r in rows:
+        ctx = r.get("context")
+        ps = ctx.get("prediction_seen") if isinstance(ctx, dict) else None
+        if isinstance(ps, dict) and ps:
+            seen_rows.append((ps, r))
+    out["n_with_prediction"] = len(seen_rows)
+
+    for field in _PREDICTION_FIELDS:
+        pairs: List[Tuple[float, float]] = []
+        for ps, r in seen_rows:
+            p = ps.get(field)
+            if isinstance(p, (int, float)) and not isinstance(p, bool) and 0.0 <= float(p) <= 1.0:
+                pairs.append((float(p), 1.0 if r.get("win") else 0.0))
+        n = len(pairs)
+        if n == 0:
+            continue
+        base = sum(y for _, y in pairs) / n
+        brier = sum((p - y) ** 2 for p, y in pairs) / n
+        brier_base = sum((base - y) ** 2 for _, y in pairs) / n
+        skill = (1.0 - brier / brier_base) if brier_base > 1e-12 else None
+        bins: List[Dict[str, Any]] = []
+        ece = 0.0
+        for b in range(n_bins):
+            lo, hi = b / n_bins, (b + 1) / n_bins
+            grp = [(p, y) for p, y in pairs if (lo <= p < hi) or (b == n_bins - 1 and p == 1.0)]
+            if not grp:
+                continue
+            mp = sum(p for p, _ in grp) / len(grp)
+            wr = sum(y for _, y in grp) / len(grp)
+            ece += (len(grp) / n) * abs(mp - wr)
+            bins.append({"lo": round(lo, 2), "hi": round(hi, 2), "n": len(grp),
+                         "mean_p": round(mp, 3), "wr": round(wr, 3)})
+        if n < min_n:
+            status = "insufficient"
+        elif skill is None or skill <= min_skill:
+            status = "no_skill"
+        elif ece > max_ece:
+            status = "skilful_but_miscalibrated"
+        else:
+            status = "skilful"
+        out["predictors"][field] = {
+            "n": n, "base_rate": round(base, 4), "brier": round(brier, 5),
+            "brier_baseline": round(brier_base, 5),
+            "brier_skill": None if skill is None else round(skill, 4),
+            "ece": round(ece, 4), "bins": bins, "status": status,
+        }
+
+    by_verdict: DefaultDict[str, List[Row]] = defaultdict(list)
+    for ps, r in seen_rows:
+        v = ps.get("verdict")
+        if isinstance(v, str) and v:
+            by_verdict[v].append(r)
+    for v, grp in by_verdict.items():
+        evo = ev_first_objective(grp, min_sample=min_n)
+        out["by_verdict"][v] = {
+            "n": len(grp),
+            "wr": round(sum(1 for r in grp if r.get("win")) / len(grp), 4),
+            "net_ev": round(evo["net_ev"], 4) if evo.get("valid") else None,
+        }
+    return out
+
 def gate_shadow_comparison(rows: List[Row], min_flagged: int = 20) -> Dict[str, Any]:
     """Did the alerts a gate flagged really do worse than the ones it left alone?
 
@@ -687,7 +787,7 @@ def gate_shadow_comparison(rows: List[Row], min_flagged: int = 20) -> Dict[str, 
     'looks_justified' means ready, flagged win rate lower and p <= 0.20.
     Purely diagnostic: never changes a verdict."""
     out: Dict[str, Any] = {"valid": True, "gates": {}}
-    for gate in ("ensemble", "regime"):
+    for gate in ("ensemble", "regime", "epistemic"):
         flagged: List[Row] = []
         clean: List[Row] = []
         for r in rows:
@@ -745,6 +845,8 @@ def trade_quality_score(
     ml_calibration_curve: Optional[Dict[str, Any]] = None,
     regime_gate: Optional[Dict[str, Any]] = None,
     regime_gate_mode: str = "off",
+    epistemic: Optional[Dict[str, Any]] = None,
+    epistemic_mode: str = "off",
 ) -> Dict[str, Any]:
     """Unified quality assessment for a single prospective trade."""
     result: Dict[str, Any] = {
@@ -922,6 +1024,11 @@ def trade_quality_score(
             int(n_oos),
             bool(ev_model_result.get("oos_validated")),
         )
+
+    # ── Epistemic check: unfamiliar input -> lower confidence (restrict-only) ──
+    if epistemic:
+        result["epistemic"] = epistemic
+        apply_epistemic_gate(result, epistemic, epistemic_mode)
 
     # Advisory size hint only — never used to place orders in this bot
     if getattr(cfg, "ENABLE_BRAIN_SIZE_HINT", False):

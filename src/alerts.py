@@ -3035,9 +3035,31 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 _out = {
                     k: _tq[k]
                     for k in ("regime_gate_shadow", "ensemble_gate_shadow",
-                              "regime_gate", "ensemble_gate")
+                              "epistemic_gate_shadow",
+                              "regime_gate", "ensemble_gate", "epistemic_gate")
                     if _tq.get(k)
                 }
+                return _out or None
+
+            def _prediction_seen_for(alert_key: str) -> Optional[Dict[str, Any]]:
+                """What the Brain predicted when this alert fired. Stored with the
+                pending outcome BEFORE the result is known, so the prediction
+                track record can later compare it with what actually happened."""
+                _tq = alert_tq_by_key.get(alert_key)
+                if not _tq:
+                    return None
+                _out: Dict[str, Any] = {
+                    k: _tq[k]
+                    for k in ("verdict", "verdict_uncapped", "quality_score", "ensemble_p",
+                              "p_ev_positive", "market_state_p_win", "market_state_p_win_raw",
+                              "net_ev", "ev_p5", "n_oos", "evidence_state", "oos_validated")
+                    if _tq.get(k) is not None
+                }
+                _epi = _tq.get("epistemic")
+                if isinstance(_epi, dict):
+                    _out["epistemic"] = {
+                        k: _epi.get(k) for k in ("max_abs_z", "n_extreme", "missing_frac", "novel")
+                    }
                 return _out or None
 
             def _playbook_seen_for(alert_key: str) -> Optional[Dict[str, Any]]:
@@ -3093,6 +3115,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     ),
                     "gate_shadow": _gate_shadow_for(alert_key),
                     "playbook_seen": _playbook_seen_for(alert_key),
+                    "prediction_seen": _prediction_seen_for(alert_key),
                     "co_fired_keys": (
                         [ak for _, _, ak in alerts_to_send if ak != alert_key]
                         if cfg.ENABLE_SINGLE_ACTIVE_TRADE else None

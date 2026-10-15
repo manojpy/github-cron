@@ -640,6 +640,8 @@ class BrainCore:
         }
         market_state_p_win = None
         ml_calibration_curve = None
+        epistemic = None
+        _epi_mode = str(getattr(cfg, "EPISTEMIC_GATE_MODE", "shadow"))
         if getattr(cfg, "ENABLE_MARKET_STATE_MODEL", True):
             model = await self._load_market_state_model()
             market_state_p_win = engine.predict_market_state_proba(
@@ -647,7 +649,13 @@ class BrainCore:
             )
             if market_state_p_win is not None:
                 ml_calibration_curve = await self._load_ml_calibration_curve()
-     
+                if _epi_mode != "off":
+                    epistemic = engine.market_state_novelty(
+                        model, votes=votes, context=context,
+                        z_limit=float(getattr(cfg, "EPISTEMIC_Z_LIMIT", 4.0)),
+                        max_extreme=int(getattr(cfg, "EPISTEMIC_MAX_EXTREME", 2)),
+                        max_missing_frac=float(getattr(cfg, "EPISTEMIC_MAX_MISSING_FRAC", 0.34)),
+                    )
         _rg_mode = str(getattr(cfg, "REGIME_GATE_MODE", "live"))
         _rg_seg = (
             engine.regime_gate_lookup(
@@ -665,6 +673,7 @@ class BrainCore:
 
                 use_market_state_live=getattr(cfg, "ENABLE_MARKET_STATE_LIVE_SCORE", False),
                 ml_calibration_curve=ml_calibration_curve,
+                epistemic=epistemic, epistemic_mode=_epi_mode,
             )
         except Exception as e:
             # Must not be silent: None means "no brain data", which the advisor
