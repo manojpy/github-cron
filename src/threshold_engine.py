@@ -147,6 +147,9 @@ from threshold_quality import (
 )
 from threshold_repair import (
     simulate_config_change,
+    policy_counterfactual,
+    policy_from_action,
+    replay_plan_actions,
     regime_profile_optimizer,
     compare_config_versions,
     _STRUCTURAL_CONFIG_FIELDS,
@@ -298,6 +301,9 @@ __all__ = [
     "apply_regime_gate",
     "trade_quality_score",
     "simulate_config_change",
+    "policy_counterfactual",
+    "policy_from_action",
+    "replay_plan_actions",
     "regime_profile_optimizer",
     "compare_config_versions",
     "_STRUCTURAL_CONFIG_FIELDS",

@@ -174,19 +174,26 @@ async def record_repair_issued(sdb, rec: Dict[str, Any], snapshot: Dict[str, Any
     await _save_ledger(sdb, entries)
     return rid
 
-async def mark_plan_applied(sdb, plan_ts: int) -> int:
-    """Called by apply_pending_plan. Marks every repair whose issued_at is
-    within APPLY_WINDOW_SEC of the plan's own timestamp. Returns count."""
+async def mark_plan_applied(sdb, plan_ts: int, repair_ids: Optional[List[str]] = None) -> int:
+    """Called by apply_pending_plan. With `repair_ids`, marks exactly those
+    repairs (the ones whose change was actually applied). Without it (plans
+    stored before ids were recorded), falls back to every repair whose issued_at
+    is within APPLY_WINDOW_SEC of the plan's own timestamp. Returns count."""
     try:
         entries = await _load_ledger_strict(sdb)
     except Exception:
         return 0
     n = 0
     now = int(time.time())
+    wanted = set(repair_ids) if repair_ids is not None else None
     for e in entries:
         if e["applied_at"] is not None:
             continue
-        if abs(e["issued_at"] - plan_ts) <= APPLY_WINDOW_SEC:
+        if wanted is not None:
+            hit = e["id"] in wanted
+        else:
+            hit = abs(e["issued_at"] - plan_ts) <= APPLY_WINDOW_SEC
+        if hit:
             e["applied_at"] = now
             n += 1
     if n:
@@ -271,8 +278,8 @@ async def evaluate_pending_repairs(sdb, current_rows: List[dict], horizon_hours:
             verdict = "hurt"
         else:
             verdict = "neutral"
-
         e["verdict"] = verdict
+        e["verdict_at"] = now
         e["delta_observed"] = {
             "wr": round(delta_wr, 4),
             "ev": round(delta_ev, 4),
@@ -310,6 +317,54 @@ async def repair_success_rates(sdb) -> Dict[str, Dict[str, float]]:
         }
         for k, v in stats.items()
     }
+
+def family_accountability(entries: List[dict], now: int, window_days: int = 60, min_verdicts: int = 6, hurt_streak: int = 3, suspend_days: int = 14) -> Dict[str, Dict[str, Any]]:
+    """Per recommendation family (ledger category), has acting on it helped?
+
+    Pure. Only resolved verdicts inside the window count. A family is
+    'suspended' when its last `hurt_streak` verdicts were all 'hurt', or when
+    at least 5 decisive verdicts have a 'hurt' share whose Wilson lower bound
+    exceeds 50%. A suspended family returns to 'probation' `suspend_days` after
+    its last 'hurt' verdict (it has to be allowed to try again, or it could
+    never show recovery). 'insufficient' = fewer than `min_verdicts` verdicts.
+    eligible is False only for 'suspended'."""
+    cutoff = now - window_days * 86400
+    by_cat: Dict[str, List[dict]] = defaultdict(list)
+    for e in entries:
+        if e.get("verdict") is None:
+            continue
+        ts = int(e.get("verdict_at") or e.get("applied_at") or e.get("issued_at") or 0)
+        if ts < cutoff:
+            continue
+        by_cat[str(e.get("category") or e.get("type") or "unknown")].append({**e, "_ts": ts})
+    out: Dict[str, Dict[str, Any]] = {}
+    for cat, items in by_cat.items():
+        items.sort(key=lambda x: x["_ts"])
+        helped = sum(1 for x in items if x["verdict"] == "helped")
+        hurt = sum(1 for x in items if x["verdict"] == "hurt")
+        neutral = len(items) - helped - hurt
+        decisive = helped + hurt
+        streak = len(items) >= hurt_streak and all(x["verdict"] == "hurt" for x in items[-hurt_streak:])
+        majority = False
+        if decisive >= 5:
+            lo, _hi, _ = wilson_ci(hurt, decisive)
+            majority = lo > 0.5
+        last_hurt = max((x["_ts"] for x in items if x["verdict"] == "hurt"), default=0)
+        reason = ""
+        if streak or majority:
+            reason = f"last {hurt_streak} verdicts all hurt" if streak else "hurt verdicts outnumber helped (95% bound)"
+            status = "suspended" if now < last_hurt + suspend_days * 86400 else "probation"
+        elif len(items) < min_verdicts:
+            status = "insufficient"
+        else:
+            status = "eligible"
+        out[cat] = {
+            "status": status, "eligible": status != "suspended", "reason": reason,
+            "n": len(items), "helped": helped, "hurt": hurt, "neutral": neutral,
+            "hurt_rate": round(hurt / len(items), 3),
+            "suspended_until": (last_hurt + suspend_days * 86400) if status == "suspended" else None,
+        }
+    return out
 
 async def ledger_stats(sdb) -> Dict[str, Any]:
     """For the report header: how many repairs issued/applied/verdict'd."""

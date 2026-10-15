@@ -20,6 +20,49 @@ MARKET_STATE_MODEL_KEY = "brain:market_state_model"
 
 ML_CALIBRATION_KEY = "brain:ml_calibration_curve"
 
+EXPERIMENT_LEDGER_KEY = "brain_experiment_ledger"
+
+ACTION_PLAN_KEY = "brain_action_plan"
+
+def count_brain_trials(ai_metrics: Dict[str, Any], n_recommendations: int) -> Dict[str, int]:
+    """How many candidate hypotheses this Brain cycle examined (not just the
+    ones that survived): TP/SL zone candidates, alert+direction+regime segments
+    and recommendations issued."""
+    zp = ai_metrics.get("zone_profiles") or {}
+    rg = ai_metrics.get("regime_gate") or {}
+    return {
+        "zone_candidates": int(zp.get("n_candidates") or 0),
+        "regime_segments": int(rg.get("n_evaluated") or 0),
+        "recommendations": int(n_recommendations),
+    }
+
+def update_experiment_ledger(prev: Optional[Dict[str, Any]], trials: Dict[str, int], now: int) -> Dict[str, Any]:
+    """Fold one cycle's trial counts into the persisted ledger. `last` is the
+    family size of the latest cycle (what a chance-hit estimate should use);
+    `cum` counts repeated looks at the same data since `since_ts` and is only
+    a measure of how much has been tried, not of independent hypotheses."""
+    prev = prev if isinstance(prev, dict) else {}
+    cum_prev = prev.get("cum") if isinstance(prev.get("cum"), dict) else {}
+    cum = {k: int(cum_prev.get(k, 0)) + int(v) for k, v in trials.items()}
+    return {
+        "since_ts": int(prev.get("since_ts") or now),
+        "cycles": int(prev.get("cycles") or 0) + 1,
+        "cum": cum,
+        "last": {"ts": int(now), **{k: int(v) for k, v in trials.items()}},
+    }
+
+def multiple_testing_note(n_tests: int, alpha: float = 0.05) -> Dict[str, Any]:
+    """Rough chance-hit estimate for a family of n_tests tests at level alpha:
+    about n_tests * alpha would look significant with no real effect at all,
+    and a Bonferroni-corrected level would be alpha / n_tests."""
+    n = max(0, int(n_tests))
+    return {
+        "tests_this_cycle": n,
+        "alpha": alpha,
+        "expected_chance_hits": round(n * alpha, 2),
+        "bonferroni_alpha": (alpha / n) if n else alpha,
+    }
+
 def _resolve_config_path(alert_key: str) -> Optional[str]:
     """Single registry: delegates to alerts.ALERT_CONFIG_MAP."""
     return resolve_alert_config_path(alert_key)

@@ -52,7 +52,9 @@ from brain_report import (
     build_brain_report_sections,
     render_report_markdown,
     render_report_messages,
+    to_action_plan,
 )
+from brain_helpers import ACTION_PLAN_KEY
 
 # Backward-compatible alias for the core class (was `from brain import BrainEngine as BaseBrainEngine`).
 BaseBrainEngine = BrainCore
@@ -531,6 +533,7 @@ class BrainEngineV2(BrainCore):
                         continue
                     adj = self._root_cause_to_weight_adjustment(rec)
                     if adj:
+                        adj["_repair_id"] = rec.get("_repair_id")
                         weight_adjustments.append(adj)
 
                 elif rec_type == "condition_ablation":
@@ -564,8 +567,15 @@ class BrainEngineV2(BrainCore):
                             "suggested": suggested,
                             "reason": rec.get("message", ""),
                             "_source_category": "threshold_too_low",
+                            "_repair_id": rec.get("_repair_id"),
                         })
-
+            # Revert patches from a change-point regression belong to that repair.
+            _pin_id = next(
+                (r.get("_repair_id") for r in recs.get("recommendations", [])
+                 if r.get("type") == "repair_shop" and r.get("category") == "config_regression_pinpoint"
+                 and r.get("_repair_id")),
+                None,
+            )
             # Only store safe config patches
             for patch in recs.get("config_patch", []):
                 # Action gate is authoritative — a patch marked blocked must
@@ -586,8 +596,11 @@ class BrainEngineV2(BrainCore):
                             patch.get("_source_category")
                             or self._infer_patch_category(field)
                         ),
+                        "_repair_id": (
+                            patch.get("_repair_id")
+                            or (_pin_id if patch.get("_source_category") == "config_regression_pinpoint" else None)
+                        ),
                     })
-
             # ── FIX: dedupe by field. Both repair_shop_diagnosis()
             def _delta(p: Dict[str, Any]) -> float:
                 cur, sug = p.get("current"), p.get("suggested")
@@ -634,6 +647,31 @@ class BrainEngineV2(BrainCore):
                     disable_alerts = [item for _, k, item in keep if k == "disable"]
                     reinstate_alerts = [item for _, k, item in keep if k == "reinstate"]
             
+            # ── Family accountability (restrict-only): a recommendation family
+            # whose changes keep hurting stops contributing to the plan. ──
+            _acct_mode = str(getattr(cfg, "FAMILY_ACCOUNTABILITY_MODE", "shadow"))
+            _acct = (recs.get("ai_metrics") or {}).get("family_accountability") or {}
+            _suppressed: List[Dict[str, Any]] = []
+            if _acct_mode != "off" and _acct:
+                def _blocked(item: Dict[str, Any], cat: Optional[str]) -> bool:
+                    fam = _acct.get(cat) if cat else None
+                    if fam and not fam.get("eligible", True):
+                        _suppressed.append({
+                            "target": item.get("path") or f"weight:{item.get('vote')}",
+                            "family": cat, "reason": fam.get("reason"),
+                            "suspended_until": fam.get("suspended_until"),
+                        })
+                        return True
+                    return False
+                _keep_cfg = [p for p in config_patches if not _blocked(p, p.get("_source_category"))]
+                _keep_w = [w for w in weight_adjustments if not _blocked(w, w.get("category"))]
+                if _acct_mode == "live":
+                    config_patches, weight_adjustments = _keep_cfg, _keep_w
+            _repair_ids = sorted({
+                str(x["_repair_id"]) for x in list(config_patches) + list(weight_adjustments)
+                if x.get("_repair_id")
+            })
+
             plan_data = {
                 "generated_at": int(time.time()),
                 "_action_gate_passed": action_gate_passed,
@@ -641,6 +679,8 @@ class BrainEngineV2(BrainCore):
                 "disable_alerts": disable_alerts,
                 "reinstate_alerts": reinstate_alerts,
                 "weight_adjustments": weight_adjustments,
+                "repair_ids": _repair_ids,
+                ("suppressed_families" if _acct_mode == "live" else "would_suppress_families"): _suppressed,
             }
             _plan_empty = not (config_patches or disable_alerts
                                or reinstate_alerts or weight_adjustments)
@@ -708,6 +748,24 @@ class BrainEngineV2(BrainCore):
                         "n_weights": len(weight_adjustments),
                     },
                 })
+                try:
+                    # Machine-readable twin of the report (schema brain_action_plan/1).
+                    _impacts = None
+                    try:
+                        _impacts = engine.replay_plan_actions(
+                            recs.get("_real_rows") or [], recs.get("_shadow_rows") or [], plan_data,
+                            {"min_conf_pct": cfg.CONFLUENCE_MIN_PCT, "min_abs_score": cfg.CONFLUENCE_MIN_ABS_SCORE},
+                            single_active_sec=(
+                                int(cfg.OUTCOME_LOOKAHEAD_CANDLES) * 900
+                                if getattr(cfg, "ENABLE_SINGLE_ACTIVE_TRADE", False) else 0
+                            ),
+                        )
+                    except Exception as e:
+                        logging.getLogger("macd_bot").debug(f"Plan replay failed (non-fatal): {e}")
+                    _ap = to_action_plan(plan_data, recs, cfg, impacts=_impacts)
+                    await self.sdb.set_metadata(ACTION_PLAN_KEY, json_dumps(_ap), ttl=7 * 86400)
+                except Exception as e:
+                    logging.getLogger("macd_bot").warning(f"Action plan build failed (non-fatal): {e}")
                 logging.getLogger("macd_bot").info(
                     f"Brain plan stored: {plan_id} "
                     f"(patches={len(config_patches)} disable={len(disable_alerts)} "
@@ -1149,6 +1207,7 @@ class BrainEngineV2(BrainCore):
             
             plan = json_loads(raw)
             applied = []
+            applied_repair_ids: List[str] = []   # ledger repairs whose change really went live
             applied_config = False   # config overrides — loaded only at startup
             applied_live = False     # dynamic weights / alert flags — read live
 
@@ -1190,6 +1249,8 @@ class BrainEngineV2(BrainCore):
                     if ok:
                         snap_overrides[field] = {"prev": _ov_before.get(field), "new": value}
                         applied.append(f"✅ {field}: {value}")
+                        if patch.get("_repair_id"):
+                            applied_repair_ids.append(str(patch["_repair_id"]))
                         applied_config = True
                         logger_run.info(f"Applied brain config: {field} = {value}")
 
@@ -1262,6 +1323,9 @@ class BrainEngineV2(BrainCore):
                     if await self.sdb.set_dynamic_weights(weights):
                         snap_weights = {"prev": _w_before, "new": dict(weights)}
                         applied_live = True
+                        applied_repair_ids.extend(
+                            str(a["_repair_id"]) for a in weight_adj if a.get("_repair_id")
+                        )
                         for adj in weight_adj:
                             applied.append(
                                 f"⚖️ {adj.get('vote')}: "
@@ -1279,9 +1343,12 @@ class BrainEngineV2(BrainCore):
                 # ── Ledger: mark all repairs in this plan as applied ──
                 plan_ts = plan.get("generated_at", int(time.time()))
                 try:
-                    marked = await mark_plan_applied(self.sdb, plan_ts)
+                    marked = await mark_plan_applied(
+                        self.sdb, plan_ts,
+                        repair_ids=applied_repair_ids if "repair_ids" in plan else None,
+                    )
                     if marked:
-                        logger_run.info(f"���� Repair ledger: marked {marked} repair(s) applied")
+                        logger_run.info(f" Repair ledger: marked {marked} repair(s) applied")
                 except Exception as e:
                     logger_run.debug(f"Repair ledger apply-mark failed (non-fatal): {e}")
 

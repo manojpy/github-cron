@@ -24,6 +24,7 @@ from repair_ledger import (
     repair_success_rates,
     ledger_stats,
     load_ledger_entries,
+    family_accountability,
 )
 
 async def build_full_recommendations(self) -> Dict[str, Any]:
@@ -188,6 +189,18 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
     # then annotates each new repair with that probability below.
     try:
         ledger_entries = await load_ledger_entries(self.sdb)
+        # Which recommendation families have repeatedly hurt when acted on?
+        # (Enforcement happens when the plan is stored; mode off/shadow/live.)
+        if str(getattr(cfg, "FAMILY_ACCOUNTABILITY_MODE", "shadow")) != "off":
+            try:
+                ai_metrics["family_accountability"] = family_accountability(
+                    ledger_entries, int(time.time()),
+                    window_days=int(getattr(cfg, "FAMILY_ACCOUNTABILITY_WINDOW_DAYS", 60)),
+                    hurt_streak=int(getattr(cfg, "FAMILY_HURT_STREAK", 3)),
+                    suspend_days=int(getattr(cfg, "FAMILY_SUSPEND_DAYS", 14)),
+                )
+            except Exception as e:
+                audit.record_analysis_exception("family_accountability", e)
         current_state = {
             "overall_wr": (
                 sum(1 for r in real_rows if r["win"]) / len(real_rows)
@@ -701,6 +714,22 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
             if not real_sim:
                 continue
             scenario = {"label": spec["label"], **real_sim}
+            # Same-opportunity replay with an uncertainty interval, trade counts
+            # and drawdown (descriptive, not causal). Best-effort.
+            try:
+                scenario["replay"] = engine.policy_counterfactual(
+                    real_rows, shadow_rows,
+                    {"min_abs_score": spec["new_threshold"], "ctx_caps": spec["new_params"],
+                     "caps_direction": spec.get("params_direction")},
+                    {"min_conf_pct": cfg.CONFLUENCE_MIN_PCT, "min_abs_score": cfg.CONFLUENCE_MIN_ABS_SCORE},
+                    single_active_sec=(
+                        int(cfg.OUTCOME_LOOKAHEAD_CANDLES) * 900
+                        if getattr(cfg, "ENABLE_SINGLE_ACTIVE_TRADE", False) else 0
+                    ),
+                )
+            except Exception as _e:
+                logging.getLogger("macd_bot").debug(f"Scenario replay failed (non-fatal): {_e}")
+
             # ── Shadow out-of-sample check: same change, second sample ──
             if shadow_usable:
                 shadow_sim = simulate_config_change(
@@ -1013,7 +1042,7 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
 
     logger.info(f"⏱️   └ actionability_block: {time.time() - _act_t0:.2f}s")
 
-    # ── Config version hash ──────────────��───────────────────────────
+    # ── Config version hash ──────────────��──────────���────────────────
     _hash_t0 = time.time()
     ai_metrics["config_version"] = hash_config_state(
         CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT

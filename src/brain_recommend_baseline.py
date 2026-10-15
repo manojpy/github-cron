@@ -10,7 +10,10 @@ from state import _rc
 import threshold_engine as engine
 from threshold_quality import gate_shadow_comparison, prediction_track_record
 from brain_audit import get_audit, HealthStatus
-from brain_helpers import KILL_SWITCH_KEY, _resolve_config_path
+from brain_helpers import (
+    KILL_SWITCH_KEY, _resolve_config_path,
+    EXPERIMENT_LEDGER_KEY, count_brain_trials, update_experiment_ledger,
+)
 
 async def build_baseline_recommendations(self) -> Dict[str, Any]:
     """Build the full recommendation set: per-alert verdicts, a confluence
@@ -1408,6 +1411,27 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                 ),
                 "delta_ev": -fr.get("ev_overstated_pct_per_trade", 0.0),
             })
+
+    # ── Experiment ledger: how many candidates were examined this cycle (not
+    # just the survivors), persisted so the report can show the family size
+    # behind every "validated" claim. Best-effort: never blocks the report. ──
+    try:
+        _led_prev: Dict[str, Any] = {}
+        if not self.sdb.degraded:
+            _led_raw = await self.sdb.get_metadata(EXPERIMENT_LEDGER_KEY)
+            _led_prev = json_loads(_led_raw) if _led_raw else {}
+        _led = update_experiment_ledger(
+            _led_prev, count_brain_trials(ai_metrics, len(recommendations)), int(time.time()),
+        )
+        if not self.sdb.degraded:
+            _pb_raw = await self.sdb.get_metadata("playbook_state")
+            _pb = json_loads(_pb_raw) if _pb_raw else {}
+            if isinstance(_pb, dict) and _pb.get("cum_hypotheses") is not None:
+                _led["learner_cum_hypotheses"] = int(_pb["cum_hypotheses"])
+            await self.sdb.set_metadata(EXPERIMENT_LEDGER_KEY, json_dumps(_led), ttl=180 * 86400)
+        ai_metrics["experiment_ledger"] = _led
+    except Exception as e:
+        audit.record_analysis_exception("experiment_ledger", e)
 
     severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     recommendations.sort(key=lambda x: severity_order.get(x["severity"], 4))

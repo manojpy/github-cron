@@ -14,6 +14,7 @@ from plan_replay import build_plan_lab
 from alerts import escape_markdown_v2
 from state import format_outcome_totals
 from alert_registry import alert_family_of as _registry_family_of, pretty_alert as _pretty_alert
+from brain_helpers import multiple_testing_note
 
 _PHASE_MIN_SAMPLES = {
     "weight_optimizer": 100,
@@ -662,6 +663,23 @@ def _cf_verdict(scenario: Dict[str, Any], cfg) -> Tuple[str, str]:
     return (f"🟢 confirmed (n={shadow_n})",
             f"🕒 NOT YET (need {min_shadow} shadow, have {shadow_n})")
 
+def _replay_text(s: Dict[str, Any]) -> str:
+    """One short line of same-opportunity replay evidence for a scenario ('' if none)."""
+    rp = s.get("replay") or {}
+    dl = rp.get("delta")
+    if not rp.get("valid") or not dl:
+        return ""
+    label = {
+        "supported": "🟢 change holds up after allowing for clustering",
+        "likely_harmful": "🔴 replay says it would have lost money",
+        "not_distinguishable": "🟡 change not distinguishable from zero",
+        "insufficient": "🟡 too few changed trades to judge",
+    }.get(rp.get("verdict"), "")
+    ci = "" if dl.get("lcb") is None else f" (90% range {dl['lcb']:+.1f} to {dl['ucb']:+.1f})"
+    return (f"\n   Replay: {dl['total_pnl_pct']:+.1f} pts total P&L{ci}, "
+            f"trades -{rp.get('trades_removed', 0)}/+{rp.get('trades_added', 0)}, "
+            f"max drawdown {dl['max_dd_change_pct']:+.1f} pts — {label}")
+
 def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
     n, wr = F["n"], F["wr"]
     out = [_hdr(3, "🚦 WHAT SHOULD I DO NOW?")]
@@ -730,7 +748,7 @@ def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
                 verdict = "🕒 HOLD (still negative EV)"
             lines.append(
                 f"• {s.get('label', '?')}: {_ev_text(F)} → {s.get('ev', 0.0):+.2f}% "
-                f"(n={s.get('n', 0)}) — {verdict}"
+                f"(n={s.get('n', 0)}) — {verdict}" + _replay_text(s)
             )
         out.append(_p("🥇 CANDIDATE CONFIGS (beat current live config)\n\n" + "\n".join(lines)))
     return out
@@ -1042,7 +1060,197 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     if _ptr_lines:
         out.append(_p("PREDICTION TRACK RECORD — did the Brain's stated odds match reality?"))
         out.extend(_c_split(_ptr_lines))
+    _acct_lines = _accountability_lines(
+        (F.get("ai") or {}).get("family_accountability"),
+        str(getattr(cfg, "FAMILY_ACCOUNTABILITY_MODE", "shadow")),
+    )
+    if _acct_lines:
+        out.append(_p("RECOMMENDATION ACCOUNTABILITY — did past changes help?"))
+        out.extend(_c_split(_acct_lines))
+    _exp_lines = _experiment_lines((F.get("ai") or {}).get("experiment_ledger"))
+    if _exp_lines:
+        out.append(_p("EXPERIMENT LEDGER — how much was tried to find these results?"))
+        out.extend(_c_split(_exp_lines))
     return out
+
+ACTION_PLAN_SCHEMA = "brain_action_plan/1"
+ACTION_PLAN_TTL_HOURS = 7 * 24          # matches the 7-day life of the stored pending plan
+ACTION_MONITOR_HORIZON_HOURS = 48       # same defaults evaluate_pending_repairs uses
+ACTION_MONITOR_MIN_OUTCOMES = 30
+_GATE_LAYERS = ("data_quality", "oos_prediction", "profitability", "stability", "risk", "execution")
+
+def to_action_plan(plan_data: Dict[str, Any], recs: Dict[str, Any], cfg, now: Optional[int] = None, impacts: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Machine-readable twin of the human report: one object per proposed change.
+
+    Pure: reads the stored pending plan and the recommendation dict, returns JSON-safe
+    data, changes nothing. `validation_status` is one of insufficient / exploratory /
+    validated. (shadow- and live-confirmed need a repair-ledger verdict, which exists
+    only after the change has been applied, so they are not assigned here.)
+    `gate_cleared` says the six-layer action gate passed; whether a change is actually
+    applied automatically is decided elsewhere, never by this function.
+    `impacts` (optional) maps 'kind:target' to a counterfactual replay result; a change
+    whose replay is 'likely_harmful' is marked not cleared. Replay is descriptive, not causal."""
+    import time as _time
+    now = int(now if now is not None else _time.time())
+    ai = recs.get("ai_metrics") or {}
+    gate = ai.get("action_gate") or {}
+    gate_passed = bool(plan_data.get("_action_gate_passed"))
+    failed = [k for k in _GATE_LAYERS if not gate.get(k)]
+    if not gate.get("data_quality"):
+        status = "insufficient"
+    elif gate_passed:
+        status = "validated"
+    else:
+        status = "exploratory"
+    generated = int(plan_data.get("generated_at") or now)
+    expires = generated + ACTION_PLAN_TTL_HOURS * 3600
+    plan_id = plan_data.get("plan_id")
+    acct = ai.get("family_accountability") or {}
+    disable_recs = {
+        str(r.get("alert") or r.get("alert_key")): r
+        for r in (recs.get("recommendations") or []) if r.get("type") == "disable_alert"
+    }
+
+    actions: List[Dict[str, Any]] = []
+
+    def _add(kind: str, target: str, old: Any, new: Any, rationale: str,
+             applies_via: str, category: Optional[str], impact: Dict[str, Any],
+             auto_enabled: Optional[bool]) -> None:
+        rp = (impacts or {}).get(f"{kind}:{target}")
+        harmful = False
+        if rp and rp.get("replayable") and rp.get("delta"):
+            dl = rp["delta"]
+            impact = {
+                "basis": "historical_replay", "causal": False,
+                "net_pnl_delta_pct_points": dl.get("total_pnl_pct"),
+                "ci90": [dl.get("lcb"), dl.get("ucb")],
+                "net_ev_delta_pct": dl.get("ev_per_trade_change"),
+                "trades_added": rp.get("trades_added"), "trades_removed": rp.get("trades_removed"),
+                "max_dd_change_pct_points": dl.get("max_dd_change_pct"),
+                "uses_shadow_rows": rp.get("uses_shadow_rows"),
+                "replay_verdict": rp.get("verdict"),
+                "n_opportunities": rp.get("n_opportunities"),
+            }
+            harmful = rp.get("verdict") == "likely_harmful"
+        elif rp and not rp.get("replayable", True):
+            impact = {"basis": "not_replayable", "reason": rp.get("reason"), "net_ev_delta_pct": None}
+        actions.append({
+            "id": f"{plan_id or 'PLAN'}#{len(actions) + 1}",
+            "kind": kind, "target": target, "old": old, "new": new,
+            "rationale": rationale, "source_category": category,
+            "family": (
+                {k: acct[category][k] for k in ("status", "n", "helped", "hurt")}
+                if category in acct else None
+            ),
+            "validation_status": status,
+            "gate_cleared": gate_passed and not harmful,
+            "blocked_by": ([] if gate_passed else list(failed)) + (["counterfactual_replay"] if harmful else []),
+            "applies_via": applies_via,
+            "auto_apply_enabled": auto_enabled,
+            "expected_impact": impact,
+            "monitoring": {
+                "metric": "scoped net EV and win rate after application",
+                "horizon_hours": ACTION_MONITOR_HORIZON_HOURS,
+                "min_outcomes": ACTION_MONITOR_MIN_OUTCOMES,
+                "baseline_net_ev_pct": ai.get("net_ev"),
+                "ledger_key": "brain_repair_ledger",
+            },
+            "rollback": {
+                "trigger": "repair-ledger verdict 'hurt' (net EV falls by more than 0.02 with win rate not rising)",
+                "restore": old,
+            },
+            "expires_at": expires,
+        })
+
+    _unknown = {"basis": "not_estimated", "net_ev_delta_pct": None}
+    for p in plan_data.get("config_patch") or []:
+        _add("config_patch", str(p.get("path")), p.get("current"), p.get("suggested"),
+             str(p.get("reason") or ""), "apply_config_override", p.get("_source_category"), _unknown, None)
+    for w in plan_data.get("weight_adjustments") or []:
+        _add("weight", f"weight:{w.get('vote')}", w.get("current"), w.get("suggested"),
+             str(w.get("reason") or ""), "dynamic_weights", w.get("category"), _unknown,
+             bool(getattr(cfg, "BRAIN_AUTO_APPLY_DYNAMIC_WEIGHTS", False)))
+    for ak in plan_data.get("disable_alerts") or []:
+        r = disable_recs.get(str(ak)) or {}
+        _add("disable_alert", str(ak), "enabled", "disabled", str(r.get("message") or "brain_disable"),
+             "alert_toggle", "disable_alert",
+             {"basis": "observed", "win_rate": r.get("win_rate"), "n": r.get("sample_size"), "net_ev_delta_pct": None}, None)
+    for ak in plan_data.get("reinstate_alerts") or []:
+        _add("reinstate_alert", str(ak), "disabled", "enabled", "brain_reinstate",
+             "alert_toggle", "reinstate_alert", _unknown, None)
+
+    ptr = ai.get("prediction_track_record") or {}
+    ledger = ai.get("experiment_ledger") or {}
+    n_tests = int((ledger.get("last") or {}).get("zone_candidates", 0)) + int((ledger.get("last") or {}).get("regime_segments", 0))
+    return {
+        "schema": ACTION_PLAN_SCHEMA,
+        "plan_id": plan_id,
+        "generated_at": generated,
+        "expires_at": expires,
+        "status": status,
+        "evidence": {
+            "n_real": (plan_data.get("sample_size") or {}).get("real"),
+            "n_shadow": (plan_data.get("sample_size") or {}).get("shadow"),
+            "action_gate": {k: bool(gate.get(k)) for k in _GATE_LAYERS},
+            "oos_p_ev_positive": gate.get("oos_p_ev_positive"),
+            "profit_p_ev_positive": gate.get("profit_p_ev_positive"),
+            "ev_p5": gate.get("ev_p5"),
+            "net_ev_pct": ai.get("net_ev"),
+            "prediction_status": {
+                f: p.get("status") for f, p in (ptr.get("predictors") or {}).items()
+            },
+            "multiple_testing": multiple_testing_note(n_tests),
+        },
+        "actions": actions,
+        "accountability_mode": str(getattr(cfg, "FAMILY_ACCOUNTABILITY_MODE", "shadow")),
+        "suppressed_families": plan_data.get("suppressed_families") or [],
+        "would_suppress_families": plan_data.get("would_suppress_families") or [],
+        "note": "Historical evidence on fired alerts; not a forecast of future profit.",
+    }
+
+def _accountability_lines(acct: Optional[Dict[str, Any]], mode: str) -> List[str]:
+    """Plain-text lines: which recommendation families helped or hurt when acted on."""
+    if not acct:
+        return []
+    icon = {"eligible": "🟢", "insufficient": "⚪", "probation": "🟡", "suspended": "🔴"}
+    rows: List[Tuple[str, ...]] = []
+    for cat, f in sorted(acct.items(), key=lambda kv: (kv[1].get("eligible", True), -kv[1].get("n", 0))):
+        rows.append((f"{icon.get(f['status'], '⚪')} {cat}", f"n={f['n']}",
+                     f"helped {f['helped']} / hurt {f['hurt']} / neutral {f['neutral']}", f["status"]))
+    lines = list(_table(rows, "llll"))
+    sus = [c for c, f in acct.items() if not f.get("eligible", True)]
+    if sus:
+        lines.append("")
+        lines.append(
+            ("Suspended (changes from these are left out of the plan): " if mode == "live"
+             else "Would be suspended (shadow mode, nothing is blocked yet): ") + ", ".join(sorted(sus))
+        )
+    lines.append("")
+    lines.append("Counts only changes that were applied and later measured; families with no measured changes do not appear.")
+    return lines
+
+def _experiment_lines(led: Optional[Dict[str, Any]]) -> List[str]:
+    """Plain-text lines for the experiment ledger (empty when nothing recorded)."""
+    if not led or not led.get("last"):
+        return []
+    last = led["last"]
+    n = int(last.get("zone_candidates", 0)) + int(last.get("regime_segments", 0))
+    note = multiple_testing_note(n)
+    lines = [
+        f"Candidates examined this cycle: {last.get('zone_candidates', 0)} TP/SL zones, "
+        f"{last.get('regime_segments', 0)} regime segments, {last.get('recommendations', 0)} recommendations",
+    ]
+    if n:
+        lines.append(
+            f"With {n} segment/zone tests, about {note['expected_chance_hits']:.1f} would look "
+            f"significant at the 5% level by chance alone."
+        )
+    cum = led.get("cum") or {}
+    lines.append(f"Looks since tracking began: {sum(int(v) for v in cum.values())} over {led.get('cycles', 0)} cycles "
+                 f"(same data re-examined, not independent tests).")
+    if led.get("learner_cum_hypotheses") is not None:
+        lines.append(f"Learner playbook hypotheses tried to date: {led['learner_cum_hypotheses']}")
+    return lines
 
 def _prediction_track_lines(ptr: Optional[Dict[str, Any]]) -> List[str]:
     """Plain-text lines for the prediction track record (empty when there is nothing to show)."""

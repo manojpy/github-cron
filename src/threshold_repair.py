@@ -15,8 +15,11 @@ from threshold_analysis import (
 from threshold_models import (
     _train_logistic,
 )
+from plan_replay import cluster_se, max_drawdown
 from threshold_stats import (
     Row,
+    _resolve_costs,
+    row_net_pnl_pct,
     _flatten_row_features,
     _prob_edge_broken,
     _prob_ev_negative,
@@ -77,6 +80,187 @@ def simulate_config_change(rows: List[Row], baseline_ev: float, new_threshold: O
         "filtered_out": len(rows) - n,
         "rr": rr,
     } 
+# ── Counterfactual policy replay (current vs proposed, same opportunities) ──
+def _total_cost_pct() -> float:
+    fee, slip = _resolve_costs(None, None)
+    return ((fee * 2) + (slip * 2)) * 100
+
+def _row_reason(r: Row) -> Optional[str]:
+    return r.get("rejection_reason") or (r.get("context") or {}).get("rejection_reason")
+
+def _passes_policy(r: Row, policy: Dict[str, Any], current: Dict[str, Any], is_real: bool) -> bool:
+    """Would the proposed policy take this row? Real rows already cleared the
+    CURRENT thresholds, so a threshold is only re-checked on them when the
+    proposal makes it stricter; shadow rows must clear the proposed one."""
+    for field, key in (("min_conf_pct", "conf_pct"), ("min_abs_score", "score")):
+        new = policy.get(field)
+        if new is None or r.get(key) is None:
+            continue
+        cur = current.get(field)
+        if is_real and cur is not None and float(new) <= float(cur):
+            continue
+        if float(r[key]) < float(new):
+            return False
+    if r.get("alert_key") in (policy.get("disable_alert_keys") or []):
+        return False
+    caps = policy.get("ctx_caps")
+    if caps and policy.get("caps_direction") in (None, r.get("direction")):
+        ctx = r.get("context") or {}
+        for k, mx in caps.items():
+            v = ctx.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v > mx:
+                return False
+    return True
+
+def _admits_shadow(r: Row, policy: Dict[str, Any], current: Dict[str, Any]) -> bool:
+    """Would a previously BLOCKED opportunity be taken under the proposal?"""
+    if (r.get("context") or {}).get("cooldown_active"):
+        return False
+    relax = set(policy.get("relax_gates") or [])
+    for field in ("min_conf_pct", "min_abs_score"):
+        new, cur = policy.get(field), current.get(field)
+        if new is not None and cur is not None and float(new) < float(cur):
+            relax.add("confluence_gate")
+    if _row_reason(r) not in relax:
+        return False
+    only = policy.get("relax_alert_keys")
+    if only and r.get("alert_key") not in only:
+        return False
+    return _passes_policy(r, policy, current, False)
+
+def _path_stats(pnls: List[float]) -> Dict[str, Any]:
+    n = len(pnls)
+    return {
+        "n": n,
+        "total_pnl_pct": round(sum(pnls), 3),
+        "ev_pct": round(sum(pnls) / n, 4) if n else None,
+        "max_dd_pct": round(max_drawdown(pnls), 3),
+        "worst10_pct": round(sorted(pnls)[max(0, int(0.1 * (n - 1)))], 3) if n else None,
+    }
+
+def policy_counterfactual(real_rows: List[Row], shadow_rows: List[Row], policy: Dict[str, Any], current: Optional[Dict[str, Any]] = None, cost_pct: Optional[float] = None, single_active_sec: int = 0, min_flips: int = 10, z: float = 1.645) -> Dict[str, Any]:
+    """Replay a proposed entry policy on the SAME historical opportunities.
+
+    Current policy = the trades actually taken (real rows). Proposed policy =
+    real rows that still pass, plus blocked (shadow) rows it would have let
+    through (skipping any that overlap a taken trade on the same pair when
+    single_active_sec is set). policy keys (all optional): min_conf_pct,
+    min_abs_score, disable_alert_keys, ctx_caps + caps_direction, relax_gates,
+    relax_alert_keys. `current` holds today's min_conf_pct / min_abs_score so
+    loosening is detected.
+
+    The headline is the paired change in total net P&L (percentage points, flat
+    size per trade) with a time-clustered 90% interval, plus trade counts and
+    max drawdown of both paths. verdict: supported (interval above 0),
+    likely_harmful (below 0), not_distinguishable, or insufficient.
+
+    Descriptive replay, NOT a causal estimate: blocked rows are only scored on
+    the gate that blocked them (later live gates are unknown), execution and
+    selection can differ from live, and one data window is one draw."""
+    current = current or {}
+    total_cost = cost_pct if cost_pct is not None else _total_cost_pct()
+    opps: List[Tuple[Row, bool]] = [(r, True) for r in real_rows]
+    opps += [(r, False) for r in shadow_rows if _admits_shadow(r, policy, current)]
+    taken = [i for i, (r, real) in enumerate(opps) if (not real) or _passes_policy(r, policy, current, True)]
+    if single_active_sec > 0:
+        # Trades that really happened are never dropped. A newly admitted
+        # (blocked) opportunity is dropped when the same pair already has a
+        # taken trade within single_active_sec either side of it, because the
+        # one-trade-per-pair rule would not have allowed both.
+        by_pair: Dict[Any, List[float]] = {}
+        for i in taken:
+            if opps[i][1]:
+                by_pair.setdefault(opps[i][0].get("pair"), []).append(float(opps[i][0].get("entry_ts") or 0))
+        kept = [i for i in taken if opps[i][1]]
+        for i in sorted((k for k in taken if not opps[k][1]), key=lambda k: opps[k][0].get("entry_ts") or 0):
+            r = opps[i][0]
+            ts, pair = float(r.get("entry_ts") or 0), r.get("pair")
+            if any(abs(ts - t) < single_active_sec for t in by_pair.get(pair, [])):
+                continue
+            by_pair.setdefault(pair, []).append(ts)
+            kept.append(i)
+        taken = kept
+    new_set = set(taken)
+    pnl = [row_net_pnl_pct(r, total_cost) for r, _ in opps]
+    order = sorted(range(len(opps)), key=lambda k: opps[k][0].get("entry_ts") or 0)
+    cur_path = [pnl[i] for i in order if opps[i][1]]
+    new_path = [pnl[i] for i in order if i in new_set]
+    d = [(pnl[i] if i in new_set else 0.0) - (pnl[i] if opps[i][1] else 0.0) for i in range(len(opps))]
+    added = sum(1 for i in new_set if not opps[i][1])
+    removed = sum(1 for i, (_, real) in enumerate(opps) if real and i not in new_set)
+    total_delta = sum(d)
+    out: Dict[str, Any] = {
+        "valid": bool(opps), "policy": policy, "n_opportunities": len(opps),
+        "current": _path_stats(cur_path), "proposed": _path_stats(new_path),
+        "trades_added": added, "trades_removed": removed,
+        "uses_shadow_rows": added > 0, "causal": False,
+    }
+    if not opps:
+        out["verdict"] = "insufficient"
+        return out
+    se_mean, n_blocks = cluster_se(d, [r.get("entry_ts") for r, _ in opps])
+    se_total = se_mean * len(opps) if se_mean != float("inf") else None
+    out["delta"] = {
+        "total_pnl_pct": round(total_delta, 3),
+        "se": None if se_total is None else round(se_total, 3),
+        "lcb": None if se_total is None else round(total_delta - z * se_total, 3),
+        "ucb": None if se_total is None else round(total_delta + z * se_total, 3),
+        "n_blocks": n_blocks,
+        "ev_per_trade_change": (
+            round(out["proposed"]["ev_pct"] - out["current"]["ev_pct"], 4)
+            if out["proposed"]["ev_pct"] is not None and out["current"]["ev_pct"] is not None else None
+        ),
+        "max_dd_change_pct": round(out["proposed"]["max_dd_pct"] - out["current"]["max_dd_pct"], 3),
+    }
+    if added + removed < min_flips or se_total is None:
+        out["verdict"] = "insufficient"
+    elif out["delta"]["lcb"] > 0:
+        out["verdict"] = "supported"
+    elif out["delta"]["ucb"] < 0:
+        out["verdict"] = "likely_harmful"
+    else:
+        out["verdict"] = "not_distinguishable"
+    return out
+
+def policy_from_action(kind: str, target: str, new: Any) -> Optional[Dict[str, Any]]:
+    """Row-level policy equivalent of one Action Plan item, or None when the
+    change cannot be replayed from stored rows (weights, most config fields)."""
+    try:
+        if kind == "config_patch":
+            if target == "CONFLUENCE_MIN_PCT":
+                return {"min_conf_pct": float(new)}
+            if target == "CONFLUENCE_MIN_ABS_SCORE":
+                return {"min_abs_score": float(new)}
+            return None
+        if kind == "disable_alert":
+            return {"disable_alert_keys": [target]}
+        if kind == "reinstate_alert":
+            return {"relax_gates": ["brain_disabled"], "relax_alert_keys": [target]}
+    except (TypeError, ValueError):
+        return None
+    return None
+
+def replay_plan_actions(real_rows: List[Row], shadow_rows: List[Row], plan_data: Dict[str, Any], current: Dict[str, Any], single_active_sec: int = 0) -> Dict[str, Dict[str, Any]]:
+    """Replay every change in a stored plan, one at a time, keyed 'kind:target'."""
+    items: List[Tuple[str, str, Any]] = []
+    for p in plan_data.get("config_patch") or []:
+        items.append(("config_patch", str(p.get("path")), p.get("suggested")))
+    for w in plan_data.get("weight_adjustments") or []:
+        items.append(("weight", f"weight:{w.get('vote')}", w.get("suggested")))
+    for ak in plan_data.get("disable_alerts") or []:
+        items.append(("disable_alert", str(ak), None))
+    for ak in plan_data.get("reinstate_alerts") or []:
+        items.append(("reinstate_alert", str(ak), None))
+    out: Dict[str, Dict[str, Any]] = {}
+    for kind, target, new in items:
+        pol = policy_from_action(kind, target, new)
+        if pol is None:
+            out[f"{kind}:{target}"] = {"replayable": False, "reason": "no row-level rule for this change"}
+            continue
+        res = policy_counterfactual(real_rows, shadow_rows, pol, current, single_active_sec=single_active_sec)
+        res["replayable"] = True
+        out[f"{kind}:{target}"] = res
+    return out
 
 def regime_profile_optimizer(rows: List[Row], regime_field: str = "adx_val", n_regimes: int = 3, min_sample: int = 25, target_winrate: float = 0.55) -> Dict[str, Any]:
     valid = [r for r in rows if r.get("context") and r["context"].get(regime_field) is not None]
@@ -461,7 +645,7 @@ def repair_shop_diagnosis(rows: List[Row], drift_alerts: List[Dict[str, Any]], c
     prioritized, actionable fix recommendations. Each item has:
     • severity: critical / high / medium / low
     • category: what's broken
-    • diagnosis: what the data shows
+    �� diagnosis: what the data shows
     • action: what to do about it
     • expected_impact: rough estimate of improvement
     """
