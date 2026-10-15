@@ -768,11 +768,11 @@ def prediction_track_record(rows: List[Row], min_n: int = 30, n_bins: int = 5, m
         v = ps.get("verdict")
         if isinstance(v, str) and v:
             by_verdict[v].append(r)
-    for v, grp in by_verdict.items():
-        evo = ev_first_objective(grp, min_sample=min_n)
+    for v, vrows in by_verdict.items():
+        evo = ev_first_objective(vrows, min_sample=min_n)
         out["by_verdict"][v] = {
-            "n": len(grp),
-            "wr": round(sum(1 for r in grp if r.get("win")) / len(grp), 4),
+            "n": len(vrows),
+            "wr": round(sum(1 for r in vrows if r.get("win")) / len(vrows), 4),
             "net_ev": round(evo["net_ev"], 4) if evo.get("valid") else None,
         }
     return out
