@@ -149,9 +149,12 @@ def wipe_labels(data_dir: Path, labels: list, dry_run: bool = False) -> int:
         # 4. ADD .gitkeep so Git tracks the folder even when empty
         gitkeep = label_dir / ".gitkeep"
         if not gitkeep.exists():
-            gitkeep.write_text("# This file ensures Git tracks this empty directory.\n")
+            gitkeep.write_text(
+                "# This file ensures Git tracks this empty directory.\n",
+                encoding="utf-8",
+            )
             print(f"📌 Added {gitkeep}")
-                
+               
     return removed
 
 def main():
