@@ -51,14 +51,37 @@ jobs:
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
+          set -euo pipefail
+
+          ASKPASS="$RUNNER_TEMP/git-askpass.sh"
+          trap 'rm -f "$ASKPASS"' EXIT
+
+          cat > "$ASKPASS" <<'EOF'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$DATA_REPO_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 700 "$ASKPASS"
+
+          export GIT_ASKPASS="$ASKPASS"
+          export GIT_TERMINAL_PROMPT=0
+
           git clone --depth 1 \
-            "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" \
+            "https://github.com/manojpy/outcome-data.git" \
             /tmp/data-repo
-          # The image checks at import time that the archive folder is writable
-          # (same as run-bot.yml). The learner never writes archives, and this
-          # clone is thrown away with the runner, so open the permissions.
-          mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
-          chmod -R 777 /tmp/data-repo
+
+          # Ensure the expected archive directories exist.
+          mkdir -p \
+            /tmp/data-repo/outcomes \
+            /tmp/data-repo/shadow \
+            /tmp/data-repo/reports
+
+          # Avoid world-writable permissions. The owner retains write access;
+          # other users receive read/traverse access only.
+          chmod -R u+rwX,go+rX /tmp/data-repo
 
       - name: 🐳 Log in to GHCR
         uses: docker/login-action@v4
@@ -67,17 +90,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🔥 Pull Image (commit-matched, else latest)
+      - name: 🔥 Pull Image (commit-matched only)
         run: |
+          set -euo pipefail
+
           BASE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           IMAGE="$BASE:sha-${GITHUB_SHA}"
-          echo "🐳 Pulling image..."
+
+          echo "🐳 Pulling commit-matched image: $IMAGE"
           START=$(date +%s)
-          if ! docker pull --quiet --platform linux/amd64 "$IMAGE"; then
-            echo "::warning::Image for commit ${GITHUB_SHA} not built yet — running :latest (config may be newer than code)"
-            IMAGE="$BASE:latest"
-            docker pull --quiet --platform linux/amd64 "$IMAGE"
-          fi
+
+          # Fail closed if the exact image is unavailable.
+          # Do not silently run code from a different revision.
+          docker pull --quiet --platform linux/amd64 "$IMAGE"
+
           echo "RUN_IMAGE=$IMAGE" >> "$GITHUB_ENV"
           echo "✅ Image ready in $(( $(date +%s) - START ))s"
 

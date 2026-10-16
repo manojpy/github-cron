@@ -28,8 +28,26 @@ jobs:
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
+          set -euo pipefail
+
+          ASKPASS="$RUNNER_TEMP/git-askpass.sh"
+          trap 'rm -f "$ASKPASS"' EXIT
+
+          cat > "$ASKPASS" <<'EOF'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$DATA_REPO_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 700 "$ASKPASS"
+
+          export GIT_ASKPASS="$ASKPASS"
+          export GIT_TERMINAL_PROMPT=0
+
           git clone --depth 1 \
-            "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" \
+            "https://github.com/manojpy/outcome-data.git" \
             /tmp/data-repo
 
       - name: 🧹 Cleanup old archives
@@ -53,34 +71,58 @@ jobs:
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
+          set -euo pipefail
           cd /tmp/data-repo
+
+          ASKPASS="$RUNNER_TEMP/git-askpass.sh"
+          trap 'rm -f "$ASKPASS"' EXIT
+
+          cat > "$ASKPASS" <<'EOF'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$DATA_REPO_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 700 "$ASKPASS"
+
+          export GIT_ASKPASS="$ASKPASS"
+          export GIT_TERMINAL_PROMPT=0
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .
+
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
+
           git commit -m "chore: cleanup old outcomes $(date -u +%Y-%m-%d)"
 
-          # The alert workflow pushes to this repo every 15 minutes. If it landed
-          # after our clone, a plain push is rejected — rebase and retry.
+          # The alert workflow pushes every 15 minutes. If it pushed after
+          # our clone, rebase onto the latest main and retry.
           for attempt in 1 2 3 4 5; do
             if git push origin main; then
               echo "✅ Cleanup pushed (attempt ${attempt})"
               exit 0
             fi
+
             if [ "$attempt" -eq 5 ]; then
               break
             fi
+
             echo "::warning::Push rejected (attempt ${attempt}/5) — rebasing onto latest main"
             sleep $(( attempt * 2 + RANDOM % 3 ))
+
             if ! git pull --rebase --no-tags origin main; then
               echo "::error::Rebase conflict — aborting; cleanup NOT pushed"
               git rebase --abort 2>/dev/null || true
               exit 1
             fi
           done
+
           echo "::error::Could not push cleanup after 5 attempts"
           exit 1
 
@@ -89,8 +131,29 @@ jobs:
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
+          set -euo pipefail
           cd /tmp/data-repo
+
+          ASKPASS="$RUNNER_TEMP/git-askpass.sh"
+          trap 'rm -f "$ASKPASS"' EXIT
+
+          cat > "$ASKPASS" <<'EOF'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$DATA_REPO_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 700 "$ASKPASS"
+
+          export GIT_ASKPASS="$ASKPASS"
+          export GIT_TERMINAL_PROMPT=0
+
           git checkout --orphan squashed
           git add -A
           git commit -m "chore: squash history $(date -u +%Y-%m-%d)"
-          git push --force "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" squashed:main
+
+          # Use the token-free origin URL. This operation intentionally
+          # force-pushes main and must remain manual-only.
+          git push --force origin squashed:main

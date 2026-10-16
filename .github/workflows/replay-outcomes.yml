@@ -74,10 +74,27 @@ jobs:
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
-          # Full clone (not sparse): we may need to write any date's file,
-          # and the number of artifacts per cycle is tiny.
+          set -euo pipefail
+
+          ASKPASS="$RUNNER_TEMP/git-askpass.sh"
+          trap 'rm -f "$ASKPASS"' EXIT
+
+          cat > "$ASKPASS" <<'EOF'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$DATA_REPO_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 700 "$ASKPASS"
+
+          export GIT_ASKPASS="$ASKPASS"
+          export GIT_TERMINAL_PROMPT=0
+
+          # Full clone (not sparse): replay may need to write any date's file.
           git clone --depth=1 \
-            "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" \
+            "https://github.com/manojpy/outcome-data.git" \
             /tmp/data-repo
 
       - name: ♻️ Merge artifacts into data repo
@@ -152,20 +169,40 @@ jobs:
         run: |
           set -euo pipefail
           cd /tmp/data-repo
-          PUSH_URL="https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git"
+
+          ASKPASS="$RUNNER_TEMP/git-askpass.sh"
+          trap 'rm -f "$ASKPASS"' EXIT
+
+          cat > "$ASKPASS" <<'EOF'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$DATA_REPO_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 700 "$ASKPASS"
+
+          export GIT_ASKPASS="$ASKPASS"
+          export GIT_TERMINAL_PROMPT=0
+
+          # Use the token-free origin URL created by the clone step.
           for attempt in 1 2 3 4 5; do
-            if git push "$PUSH_URL" HEAD:main; then
+            if git push origin HEAD:main; then
               echo "✅ Replay pushed (attempt ${attempt})"
               exit 0
             fi
+
             echo "::warning::Push rejected (attempt ${attempt}/5) — rebasing onto latest main"
             sleep $(( attempt * 2 + RANDOM % 3 ))
-            if ! git pull --rebase --no-tags "$PUSH_URL" main; then
+
+            if ! git pull --rebase --no-tags origin main; then
               echo "::error::Rebase conflict — aborting; replay NOT pushed"
               git rebase --abort 2>/dev/null || true
               exit 1
             fi
           done
+
           echo "::error::Could not push replay after 5 attempts"
           exit 1
 
