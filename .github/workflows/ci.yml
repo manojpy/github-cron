@@ -2,6 +2,10 @@ name: 🛑 CI Bot
 
 on: [push, pull_request, workflow_dispatch]
 
+concurrency:
+  group: "${{ github.workflow }}-${{ github.head_ref || github.ref }}"
+  cancel-in-progress: true
+
 jobs:
   static-checks:
     runs-on: ubuntu-latest
@@ -9,15 +13,20 @@ jobs:
     env:
       PYTHONUTF8: "1"
       PYTHONIOENCODING: "utf-8"
+
     steps:
       - uses: actions/checkout@v7
+
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+
       - name: Install linters
         run: pip install pyflakes==3.2.0 mypy==1.11.0
+
       - name: Syntax gate (py_compile everything)
         run: python -m compileall -q .
+
       - name: Encoding gate (UTF-8 / U+FFFD / mojibake / missing encoding=)
         run: |
           python - <<'PY'
@@ -31,44 +40,38 @@ jobs:
               ".py", ".md", ".yml", ".yaml", ".json", ".txt",
               ".rst", ".cfg", ".ini", ".toml", ".sh", ".bash",
           }
+
           TEXT_FILENAMES = {
               "Dockerfile", "Makefile", "requirements.txt",
               ".gitignore", ".gitattributes", ".editorconfig",
           }
+
           SKIP_DIR_PARTS = {
               ".git", "__pycache__", ".venv", "venv", "env",
               "node_modules", ".mypy_cache", ".pytest_cache",
               ".ruff_cache", ".tox", ".eggs", "build", "dist",
           }
 
-          # Each pattern is the accidental rendering of a real UTF-8
-          # sequence when a UTF-8 file is decoded as Latin-1 or CP1252.
-          # These sequences are VALID UTF-8, so a straight UTF-8 decode
-          # accepts them silently - only a regex catches them. Written with
-          # \u escapes and ASCII-only comments so THIS file contains none
-          # of the glyphs it is hunting for.
-          #
-          #   \u00c3 = A-tilde   Latin-1 misread of a UTF-8 lead byte 0xC3
-          #   \u00c2 = A-circ    Latin-1 misread of a UTF-8 lead byte 0xC2
-          #   \u00e2\u20ac = a-circ + euro  CP1252 misread of 0xE2 0x80
-          #   \u00e2\u0080 = a-circ + C1     Latin-1 misread of 0xE2 0x80
-          #   \u00f0\u0178 = eth + Y-diaer   CP1252 misread of an emoji
-          #   \u00f0\u009f = eth + C1        Latin-1 misread of an emoji
-          #   \u00ef\u00bb\u00bf = BOM rendered as text
+          CP1252_CONT = (
+              "[\u0080-\u00bf"
+              "\u20ac\u201a\u0192\u201e\u2026\u2020\u2021"
+              "\u02c6\u2030\u0160\u2039\u0152\u017d"
+              "\u2018\u2019\u201c\u201d"
+              "\u2022\u2013\u2014\u02dc\u2122"
+              "\u0161\u203a\u0153\u017e\u0178]"
+          )
+
           MOJIBAKE_PATTERNS = [
               "\u00c3[\u0080-\u00bf]",
               "\u00c2[\u0080-\u00bf]",
-              "\u00e2\u20ac[\u0080-\u00bf]",
+              f"\u00e2\u20ac{CP1252_CONT}",
               "\u00e2\u0080[\u0080-\u00bf]",
-              "\u00f0\u0178[\u0080-\u00bf]",
-              "\u00f0\u009f[\u0080-\u00bf]",
+              f"\u00f0\u0178{CP1252_CONT}{CP1252_CONT}",
+              "\u00f0\u009f[\u0080-\u00bf][\u0080-\u00bf]",
               "\u00ef\u00bb\u00bf",
           ]
-          MOJIBAKE_RE = re.compile("|".join(MOJIBAKE_PATTERNS))
 
-          # Repo-relative paths (posix, e.g. "tests/fixtures/x.py") whose
-          # mojibake patterns are intentional - typically encoding-detector
-          # test fixtures. Keep this list empty unless you actually need it.
+          MOJIBAKE_RE = re.compile("|".join(MOJIBAKE_PATTERNS))
           MOJIBAKE_ALLOWLIST: set[str] = set()
 
           def iter_text_files(root: Path):
@@ -82,6 +85,7 @@ jobs:
 
           def check_bytes_and_mojibake(root: Path) -> list[str]:
               problems: list[str] = []
+
               for p in iter_text_files(root):
                   try:
                       text = p.read_text(encoding="utf-8")
@@ -99,12 +103,32 @@ jobs:
 
                   if p.as_posix() in MOJIBAKE_ALLOWLIST:
                       continue
+
                   for i, line in enumerate(text.splitlines(), 1):
-                      m = MOJIBAKE_RE.search(line)
-                      if m:
+                      matches = list(MOJIBAKE_RE.finditer(line))
+                      if not matches:
+                          continue
+
+                      max_shown = 3
+
+                      for m in matches[:max_shown]:
+                          start = max(0, m.start() - 20)
+                          end = min(len(line), m.end() + 20)
+
+                          left = "..." if start > 0 else ""
+                          right = "..." if end < len(line) else ""
+
+                          context = line[start:end].strip()
+
                           problems.append(
-                              f"{p}:{i}: mojibake {m.group()!r}: "
-                              f"{line.strip()[:120]}"
+                              f"{p}:{i}: mojibake {m.group()!r} near "
+                              f"{left}{context}{right}"
+                          )
+
+                      remaining = len(matches) - max_shown
+                      if remaining > 0:
+                          problems.append(
+                              f"{p}:{i}: {remaining} more mojibake match(es) on same line"
                           )
               return problems
 
@@ -114,65 +138,91 @@ jobs:
           def _open_missing_encoding(node: ast.Call) -> bool:
               if not _missing_kw(node, "encoding"):
                   return False
+
               mode = None
+
               if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
                   mode = node.args[1].value
+
               for kw in node.keywords:
                   if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
                       mode = kw.value.value
+
               if isinstance(mode, str) and "b" in mode:
                   return False
+
               return True
 
           def check_python_encodings(root: Path) -> list[str]:
               problems: list[str] = []
+
               for p in sorted(root.rglob("*.py")):
                   if any(part in SKIP_DIR_PARTS for part in p.parts):
                       continue
+
                   try:
-                      tree = ast.parse(p.read_text(encoding="utf-8"), filename=str(p))
+                      tree = ast.parse(
+                          p.read_text(encoding="utf-8"),
+                          filename=str(p),
+                      )
                   except (SyntaxError, UnicodeDecodeError):
                       continue
+
                   for node in ast.walk(tree):
                       if not isinstance(node, ast.Call):
                           continue
+
                       fn = node.func
+
                       if isinstance(fn, ast.Name) and fn.id == "open":
                           if _open_missing_encoding(node):
                               problems.append(
                                   f"{p}:{node.lineno}: open() missing encoding= - "
                                   f"add encoding='utf-8'"
                               )
+
                       if isinstance(fn, ast.Attribute) and fn.attr in (
-                          "read_text", "write_text",
+                          "read_text",
+                          "write_text",
                       ):
                           if _missing_kw(node, "encoding"):
                               problems.append(
                                   f"{p}:{node.lineno}: .{fn.attr}() missing encoding= - "
                                   f"add encoding='utf-8'"
                               )
+
                       if isinstance(fn, ast.Attribute) and fn.attr in (
-                          "run", "Popen", "check_output", "check_call", "call",
+                          "run",
+                          "Popen",
+                          "check_output",
+                          "check_call",
+                          "call",
                       ):
                           kw_names = {k.arg for k in node.keywords if k.arg}
-                          if ("text" in kw_names or "universal_newlines" in kw_names) \
-                                  and "encoding" not in kw_names:
+
+                          if (
+                              "text" in kw_names
+                              or "universal_newlines" in kw_names
+                          ) and "encoding" not in kw_names:
                               problems.append(
                                   f"{p}:{node.lineno}: subprocess.{fn.attr}"
                                   f"(text=True) missing encoding= - add "
                                   f"encoding='utf-8'"
                               )
+
               return problems
 
           def main() -> int:
               root = Path(".")
               problems = check_bytes_and_mojibake(root)
               problems += check_python_encodings(root)
+
               if problems:
                   print("BLOCKING: encoding / mojibake / UTF-8 issues")
                   for prob in problems:
                       print("  -", prob)
                   return 1
+
               print(
                   "All text files valid UTF-8, no U+FFFD, no mojibake, "
                   "and every Python text I/O call declares UTF-8."
@@ -181,25 +231,31 @@ jobs:
 
           sys.exit(main())
           PY
+
       - name: Pyflakes (BLOCKING on real errors only)
         run: |
           set +e
           OUTPUT=$(pyflakes . 2>&1)
           PYFLAKES_EXIT=$?
           set -e
+
           if [ "$PYFLAKES_EXIT" -eq 0 ]; then
             echo "pyflakes clean"
             exit 0
           fi
+
           echo "pyflakes findings"
           echo "$OUTPUT"
+
           BLOCKING=$(echo "$OUTPUT" | grep -E "undefined name" || true)
           if [ -n "$BLOCKING" ]; then
             echo "BLOCKING: undefined names"
             echo "$BLOCKING"
             exit 1
           fi
+
           echo "No undefined-name errors (other findings are advisory)"
+
       - name: Mypy (advisory until the baseline is clean, then make blocking)
         continue-on-error: true
         run: |
@@ -217,25 +273,36 @@ jobs:
       TELEGRAM_CHAT_ID: "12345"
       REDIS_URL: "redis://localhost:6379/0"
       DELTA_API_BASE: "https://api.example.com"
-      PYTHONPATH: src
+      PYTHONPATH: "src"
       PYTHONUTF8: "1"
       PYTHONIOENCODING: "utf-8"
+
     steps:
       - uses: actions/checkout@v7
+
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      - run: pip install -r requirements.txt pytest
-      - run: pip check
-      - run: python -m pytest tests/ -q
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Dependency sanity check
+        run: pip check
+
+      - name: Run unit tests
+        run: python -m pytest tests/ -q
+
       - name: Numeric self-test (must pass before a build is trusted)
         run: |
           python - <<'PY'
           import sys
           import numeric_selftest
+
           ok, failures = numeric_selftest.run_self_test()
           for msg in failures:
               print("FAIL:", msg)
+
           sys.exit(0 if ok else 1)
           PY
 
@@ -244,8 +311,10 @@ jobs:
     timeout-minutes: 5
     env:
       SHELLCHECK_OPTS: "--severity=warning"
+
     steps:
       - uses: actions/checkout@v7
+
       - name: Run actionlint
         run: |
           bash <(curl -s https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
