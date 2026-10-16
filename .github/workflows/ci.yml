@@ -40,26 +40,36 @@ jobs:
               "node_modules", ".mypy_cache", ".pytest_cache",
               ".ruff_cache", ".tox", ".eggs", "build", "dist",
           }
-          # Paths (repo-relative, as strings) whose mojibake patterns are
-          # intentional — e.g. a test that asserts the detector works.
-          MOJIBAKE_ALLOWLIST: set[str] = set()
 
-          # ── Mojibake patterns ─────────────────────────────────────────
-          # Each is a real UTF-8 sequence decoded as Latin-1 or CP1252.
-          # They are VALID UTF-8, so read_text() accepts them silently —
-          # only a regex catches them. Written with \u escapes (not raw
-          # strings) so the source of this workflow file itself stays free
-          # of the characters we're hunting for.
+          # Each pattern is the accidental rendering of a real UTF-8
+          # sequence when a UTF-8 file is decoded as Latin-1 or CP1252.
+          # These sequences are VALID UTF-8, so a straight UTF-8 decode
+          # accepts them silently - only a regex catches them. Written with
+          # \u escapes and ASCII-only comments so THIS file contains none
+          # of the glyphs it is hunting for.
+          #
+          #   \u00c3 = A-tilde   Latin-1 misread of a UTF-8 lead byte 0xC3
+          #   \u00c2 = A-circ    Latin-1 misread of a UTF-8 lead byte 0xC2
+          #   \u00e2\u20ac = a-circ + euro  CP1252 misread of 0xE2 0x80
+          #   \u00e2\u0080 = a-circ + C1     Latin-1 misread of 0xE2 0x80
+          #   \u00f0\u0178 = eth + Y-diaer   CP1252 misread of an emoji
+          #   \u00f0\u009f = eth + C1        Latin-1 misread of an emoji
+          #   \u00ef\u00bb\u00bf = BOM rendered as text
           MOJIBAKE_PATTERNS = [
-              "\u00c3[\u0080-\u00bf]",         # Ã©, Ã¨, Ã¼, ...      (UTF-8 → Latin-1)
-              "\u00c2[\u0080-\u00bf]",         # Â©, Â®, Â, ...       (UTF-8 → Latin-1)
-              "\u00e2\u20ac[\u0080-\u00bf]",   # â€™, â€œ, â€¦, ...     (UTF-8 → CP1252)
-              "\u00e2\u0080[\u0080-\u00bf]",   # â€ sequences          (UTF-8 → Latin-1)
-              "\u00f0\u0178[\u0080-\u00bf]",   # ðŸ˜€, ðŸš€, ...        (emoji → CP1252)
-              "\u00f0\u009f[\u0080-\u00bf]",   # ðŸ... emoji          (emoji → Latin-1)
-              "\u00ef\u00bb\u00bf",            # ï»¿ (BOM rendered as text)
+              "\u00c3[\u0080-\u00bf]",
+              "\u00c2[\u0080-\u00bf]",
+              "\u00e2\u20ac[\u0080-\u00bf]",
+              "\u00e2\u0080[\u0080-\u00bf]",
+              "\u00f0\u0178[\u0080-\u00bf]",
+              "\u00f0\u009f[\u0080-\u00bf]",
+              "\u00ef\u00bb\u00bf",
           ]
           MOJIBAKE_RE = re.compile("|".join(MOJIBAKE_PATTERNS))
+
+          # Repo-relative paths (posix, e.g. "tests/fixtures/x.py") whose
+          # mojibake patterns are intentional - typically encoding-detector
+          # test fixtures. Keep this list empty unless you actually need it.
+          MOJIBAKE_ALLOWLIST: set[str] = set()
 
           def iter_text_files(root: Path):
               for p in root.rglob("*"):
@@ -73,14 +83,12 @@ jobs:
           def check_bytes_and_mojibake(root: Path) -> list[str]:
               problems: list[str] = []
               for p in iter_text_files(root):
-                  # 1. Must decode as UTF-8 at all.
                   try:
                       text = p.read_text(encoding="utf-8")
                   except UnicodeDecodeError as e:
                       problems.append(f"{p}: invalid UTF-8: {e}")
                       continue
 
-                  # 2. No U+FFFD (already-lost data).
                   if "\ufffd" in text:
                       for i, line in enumerate(text.splitlines(), 1):
                           if "\ufffd" in line:
@@ -89,8 +97,7 @@ jobs:
                                   f"{line.strip()[:120]}"
                               )
 
-                  # 3. No common mojibake sequences.
-                  if str(p) in MOJIBAKE_ALLOWLIST:
+                  if p.as_posix() in MOJIBAKE_ALLOWLIST:
                       continue
                   for i, line in enumerate(text.splitlines(), 1):
                       m = MOJIBAKE_RE.search(line)
@@ -105,7 +112,6 @@ jobs:
               return not any(k.arg == name for k in node.keywords)
 
           def _open_missing_encoding(node: ast.Call) -> bool:
-              """open(...) in text mode without an explicit encoding="""
               if not _missing_kw(node, "encoding"):
                   return False
               mode = None
@@ -115,11 +121,10 @@ jobs:
                   if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
                       mode = kw.value.value
               if isinstance(mode, str) and "b" in mode:
-                  return False        # binary mode: encoding is meaningless
+                  return False
               return True
 
           def check_python_encodings(root: Path) -> list[str]:
-              """AST scan: text I/O must declare UTF-8 explicitly."""
               problems: list[str] = []
               for p in sorted(root.rglob("*.py")):
                   if any(part in SKIP_DIR_PARTS for part in p.parts):
@@ -127,42 +132,34 @@ jobs:
                   try:
                       tree = ast.parse(p.read_text(encoding="utf-8"), filename=str(p))
                   except (SyntaxError, UnicodeDecodeError):
-                      continue    # already reported by the byte-level pass
+                      continue
                   for node in ast.walk(tree):
                       if not isinstance(node, ast.Call):
                           continue
                       fn = node.func
-
-                      # open(...)
                       if isinstance(fn, ast.Name) and fn.id == "open":
                           if _open_missing_encoding(node):
                               problems.append(
-                                  f"{p}:{node.lineno}: open() missing encoding= — "
+                                  f"{p}:{node.lineno}: open() missing encoding= - "
                                   f"add encoding='utf-8'"
                               )
-
-                      # Path.read_text / Path.write_text
                       if isinstance(fn, ast.Attribute) and fn.attr in (
                           "read_text", "write_text",
                       ):
                           if _missing_kw(node, "encoding"):
                               problems.append(
-                                  f"{p}:{node.lineno}: .{fn.attr}() missing encoding= — "
+                                  f"{p}:{node.lineno}: .{fn.attr}() missing encoding= - "
                                   f"add encoding='utf-8'"
                               )
-
-                      # subprocess.run / Popen / check_output / check_call / call
                       if isinstance(fn, ast.Attribute) and fn.attr in (
                           "run", "Popen", "check_output", "check_call", "call",
                       ):
                           kw_names = {k.arg for k in node.keywords if k.arg}
-                          # Only flag when text mode is requested explicitly.
-                          # Capture without text mode may legitimately want bytes.
                           if ("text" in kw_names or "universal_newlines" in kw_names) \
                                   and "encoding" not in kw_names:
                               problems.append(
                                   f"{p}:{node.lineno}: subprocess.{fn.attr}"
-                                  f"(text=True) missing encoding= — add "
+                                  f"(text=True) missing encoding= - add "
                                   f"encoding='utf-8'"
                               )
               return problems
@@ -172,12 +169,12 @@ jobs:
               problems = check_bytes_and_mojibake(root)
               problems += check_python_encodings(root)
               if problems:
-                  print("❌ BLOCKING: encoding / mojibake / UTF-8 issues")
+                  print("BLOCKING: encoding / mojibake / UTF-8 issues")
                   for prob in problems:
                       print("  -", prob)
                   return 1
               print(
-                  "✅ All text files valid UTF-8, no U+FFFD, no mojibake, "
+                  "All text files valid UTF-8, no U+FFFD, no mojibake, "
                   "and every Python text I/O call declares UTF-8."
               )
               return 0
@@ -185,30 +182,24 @@ jobs:
           sys.exit(main())
           PY
       - name: Pyflakes (BLOCKING on real errors only)
-        # Blocks on undefined names — the class of bug that shipped the
-        # logger regression. Unused imports / f-strings without placeholders
-        # / unused locals are printed for visibility but are advisory until
-        # the accumulated lint debt is paid down.
         run: |
           set +e
           OUTPUT=$(pyflakes . 2>&1)
           PYFLAKES_EXIT=$?
           set -e
           if [ "$PYFLAKES_EXIT" -eq 0 ]; then
-            echo "✅ pyflakes clean"
+            echo "pyflakes clean"
             exit 0
           fi
-          echo "── pyflakes findings ──────────────────────────"
+          echo "pyflakes findings"
           echo "$OUTPUT"
-          echo "───────────────────────────────────────────────"
           BLOCKING=$(echo "$OUTPUT" | grep -E "undefined name" || true)
           if [ -n "$BLOCKING" ]; then
-            echo ""
-            echo "❌ BLOCKING: undefined names"
+            echo "BLOCKING: undefined names"
             echo "$BLOCKING"
             exit 1
           fi
-          echo "✅ No undefined-name errors (other findings are advisory)"
+          echo "No undefined-name errors (other findings are advisory)"
       - name: Mypy (advisory until the baseline is clean, then make blocking)
         continue-on-error: true
         run: |
@@ -222,18 +213,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      # bot_config.load_config() hard-exits without these; CI dummies are fine
       TELEGRAM_BOT_TOKEN: "123456:CI_DUMMY_TOKEN_FOR_TESTS"
       TELEGRAM_CHAT_ID: "12345"
       REDIS_URL: "redis://localhost:6379/0"
       DELTA_API_BASE: "https://api.example.com"
-      # Bot modules live in src/. Tests import them by bare name, so src/
-      # must be on sys.path. The root conftest.py also inserts it, but
-      # being explicit here means the tests still work if conftest is
-      # ever refactored away.
       PYTHONPATH: src
-      # Belt-and-braces: force UTF-8 for open(), subprocess pipes and
-      # stdio, so the runner's locale can never silently change decoding.
       PYTHONUTF8: "1"
       PYTHONIOENCODING: "utf-8"
     steps:
@@ -259,10 +243,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      # Only fail on real bugs (warning/error). shellcheck's "info"/"style"
-      # findings (unquoted vars in low-risk spots, redirect-grouping
-      # preferences) are noisy across existing scripts and aren't worth
-      # blocking merges over.
       SHELLCHECK_OPTS: "--severity=warning"
     steps:
       - uses: actions/checkout@v7
