@@ -645,7 +645,7 @@ def repair_shop_diagnosis(rows: List[Row], drift_alerts: List[Dict[str, Any]], c
     prioritized, actionable fix recommendations. Each item has:
     • severity: critical / high / medium / low
     • category: what's broken
-    �� diagnosis: what the data shows
+    • diagnosis: what the data shows
     • action: what to do about it
     • expected_impact: rough estimate of improvement
     """

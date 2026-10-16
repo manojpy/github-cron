@@ -225,7 +225,7 @@ def _advise_pair_core(*, direction: str, score: Optional[float], total: Optional
     weak = _support_labels(votes, vote_weights, False, 2)
     support_txt = _support_text(votes, vote_weights, support)
 
-    # ═════════ no brain data at all ═══��═════
+    # ═════════ no brain data at all ════════
     if not data:
         strong_bar = (unproven_take_min_pct if unproven_take_min_pct is not None else 90.0) / 100.0
         qualifier = ""

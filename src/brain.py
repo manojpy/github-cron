@@ -731,7 +731,7 @@ class BrainCore:
         except Exception:
             return False
 
-    # ── Stream reading helpers ─────────────────────────────────�����─────────
+    # ── Stream reading helpers ─────────────────────────────────────────
 
     async def _read_stream(self, stream_key: str, count: int) -> List[Dict[str, str]]:
         """Read the most recent `count` entries from an outcome stream."""

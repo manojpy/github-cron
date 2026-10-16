@@ -48,9 +48,9 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
     _phase_mark("baseline")
     real_rows = base_recs.get("_real_rows", [])
     shadow_rows = base_recs.get("_shadow_rows", [])
-    # ════════════════════════════════════════���═════════════════════════
+    # ════════════════════════════════════════════════════════════════
     #  BRAIN AUDIT LAYER — initialize and validate data population
-    # ══════════════════════���════════════════���══════════════════════════  
+    # ═══════════════════════════════════════════════════════════════  
     audit = get_audit()  # keep coverage/reconciliation set during baseline
 
     # History coverage was already set in _generate_baseline_recommendations
@@ -542,7 +542,7 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
             })
     _phase_mark("weight_optimizer")
 
-    # ─ Per-alert breakdown ───────────────────────────────���──────────
+    # ─ Per-alert breakdown ────────────────────────────────────────
     alert_stats = engine.per_alert_breakdown(real_rows, min_sample=min_sample)
     if alert_stats:
         display = alert_stats if len(alert_stats) <= 10 else alert_stats[:5] + alert_stats[-5:]
@@ -784,7 +784,7 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
             elif sv is False:
                 shadow_note = (
                     f"\n   ⚠️ Shadow DISAGREES: Δ{best['shadow_delta_ev']:+.3f}% "
-                    f"on {best['shadow_n']} samples — treat as curve-fit."
+                    f"on {best['shadow_n']} samples �� treat as curve-fit."
                 )
             else:
                 shadow_note = "\n   Shadow sample too thin to validate."
@@ -1062,7 +1062,7 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
 
     logger.info(f"⏱️   └ actionability_block: {time.time() - _act_t0:.2f}s")
 
-    # ── Config version hash ──────────────��──────────���────────────────
+    # ── Config version hash ───────────────────────────────────────
     _hash_t0 = time.time()
     ai_metrics["config_version"] = hash_config_state(
         CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
@@ -1070,7 +1070,7 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
     await self._remember_config_version(ai_metrics["config_version"])
     logger.info(f"⏱️   └ hash_and_remember: {time.time() - _hash_t0:.2f}s")
 
-    # ── Bonus-aware metrics ──���────────────────────────────�����──────────
+    # ── Bonus-aware metrics ────────────────────────────────────────
     if real_rows:
         bonus_count = sum(1 for r in real_rows if r.get("bonus_win"))
         total_wins = sum(1 for r in real_rows if r["win"])

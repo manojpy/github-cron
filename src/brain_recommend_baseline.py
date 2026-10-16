@@ -243,7 +243,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
         real_rows, target_winrate=target_wr, min_sample=min_sample,
     ) if real_rows else {"valid": False}
 
-    # ── Brier Score / Calibration ─────────────────────────────���──────
+    # ── Brier Score / Calibration ───────────────────────────────────
     brier, cal_curve = engine.brier_score_and_calibration(real_rows)
     cal_alerts = engine.calibration_alert(real_rows)
     has_calibration_data = bool(cal_curve or cal_alerts)
@@ -611,7 +611,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                         "type": "alert_family_analysis",
                         "severity": "low",
                         "message": (
-                            "👨����‍👧‍👦 Alert-family intelligence:\n"
+                            "👨‍👩‍👧‍👦 Alert-family intelligence:\n"
                             + "\n".join(fam_lines[:8])
                             + "\nDiagnostic only — families are learning entities, not live gates."
                         ),
@@ -805,7 +805,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             ),
         })
 
-    # ── R:R and Bonus Analysis ─��
+    # ── R:R and Bonus Analysis ─
     if real_rows:
         bonus_wins = sum(1 for r in real_rows if r.get("bonus_win"))
         total_wins = sum(1 for r in real_rows if r["win"])

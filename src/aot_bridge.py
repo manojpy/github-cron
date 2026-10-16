@@ -224,7 +224,7 @@ def dynamic_flow_direction_loop(src: np.ndarray, basis: np.ndarray,
     return _dispatch["dynamic_flow_direction_loop"](src, basis, dist, factor)
 
 
-# ────────────────────────���─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
 # COMPLETENESS CHECK — catches a forgotten wrapper at import time
 # ──────────────────────────────────────────────────────────────────────
 _missing_wrappers = [

@@ -340,7 +340,8 @@ def _leading_emoji(title: str) -> str:
     """
     if not title:
         return ""
-    m = re.match(r"^([\W_🟢🔴🔵🟣🌀⬆️⬇️▲▼🌊����������️🔄☁️]+)", title.strip())
+    m = re.match(r"^([\W_🟢🔴🔵🟣🌀⬆️⬇️▲▼🌊⚖️🔄☁️]+)", title.strip())
+
     if not m:
         return ""
     return m.group(1).strip()
@@ -721,7 +722,7 @@ def _format_bias_header(bias_context: BiasContext) -> str:
     ]
     _, emoji, arrow, label, pct = max(candidates, key=lambda t: t[0])
 
-    # Non-dominant fragments in fixed order: up → down �� neutral
+    # Non-dominant fragments in fixed order: up → down → neutral
     fragments = []
     for lbl, arr, p in (
         ("Uptrend",   "▲", up_pct),
@@ -1302,7 +1303,7 @@ async def send_trade_close_notices(sdb: RedisStateStore, telegram_queue: Telegra
             f"{format_ist_time(int(e['entry_ts']), '%H:%M')} candle, hit in {when}"
         )
     if len(events) > 30:
-        lines.append(f"… and {len(events) - 30} more")
+        lines.append(f"������� and {len(events) - 30} more")
     text = "\n".join(lines)
     if cfg.DRY_RUN_MODE:
         logger_run.info(f"[DRY RUN] Would send trade updates:\n{text}")
@@ -2836,7 +2837,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             else:
                                 pass
 
-                        # ── ML-EV shadow / hard qualification ���─
+                        # ── ML-EV shadow / hard qualification ─
                         if (
                             (getattr(cfg, "ENABLE_ML_EV_SHADOW", False)
                              or getattr(cfg, "ENABLE_ML_EV_GATE", False))
@@ -2947,7 +2948,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         f"[{pair_name}] 🧠 Rewardable override for {alert_key}: "
                         f"WR={failing_rate:.0%} below {cfg.MIN_WIN_RATE:.0%}, but {override_reason}"
                     )
-                    alert_extra = f"{alert_extra} | �� {override_reason}"
+                    alert_extra = f"{alert_extra} | ⚠️ {override_reason}"
                     surviving_alerts.append((alert_title, alert_extra, alert_key))
                     continue
 
@@ -3520,9 +3521,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 }
             }, payload
 
-        # ═════════════════════════════════════════════���������════════════════════
+        # ══════════════════════════════════════════════════════════════
         # IMMEDIATE MODE  →  legacy per-pair Telegram send (unchanged logic)
-        # ══════════════════════════════════════����═════════════════════════════
+        # ══════════════════════════════════════════════════════════════
         async def _refund_alert_budget(n: int) -> None:
             """Undo the optimistic budget reservation when a send does not go out."""
             if n > 0 and alerts_sent_ref is not None and alerts_sent_lock is not None:
@@ -3801,7 +3802,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
             if rsi_prev <= rsi_ema_prev and rsi_curr > rsi_ema_curr:
                 if rsi_curr >= rsi_adaptive_buy:
-                    reasons.append(f"RSI>EMA5 blocked: RSI={rsi_curr:.2f} ��� cap {rsi_adaptive_buy:.1f}")
+                    reasons.append(f"RSI>EMA5 blocked: RSI={rsi_curr:.2f} ≥ cap {rsi_adaptive_buy:.1f}")
                 elif ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY:
                     reasons.append(f"RSI>EMA5 blocked: PPO={ppo_gate_curr:.2f} ≥ guard {Constants.PPO_RSI_GUARD_BUY}")
                 elif not buy_common:

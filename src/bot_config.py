@@ -541,7 +541,7 @@ class BotConfig(BaseModel):
             raise ValueError(
                 f'RSI_ADAPTIVE_SELL_CALM ({self.RSI_ADAPTIVE_SELL_CALM}) must be > '
                 f'RSI_ADAPTIVE_SELL_VOLATILE ({self.RSI_ADAPTIVE_SELL_VOLATILE}) '
-                f'�� sell threshold drops as volatility rises'
+                f'— sell threshold drops as volatility rises'
             )
         if self.CPR_ADAPTIVE_CALM >= self.CPR_ADAPTIVE_VOLATILE:
             raise ValueError(

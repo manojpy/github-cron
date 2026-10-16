@@ -3214,7 +3214,7 @@ class RedisStateStore:
             await self._record_redis_failure("atomic_batch_update", e)
             return False
 
-    # ── CUSUM state persistence ────────────────────────────────�����───────
+    # ── CUSUM state persistence ────────────────────────────────────
     async def load_cusum_state(self, alert_key: str) -> Optional[Dict[str, Any]]:
         """Load persisted CUSUM accumulator for one alert_key."""
         if self.degraded or not self._redis:
