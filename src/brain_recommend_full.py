@@ -26,8 +26,8 @@ from repair_ledger import (
     load_ledger_entries,
     family_accountability,
     control_summary,
+    family_ev_lift,
 )
-
 async def build_full_recommendations(self) -> Dict[str, Any]:
     # ── Phase timer — one INFO line per phase so a slow report can be
     # diagnosed from the workflow log without a profiler. Overhead is
@@ -198,12 +198,24 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
                     ledger_entries, int(time.time()),
                     window_days=int(getattr(cfg, "FAMILY_ACCOUNTABILITY_WINDOW_DAYS", 60)),
                     hurt_streak=int(getattr(cfg, "FAMILY_HURT_STREAK", 3)),
-
                     suspend_days=int(getattr(cfg, "FAMILY_SUSPEND_DAYS", 14)),
                     use_control=str(getattr(cfg, "ACCOUNTABILITY_CONTROL_MODE", "shadow")) == "live",
                 )
             except Exception as e:
                 audit.record_analysis_exception("family_accountability", e)
+        # Rolling EV lift per family (shadow metric; surfaces in the Action
+        # Plan and report so underperformers are visible before any live
+        # suspension logic depends on them).
+
+        try:
+            ai_metrics["family_ev_lift"] = family_ev_lift(
+                ledger_entries,
+                int(time.time()),
+                window_days=int(getattr(cfg, "FAMILY_ACCOUNTABILITY_WINDOW_DAYS", 60)),
+                min_n=int(getattr(cfg, "FAMILY_EV_LIFT_MIN_N", 5)),
+            )
+        except Exception as e:
+            audit.record_analysis_exception("family_ev_lift", e)
         if str(getattr(cfg, "ACCOUNTABILITY_CONTROL_MODE", "shadow")) != "off":
             try:
                 ai_metrics["control_summary"] = control_summary(ledger_entries, int(time.time()))
