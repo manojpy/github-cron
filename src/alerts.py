@@ -1303,7 +1303,7 @@ async def send_trade_close_notices(sdb: RedisStateStore, telegram_queue: Telegra
             f"{format_ist_time(int(e['entry_ts']), '%H:%M')} candle, hit in {when}"
         )
     if len(events) > 30:
-        lines.append(f"������� and {len(events) - 30} more")
+        lines.append(f"… and {len(events) - 30} more")
     text = "\n".join(lines)
     if cfg.DRY_RUN_MODE:
         logger_run.info(f"[DRY RUN] Would send trade updates:\n{text}")

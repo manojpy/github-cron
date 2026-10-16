@@ -784,7 +784,7 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
             elif sv is False:
                 shadow_note = (
                     f"\n   ⚠️ Shadow DISAGREES: Δ{best['shadow_delta_ev']:+.3f}% "
-                    f"on {best['shadow_n']} samples �� treat as curve-fit."
+                    f"on {best['shadow_n']} samples — treat as curve-fit."
                 )
             else:
                 shadow_note = "\n   Shadow sample too thin to validate."

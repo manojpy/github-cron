@@ -695,7 +695,7 @@ def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
         do_now.append(f"Investigate the very low {wr:.0%} win rate (see section 04).")
     if F["gate"].get("stability") is False or F["gate"].get("risk") is False:
         do_now.append("Monitor active drift/drawdown warnings.")
-    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"• {x}" for x in do_now)))
+    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"�� {x}" for x in do_now)))
     watch: List[str] = []
     seen = set()
     for a in F["weak"]:
@@ -1664,7 +1664,7 @@ def _md_prose(raw: str) -> str:
 def render_report_markdown(sections: List[List[_Piece]], stamp: str) -> str:
     """The same report as a Markdown document (for the reports/ archive):
     no Telegram escaping, real headings, tables kept as code blocks."""
-    out: List[str] = [f"# 🧠 Brain Report �� {stamp}"]
+    out: List[str] = [f"# 🧠 Brain Report — {stamp}"]
     for idx, pieces in enumerate(sections, 1):
         for piece in pieces:
             kind = getattr(piece, "kind", "p")
