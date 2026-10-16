@@ -2887,6 +2887,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                             "rr": rr,
                                             "sl_pct": sl_pct,
                                             "would_block": not qualify,
+                                            "baseline_proof": (
+                                                (ml_market_state_model.get("ev_baseline_proof") or {}).get("status")
+                                                if isinstance(ml_market_state_model, dict) else None
+                                            ),
                                         }
                                         # Shadow stays in context/logs only — not in Telegram
                                         # (already stored on context["ml_ev_shadow_by_alert"])
@@ -3036,8 +3040,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 _out = {
                     k: _tq[k]
                     for k in ("regime_gate_shadow", "ensemble_gate_shadow",
-                              "epistemic_gate_shadow",
-                              "regime_gate", "ensemble_gate", "epistemic_gate")
+                              "epistemic_gate_shadow", "uncertainty_gate_shadow",
+                              "regime_gate", "ensemble_gate", "epistemic_gate", "uncertainty_gate")
+
                     if _tq.get(k)
                 }
                 return _out or None
@@ -3060,6 +3065,11 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 if isinstance(_epi, dict):
                     _out["epistemic"] = {
                         k: _epi.get(k) for k in ("max_abs_z", "n_extreme", "missing_frac", "novel")
+                    }
+                _unc = _tq.get("uncertainty")
+                if isinstance(_unc, dict):
+                    _out["uncertainty"] = {
+                        k: _unc.get(k) for k in ("aleatoric_sd", "epistemic_sd", "epistemic_share", "future_edge", "fes_status")
                     }
                 return _out or None
 

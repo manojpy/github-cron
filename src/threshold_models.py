@@ -727,6 +727,186 @@ def predict_market_state_proba(model: Optional[Dict[str, Any]], votes: Optional[
     z = sum(b * x for b, x in zip(beta, X[0]))
     return _sigmoid(z)
 
+def _auc(scores: List[float], positive: List[bool]) -> Optional[float]:
+    """Probability a random winner is scored above a random loser (ties count half)."""
+    pos = [s for s, p in zip(scores, positive) if p]
+    neg = [s for s, p in zip(scores, positive) if not p]
+    if not pos or not neg:
+        return None
+    order = sorted(range(len(scores)), key=scores.__getitem__)
+    ranks = [0.0] * len(scores)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and scores[order[j + 1]] == scores[order[i]]:
+            j += 1
+        for k in range(i, j + 1):
+            ranks[order[k]] = (i + j) / 2.0 + 1.0
+        i = j + 1
+    r_pos = sum(r for r, p in zip(ranks, positive) if p)
+    return (r_pos - len(pos) * (len(pos) + 1) / 2.0) / (len(pos) * len(neg))
+
+def online_update_beta(beta: List[float], x: List[float], y: float, lr: float = 0.05, l2: float = 0.01, max_step: float = 0.5) -> List[float]:
+    """One stochastic-gradient step of the logistic model on a single resolved
+    trade (x already standardised). Safeguards: small learning rate, L2 pull
+    toward zero, and a hard cap on how far any coefficient may move in one step."""
+    z = max(-30.0, min(30.0, sum(b * v for b, v in zip(beta, x))))
+    p = 1.0 / (1.0 + math.exp(-z))
+    out = []
+    for b, v in zip(beta, x):
+        step = lr * ((p - y) * v + l2 * b)
+        out.append(b - max(-max_step, min(max_step, step)))
+    return out
+
+def net_ev_baseline_audit(rows: List[Row], horizon: int = 12, min_train: int = 100, min_test: int = 40, test_frac: float = 0.3, z: float = 1.645, default_cost_pct: float = 0.0) -> Dict[str, Any]:
+    """Does the market-state model pick better trades than simple chronological
+    rules, measured in NET percent after costs on newer, unseen trades?
+
+    Oldest trades train the model (purged so no training label overlaps the
+    test period); the newest are the test. On every test trade a policy earns
+    its net P&L if it takes the trade and 0 if it skips, so policies are
+    compared over the SAME trades. Baselines:
+      take_all    take everything
+      key_rule    take an alert key only if its TRAIN mean net P&L is positive
+      trailing    take an alert key only if its mean net P&L over trades that
+                  had already finished before this one is positive (>= 5)
+    The model takes a trade when  p * avg_win + (1 - p) * avg_loss > 0  (train
+    averages). 'validated' needs the model to beat the BEST baseline with a
+    one-sided lower bound above zero (time-blocked standard error) AND to earn
+    a positive net result itself. Descriptive evidence, not proof of cause."""
+    from feature_store import build_point_in_time_dataset, chronological_split
+    from plan_replay import cluster_se
+
+    ds = build_point_in_time_dataset(rows, horizons=(horizon,), default_cost_pct=default_cost_pct)
+    usable = [r for r in ds["rows"] if (r["labels"].get(horizon) or {}).get("net") is not None]
+    train, test = chronological_split(usable, test_frac=test_frac, max_horizon=horizon)
+    out: Dict[str, Any] = {"horizon": horizon, "n_train": len(train), "n_test": len(test), "feature_hash": ds.get("feature_hash"), "causal": False}
+    if len(train) < min_train or len(test) < min_test:
+        out["status"] = "insufficient"
+        return out
+
+    def net(r: Dict[str, Any]) -> float:
+        return float(r["labels"][horizon]["net"])
+
+    y = [1.0 if net(r) > 0 else 0.0 for r in train]
+    if sum(y) in (0, len(y)):
+        out["status"] = "insufficient"
+        out["reason"] = "single_class"
+        return out
+    names = ds["feature_names"]
+    scaler = _fit_scaler([r["x"] for r in train], names)
+    Xtr = _apply_scaler([r["x"] for r in train], scaler)
+    Xte = _apply_scaler([r["x"] for r in test], scaler)
+    beta = _train_logistic(Xtr, y, [1.0] * len(Xtr))
+    p_te = [_sigmoid(sum(b * v for b, v in zip(beta, x))) for x in Xte]
+    wins = [net(r) for r in train if net(r) > 0]
+    losses = [net(r) for r in train if net(r) <= 0]
+    avg_win = sum(wins) / len(wins)
+    avg_loss = sum(losses) / len(losses)
+    ev_te = [p * avg_win + (1.0 - p) * avg_loss for p in p_te]
+
+    by_key: Dict[Any, List[float]] = {}
+    for r in train:
+        by_key.setdefault(r["alert_key"], []).append(net(r))
+    key_ok = {k: (sum(v) / len(v)) > 0 for k, v in by_key.items()}
+    reach = (horizon + 2) * 900
+    hist: Dict[Any, List[Tuple[int, float]]] = {}
+    for r in sorted(train, key=lambda r: r["ts"]):
+        hist.setdefault(r["alert_key"], []).append((r["ts"], net(r)))
+
+    take: Dict[str, List[bool]] = {"model": [e > 0 for e in ev_te], "take_all": [True] * len(test), "key_rule": [], "trailing": []}
+    for r in test:
+        take["key_rule"].append(bool(key_ok.get(r["alert_key"], False)))
+        past = [v for t, v in hist.get(r["alert_key"], []) if t + reach <= r["ts"]]
+        take["trailing"].append(len(past) >= 5 and sum(past) / len(past) > 0)
+    for r in test:   # test trades become history for LATER test trades only
+        hist.setdefault(r["alert_key"], []).append((r["ts"], net(r)))
+
+    stamps = [float(r["ts"]) for r in test]
+    pnl = {k: [net(r) if t else 0.0 for r, t in zip(test, flags)] for k, flags in take.items()}
+    mean = {k: sum(v) / len(v) for k, v in pnl.items()}
+    best = max(("take_all", "key_rule", "trailing"), key=lambda k: mean[k])
+    delta = [a - b for a, b in zip(pnl["model"], pnl[best])]
+    d_mean = sum(delta) / len(delta)
+    se, n_blocks = cluster_se(delta, stamps)
+    lo = d_mean - z * se if se != float("inf") else None
+    n_taken = sum(take["model"])
+    base_rate = sum(y) / len(y)
+    brier = sum((p - (1.0 if net(r) > 0 else 0.0)) ** 2 for p, r in zip(p_te, test)) / len(test)
+    brier_base = sum((base_rate - (1.0 if net(r) > 0 else 0.0)) ** 2 for r in test) / len(test)
+    out.update({
+        "n_taken": n_taken,
+        "mean_net_per_test_trade": {k: round(v, 4) for k, v in mean.items()},
+        "taken_mean_net": round(sum(net(r) for r, t in zip(test, take["model"]) if t) / n_taken, 4) if n_taken else None,
+        "best_baseline": best,
+        "delta_vs_best": round(d_mean, 4),
+        "delta_lo": None if lo is None else round(lo, 4),
+        "n_blocks": n_blocks,
+        "auc": None if (a := _auc(ev_te, [net(r) > 0 for r in test])) is None else round(a, 3),
+        "brier_skill": round(1.0 - brier / brier_base, 4) if brier_base > 0 else None,
+    })
+    # ── Does updating the model as outcomes resolve help? Replay the test
+    # period trade by trade. A trade's label is only used for learning once its
+    # own outcome window has closed (same purge rule as the split).
+    #   static  the model as trained on the older trades, never updated
+    #   online  the same model nudged by one gradient step per resolved trade
+    #   refit   retrained from scratch every `refit_every` trades
+    try:
+        refit_every = max(50, len(test) // 8)
+        beta_on = list(beta)
+        beta_rf = list(beta)
+        seen_x = list(Xtr)
+        seen_y = list(y)
+        k = 0
+        flags_on: List[bool] = []
+        flags_rf: List[bool] = []
+        since_refit = 0
+        for i, r in enumerate(test):
+            while k < i and test[k]["ts"] + reach <= r["ts"]:
+                yk = 1.0 if net(test[k]) > 0 else 0.0
+                beta_on = online_update_beta(beta_on, Xte[k], yk)
+                seen_x.append(Xte[k])
+                seen_y.append(yk)
+                since_refit += 1
+                k += 1
+            if since_refit >= refit_every and 0 < sum(seen_y) < len(seen_y):
+                beta_rf = _train_logistic(seen_x, seen_y, [1.0] * len(seen_x), max_iter=800)
+                since_refit = 0
+            p_on = _sigmoid(sum(b * v for b, v in zip(beta_on, Xte[i])))
+            p_rf = _sigmoid(sum(b * v for b, v in zip(beta_rf, Xte[i])))
+            flags_on.append(p_on * avg_win + (1.0 - p_on) * avg_loss > 0)
+            flags_rf.append(p_rf * avg_win + (1.0 - p_rf) * avg_loss > 0)
+        pnl_on = [net(r) if t else 0.0 for r, t in zip(test, flags_on)]
+        pnl_rf = [net(r) if t else 0.0 for r, t in zip(test, flags_rf)]
+
+        def _vs(a: List[float], b: List[float]) -> Dict[str, Any]:
+            d = [u - v for u, v in zip(a, b)]
+            m = sum(d) / len(d)
+            se_, _nb = cluster_se(d, stamps)
+            lo_ = None if se_ == float("inf") else m - z * se_
+            hi_ = None if se_ == float("inf") else m + z * se_
+            return {"delta": round(m, 4), "lo": None if lo_ is None else round(lo_, 4),
+                    "status": "insufficient" if lo_ is None else "better" if lo_ > 0 else "worse" if (hi_ is not None and hi_ < 0) else "not_distinguishable"}
+
+        out["online"] = {
+            "mean_net": {"static": round(mean["model"], 4), "online": round(sum(pnl_on) / len(pnl_on), 4), "refit": round(sum(pnl_rf) / len(pnl_rf), 4)},
+            "n_taken": {"static": n_taken, "online": sum(flags_on), "refit": sum(flags_rf)},
+            "online_vs_static": _vs(pnl_on, pnl["model"]),
+            "refit_vs_static": _vs(pnl_rf, pnl["model"]),
+            "online_vs_refit": _vs(pnl_on, pnl_rf),
+            "refit_every": refit_every, "n_updates": k,
+        }
+    except Exception as exc:   # evidence only: never break the audit
+        out["online"] = {"error": type(exc).__name__}
+    if n_taken < 10:
+        out["status"] = "insufficient"
+        out["reason"] = "model_takes_too_few"
+    elif lo is not None and lo > 0 and mean["model"] > 0:
+        out["status"] = "validated"
+    else:
+        out["status"] = "not_better"
+    return out
+
 def market_state_novelty(model: Optional[Dict[str, Any]], votes: Optional[Dict[str, bool]], context: Optional[Dict[str, Any]], z_limit: float = 4.0, max_extreme: int = 2, max_missing_frac: float = 0.34) -> Optional[Dict[str, Any]]:
     """How unfamiliar is this live input compared with what the model was
     trained on? Epistemic (model-ignorance) signal, separate from market noise.

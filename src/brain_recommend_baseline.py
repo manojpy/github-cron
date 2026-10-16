@@ -8,10 +8,9 @@ from typing import Any, Dict, List, Optional
 from bot_config import cfg, json_dumps, json_loads, CONFLUENCE_WEIGHTS
 from state import _rc
 import threshold_engine as engine
-from threshold_quality import gate_shadow_comparison, prediction_track_record
+from threshold_quality import gate_shadow_comparison, prediction_track_record, future_edge_track_record
 from feature_store import build_point_in_time_dataset, dataset_coverage
-
-
+from plan_replay import volatility_plan_study
 from brain_audit import get_audit, HealthStatus
 from brain_helpers import (
     KILL_SWITCH_KEY, _resolve_config_path,
@@ -1144,6 +1143,15 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
     except Exception as e:
         audit.record_analysis_exception("prediction_track_record", e)
 
+    # ── Future Edge Score track record: did "edge survives the uncertainty"
+    # alerts really earn more than the rest? ──
+    try:
+        ai_metrics["future_edge_record"] = future_edge_track_record(
+            list(real_rows), min_n=int(getattr(cfg, "PREDICTION_AUDIT_MIN_N", 30)),
+        )
+    except Exception as e:
+        audit.record_analysis_exception("future_edge_record", e)
+
     # ── Data foundation: versioned point-in-time features + multi-horizon
     # labels. Counts only; nothing here changes a decision. ──
     try:
@@ -1154,6 +1162,41 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
         ai_metrics["data_foundation"] = dataset_coverage(_ds)
     except Exception as e:
         audit.record_analysis_exception("data_foundation", e)
+
+    # ── Net-EV audit: does the market-state model beat simple chronological
+    # rules in net P&L on newer, unseen trades? Report-only. ──
+    _nev_proof: Optional[Dict[str, Any]] = None
+    try:
+        _nev = engine.net_ev_baseline_audit(
+            list(real_rows),
+            horizon=int(getattr(cfg, "NET_EV_AUDIT_HORIZON", 12)),
+            min_test=int(getattr(cfg, "NET_EV_AUDIT_MIN_TEST", 40)),
+            default_cost_pct=(float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100,
+        )
+        ai_metrics["net_ev_audit"] = _nev
+        _nev_proof = {k: _nev.get(k) for k in ("status", "delta_vs_best", "delta_lo", "best_baseline", "n_test", "horizon")}
+        _nev_proof["at"] = int(time.time())
+        logging.getLogger("macd_bot").info(
+            f"📐 Net-EV audit | {_nev.get('status')}: n_train={_nev.get('n_train')} "
+            f"n_test={_nev.get('n_test')} delta_vs_{_nev.get('best_baseline')}={_nev.get('delta_vs_best')} "
+            f"lo={_nev.get('delta_lo')} auc={_nev.get('auc')}"
+        )
+    except Exception as e:
+        audit.record_analysis_exception("net_ev_baseline_audit", e)
+
+    # ── Volatility-scaled plans: would a stop / target / horizon per volatility
+    # regime beat ONE tuned plan on newer trades? Read-side; the fixed outcome
+    # label is untouched and nothing is applied. ──
+    try:
+        _vsl = float(getattr(cfg, "OUTCOME_MAE_LOSS_PCT", 0.5))
+        ai_metrics["vol_horizon_study"] = volatility_plan_study(
+            list(real_rows),
+            (float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100,
+            _vsl, _vsl * float(getattr(cfg, "OUTCOME_RR_TARGET", 2.0)),
+            int(getattr(cfg, "OUTCOME_LOOKAHEAD_CANDLES", 12)),
+        )
+    except Exception as e:
+        audit.record_analysis_exception("vol_horizon_study", e)
 
     # ── Validated TP/SL zones: sample-gated, OOS-replayed, streak-promoted.
     # Only PROMOTED zones are persisted for dispatch; candidates and the
@@ -1288,6 +1331,8 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             min_sample=getattr(cfg, "MARKET_STATE_MODEL_MIN_SAMPLE", 150),
             min_oos_p_ev_positive=getattr(cfg, "MARKET_STATE_MODEL_MIN_OOS_P", 0.70),
         )
+        if _nev_proof:
+            ms_model["ev_baseline_proof"] = _nev_proof
         ai_metrics["market_state_model"] = {
             k: v for k, v in ms_model.items() if k != "beta"
         }

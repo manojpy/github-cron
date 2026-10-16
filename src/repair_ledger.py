@@ -15,8 +15,9 @@ import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
-from bot_config import json_dumps, json_loads
-from threshold_engine import _flatten_row_features, wilson_ci, ev_and_kelly_for
+from bot_config import cfg, json_dumps, json_loads
+from threshold_engine import _flatten_row_features, wilson_ci, ev_and_kelly_for, row_net_pnl_pct
+from plan_replay import cluster_se
 
 LEDGER_KEY = "brain_repair_ledger"
 LEDGER_MAX = 500
@@ -200,6 +201,79 @@ async def mark_plan_applied(sdb, plan_ts: int, repair_ids: Optional[List[str]] =
         await _save_ledger(sdb, entries)
     return n
 
+def control_comparison(rows: List[dict], scope: Optional[dict], applied_at: int, now: int, min_scope: int = 8, min_control: int = 15, z: float = 1.645) -> Dict[str, Any]:
+    """Did the repaired slice move differently from trades the repair did NOT
+    touch, over the same two periods? (difference-in-differences, net % per trade)
+
+    pre  = the period of equal length just BEFORE the repair was applied
+    post = applied_at .. now
+    effect = (scope_post - scope_pre) - (control_post - control_pre)
+    so a market-wide move that lifts or sinks every alert cancels out.
+    The standard error uses 3-hour time blocks (alerts on one move are not
+    independent). Verdicts: helped / hurt (the bound clears zero),
+    indistinguishable, insufficient (too few trades), no_control (global scope
+    or nothing outside the scope). Descriptive: a repair that also changes the
+    control group (a global threshold) is not separable this way."""
+    kind = (scope or {}).get("kind")
+    if kind in (None, "global", "none"):
+        return {"verdict": "no_control"}
+    span = int(now) - int(applied_at)
+    if span <= 0:
+        return {"verdict": "insufficient"}
+    lo_t = int(applied_at) - span
+    cost = (float(getattr(cfg, "BRAIN_FEE_PCT", 0.0006)) + float(getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003))) * 2 * 100
+    groups: Dict[str, List[Any]] = {"s0": [], "s1": [], "c0": [], "c1": []}
+    for r in rows:
+        t = r.get("entry_ts")
+        if t is None or t < lo_t or t > now:
+            continue
+        side = "s" if _matches_scope(r, scope) else "c"
+        groups[side + ("1" if t >= applied_at else "0")].append((float(t), row_net_pnl_pct(r, cost)))
+    n = {k: len(v) for k, v in groups.items()}
+    if min(n["s0"], n["s1"]) < min_scope or min(n["c0"], n["c1"]) < min_control:
+        return {"verdict": "insufficient" if (n["c0"] + n["c1"]) else "no_control", "n": n}
+    means: Dict[str, float] = {}
+    var = 0.0
+    for k, v in groups.items():
+        vals = [x[1] for x in v]
+        means[k] = sum(vals) / len(vals)
+        se, _nb = cluster_se(vals, [x[0] for x in v])
+        if se == float("inf"):
+            return {"verdict": "insufficient", "n": n}
+        var += se * se
+    s_chg = means["s1"] - means["s0"]
+    c_chg = means["c1"] - means["c0"]
+    did = s_chg - c_chg
+    se_d = var ** 0.5
+    lo, hi = did - z * se_d, did + z * se_d
+    verdict = "helped" if lo > 0 else "hurt" if hi < 0 else "indistinguishable"
+    return {
+        "verdict": verdict, "effect": round(did, 4), "lo": round(lo, 4), "hi": round(hi, 4),
+        "scope_change": round(s_chg, 4), "control_change": round(c_chg, 4), "n": n,
+    }
+
+def control_summary(entries: List[dict], now: int, window_days: int = 60) -> Dict[str, Any]:
+    """Of the repairs measured in the window, how many verdicts survive the
+    same-period comparison? Counts by (before/after verdict, control verdict)."""
+    cutoff = now - window_days * 86400
+    out: Dict[str, Any] = {"n": 0, "checked": 0, "confirmed": 0, "drift": 0, "contradicted": 0}
+    for e in entries:
+        if e.get("verdict") not in ("helped", "hurt"):
+            continue
+        if int(e.get("verdict_at") or e.get("applied_at") or 0) < cutoff:
+            continue
+        out["n"] += 1
+        cv = (e.get("control") or {}).get("verdict")
+        if cv in ("helped", "hurt", "indistinguishable"):
+            out["checked"] += 1
+            if cv == "indistinguishable":
+                out["drift"] += 1
+            elif cv == e["verdict"]:
+                out["confirmed"] += 1
+            else:
+                out["contradicted"] += 1
+    return out
+
 async def evaluate_pending_repairs(sdb, current_rows: List[dict], horizon_hours: int = 48, min_outcomes: int = 30) -> List[dict]:
     """Called once per brain report. For each applied repair whose horizon
     has passed, compare post-application metrics against the pre-application
@@ -280,6 +354,11 @@ async def evaluate_pending_repairs(sdb, current_rows: List[dict], horizon_hours:
             verdict = "neutral"
         e["verdict"] = verdict
         e["verdict_at"] = now
+        if str(getattr(cfg, "ACCOUNTABILITY_CONTROL_MODE", "shadow")) != "off":
+            try:
+                e["control"] = control_comparison(current_rows, scope, int(e["applied_at"]), now)
+            except Exception:
+                e["control"] = {"verdict": "insufficient"}
         e["delta_observed"] = {
             "wr": round(delta_wr, 4),
             "ev": round(delta_ev, 4),
@@ -318,9 +397,8 @@ async def repair_success_rates(sdb) -> Dict[str, Dict[str, float]]:
         for k, v in stats.items()
     }
 
-def family_accountability(entries: List[dict], now: int, window_days: int = 60, min_verdicts: int = 6, hurt_streak: int = 3, suspend_days: int = 14) -> Dict[str, Dict[str, Any]]:
+def family_accountability(entries: List[dict], now: int, window_days: int = 60, min_verdicts: int = 6, hurt_streak: int = 3, suspend_days: int = 14, use_control: bool = False) -> Dict[str, Dict[str, Any]]:
     """Per recommendation family (ledger category), has acting on it helped?
-
     Pure. Only resolved verdicts inside the window count. A family is
     'suspended' when its last `hurt_streak` verdicts were all 'hurt', or when
     at least 5 decisive verdicts have a 'hurt' share whose Wilson lower bound
@@ -336,7 +414,11 @@ def family_accountability(entries: List[dict], now: int, window_days: int = 60, 
         ts = int(e.get("verdict_at") or e.get("applied_at") or e.get("issued_at") or 0)
         if ts < cutoff:
             continue
-        by_cat[str(e.get("category") or e.get("type") or "unknown")].append({**e, "_ts": ts})
+        item = {**e, "_ts": ts}
+        if use_control and e["verdict"] in ("helped", "hurt") and (e.get("control") or {}).get("verdict") == "indistinguishable":
+            item["verdict"] = "neutral"     # the untouched trades moved the same way
+            item["_drift"] = True
+        by_cat[str(e.get("category") or e.get("type") or "unknown")].append(item)
     out: Dict[str, Dict[str, Any]] = {}
     for cat, items in by_cat.items():
         items.sort(key=lambda x: x["_ts"])
@@ -362,6 +444,7 @@ def family_accountability(entries: List[dict], now: int, window_days: int = 60, 
             "status": status, "eligible": status != "suspended", "reason": reason,
             "n": len(items), "helped": helped, "hurt": hurt, "neutral": neutral,
             "hurt_rate": round(hurt / len(items), 3),
+            "drift_discounted": sum(1 for x in items if x.get("_drift")),
             "suspended_until": (last_hurt + suspend_days * 86400) if status == "suspended" else None,
         }
     return out

@@ -674,6 +674,8 @@ class BrainCore:
                 use_market_state_live=getattr(cfg, "ENABLE_MARKET_STATE_LIVE_SCORE", False),
                 ml_calibration_curve=ml_calibration_curve,
                 epistemic=epistemic, epistemic_mode=_epi_mode,
+                uncertainty_mode=str(getattr(cfg, "UNCERTAINTY_GATE_MODE", "shadow")),
+                uncertainty_min_n=int(getattr(cfg, "UNCERTAINTY_GATE_MIN_N", 100)),
             )
         except Exception as e:
             # Must not be silent: None means "no brain data", which the advisor

@@ -845,6 +845,7 @@ def ev_first_objective(rows: List[Row], min_sample: int = 20, fee_pct: Optional[
         "p_ev_positive": round(p_ev_positive, 4),
         "ev_p5": round(ev_p5, 4),
         "ev_std": round(ev_std, 4),
+        "outcome_sd": round(statistics.pstdev(net_pnls), 4) if len(net_pnls) > 1 else 0.0,
         "half_kelly": round(half_kelly, 4),
         "profit_factor": round(profit_factor, 3),
         "max_drawdown_pct": round(max_dd, 3),

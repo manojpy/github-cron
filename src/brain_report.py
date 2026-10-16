@@ -695,7 +695,7 @@ def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
         do_now.append(f"Investigate the very low {wr:.0%} win rate (see section 04).")
     if F["gate"].get("stability") is False or F["gate"].get("risk") is False:
         do_now.append("Monitor active drift/drawdown warnings.")
-    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"�� {x}" for x in do_now)))
+    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"������� {x}" for x in do_now)))
 
     watch: List[str] = []
     seen = set()
@@ -1063,6 +1063,7 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     _acct_lines = _accountability_lines(
         (F.get("ai") or {}).get("family_accountability"),
         str(getattr(cfg, "FAMILY_ACCOUNTABILITY_MODE", "shadow")),
+        (F.get("ai") or {}).get("control_summary"),
     )
     if _acct_lines:
         out.append(_p("RECOMMENDATION ACCOUNTABILITY — did past changes help?"))
@@ -1071,8 +1072,24 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     if _df_lines:
         out.append(_p("DATA FOUNDATION — is the evidence base consistent?"))
         out.extend(_c_split(_df_lines))
-    _exp_lines = _experiment_lines((F.get("ai") or {}).get("experiment_ledger"))
+    _vh_lines = _vol_horizon_lines((F.get("ai") or {}).get("vol_horizon_study"))
+    if _vh_lines:
+        out.append(_p("VOLATILITY AND TRADE PLANS — do regimes need different stops and horizons?"))
+        out.extend(_c_split(_vh_lines))
+    _fe_lines = _future_edge_lines((F.get("ai") or {}).get("future_edge_record"))
+    if _fe_lines:
+        out.append(_p("FUTURE EDGE SCORE — noise vs ignorance"))
+        out.extend(_c_split(_fe_lines))
+    _nev_lines = _net_ev_audit_lines((F.get("ai") or {}).get("net_ev_audit"))
 
+    if _nev_lines:
+        out.append(_p("NET-EV MODEL vs SIMPLE RULES — does it pick better trades?"))
+        out.extend(_c_split(_nev_lines))
+    _hyp_lines = _hypothesis_lines((F.get("ai") or {}).get("hypothesis_ledger"))
+    if _hyp_lines:
+        out.append(_p("CONCLUSIONS THAT CHANGED — what the Brain used to believe"))
+        out.extend(_c_split(_hyp_lines))
+    _exp_lines = _experiment_lines((F.get("ai") or {}).get("experiment_ledger"))
     if _exp_lines:
         out.append(_p("EXPERIMENT LEDGER — how much was tried to find these results?"))
         out.extend(_c_split(_exp_lines))
@@ -1213,7 +1230,7 @@ def to_action_plan(plan_data: Dict[str, Any], recs: Dict[str, Any], cfg, now: Op
         "note": "Historical evidence on fired alerts; not a forecast of future profit.",
     }
 
-def _accountability_lines(acct: Optional[Dict[str, Any]], mode: str) -> List[str]:
+def _accountability_lines(acct: Optional[Dict[str, Any]], mode: str, control_sum: Optional[Dict[str, Any]] = None) -> List[str]:
     """Plain-text lines: which recommendation families helped or hurt when acted on."""
     if not acct:
         return []
@@ -1232,6 +1249,85 @@ def _accountability_lines(acct: Optional[Dict[str, Any]], mode: str) -> List[str
         )
     lines.append("")
     lines.append("Counts only changes that were applied and later measured; families with no measured changes do not appear.")
+    cs = control_sum or {}
+    if cs.get("checked"):
+        lines.append(
+            f"Comparison-group check: of {cs['checked']} measured verdicts, {cs['confirmed']} held up against trades "
+            f"the change did not touch, {cs['drift']} looked like the whole market moving, {cs['contradicted']} pointed the other way."
+        )
+    return lines
+
+def _hypothesis_lines(led: Optional[Dict[str, Any]]) -> List[str]:
+    """Plain-text lines: conclusions that were later reversed, and unstable ones."""
+    if not led or not led.get("subjects"):
+        return []
+    ev = led.get("events") or []
+    lines = [f"Tracking {len(led['subjects'])} standing conclusions; {sum(1 for e in ev if e.get('kind') == 'overturned')} reversed so far."]
+    for e in ev[:5]:
+        held = e.get("held_sec") or 0
+        lines.append(
+            f"{'Reversed' if e['kind'] == 'overturned' else 'No longer supported'}: {e.get('claim')} "
+            f"({e.get('from')} -> {e.get('to')}, stood {held / 86400:.1f} days)"
+        )
+    shaky = [sid for sid, v in led["subjects"].items() if int(v.get("flips") or 0) >= 2]
+    if shaky:
+        lines.append("Keeps flipping (treat as unproven): " + ", ".join(sorted(shaky)))
+    return lines
+
+def _future_edge_lines(rec: Optional[Dict[str, Any]]) -> List[str]:
+    """Plain-text lines: noise vs ignorance, and whether the Future Edge Score has predicted anything."""
+    if not rec or not rec.get("n"):
+        return []
+    g = rec.get("groups") or {}
+    names = {"positive": "edge survives the uncertainty", "uncertain": "average is positive but not after uncertainty", "none": "no positive average"}
+    lines = []
+    for k in ("positive", "uncertain", "none"):
+        if k in g:
+            lines.append(f"{names[k]}: {g[k]['n']} alerts, average {g[k]['mean_net']:+.3f}% per trade")
+    if rec.get("mean_epistemic_share") is not None:
+        lines.append(
+            f"On average {rec['mean_epistemic_share']:.1%} of the uncertainty about a single trade is ignorance "
+            f"(reducible with more data); the rest is market noise that no model can remove."
+        )
+    st = rec.get("status")
+    if st == "predictive":
+        lines.append(f"Verdict: PREDICTIVE — positive-score alerts beat the rest by {rec['positive_minus_rest']:+.3f}% per trade (lower bound {rec['lo']}).")
+    elif st == "not_predictive":
+        lines.append(f"Verdict: NOT PREDICTIVE yet — difference {rec['positive_minus_rest']:+.3f}% per trade, lower bound {rec['lo']}.")
+    else:
+        lines.append("Verdict: too few alerts in each group to judge yet.")
+    return lines
+
+def _vol_horizon_lines(st: Optional[Dict[str, Any]]) -> List[str]:
+    """Plain-text lines: do volatility regimes call for different stops, targets or horizons?"""
+    if not st or not st.get("buckets"):
+        return []
+    if st.get("status") == "insufficient":
+        return [f"Not judged yet: {st.get('n', 0)} trades with a stored path and volatility reading."]
+    lines = []
+    for name in ("low", "mid", "high"):
+        b = (st.get("buckets") or {}).get(name) or {}
+        if not b.get("n"):
+            continue
+        p = b.get("plan") or {}
+        plan = f"best stop {p['sl']:g}% / target {p['tp']:g}% / {p['h']} candles" if p else "no plan chosen"
+        lines.append(
+            f"{name.capitalize()} volatility (n={b['n']}): typical best move {b.get('median_best_move')}%, "
+            f"typical worst {b.get('median_worst_move')}%, best move comes around candle {b.get('median_candle_of_best')}; {plan}"
+        )
+    sp = st.get("single_plan") or {}
+    if sp:
+        lines.append(f"One tuned plan for everything: stop {sp['sl']:g}% / target {sp['tp']:g}% / {sp['h']} candles.")
+    if st.get("overall_delta") is not None:
+        lines.append(
+            f"On {st.get('n_hold_pairs')} newer trades, per-regime plans vs that single plan: {st['overall_delta']:+.3f}% per trade "
+            f"(lower bound {st.get('overall_lo')}); single tuned plan vs the current fixed plan: {st.get('single_over_fixed'):+.3f}%."
+        )
+    verdict = {"supported": "SUPPORTED — volatility-specific plans beat one tuned plan on unseen trades.",
+               "worse": "WORSE — per-regime plans did worse than one tuned plan.",
+               "not_distinguishable": "NOT DISTINGUISHABLE — no evidence that volatility regimes need different plans."}.get(st.get("status"), "")
+    if verdict:
+        lines.append("Verdict: " + verdict + " Nothing is applied; the outcome label stays at the fixed 12 candles.")
     return lines
 
 def _data_foundation_lines(cov: Optional[Dict[str, Any]]) -> List[str]:
@@ -1258,6 +1354,48 @@ def _data_foundation_lines(cov: Optional[Dict[str, Any]]) -> List[str]:
         lines.append("Mostly-empty features: " + ", ".join(f"{n} ({z:.0%})" for n, z in weak))
     return lines
 
+def _net_ev_audit_lines(a: Optional[Dict[str, Any]]) -> List[str]:
+    """Plain-text lines for the net-EV baseline audit (empty when not run)."""
+    if not a or not a.get("status"):
+        return []
+    if a["status"] == "insufficient":
+        why = "the model would take too few trades to judge" if a.get("reason") == "model_takes_too_few" else "not enough older/newer trades yet"
+        return [f"Not judged: {why} (trained on {a.get('n_train', 0)}, tested on {a.get('n_test', 0)})."]
+    m = a.get("mean_net_per_test_trade") or {}
+    lines = [
+        f"Tested on the newest {a['n_test']} trades after training on {a['n_train']} older ones "
+        f"(outcome at {a['horizon']} candles, after costs).",
+        "Average result per test trade — model {model:+.3f}%, take-all {take_all:+.3f}%, "
+        "key rule {key_rule:+.3f}%, trailing rule {trailing:+.3f}%".format(**{k: m.get(k, 0.0) for k in ("model", "take_all", "key_rule", "trailing")}),
+        f"Model takes {a.get('n_taken')} of {a['n_test']}; the trades it takes average {a.get('taken_mean_net')}%.",
+        f"Against the best simple rule ({a.get('best_baseline')}): change {a.get('delta_vs_best'):+.3f}% per trade, "
+        f"one-sided lower bound {a.get('delta_lo')}.",
+    ]
+    if a.get("auc") is not None:
+        lines.append(f"Ranking quality (AUC) {a['auc']:.2f}; probability skill vs base rate {a.get('brier_skill')}.")
+
+    lines.append(
+        "Verdict: VALIDATED — beats every simple rule on unseen newer trades." if a["status"] == "validated"
+        else "Verdict: NOT BETTER than a simple rule yet — keep the ML-EV gate off."
+    )
+    on = a.get("online") or {}
+    if on.get("mean_net"):
+        mn, vs = on["mean_net"], on.get("online_vs_static") or {}
+        rf, orf = on.get("refit_vs_static") or {}, on.get("online_vs_refit") or {}
+        lines.append(
+            f"Updating as results arrive (newest trades replayed one by one): fixed model {mn['static']:+.3f}%, "
+            f"updated after every resolved trade {mn['online']:+.3f}%, retrained every {on.get('refit_every')} trades {mn['refit']:+.3f}% per trade."
+        )
+        lines.append(
+            f"Updated vs fixed: {vs.get('delta'):+.3f}% (lower bound {vs.get('lo')}, {vs.get('status')}); "
+            f"retrained vs fixed: {rf.get('delta'):+.3f}% ({rf.get('status')}); updated vs retrained: {orf.get('delta'):+.3f}% ({orf.get('status')})."
+        )
+        lines.append(
+            "Read: if updating beats the fixed model but not the periodic retrain, the existing refresh cycle is enough; "
+            "nothing here changes the live model."
+        )
+    return lines
+
 def _experiment_lines(led: Optional[Dict[str, Any]]) -> List[str]:
     """Plain-text lines for the experiment ledger (empty when nothing recorded)."""
     if not led or not led.get("last"):
@@ -1269,6 +1407,11 @@ def _experiment_lines(led: Optional[Dict[str, Any]]) -> List[str]:
         f"Candidates examined this cycle: {last.get('zone_candidates', 0)} TP/SL zones, "
         f"{last.get('regime_segments', 0)} regime segments, {last.get('recommendations', 0)} recommendations",
     ]
+    if last.get("plan_variants"):
+        lines.append(
+            f"Plus {last['plan_variants']} stop/target/horizon variants tried per volatility regime "
+            f"(chosen on older trades and re-checked on newer ones, so not counted in the chance-hit estimate below)."
+        )
     if n:
         lines.append(
             f"With {n} segment/zone tests, about {note['expected_chance_hits']:.1f} would look "

@@ -701,6 +701,127 @@ def apply_epistemic_gate(result: Dict[str, Any], novelty: Optional[Dict[str, Any
     entry["applied"] = True
     result["epistemic_gate"] = entry
 
+_FES_Z = 1.645   # one-sided 95%
+
+def uncertainty_split(result: Dict[str, Any], ev_model_result: Dict[str, Any], z: float = _FES_Z) -> Optional[Dict[str, Any]]:
+    """Split what we do not know into noise we can never remove and ignorance we could.
+
+    aleatoric_sd  the spread of single-trade outcomes for this alert key (percent).
+                  Even a perfectly known average leaves each trade this uncertain.
+    epistemic_sd  uncertainty about the AVERAGE itself: the block-bootstrap error
+                  of the EV estimate, combined with how far the probability
+                  sources (Bayesian, ML, recent) disagree, converted to EV units.
+                  More data or a better model shrinks this one.
+    future_edge   net EV minus z * epistemic_sd: the edge that is still there once
+                  what we do not know is subtracted.
+    The 'ev' ensemble component is P(EV>0), not a win probability, so it is left
+    out of the disagreement. Returns None when the inputs are missing."""
+    net_ev = result.get("net_ev")
+    sd_out = ev_model_result.get("outcome_sd")
+    ev_std = ev_model_result.get("ev_std")
+    if net_ev is None or sd_out is None or ev_std is None:
+        return None
+    wr = ev_model_result.get("wr")
+    comps = result.get("ensemble_components") or {}
+    ps = [float(comps[k]["value"]) for k in ("bayesian", "ml", "recent") if isinstance(comps.get(k), dict)]
+    spread_p = statistics.pstdev(ps) if len(ps) >= 2 else 0.0
+    slope = float(sd_out) / math.sqrt(float(wr) * (1.0 - float(wr))) if wr is not None and 0.0 < float(wr) < 1.0 and sd_out > 0 else 0.0
+    disagreement = spread_p * slope
+    epi_sd = math.hypot(float(ev_std), disagreement)
+    fes = float(net_ev) - z * epi_sd
+    total_var = float(sd_out) ** 2 + epi_sd ** 2
+    flags = []
+    epi = result.get("epistemic") or {}
+    if epi.get("novel"):
+        flags.append("novel_input")
+    if result.get("drift_warning"):
+        flags.append("recent_drift")
+    if not result.get("oos_validated"):
+        flags.append("no_oos_validation")
+    if result.get("evidence_state") in ("INSUFFICIENT", "SHADOW"):
+        flags.append("thin_evidence")
+    return {
+        "aleatoric_sd": round(float(sd_out), 4),
+        "epistemic_sd": round(epi_sd, 4),
+        "epistemic_parts": {"sampling": round(float(ev_std), 4), "disagreement": round(disagreement, 4)},
+        "epistemic_share": round(epi_sd ** 2 / total_var, 4) if total_var > 0 else None,
+        "future_edge": round(fes, 4),
+        "fes_status": "positive" if fes > 0 else ("uncertain" if float(net_ev) > 0 else "none"),
+        "edge_per_noise": round(fes / float(sd_out), 4) if sd_out > 0 else None,
+        "flags": flags,
+    }
+
+def apply_uncertainty_gate(result: Dict[str, Any], unc: Optional[Dict[str, Any]], mode: str, min_n: int, n_oos: int) -> None:
+    """Lower the verdict one step when the edge does not survive its uncertainty.
+
+    HIGH -> MEDIUM when the future edge is not positive; MEDIUM -> LOW only when
+    net EV itself is not positive. Restrict-only (nothing is ever raised), acts
+    only with at least min_n out-of-sample trades behind the alert key.
+    'shadow' annotates, 'off' does nothing."""
+    if mode == "off" or not unc or n_oos < min_n:
+        return
+    before = result.get("verdict")
+    status = unc.get("fes_status")
+    if before == "HIGH" and status in ("uncertain", "none"):
+        target = "MEDIUM"
+    elif before == "MEDIUM" and status == "none":
+        target = "LOW"
+    else:
+        return
+    entry = {"from": before, "to": target, "future_edge": unc.get("future_edge"),
+             "epistemic_sd": unc.get("epistemic_sd"), "status": status}
+    if mode != "live":
+        result["uncertainty_gate_shadow"] = entry
+        return
+    result["verdict_before_uncertainty_gate"] = before
+    result["verdict"] = target
+    entry["applied"] = True
+    result["uncertainty_gate"] = entry
+
+def future_edge_track_record(rows: List[Row], min_n: int = 20, z: float = 1.645) -> Dict[str, Any]:
+    """Did alerts the Future Edge Score called 'positive' really earn more?
+
+    Reads context["prediction_seen"]["uncertainty"] stored when the alert fired.
+    Groups resolved rows by that status and compares realised net P&L per trade
+    (time-blocked standard error). 'predictive' = positive group beats the rest
+    with a one-sided lower bound above zero. Fired alerts only; descriptive."""
+    from plan_replay import cluster_se
+    fee, slip = _resolve_costs(None, None)
+    cost = (fee * 2 + slip * 2) * 100
+    groups: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+    shares: List[float] = []
+    for r in rows:
+        ctx = r.get("context")
+        u = ((ctx or {}).get("prediction_seen") or {}).get("uncertainty") if isinstance(ctx, dict) else None
+        if not isinstance(u, dict) or not u.get("fes_status") or r.get("entry_ts") is None:
+            continue
+        groups[u["fes_status"]].append((float(r["entry_ts"]), row_net_pnl_pct(r, cost)))
+        if u.get("epistemic_share") is not None:
+            shares.append(float(u["epistemic_share"]))
+    out: Dict[str, Any] = {"valid": True, "n": sum(len(v) for v in groups.values()), "groups": {}}
+    for k, v in groups.items():
+        vals = [x[1] for x in v]
+        se, _nb = cluster_se(vals, [x[0] for x in v])
+        out["groups"][k] = {"n": len(v), "mean_net": round(sum(vals) / len(vals), 4),
+                            "se": None if se == float("inf") else round(se, 4)}
+    if shares:
+        out["mean_epistemic_share"] = round(sum(shares) / len(shares), 4)
+    pos = groups.get("positive", [])
+    rest = [x for k, v in groups.items() if k != "positive" for x in v]
+    if len(pos) < min_n or len(rest) < min_n:
+        out["status"] = "insufficient"
+        return out
+    se_p, _ = cluster_se([x[1] for x in pos], [x[0] for x in pos])
+    se_r, _ = cluster_se([x[1] for x in rest], [x[0] for x in rest])
+    diff = sum(x[1] for x in pos) / len(pos) - sum(x[1] for x in rest) / len(rest)
+    if se_p == float("inf") or se_r == float("inf"):
+        out["status"] = "insufficient"
+        return out
+    lo = diff - z * math.hypot(se_p, se_r)
+    out.update({"positive_minus_rest": round(diff, 4), "lo": round(lo, 4),
+                "status": "predictive" if lo > 0 else "not_predictive"})
+    return out
+
 _PREDICTION_FIELDS = ("ensemble_p", "market_state_p_win", "p_ev_positive")
 
 def prediction_track_record(rows: List[Row], min_n: int = 30, n_bins: int = 5, min_skill: float = 0.02, max_ece: float = 0.10) -> Dict[str, Any]:
@@ -787,7 +908,8 @@ def gate_shadow_comparison(rows: List[Row], min_flagged: int = 20) -> Dict[str, 
     'looks_justified' means ready, flagged win rate lower and p <= 0.20.
     Purely diagnostic: never changes a verdict."""
     out: Dict[str, Any] = {"valid": True, "gates": {}}
-    for gate in ("ensemble", "regime", "epistemic"):
+
+    for gate in ("ensemble", "regime", "epistemic", "uncertainty"):
         flagged: List[Row] = []
         clean: List[Row] = []
         for r in rows:
@@ -847,6 +969,8 @@ def trade_quality_score(
     regime_gate_mode: str = "off",
     epistemic: Optional[Dict[str, Any]] = None,
     epistemic_mode: str = "off",
+    uncertainty_mode: str = "off",
+    uncertainty_min_n: int = 100,
 ) -> Dict[str, Any]:
     """Unified quality assessment for a single prospective trade."""
     result: Dict[str, Any] = {
@@ -1029,6 +1153,13 @@ def trade_quality_score(
     if epistemic:
         result["epistemic"] = epistemic
         apply_epistemic_gate(result, epistemic, epistemic_mode)
+
+    # ── Noise vs ignorance: Future Edge Score (restrict-only) ──
+    if uncertainty_mode != "off":
+        _unc = uncertainty_split(result, ev_model_result)
+        if _unc:
+            result["uncertainty"] = _unc
+            apply_uncertainty_gate(result, _unc, uncertainty_mode, int(uncertainty_min_n), int(n_oos))
 
     # Advisory size hint only — never used to place orders in this bot
     if getattr(cfg, "ENABLE_BRAIN_SIZE_HINT", False):

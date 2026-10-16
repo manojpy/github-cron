@@ -316,6 +316,110 @@ def select_plan(rows: Sequence[Row], default_cost_pct: float, fixed_sl: float, f
         res["status"] = "PROMISING"
     return res
 
+VOL_BUCKETS: Tuple[str, ...] = ("low", "mid", "high")
+
+def _vol_bucket(v: float, cuts: Tuple[float, float]) -> str:
+    return VOL_BUCKETS[0] if v <= cuts[0] else VOL_BUCKETS[1] if v <= cuts[1] else VOL_BUCKETS[2]
+
+def volatility_plan_study(rows: Sequence[Row], default_cost_pct: float, fixed_sl: float, fixed_tp: float, fixed_h: int, *, min_n: int = 150, min_bucket_train: int = 25, train_frac: float = 0.6, z: float = 1.645) -> Dict[str, Any]:
+    """Would a different stop / target / horizon per volatility regime beat ONE plan tuned on the same data?
+
+    Regime = the ATR percentile stored when the alert fired (low / mid / high
+    terciles, cut points taken from the OLDER trades). For each regime the best
+    (stop, target, horizon) is chosen on older trades only, then both that plan
+    and the fixed plan are replayed on the newer, untouched trades of the same
+    regime; the comparison is per trade, paired, with a time-blocked standard
+    error. The yardstick is the best SINGLE plan chosen on the same older trades,
+    not the current fixed plan: any tuned plan beats an arbitrary one, so only a
+    single tuned plan isolates what volatility conditioning adds. 'supported' =
+    regime plans beat that single plan with a one-sided lower bound above zero.
+    The gain over the current fixed plan is reported separately. Descriptive only:
+    nothing is applied, and the fixed 12-candle label used everywhere else is
+    untouched."""
+    usable = sorted(
+        (r for r in rows if has_path(r) and r.get("entry_ts") is not None
+         and isinstance((r.get("context") or {}).get("atr_pctl"), (int, float))),
+        key=lambda r: r["entry_ts"])
+    out: Dict[str, Any] = {"status": "insufficient", "n": len(usable), "causal": False, "buckets": {}, "n_candidates": 0}
+    if len(usable) < min_n:
+        return out
+    cut = int(len(usable) * train_frac)
+    hold = usable[cut:]
+    split_ts = hold[0]["entry_ts"]
+    embargo = (max(DEFAULT_HORIZONS) + 2) * _CANDLE_SEC
+    train = [r for r in usable[:cut] if r["entry_ts"] <= split_ts - embargo]
+    if len(train) < min_n // 2 or len(hold) < min_n // 4:
+        return out
+    vals = sorted(float(r["context"]["atr_pctl"]) for r in train)
+    cuts = (vals[len(vals) // 3], vals[(2 * len(vals)) // 3])
+    out["cuts"] = [round(cuts[0], 2), round(cuts[1], 2)]
+
+    def bucket_of(r: Row) -> str:
+        return _vol_bucket(float(r["context"]["atr_pctl"]), cuts)
+
+    g_cands = [c for c in grid_search(train, default_cost_pct) if c["n"] >= max(10, min_bucket_train // 2)]
+    if not g_cands:
+        return out
+    g_best = max(g_cands, key=lambda c: c["ev"])
+    out["single_plan"] = {"sl": g_best["sl"], "tp": g_best["tp"], "h": g_best["h"], "train_ev": round(g_best["ev"], 4)}
+    paired: List[Tuple[float, float, float]] = []   # (regime plan, single tuned plan, current fixed plan) per holdout trade
+    stamps: List[float] = []
+    grid_size = len(DEFAULT_SL_GRID) * len(DEFAULT_TP_GRID) * len(DEFAULT_HORIZONS)
+    for name in VOL_BUCKETS:
+        tr = [r for r in train if bucket_of(r) == name]
+        ho = [r for r in hold if bucket_of(r) == name]
+        allb = [r for r in usable if bucket_of(r) == name]
+        mfes = [float(max(r["path_fav"])) for r in allb]
+        maes = [float(max(r["path_adv"])) for r in allb]
+        tmf = [r["mfe_candle"] for r in allb if r.get("mfe_candle") is not None]
+        info: Dict[str, Any] = {
+            "n": len(allb), "n_train": len(tr), "n_hold": len(ho),
+            "median_best_move": round(statistics.median(mfes), 3) if mfes else None,
+            "median_worst_move": round(statistics.median(maes), 3) if maes else None,
+            "median_candle_of_best": statistics.median(tmf) if tmf else None,
+        }
+        out["buckets"][name] = info
+        if len(tr) < min_bucket_train or not ho:
+            info["plan"] = None
+            continue
+        cands = [c for c in grid_search(tr, default_cost_pct) if c["n"] >= max(10, min_bucket_train // 2)]
+        out["n_candidates"] += grid_size
+        if not cands:
+            info["plan"] = None
+            continue
+        best = max(cands, key=lambda c: c["ev"])
+        info["plan"] = {"sl": best["sl"], "tp": best["tp"], "h": best["h"], "train_ev": round(best["ev"], 4)}
+        reg: List[float] = []
+        sgl: List[float] = []
+        for r in ho:
+            a = replay_plan(r, best["sl"], best["tp"], best["h"], default_cost_pct)
+            b = replay_plan(r, g_best["sl"], g_best["tp"], g_best["h"], default_cost_pct)
+            f = replay_plan(r, fixed_sl, fixed_tp, fixed_h, default_cost_pct)
+            if a is None or b is None or f is None:
+                continue
+            reg.append(a[1])
+            sgl.append(b[1])
+            paired.append((a[1], b[1], f[1]))
+            stamps.append(float(r["entry_ts"]))
+        if reg:
+            info["hold_ev_regime"] = round(sum(reg) / len(reg), 4)
+            info["hold_ev_single"] = round(sum(sgl) / len(sgl), 4)
+    if len(paired) < max(20, min_n // 5):
+        return out
+    delta = [a - b for a, b, _f in paired]
+    d_mean = sum(delta) / len(delta)
+    se, nb = cluster_se(delta, stamps)
+    lo = None if se == float("inf") else d_mean - z * se
+    hi = None if se == float("inf") else d_mean + z * se
+    out.update({
+        "n_hold_pairs": len(paired), "overall_delta": round(d_mean, 4),
+        "gain_over_fixed": round(sum(a - f for a, _b, f in paired) / len(paired), 4),
+        "single_over_fixed": round(sum(b - f for _a, b, f in paired) / len(paired), 4),
+        "overall_lo": None if lo is None else round(lo, 4), "n_blocks": nb,
+        "fixed_plan": {"sl": fixed_sl, "tp": fixed_tp, "h": fixed_h},
+        "status": "insufficient" if lo is None else "supported" if lo > 0 else "worse" if (hi is not None and hi < 0) else "not_distinguishable",
+    })
+    return out
 
 # ── Works on legacy rows too (MAE/MFE only) ───────────────────────────────
 def reach_table(rows: Sequence[Row], levels: Sequence[float] = REACH_LEVELS) -> Dict[str, Any]:

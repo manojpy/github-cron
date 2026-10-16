@@ -5,8 +5,8 @@ import time
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 from brain_audit import DataCoverage, HealthStatus, get_audit
-from bot_config import cfg, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS
-from brain_helpers import _extract_p_value_for_fdr
+from bot_config import cfg, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS, json_dumps, json_loads
+from brain_helpers import _extract_p_value_for_fdr, HYPOTHESIS_LEDGER_KEY, collect_conclusions, update_hypothesis_ledger
 import threshold_engine as engine
 from threshold_engine import (
     optimize_vote_weights,
@@ -25,6 +25,7 @@ from repair_ledger import (
     ledger_stats,
     load_ledger_entries,
     family_accountability,
+    control_summary,
 )
 
 async def build_full_recommendations(self) -> Dict[str, Any]:
@@ -197,10 +198,29 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
                     ledger_entries, int(time.time()),
                     window_days=int(getattr(cfg, "FAMILY_ACCOUNTABILITY_WINDOW_DAYS", 60)),
                     hurt_streak=int(getattr(cfg, "FAMILY_HURT_STREAK", 3)),
+
                     suspend_days=int(getattr(cfg, "FAMILY_SUSPEND_DAYS", 14)),
+                    use_control=str(getattr(cfg, "ACCOUNTABILITY_CONTROL_MODE", "shadow")) == "live",
                 )
             except Exception as e:
                 audit.record_analysis_exception("family_accountability", e)
+        if str(getattr(cfg, "ACCOUNTABILITY_CONTROL_MODE", "shadow")) != "off":
+            try:
+                ai_metrics["control_summary"] = control_summary(ledger_entries, int(time.time()))
+            except Exception as e:
+                audit.record_analysis_exception("control_summary", e)
+        # ── Hypothesis ledger: which conclusions stood, and which were
+        # overturned later (and on what evidence). Best-effort. ──
+        try:
+            if not self.sdb.degraded:
+                _h_raw = await self.sdb.get_metadata(HYPOTHESIS_LEDGER_KEY)
+                _h = update_hypothesis_ledger(
+                    json_loads(_h_raw) if _h_raw else {}, collect_conclusions(ai_metrics), int(time.time()),
+                )
+                await self.sdb.set_metadata(HYPOTHESIS_LEDGER_KEY, json_dumps(_h), ttl=365 * 86400)
+                ai_metrics["hypothesis_ledger"] = _h
+        except Exception as e:
+            audit.record_analysis_exception("hypothesis_ledger", e)
         current_state = {
             "overall_wr": (
                 sum(1 for r in real_rows if r["win"]) / len(real_rows)

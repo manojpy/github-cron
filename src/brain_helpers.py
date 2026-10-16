@@ -3,7 +3,7 @@
 Split out of the original module without logic changes; the original
 module remains as a facade re-exporting every name."""
 from __future__ import annotations
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from alert_registry import resolve_alert_config_path
 from bot_config import cfg
 import threshold_engine as engine
@@ -22,6 +22,8 @@ ML_CALIBRATION_KEY = "brain:ml_calibration_curve"
 
 EXPERIMENT_LEDGER_KEY = "brain_experiment_ledger"
 
+HYPOTHESIS_LEDGER_KEY = "brain_hypothesis_ledger"
+
 ACTION_PLAN_KEY = "brain_action_plan"
 
 def count_brain_trials(ai_metrics: Dict[str, Any], n_recommendations: int) -> Dict[str, int]:
@@ -34,6 +36,7 @@ def count_brain_trials(ai_metrics: Dict[str, Any], n_recommendations: int) -> Di
         "zone_candidates": int(zp.get("n_candidates") or 0),
         "regime_segments": int(rg.get("n_evaluated") or 0),
         "recommendations": int(n_recommendations),
+        "plan_variants": int((ai_metrics.get("vol_horizon_study") or {}).get("n_candidates") or 0),
     }
 
 def update_experiment_ledger(prev: Optional[Dict[str, Any]], trials: Dict[str, int], now: int) -> Dict[str, Any]:
@@ -50,6 +53,105 @@ def update_experiment_ledger(prev: Optional[Dict[str, Any]], trials: Dict[str, i
         "cycles": int(prev.get("cycles") or 0) + 1,
         "cum": cum,
         "last": {"ts": int(now), **{k: int(v) for k, v in trials.items()}},
+    }
+
+def collect_conclusions(ai_metrics: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """The standing conclusions this report rests on, each with a polarity:
+    +1 supports using it, -1 argues against, 0 undecided. Only conclusions the
+    report actually computed this cycle are returned."""
+    out: Dict[str, Dict[str, Any]] = {}
+    nev = ai_metrics.get("net_ev_audit") or {}
+    if nev.get("status"):
+        out["net_ev_model"] = {
+            "claim": "the market-state model picks better trades than simple rules",
+            "status": nev["status"],
+            "polarity": {"validated": 1, "not_better": -1}.get(nev["status"], 0),
+            "evidence": {k: nev.get(k) for k in ("delta_vs_best", "delta_lo", "n_test", "best_baseline")},
+        }
+    ou = ((ai_metrics.get("net_ev_audit") or {}).get("online") or {}).get("online_vs_static") or {}
+    if ou.get("status") and ou["status"] != "insufficient":
+        out["online_updates"] = {
+            "claim": "updating the model after every resolved trade beats leaving it fixed",
+            "status": ou["status"],
+            "polarity": {"better": 1, "worse": -1}.get(ou["status"], 0),
+            "evidence": {"delta": ou.get("delta"), "lo": ou.get("lo")},
+        }
+    vs = ai_metrics.get("vol_horizon_study") or {}
+    if vs.get("status") and vs["status"] != "insufficient":
+        out["volatility_plans"] = {
+            "claim": "a plan per volatility regime beats one tuned plan",
+            "status": vs["status"],
+            "polarity": {"supported": 1, "worse": -1}.get(vs["status"], 0),
+            "evidence": {k: vs.get(k) for k in ("overall_delta", "overall_lo", "n_hold_pairs")},
+        }
+    fe = ai_metrics.get("future_edge_record") or {}
+    if fe.get("status"):
+        out["future_edge"] = {
+            "claim": "alerts with a positive Future Edge Score earn more than the rest",
+            "status": fe["status"],
+            "polarity": {"predictive": 1, "not_predictive": -1}.get(fe["status"], 0),
+            "evidence": {k: fe.get(k) for k in ("positive_minus_rest", "lo", "n")},
+        }
+    for name, p in ((ai_metrics.get("prediction_track_record") or {}).get("predictors") or {}).items():
+        out[f"prediction:{name}"] = {
+            "claim": f"the stated odds from {name} beat the base rate",
+            "status": p.get("status"),
+            "polarity": {"skilful": 1, "no_skill": -1}.get(p.get("status"), 0),
+            "evidence": {k: p.get(k) for k in ("n", "brier_skill", "ece")},
+        }
+    for cat, f in (ai_metrics.get("family_accountability") or {}).items():
+        if f.get("status") == "suspended":
+            pol = -1
+        elif f.get("status") == "eligible" and f.get("helped", 0) > f.get("hurt", 0):
+            pol = 1
+        else:
+            pol = 0
+        out[f"family:{cat}"] = {
+            "claim": f"acting on '{cat}' recommendations helps",
+            "status": f.get("status"), "polarity": pol,
+            "evidence": {k: f.get(k) for k in ("n", "helped", "hurt", "neutral")},
+        }
+    return out
+
+def update_hypothesis_ledger(prev: Optional[Dict[str, Any]], conclusions: Dict[str, Dict[str, Any]], now: int, max_events: int = 100) -> Dict[str, Any]:
+    """Remember what the Brain concluded and say so when a later cycle reverses it.
+
+    A subject is OVERTURNED when its polarity flips between +1 and -1, and
+    LOST SUPPORT when it falls from +/-1 to undecided. Each event keeps the
+    evidence before and after and how long the old conclusion stood, and each
+    subject counts its flips so a conclusion that keeps reversing reads as
+    unstable rather than as a series of discoveries."""
+    prev = prev if isinstance(prev, dict) else {}
+    subjects: Dict[str, Any] = {k: dict(v) for k, v in (prev.get("subjects") or {}).items()}
+    events: List[Dict[str, Any]] = list(prev.get("events") or [])
+    new_overturned = 0
+    for sid, c in conclusions.items():
+        pol = int(c.get("polarity") or 0)
+        old = subjects.get(sid)
+        if old is None:
+            subjects[sid] = {"claim": c.get("claim"), "status": c.get("status"), "polarity": pol,
+                             "since": int(now), "flips": 0, "evidence": c.get("evidence")}
+            continue
+        old_pol = int(old.get("polarity") or 0)
+        if old_pol != 0 and pol != old_pol:
+            events.insert(0, {
+                "ts": int(now), "subject": sid, "claim": c.get("claim"),
+                "kind": "overturned" if pol != 0 else "lost_support",
+                "from": old.get("status"), "to": c.get("status"),
+                "held_sec": int(now) - int(old.get("since") or now),
+                "evidence_before": old.get("evidence"), "evidence_after": c.get("evidence"),
+            })
+            if pol != 0:
+                old["flips"] = int(old.get("flips") or 0) + 1
+                new_overturned += 1
+        if pol != old_pol:
+            old["since"] = int(now)
+        old.update({"claim": c.get("claim"), "status": c.get("status"), "polarity": pol, "evidence": c.get("evidence")})
+        subjects[sid] = old
+    return {
+        "subjects": subjects, "events": events[:max_events],
+        "n_overturned": int(prev.get("n_overturned") or 0) + new_overturned,
+        "updated_at": int(now),
     }
 
 def multiple_testing_note(n_tests: int, alpha: float = 0.05) -> Dict[str, Any]:
