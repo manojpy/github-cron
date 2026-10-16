@@ -652,19 +652,14 @@ class BrainEngineV2(BrainCore):
             # whose changes keep hurting stops contributing to the plan. ──
             _acct_mode = str(getattr(cfg, "FAMILY_ACCOUNTABILITY_MODE", "shadow"))
             _acct = (recs.get("ai_metrics") or {}).get("family_accountability") or {}
-            _ev_lift = (recs.get("ai_metrics") or {}).get("family_ev_lift") or {}
             _suppressed: List[Dict[str, Any]] = []
             if _acct_mode != "off" and _acct:
                 def _blocked(item: Dict[str, Any], cat: Optional[str]) -> bool:
                     fam = _acct.get(cat) if cat else None
                     if fam and not fam.get("eligible", True):
-                        _lift = _ev_lift.get(cat) or {}
                         _suppressed.append({
                             "target": item.get("path") or f"weight:{item.get('vote')}",
-                            "family": cat,
-                            "ev_lift": _lift.get("ev_lift"),
-                            "ev_lift_tag": _lift.get("tag"),
-                            "reason": fam.get("reason"),
+                            "family": cat, "reason": fam.get("reason"),
                             "suspended_until": fam.get("suspended_until"),
                         })
                         return True

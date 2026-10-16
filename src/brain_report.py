@@ -695,7 +695,8 @@ def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
         do_now.append(f"Investigate the very low {wr:.0%} win rate (see section 04).")
     if F["gate"].get("stability") is False or F["gate"].get("risk") is False:
         do_now.append("Monitor active drift/drawdown warnings.")
-    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"• {x}" for x in do_now)))
+    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"���������� {x}" for x in do_now)))
+
     watch: List[str] = []
     seen = set()
     for a in F["weak"]:
@@ -1059,12 +1060,10 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     if _ptr_lines:
         out.append(_p("PREDICTION TRACK RECORD — did the Brain's stated odds match reality?"))
         out.extend(_c_split(_ptr_lines))
-
     _acct_lines = _accountability_lines(
         (F.get("ai") or {}).get("family_accountability"),
         str(getattr(cfg, "FAMILY_ACCOUNTABILITY_MODE", "shadow")),
         (F.get("ai") or {}).get("control_summary"),
-        ev_lift=(F.get("ai") or {}).get("family_ev_lift"),
     )
     if _acct_lines:
         out.append(_p("RECOMMENDATION ACCOUNTABILITY — did past changes help?"))
@@ -1137,7 +1136,6 @@ def to_action_plan(plan_data: Dict[str, Any], recs: Dict[str, Any], cfg, now: Op
     expires = generated + ACTION_PLAN_TTL_HOURS * 3600
     plan_id = plan_data.get("plan_id")
     acct = ai.get("family_accountability") or {}
-    ev_lift = ai.get("family_ev_lift") or {}
     disable_recs = {
         str(r.get("alert") or r.get("alert_key")): r
         for r in (recs.get("recommendations") or []) if r.get("type") == "disable_alert"
@@ -1235,42 +1233,21 @@ def to_action_plan(plan_data: Dict[str, Any], recs: Dict[str, Any], cfg, now: Op
         },
         "actions": actions,
         "accountability_mode": str(getattr(cfg, "FAMILY_ACCOUNTABILITY_MODE", "shadow")),
-        "control_mode": str(getattr(cfg, "ACCOUNTABILITY_CONTROL_MODE", "shadow")),
-        "family_ev_lift": {
-            k: {"ev_lift": v.get("ev_lift"), "n": v.get("n"),
-                "control_adjusted": v.get("control_adjusted"), "tag": v.get("tag")}
-            for k, v in ev_lift.items()
-        },
-        "family_control_summary": {
-            k: {"status": v.get("status"), "eligible": v.get("eligible", True)}
-            for k, v in acct.items()
-        },
         "suppressed_families": plan_data.get("suppressed_families") or [],
         "would_suppress_families": plan_data.get("would_suppress_families") or [],
         "note": "Historical evidence on fired alerts; not a forecast of future profit.",
     }
 
-def _accountability_lines(acct: Optional[Dict[str, Any]], mode: str, control_sum: Optional[Dict[str, Any]] = None, ev_lift: Optional[Dict[str, Any]] = None) -> List[str]:
+def _accountability_lines(acct: Optional[Dict[str, Any]], mode: str, control_sum: Optional[Dict[str, Any]] = None) -> List[str]:
     """Plain-text lines: which recommendation families helped or hurt when acted on."""
-    lines: List[str] = []
-    if ev_lift:
-        lines.append("Rolling net-EV lift per family (control-adjusted where available):")
-        for fam, v in sorted(ev_lift.items(), key=lambda kv: kv[1].get("ev_lift", 0)):
-            lines.append(
-                f"  · {fam}: EV lift {v.get('ev_lift', 0):+.4f} "
-                f"(n={v.get('n', 0)}"
-                + (", control-adjusted" if v.get("control_adjusted") else ", raw")
-                + f") — {v.get('tag', 'watch')}"
-            )
-        lines.append("")
     if not acct:
-        return lines
+        return []
     icon = {"eligible": "🟢", "insufficient": "⚪", "probation": "🟡", "suspended": "🔴"}
     rows: List[Tuple[str, ...]] = []
     for cat, f in sorted(acct.items(), key=lambda kv: (kv[1].get("eligible", True), -kv[1].get("n", 0))):
         rows.append((f"{icon.get(f['status'], '⚪')} {cat}", f"n={f['n']}",
                      f"helped {f['helped']} / hurt {f['hurt']} / neutral {f['neutral']}", f["status"]))
-    lines.extend(_table(rows, "llll"))
+    lines = list(_table(rows, "llll"))
     sus = [c for c, f in acct.items() if not f.get("eligible", True)]
     if sus:
         lines.append("")
