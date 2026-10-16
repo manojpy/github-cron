@@ -6,6 +6,9 @@ jobs:
   static-checks:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -15,35 +18,171 @@ jobs:
         run: pip install pyflakes==3.2.0 mypy==1.11.0
       - name: Syntax gate (py_compile everything)
         run: python -m compileall -q .
-      - name: Encoding gate (no U+FFFD / mojibake)
+      - name: Encoding gate (UTF-8 / U+FFFD / mojibake / missing encoding=)
         run: |
           python - <<'PY'
+          from __future__ import annotations
           from pathlib import Path
+          import ast
+          import re
           import sys
 
-          extensions = {".py", ".md", ".yml", ".yaml", ".json", ".txt"}
-          hits = []
-          for p in Path(".").rglob("*"):
-              if not p.is_file():
-                  continue
-              if p.suffix.lower() not in extensions and p.name != "Dockerfile":
-                  continue
-              try:
-                  text = p.read_text(encoding="utf-8")
-              except UnicodeDecodeError as e:
-                  print(f"❌ Invalid UTF-8 in {p}: {e}")
-                  sys.exit(1)
-              if "\ufffd" in text:
+          TEXT_EXTENSIONS = {
+              ".py", ".md", ".yml", ".yaml", ".json", ".txt",
+              ".rst", ".cfg", ".ini", ".toml", ".sh", ".bash",
+          }
+          TEXT_FILENAMES = {
+              "Dockerfile", "Makefile", "requirements.txt",
+              ".gitignore", ".gitattributes", ".editorconfig",
+          }
+          SKIP_DIR_PARTS = {
+              ".git", "__pycache__", ".venv", "venv", "env",
+              "node_modules", ".mypy_cache", ".pytest_cache",
+              ".ruff_cache", ".tox", ".eggs", "build", "dist",
+          }
+          # Paths (repo-relative, as strings) whose mojibake patterns are
+          # intentional — e.g. a test that asserts the detector works.
+          MOJIBAKE_ALLOWLIST: set[str] = set()
+
+          # ── Mojibake patterns ─────────────────────────────────────────
+          # Each is a real UTF-8 sequence decoded as Latin-1 or CP1252.
+          # They are VALID UTF-8, so read_text() accepts them silently —
+          # only a regex catches them. Written with \u escapes (not raw
+          # strings) so the source of this workflow file itself stays free
+          # of the characters we're hunting for.
+          MOJIBAKE_PATTERNS = [
+              "\u00c3[\u0080-\u00bf]",         # Ã©, Ã¨, Ã¼, ...      (UTF-8 → Latin-1)
+              "\u00c2[\u0080-\u00bf]",         # Â©, Â®, Â, ...       (UTF-8 → Latin-1)
+              "\u00e2\u20ac[\u0080-\u00bf]",   # â€™, â€œ, â€¦, ...     (UTF-8 → CP1252)
+              "\u00e2\u0080[\u0080-\u00bf]",   # â€ sequences          (UTF-8 → Latin-1)
+              "\u00f0\u0178[\u0080-\u00bf]",   # ðŸ˜€, ðŸš€, ...        (emoji → CP1252)
+              "\u00f0\u009f[\u0080-\u00bf]",   # ðŸ... emoji          (emoji → Latin-1)
+              "\u00ef\u00bb\u00bf",            # ï»¿ (BOM rendered as text)
+          ]
+          MOJIBAKE_RE = re.compile("|".join(MOJIBAKE_PATTERNS))
+
+          def iter_text_files(root: Path):
+              for p in root.rglob("*"):
+                  if not p.is_file():
+                      continue
+                  if any(part in SKIP_DIR_PARTS for part in p.parts):
+                      continue
+                  if p.suffix.lower() in TEXT_EXTENSIONS or p.name in TEXT_FILENAMES:
+                      yield p
+
+          def check_bytes_and_mojibake(root: Path) -> list[str]:
+              problems: list[str] = []
+              for p in iter_text_files(root):
+                  # 1. Must decode as UTF-8 at all.
+                  try:
+                      text = p.read_text(encoding="utf-8")
+                  except UnicodeDecodeError as e:
+                      problems.append(f"{p}: invalid UTF-8: {e}")
+                      continue
+
+                  # 2. No U+FFFD (already-lost data).
+                  if "\ufffd" in text:
+                      for i, line in enumerate(text.splitlines(), 1):
+                          if "\ufffd" in line:
+                              problems.append(
+                                  f"{p}:{i}: U+FFFD replacement char: "
+                                  f"{line.strip()[:120]}"
+                              )
+
+                  # 3. No common mojibake sequences.
+                  if str(p) in MOJIBAKE_ALLOWLIST:
+                      continue
                   for i, line in enumerate(text.splitlines(), 1):
-                      if "\ufffd" in line:
-                          hits.append(f"{p}:{i}: {line.strip()[:120]}")
+                      m = MOJIBAKE_RE.search(line)
+                      if m:
+                          problems.append(
+                              f"{p}:{i}: mojibake {m.group()!r}: "
+                              f"{line.strip()[:120]}"
+                          )
+              return problems
 
-          if hits:
-              print("❌ BLOCKING: U+FFFD (replacement character) found")
-              print("\n".join(hits))
-              sys.exit(1)
+          def _missing_kw(node: ast.Call, name: str) -> bool:
+              return not any(k.arg == name for k in node.keywords)
 
-          print("✅ No U+FFFD characters")
+          def _open_missing_encoding(node: ast.Call) -> bool:
+              """open(...) in text mode without an explicit encoding="""
+              if not _missing_kw(node, "encoding"):
+                  return False
+              mode = None
+              if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                  mode = node.args[1].value
+              for kw in node.keywords:
+                  if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+                      mode = kw.value.value
+              if isinstance(mode, str) and "b" in mode:
+                  return False        # binary mode: encoding is meaningless
+              return True
+
+          def check_python_encodings(root: Path) -> list[str]:
+              """AST scan: text I/O must declare UTF-8 explicitly."""
+              problems: list[str] = []
+              for p in sorted(root.rglob("*.py")):
+                  if any(part in SKIP_DIR_PARTS for part in p.parts):
+                      continue
+                  try:
+                      tree = ast.parse(p.read_text(encoding="utf-8"), filename=str(p))
+                  except (SyntaxError, UnicodeDecodeError):
+                      continue    # already reported by the byte-level pass
+                  for node in ast.walk(tree):
+                      if not isinstance(node, ast.Call):
+                          continue
+                      fn = node.func
+
+                      # open(...)
+                      if isinstance(fn, ast.Name) and fn.id == "open":
+                          if _open_missing_encoding(node):
+                              problems.append(
+                                  f"{p}:{node.lineno}: open() missing encoding= — "
+                                  f"add encoding='utf-8'"
+                              )
+
+                      # Path.read_text / Path.write_text
+                      if isinstance(fn, ast.Attribute) and fn.attr in (
+                          "read_text", "write_text",
+                      ):
+                          if _missing_kw(node, "encoding"):
+                              problems.append(
+                                  f"{p}:{node.lineno}: .{fn.attr}() missing encoding= — "
+                                  f"add encoding='utf-8'"
+                              )
+
+                      # subprocess.run / Popen / check_output / check_call / call
+                      if isinstance(fn, ast.Attribute) and fn.attr in (
+                          "run", "Popen", "check_output", "check_call", "call",
+                      ):
+                          kw_names = {k.arg for k in node.keywords if k.arg}
+                          # Only flag when text mode is requested explicitly.
+                          # Capture without text mode may legitimately want bytes.
+                          if ("text" in kw_names or "universal_newlines" in kw_names) \
+                                  and "encoding" not in kw_names:
+                              problems.append(
+                                  f"{p}:{node.lineno}: subprocess.{fn.attr}"
+                                  f"(text=True) missing encoding= — add "
+                                  f"encoding='utf-8'"
+                              )
+              return problems
+
+          def main() -> int:
+              root = Path(".")
+              problems = check_bytes_and_mojibake(root)
+              problems += check_python_encodings(root)
+              if problems:
+                  print("❌ BLOCKING: encoding / mojibake / UTF-8 issues")
+                  for prob in problems:
+                      print("  -", prob)
+                  return 1
+              print(
+                  "✅ All text files valid UTF-8, no U+FFFD, no mojibake, "
+                  "and every Python text I/O call declares UTF-8."
+              )
+              return 0
+
+          sys.exit(main())
           PY
       - name: Pyflakes (BLOCKING on real errors only)
         # Blocks on undefined names — the class of bug that shipped the
@@ -93,6 +232,10 @@ jobs:
       # being explicit here means the tests still work if conftest is
       # ever refactored away.
       PYTHONPATH: src
+      # Belt-and-braces: force UTF-8 for open(), subprocess pipes and
+      # stdio, so the runner's locale can never silently change decoding.
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
