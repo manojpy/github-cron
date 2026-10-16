@@ -80,6 +80,7 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
         try:
             fresh = await evaluate_pending_repairs(
                 self.sdb, real_rows, horizon_hours=48, min_outcomes=30,
+                shadow_rows=shadow_rows,
             )
             if fresh:
                 logger.info(f"📒 Repair ledger: evaluated {len(fresh)} pending repair(s)")

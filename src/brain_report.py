@@ -695,7 +695,7 @@ def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
         do_now.append(f"Investigate the very low {wr:.0%} win rate (see section 04).")
     if F["gate"].get("stability") is False or F["gate"].get("risk") is False:
         do_now.append("Monitor active drift/drawdown warnings.")
-    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"• {x}" for x in do_now)))
+    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"�� {x}" for x in do_now)))
     watch: List[str] = []
     seen = set()
     for a in F["weak"]:
@@ -1168,7 +1168,7 @@ def to_action_plan(plan_data: Dict[str, Any], recs: Dict[str, Any], cfg, now: Op
             "kind": kind, "target": target, "old": old, "new": new,
             "rationale": rationale, "source_category": category,
             "family": (
-                {k: acct[category][k] for k in ("status", "n", "helped", "hurt")}
+                {k: acct[category].get(k) for k in ("status", "n", "helped", "hurt", "ev_lift_mean", "control_effect_mean", "lift_tag")}
                 if category in acct else None
             ),
             "validation_status": status,
@@ -1244,9 +1244,14 @@ def _accountability_lines(acct: Optional[Dict[str, Any]], mode: str, control_sum
     icon = {"eligible": "🟢", "insufficient": "⚪", "probation": "🟡", "suspended": "🔴"}
     rows: List[Tuple[str, ...]] = []
     for cat, f in sorted(acct.items(), key=lambda kv: (kv[1].get("eligible", True), -kv[1].get("n", 0))):
+        _lift = f.get("ev_lift_mean")
+        _ctl = f.get("control_effect_mean")
         rows.append((f"{icon.get(f['status'], '⚪')} {cat}", f"n={f['n']}",
-                     f"helped {f['helped']} / hurt {f['hurt']} / neutral {f['neutral']}", f["status"]))
-    lines = list(_table(rows, "llll"))
+                     f"helped {f['helped']} / hurt {f['hurt']} / neutral {f['neutral']}", f["status"],
+                     "lift " + (f"{_lift:+.3f}" if _lift is not None else "n/a")
+                     + " vs control " + (f"{_ctl:+.3f}" if _ctl is not None else "n/a")
+                     + f" ({str(f.get('lift_tag') or 'insufficient').replace('_', ' ')})"))
+    lines = list(_table(rows, "lllll"))
     sus = [c for c, f in acct.items() if not f.get("eligible", True)]
     if sus:
         lines.append("")

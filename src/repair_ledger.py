@@ -13,7 +13,7 @@ import asyncio
 import hashlib
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from bot_config import cfg, json_dumps, json_loads
 from threshold_engine import _flatten_row_features, wilson_ci, ev_and_kelly_for, row_net_pnl_pct
@@ -201,6 +201,81 @@ async def mark_plan_applied(sdb, plan_ts: int, repair_ids: Optional[List[str]] =
         await _save_ledger(sdb, entries)
     return n
 
+async def record_applied_alert_toggles(sdb, toggles: List[Tuple[str, str]], real_rows: Optional[List[dict]] = None) -> int:
+    """Put alert disable / reinstate actions into the ledger as already-applied
+    repairs, so they get a verdict and count toward family accountability like
+    every other change. `toggles` is a list of (category, alert_key) where
+    category is 'disable_alert' or 'reinstate_alert'. Returns how many entries
+    were added."""
+    if not toggles or sdb.degraded or not sdb._redis:
+        return 0
+    try:
+        entries = await _load_ledger_strict(sdb)
+    except Exception:
+        return 0
+    now = int(time.time())
+    known = {e.get("id") for e in entries}
+    added = 0
+    for category, ak in toggles:
+        rec = {"type": category, "category": category, "alert": ak, "param": None}
+        rid = _repair_id(rec, now)
+        if rid in known:
+            continue
+        scope = {"kind": "alert_keys", "value": [ak]}
+        snapshot: Dict[str, Any] = {"overall_wr": None, "n": len(real_rows or []), "net_ev": None}
+        if real_rows:
+            s_wr, s_n, s_ev = _scope_metrics(real_rows, scope)
+            if s_n > 0:
+                snapshot["scope_wr"] = s_wr
+                snapshot["scope_n"] = s_n
+                snapshot["scope_ev"] = s_ev
+        entries.insert(0, {
+            "id": rid, "issued_at": now, "type": category, "category": category,
+            "severity": "medium", "alert": ak, "param": None,
+            "message": f"{category}: {ak}", "scope": scope,
+            "snapshot_before": snapshot, "applied_at": now,
+            "verdict": None, "delta_observed": None,
+        })
+        known.add(rid)
+        added += 1
+    if added:
+        await _save_ledger(sdb, entries)
+    return added
+
+def _row_rejection(r: dict) -> Optional[str]:
+    return r.get("rejection_reason") or (r.get("context") or {}).get("rejection_reason")
+
+def _disable_verdict(e: dict, shadow_rows: List[dict], min_n: int) -> Optional[Dict[str, Any]]:
+    """A disabled alert produces no real trades, so judge the disable on the
+    trades it blocked (shadow rows tagged brain_disabled) since it was applied.
+    lift = minus the blocked trades' net EV: positive when the blocked trades
+    were losers (the disable helped). Same +/-0.02 band as other verdicts."""
+    keys = set((e.get("scope") or {}).get("value") or [])
+    applied_at = int(e["applied_at"])
+    blocked = [
+        r for r in shadow_rows
+        if r.get("alert_key") in keys and int(r.get("entry_ts") or 0) >= applied_at
+        and _row_rejection(r) == "brain_disabled"
+    ]
+    if len(blocked) < min_n:
+        return None
+    ev, _hk, _wr = ev_and_kelly_for(blocked)
+    if ev is None:
+        return None
+    lift = -float(ev)
+    verdict = "helped" if lift > 0.02 else "hurt" if lift < -0.02 else "neutral"
+    wins = sum(1 for r in blocked if r["win"])
+    lo, hi, _ = wilson_ci(wins, len(blocked))
+    return {
+        "verdict": verdict,
+        "delta": {
+            "wr": None, "ev": round(lift, 4), "blocked_net_ev": round(float(ev), 4),
+            "n_post": len(blocked), "n_post_total": len(blocked), "scoped": True,
+            "scope_kind": "alert_keys", "basis": "blocked_shadow_trades",
+            "wilson_lo": round(lo, 4), "wilson_hi": round(hi, 4),
+        },
+    }
+
 def control_comparison(rows: List[dict], scope: Optional[dict], applied_at: int, now: int, min_scope: int = 8, min_control: int = 15, z: float = 1.645) -> Dict[str, Any]:
     """Did the repaired slice move differently from trades the repair did NOT
     touch, over the same two periods? (difference-in-differences, net % per trade)
@@ -274,7 +349,7 @@ def control_summary(entries: List[dict], now: int, window_days: int = 60) -> Dic
                 out["contradicted"] += 1
     return out
 
-async def evaluate_pending_repairs(sdb, current_rows: List[dict], horizon_hours: int = 48, min_outcomes: int = 30) -> List[dict]:
+async def evaluate_pending_repairs(sdb, current_rows: List[dict], horizon_hours: int = 48, min_outcomes: int = 30, shadow_rows: Optional[List[dict]] = None) -> List[dict]:
     """Called once per brain report. For each applied repair whose horizon
     has passed, compare post-application metrics against the pre-application
     snapshot using a Wilson band so a repair is only marked helped/hurt when
@@ -308,6 +383,18 @@ async def evaluate_pending_repairs(sdb, current_rows: List[dict], horizon_hours:
         scope = e.get("scope")
         scope_kind = (scope or {}).get("kind")
         is_scoped = scope_kind not in (None, "global", "none")
+
+        if e.get("category") == "disable_alert":
+            _dv = _disable_verdict(e, shadow_rows or [], min_outcomes_scoped)
+            if _dv is None:
+                continue
+            e["verdict"] = _dv["verdict"]
+            e["verdict_at"] = now
+            e["control"] = {"verdict": "no_control"}
+            e["delta_observed"] = _dv["delta"]
+            fresh_verdicts.append(e)
+            changed = True
+            continue
 
         post = [r for r in current_rows if r["entry_ts"] >= e["applied_at"]]
         post_scope = [r for r in post if _matches_scope(r, scope)]
@@ -432,6 +519,19 @@ def family_accountability(entries: List[dict], now: int, window_days: int = 60, 
             lo, _hi, _ = wilson_ci(hurt, decisive)
             majority = lo > 0.5
         last_hurt = max((x["_ts"] for x in items if x["verdict"] == "hurt"), default=0)
+        lifts = [float(x["delta_observed"]["ev"]) for x in items
+                 if isinstance(x.get("delta_observed"), dict) and x["delta_observed"].get("ev") is not None]
+        ctrl = [float(x["control"]["effect"]) for x in items
+                if isinstance(x.get("control"), dict) and x["control"].get("effect") is not None]
+        ev_lift = (sum(lifts) / len(lifts)) if lifts else None
+        if ev_lift is None or len(lifts) < min_verdicts:
+            lift_tag = "insufficient"
+        elif ev_lift > 0.02:
+            lift_tag = "positive_lift"
+        elif ev_lift < -0.02:
+            lift_tag = "negative_lift"
+        else:
+            lift_tag = "flat"
         reason = ""
         if streak or majority:
             reason = f"last {hurt_streak} verdicts all hurt" if streak else "hurt verdicts outnumber helped (95% bound)"
@@ -445,6 +545,11 @@ def family_accountability(entries: List[dict], now: int, window_days: int = 60, 
             "n": len(items), "helped": helped, "hurt": hurt, "neutral": neutral,
             "hurt_rate": round(hurt / len(items), 3),
             "drift_discounted": sum(1 for x in items if x.get("_drift")),
+            "ev_lift_mean": round(ev_lift, 4) if ev_lift is not None else None,
+            "ev_lift_n": len(lifts),
+            "control_effect_mean": round(sum(ctrl) / len(ctrl), 4) if ctrl else None,
+            "control_effect_n": len(ctrl),
+            "lift_tag": lift_tag,
             "suspended_until": (last_hurt + suspend_days * 86400) if status == "suspended" else None,
         }
     return out

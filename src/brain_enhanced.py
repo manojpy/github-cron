@@ -32,6 +32,7 @@ from threshold_engine import (
 from repair_ledger import (
     record_repair_issued,
     mark_plan_applied,
+    record_applied_alert_toggles,
     evaluate_pending_repairs,
     repair_success_rates,
     ledger_stats,
@@ -666,8 +667,11 @@ class BrainEngineV2(BrainCore):
                     return False
                 _keep_cfg = [p for p in config_patches if not _blocked(p, p.get("_source_category"))]
                 _keep_w = [w for w in weight_adjustments if not _blocked(w, w.get("category"))]
+                _keep_dis = [ak for ak in disable_alerts if not _blocked({"path": f"disable:{ak}"}, "disable_alert")]
+                _keep_re = [ak for ak in reinstate_alerts if not _blocked({"path": f"reinstate:{ak}"}, "reinstate_alert")]
                 if _acct_mode == "live":
                     config_patches, weight_adjustments = _keep_cfg, _keep_w
+                    disable_alerts, reinstate_alerts = _keep_dis, _keep_re
             _repair_ids = sorted({
                 str(x["_repair_id"]) for x in list(config_patches) + list(weight_adjustments)
                 if x.get("_repair_id")
@@ -1216,6 +1220,7 @@ class BrainEngineV2(BrainCore):
                 return False
             applied = []
             applied_repair_ids: List[str] = []   # ledger repairs whose change really went live
+            applied_toggles: List[Tuple[str, str]] = []   # (category, alert_key) disables/reinstates that went live
             applied_config = False   # config overrides — loaded only at startup
             applied_live = False     # dynamic weights / alert flags — read live
 
@@ -1268,6 +1273,7 @@ class BrainEngineV2(BrainCore):
                     if ok:
                         snap_disabled[ak] = {"prev": ak in _dis_before, "new": True}
                         applied.append(f"🔴 Disabled: {ak}")
+                        applied_toggles.append(("disable_alert", str(ak)))
                         applied_live = True
                         logger_run.info(f"Applied brain disable: {ak}")
                 for ak in plan.get("reinstate_alerts", []):
@@ -1275,6 +1281,7 @@ class BrainEngineV2(BrainCore):
                     if ok:
                         snap_disabled[ak] = {"prev": ak in _dis_before, "new": False}
                         applied.append(f"🟢 Reinstated: {ak}")
+                        applied_toggles.append(("reinstate_alert", str(ak)))
                         applied_live = True
                         logger_run.info(f"Applied brain reinstate: {ak}")
             else:
@@ -1359,7 +1366,16 @@ class BrainEngineV2(BrainCore):
                         logger_run.info(f" Repair ledger: marked {marked} repair(s) applied")
                 except Exception as e:
                     logger_run.debug(f"Repair ledger apply-mark failed (non-fatal): {e}")
-
+                # Alert disables / reinstates carry no repair id, so record them
+                # here; otherwise they would never get a verdict.
+                if applied_toggles:
+                    try:
+                        _tg_rows, _ = await self._get_rows()
+                        _tg_n = await record_applied_alert_toggles(self.sdb, applied_toggles, real_rows=_tg_rows)
+                        if _tg_n:
+                            logger_run.info(f" Repair ledger: recorded {_tg_n} alert toggle(s) for measurement")
+                    except Exception as e:
+                        logger_run.debug(f"Repair ledger toggle record failed (non-fatal): {e}")
                 trailer = ""
                 if applied_config:
                     trailer += "\nConfig overrides require a restart\\."
