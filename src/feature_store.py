@@ -1,16 +1,10 @@
 """feature_store — point-in-time feature rows + multi-horizon labels.
 
-Read-side and pure by default: no Redis, no files. The Brain already
+Read-side and pure: no Redis, no files, no new storage. The Brain already
 snapshots every feature at alert time (`votes` + `context`, written BEFORE the
 outcome is known) and every resolved row carries a 12-candle price path, so a
 versioned, leakage-checked dataset can be MATERIALISED from the archive instead
 of being re-derived ad hoc by each analysis.
-
-Optional on-disk cache: set BRAIN_DATASET_CACHE to a directory to reuse the
-materialised dataset across runs. The cache key covers the feature-set version,
-the feature-builder source, the horizon set, and the identity of every input
-row — any change invalidates it. A cache miss/hit failure is a pure
-optimisation loss, never a run failure.
 
 Guarantees:
   * features come only from `votes` / `context` / session / direction, i.e. what
@@ -25,21 +19,10 @@ Guarantees:
 from __future__ import annotations
 
 import hashlib
-import inspect
-import os
-import pickle
-import time
 from collections import Counter
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from plan_replay import has_path, replay_plan
-
-# ── Optional dataset cache (Phase B: stop re-parsing the archive every run) ──
-# Empty string = disabled (default, pure in-memory behaviour unchanged).
-DATASET_CACHE_DIR: str = os.environ.get("BRAIN_DATASET_CACHE", "")
-# 0 = entries never expire on their own (row-identity key already invalidates
-# when new outcomes arrive); >0 = max cache age in seconds.
-DATASET_CACHE_TTL_SEC: int = int(os.environ.get("BRAIN_DATASET_CACHE_TTL", "0"))
 
 Row = Dict[str, Any]
 
@@ -77,70 +60,6 @@ def _clean_row(row: Row) -> Tuple[Row, int]:
     out["context"] = {k: v for k, v in ctx.items() if k not in _POST_HOC_KEYS}
     return out, len(bad)
 
-# ── Dataset cache helpers ────────────────────────────────────────────────
-
-def _row_identity(r: Row) -> str:
-    rid = r.get("_stream_id") or f'{r.get("pair")}:{r.get("alert_key")}:{r.get("entry_ts")}'
-    return f"{rid},{r.get('entry_ts')}"
-
-
-def _dataset_cache_key(rows: Sequence[Row], horizons: Sequence[int],
-                       feature_names: Optional[List[str]],
-                       default_cost_pct: float) -> str:
-    """Anything that could change the materialised dataset feeds the key:
-    row identities, horizons, requested features, cost, feature-set version,
-    and the source of the feature builder itself (so a code change to
-    build_market_state_features invalidates old caches automatically)."""
-    from threshold_models import build_market_state_features   # lazy, same as below
-    try:
-        code_hash = hashlib.sha1(
-            inspect.getsource(build_market_state_features).encode()).hexdigest()[:10]
-    except Exception:
-        code_hash = "unknown"
-    h = hashlib.sha1()
-    for r in rows:
-        if r.get("entry_ts") is not None:
-            h.update(_row_identity(r).encode())
-    h.update(str(tuple(int(x) for x in horizons)).encode())
-    h.update(repr(feature_names).encode())
-    h.update(str(default_cost_pct).encode())
-    h.update(FEATURE_SET_VERSION.encode())
-    h.update(code_hash.encode())
-    return h.hexdigest()[:24]
-
-def _dataset_cache_path(key: str) -> str:
-    return os.path.join(DATASET_CACHE_DIR, f"pit_dataset_{FEATURE_SET_VERSION}_{key}.pkl")
-
-
-def load_cached_dataset(key: str) -> Optional[Dict[str, Any]]:
-    if not DATASET_CACHE_DIR:
-        return None
-    path = _dataset_cache_path(key)
-    try:
-        if not os.path.exists(path):
-            return None
-        if DATASET_CACHE_TTL_SEC and time.time() - os.path.getmtime(path) > DATASET_CACHE_TTL_SEC:
-            return None
-        with open(path, "rb") as fh:
-            ds = pickle.load(fh)
-        if not isinstance(ds, dict) or "rows" not in ds or "feature_hash" not in ds:
-            return None
-        return ds
-    except Exception:
-        return None    # cache is a pure optimisation; never a failure source
-
-
-def save_cached_dataset(ds: Dict[str, Any], key: str) -> None:
-    if not DATASET_CACHE_DIR:
-        return
-    try:
-        os.makedirs(DATASET_CACHE_DIR, exist_ok=True)
-        tmp = _dataset_cache_path(key) + ".tmp"
-        with open(tmp, "wb") as fh:
-            pickle.dump(ds, fh, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp, _dataset_cache_path(key))   # atomic-ish: no partial reads
-    except Exception:
-        pass           # shadow: a failed cache write must not break the run
 
 def row_labels(row: Row, horizons: Sequence[int] = LABEL_HORIZONS,
                sl_pct: Optional[float] = None, tp_pct: Optional[float] = None,
@@ -178,42 +97,17 @@ def row_labels(row: Row, horizons: Sequence[int] = LABEL_HORIZONS,
         }
     return out
 
+
 def build_point_in_time_dataset(rows: Sequence[Row], horizons: Sequence[int] = LABEL_HORIZONS,
                                 feature_names: Optional[List[str]] = None,
-                                default_cost_pct: float = 0.0,
-                                use_cache: bool = True) -> Dict[str, Any]:
-    """Materialise the dataset. Rows are ordered by entry_ts and need an
-    entry_ts; everything else degrades to None rather than being invented.
-
-    Returns {"feature_names", "feature_hash", "rows", "stats"}; each dataset row
-    is {id, ts, pair, alert_key, direction, version, x, labels}.
-
-    With BRAIN_DATASET_CACHE set, an unchanged input set returns the cached
-    materialisation instead of re-running the feature builder."""
-    if use_cache:
-        key = _dataset_cache_key(rows, horizons, feature_names, default_cost_pct)
-        cached = load_cached_dataset(key)
-        if cached is not None:
-            stats = dict(cached.get("stats") or {})
-            stats["cache_hit"] = True
-            cached["stats"] = stats
-            return cached
-        ds = _build_point_in_time_dataset_impl(rows, horizons, feature_names, default_cost_pct)
-        ds.setdefault("stats", {})["cache_hit"] = False
-        save_cached_dataset(ds, key)
-        return ds
-    return _build_point_in_time_dataset_impl(rows, horizons, feature_names, default_cost_pct)
-
-
-def _build_point_in_time_dataset_impl(rows: Sequence[Row], horizons: Sequence[int] = LABEL_HORIZONS,
-                                      feature_names: Optional[List[str]] = None,
-                                      default_cost_pct: float = 0.0) -> Dict[str, Any]:
+                                default_cost_pct: float = 0.0) -> Dict[str, Any]:
     """Materialise the dataset. Rows are ordered by entry_ts and need an
     entry_ts; everything else degrades to None rather than being invented.
 
     Returns {"feature_names", "feature_hash", "rows", "stats"}; each dataset row
     is {id, ts, pair, alert_key, direction, version, x, labels}."""
     from threshold_models import build_market_state_features   # lazy: keeps this module light
+
     usable: List[Row] = []
     leaked = 0
     for r in rows:

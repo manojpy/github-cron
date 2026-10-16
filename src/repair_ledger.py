@@ -354,16 +354,11 @@ async def evaluate_pending_repairs(sdb, current_rows: List[dict], horizon_hours:
             verdict = "neutral"
         e["verdict"] = verdict
         e["verdict_at"] = now
-        # Control comparison is always RECORDED (shadow-safe: it only writes
-        # e["control"] and never changes the verdict here). The mode gate now
-        # only controls whether the control result NEUTRALISES verdicts
-        # downstream (family_accountability use_control), not whether we
-        # gather the evidence.
-        try:
-            e["control"] = control_comparison(current_rows, scope, int(e["applied_at"]), now)
-        except Exception:
-            e["control"] = {"verdict": "insufficient"}
-
+        if str(getattr(cfg, "ACCOUNTABILITY_CONTROL_MODE", "shadow")) != "off":
+            try:
+                e["control"] = control_comparison(current_rows, scope, int(e["applied_at"]), now)
+            except Exception:
+                e["control"] = {"verdict": "insufficient"}
         e["delta_observed"] = {
             "wr": round(delta_wr, 4),
             "ev": round(delta_ev, 4),
@@ -451,59 +446,6 @@ def family_accountability(entries: List[dict], now: int, window_days: int = 60, 
             "hurt_rate": round(hurt / len(items), 3),
             "drift_discounted": sum(1 for x in items if x.get("_drift")),
             "suspended_until": (last_hurt + suspend_days * 86400) if status == "suspended" else None,
-        }
-    return out
-
-def family_ev_lift(entries: List[dict], now: int, window_days: int = 60, min_n: int = 5) -> Dict[str, Dict[str, Any]]:
-    """Rolling net-EV lift per recommendation family, control-adjusted when a
-    control comparison is available.
-
-    When a DiD control effect is present on an entry, that effect is used as the
-    per-entry contribution (true control-adjusted). Otherwise the raw scoped
-    delta_ev is used. 'tag' is rule-based: 'underperforming' (lift < -0.01 with
-    n >= min_n), 'outperforming' (lift > +0.01 with n >= min_n), else 'watch'.
-    Tagging aid only — suspension logic stays in family_accountability.
-    """
-    cutoff = now - window_days * 86400
-    agg: Dict[str, Dict[str, float]] = defaultdict(
-        lambda: {"sum_ev": 0.0, "n": 0, "n_control": 0}
-    )
-    for e in entries:
-        if e.get("verdict") is None:
-            continue
-        ts = int(e.get("verdict_at") or e.get("applied_at") or e.get("issued_at") or 0)
-        if ts < cutoff:
-            continue
-        key = e.get("category") or e.get("type") or "unknown"
-        ctrl = e.get("control") or {}
-        # Prefer DiD effect when available (already control-adjusted).
-        # Fall back to raw scoped delta_ev.
-        ce = ctrl.get("effect")
-        d = (e.get("delta_observed") or {}).get("ev")
-        if ce is not None:
-            agg[key]["sum_ev"] += float(ce)
-            agg[key]["n"] += 1
-            agg[key]["n_control"] += 1
-        elif d is not None:
-            agg[key]["sum_ev"] += float(d)
-            agg[key]["n"] += 1
-    out: Dict[str, Dict[str, Any]] = {}
-    for k, v in agg.items():
-        n = int(v["n"])
-        mean_ev = v["sum_ev"] / n if n else 0.0
-        lift = mean_ev
-        if n >= min_n and lift < -0.01:
-            tag = "underperforming"
-        elif n >= min_n and lift > 0.01:
-            tag = "outperforming"
-        else:
-            tag = "watch"
-        out[k] = {
-            "ev_lift": round(lift, 4),
-            "n": n,
-            "n_control": int(v["n_control"]),
-            "control_adjusted": bool(v["n_control"]),
-            "tag": tag,
         }
     return out
 
