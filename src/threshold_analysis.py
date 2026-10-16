@@ -204,14 +204,13 @@ def regime_transition_analysis(rows: List[Row], min_sample: int = 15, lookback_s
     with_adx = [
         r for r in rows
         if r.get("adx_val") is not None and r.get("entry_ts") is not None
-
-
     ]
     if len(with_adx) < min_sample * 2:
         result["error"] = "insufficient_adx_tagged_rows"
         return result
 
-    with_adx = sorted(with_adx, key=lambda r: int(r["ts"]))
+    with_adx = sorted(with_adx, key=lambda r: int(r["entry_ts"]))
+
     adx_vals = sorted(r["adx_val"] for r in with_adx)
     mid = len(adx_vals) // 2
     median_adx = (
