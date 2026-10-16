@@ -15,6 +15,21 @@ jobs:
         run: pip install pyflakes==3.2.0 mypy==1.11.0
       - name: Syntax gate (py_compile everything)
         run: python -m compileall -q .
+      - name: Encoding gate (no U+FFFD / mojibake)
+        run: |
+          # Fail the build if any source file still contains the Unicode
+          # replacement character (U+FFFD).  That is the only reliable
+          # signal left after past encoding corruption.
+          set +e
+          HITS=$(grep -rP --include='*.py' --include='*.md' --include='*.yml' \
+                   --include='*.json' --include='*.txt' $'\x{FFFD}' . || true)
+          set -e
+          if [ -n "$HITS" ]; then
+            echo "❌ BLOCKING: U+FFFD (replacement character) found"
+            echo "$HITS"
+            exit 1
+          fi
+          echo "✅ No U+FFFD characters"
       - name: Pyflakes (BLOCKING on real errors only)
         # Blocks on undefined names — the class of bug that shipped the
         # logger regression. Unused imports / f-strings without placeholders
