@@ -205,7 +205,7 @@ jobs:
                 "/app/src/brain_audit.py" 
                 "/app/src/repair_ledger.py"
                 "/app/src/hypothesis_gen.py"
-                "/app/src/brain_layers.py "
+                "/app/src/brain_layers.py"
                 "/app/src/apply_config_override.py" 
                 "/app/src/outcome_storage.py"
                 "/app/src/archive_reader.py"
