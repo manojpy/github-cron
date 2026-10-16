@@ -11,10 +11,12 @@ import threshold_engine as engine
 from threshold_quality import gate_shadow_comparison, prediction_track_record, future_edge_track_record
 from feature_store import build_point_in_time_dataset, dataset_coverage
 from plan_replay import volatility_plan_study
+from hypothesis_gen import update_hypothesis_pool
+from brain_layers import cached_audit
 from brain_audit import get_audit, HealthStatus
 from brain_helpers import (
     KILL_SWITCH_KEY, _resolve_config_path,
-    EXPERIMENT_LEDGER_KEY, count_brain_trials, update_experiment_ledger,
+    EXPERIMENT_LEDGER_KEY, HYPOTHESIS_POOL_KEY, count_brain_trials, update_experiment_ledger,
 )
 
 async def build_baseline_recommendations(self) -> Dict[str, Any]:
@@ -1197,6 +1199,33 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
         )
     except Exception as e:
         audit.record_analysis_exception("vol_horizon_study", e)
+
+    # ── Research / Validation / Policy boundary: read-only scan of the source. ──
+    if str(getattr(cfg, "LAYER_BOUNDARY_MODE", "report")) != "off":
+        try:
+            ai_metrics["layer_audit"] = cached_audit()
+        except Exception as e:
+            audit.record_analysis_exception("layer_audit", e)
+
+    # ── Self-generated hypotheses: propose a bounded number of new "skip when"
+    # rules, select them on older-then-newer trades with a confidence level
+    # tightened for everything ever tried, then follow survivors forward.
+    # Reported only; nothing is applied. ──
+    if str(getattr(cfg, "HYPOTHESIS_GEN_MODE", "shadow")) != "off" and not self.sdb.degraded:
+        try:
+            _hp_raw = await self.sdb.get_metadata(HYPOTHESIS_POOL_KEY)
+            _hp_pool, _hp_sum = update_hypothesis_pool(
+                json_loads(_hp_raw) if _hp_raw else {}, list(real_rows), int(time.time()),
+                cost_pct=(float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100,
+                budget=int(getattr(cfg, "HYPOTHESIS_BUDGET", 300)),
+                shadow_max=int(getattr(cfg, "HYPOTHESIS_SHADOW_MAX", 10)),
+                forward_min_n=int(getattr(cfg, "HYPOTHESIS_FORWARD_MIN_N", 30)),
+                expire_days=int(getattr(cfg, "HYPOTHESIS_EXPIRE_DAYS", 30)),
+            )
+            await self.sdb.set_metadata(HYPOTHESIS_POOL_KEY, json_dumps(_hp_pool), ttl=365 * 86400)
+            ai_metrics["hypothesis_pool_summary"] = _hp_sum
+        except Exception as e:
+            audit.record_analysis_exception("hypothesis_pool", e)
 
     # ── Validated TP/SL zones: sample-gated, OOS-replayed, streak-promoted.
     # Only PROMOTED zones are persisted for dispatch; candidates and the

@@ -695,7 +695,7 @@ def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
         do_now.append(f"Investigate the very low {wr:.0%} win rate (see section 04).")
     if F["gate"].get("stability") is False or F["gate"].get("risk") is False:
         do_now.append("Monitor active drift/drawdown warnings.")
-    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"�������� {x}" for x in do_now)))
+    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"���������� {x}" for x in do_now)))
 
     watch: List[str] = []
     seen = set()
@@ -1072,6 +1072,14 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     if _df_lines:
         out.append(_p("DATA FOUNDATION — is the evidence base consistent?"))
         out.extend(_c_split(_df_lines))
+    _ly_lines = _layer_lines((F.get("ai") or {}).get("layer_audit"), str(getattr(cfg, "LAYER_BOUNDARY_MODE", "report")))
+    if _ly_lines:
+        out.append(_p("ARCHITECTURE BOUNDARY — research, validation, policy"))
+        out.extend(_c_split(_ly_lines))
+    _hg_lines = _hypothesis_gen_lines((F.get("ai") or {}).get("hypothesis_pool_summary"))
+    if _hg_lines:
+        out.append(_p("SELF-GENERATED RULES — proposed, tested, followed forward"))
+        out.extend(_c_split(_hg_lines))
     _vh_lines = _vol_horizon_lines((F.get("ai") or {}).get("vol_horizon_study"))
     if _vh_lines:
         out.append(_p("VOLATILITY AND TRADE PLANS — do regimes need different stops and horizons?"))
@@ -1331,6 +1339,57 @@ def _vol_horizon_lines(st: Optional[Dict[str, Any]]) -> List[str]:
         lines.append("Verdict: " + verdict + " Nothing is applied; the outcome label stays at the fixed 12 candles.")
     return lines
 
+def _hypothesis_gen_lines(sm: Optional[Dict[str, Any]]) -> List[str]:
+    """Plain-text lines: self-generated skip-rules, what is being followed and what held up."""
+    if not sm or sm.get("status") == "insufficient_data" and not (sm.get("shadow") or sm.get("confirmed") or sm.get("events")):
+        return []
+    lines = []
+    if sm.get("status") == "ran":
+        lines.append(
+            f"Proposed {sm['n_tested']} new candidate rules this cycle ({sm['tried_total']} ever tried); "
+            f"a rule needed a {sm['z_required']}-sigma loss on newer trades to survive. {sm.get('survivors', 0)} survived."
+        )
+    for c in sm.get("confirmed") or []:
+        f = c.get("fwd") or {}
+        lines.append(f"CONFIRMED: skip when {c['text']} — {f.get('n')} later trades averaged {f.get('mean')}% each")
+    for c in sm.get("shadow") or []:
+        f = c.get("fwd") or {}
+        lines.append(
+            f"Watching: skip when {c['text']} — found on older data (avg {c['hold']['mean']}% on {c['hold']['n']} newer trades); "
+            f"forward so far {f.get('n', 0)} trades" + (f", avg {f['mean']}%" if f.get("mean") is not None else "")
+        )
+    for e in sm.get("events") or []:
+        if e.get("status") in ("rejected", "revoked", "expired"):
+            lines.append(f"{e['status'].capitalize()}: {e['text']}")
+    if lines:
+        lines.append("Nothing here is applied. A confirmed rule is a candidate to review before adding it to the 'when not to take it' list.")
+    return lines
+
+def _layer_lines(a: Optional[Dict[str, Any]], mode: str) -> List[str]:
+    """Plain-text lines: does anything outside the policy layer change live behaviour?"""
+    if not a:
+        return []
+    lay = a.get("layers") or {}
+    lines = [
+        f"{sum(lay.values())} modules classified ({lay.get('research', 0)} research, {lay.get('validation', 0)} validation, "
+        f"{lay.get('policy', 0)} policy, {lay.get('infra', 0)} plumbing)."
+    ]
+    for v in a.get("violations") or []:
+        lines.append(f"VIOLATION: {v['module']} (line {v['line']}) — {v['kind'].replace('_', ' ')}: {v['detail']}")
+    for e in a.get("exceptions") or []:
+        lines.append(f"Known: {e['module']} applies '{e['writer']}' itself — {e['reason']}")
+    for m in a.get("unclassified") or []:
+        lines.append(f"Unclassified module: {m} (add it to brain_layers.LAYER_OF)")
+    for s in a.get("stale_exceptions") or []:
+        lines.append(f"Documented exception no longer in the code: {s}")
+    if a.get("ok"):
+        lines.append("Boundary holds: nothing outside the policy layer changes live behaviour except the documented cases above.")
+    elif mode == "block":
+        lines.append("Plans are NOT applied until this is fixed (LAYER_BOUNDARY_MODE=block).")
+    else:
+        lines.append("Reported only; set LAYER_BOUNDARY_MODE=block to stop plan application while this stands.")
+    return lines
+
 def _data_foundation_lines(cov: Optional[Dict[str, Any]]) -> List[str]:
     """Plain-text lines for the point-in-time dataset coverage (empty when none)."""
     if not cov or not cov.get("n"):
@@ -1408,6 +1467,10 @@ def _experiment_lines(led: Optional[Dict[str, Any]]) -> List[str]:
         f"Candidates examined this cycle: {last.get('zone_candidates', 0)} TP/SL zones, "
         f"{last.get('regime_segments', 0)} regime segments, {last.get('recommendations', 0)} recommendations",
     ]
+    if last.get("generated_rules"):
+        lines.append(
+            f"Plus {last['generated_rules']} self-generated skip-rules proposed this cycle; the evidence bar rises with every rule ever tried."
+        )
     if last.get("plan_variants"):
         lines.append(
             f"Plus {last['plan_variants']} stop/target/horizon variants tried per volatility regime "

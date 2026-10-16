@@ -9,21 +9,14 @@ from bot_config import cfg
 import threshold_engine as engine
 
 _OVERRIDE_COOLDOWN_PREFIX = "brain_override_cooldown:"
-
 CALIBRATION_CURVES_KEY = "brain:calibration_curves"
-
 QUALITY_INPUTS_KEY = "brain:quality_inputs"
-
 KILL_SWITCH_KEY = "brain:kill_switch_active"
-
 MARKET_STATE_MODEL_KEY = "brain:market_state_model"
-
 ML_CALIBRATION_KEY = "brain:ml_calibration_curve"
-
 EXPERIMENT_LEDGER_KEY = "brain_experiment_ledger"
-
 HYPOTHESIS_LEDGER_KEY = "brain_hypothesis_ledger"
-
+HYPOTHESIS_POOL_KEY = "brain_hypothesis_pool"
 ACTION_PLAN_KEY = "brain_action_plan"
 
 def count_brain_trials(ai_metrics: Dict[str, Any], n_recommendations: int) -> Dict[str, int]:
@@ -37,6 +30,7 @@ def count_brain_trials(ai_metrics: Dict[str, Any], n_recommendations: int) -> Di
         "regime_segments": int(rg.get("n_evaluated") or 0),
         "recommendations": int(n_recommendations),
         "plan_variants": int((ai_metrics.get("vol_horizon_study") or {}).get("n_candidates") or 0),
+        "generated_rules": int((ai_metrics.get("hypothesis_pool_summary") or {}).get("n_tested") or 0),
     }
 
 def update_experiment_ledger(prev: Optional[Dict[str, Any]], trials: Dict[str, int], now: int) -> Dict[str, Any]:
@@ -68,6 +62,20 @@ def collect_conclusions(ai_metrics: Dict[str, Any]) -> Dict[str, Dict[str, Any]]
             "polarity": {"validated": 1, "not_better": -1}.get(nev["status"], 0),
             "evidence": {k: nev.get(k) for k in ("delta_vs_best", "delta_lo", "n_test", "best_baseline")},
         }
+    hp = ai_metrics.get("hypothesis_pool_summary") or {}
+    for c in hp.get("confirmed") or []:
+        out[f"rule:{c['id']}"] = {
+            "claim": f"skipping trades where {c['text']} saves money",
+            "status": "confirmed", "polarity": 1,
+            "evidence": {"forward_n": (c.get("fwd") or {}).get("n"), "forward_mean": (c.get("fwd") or {}).get("mean")},
+        }
+    for e in hp.get("events") or []:
+        if e.get("status") == "revoked":
+            out[f"rule:{e['id']}"] = {
+                "claim": f"skipping trades where {e['text']} saves money",
+                "status": "revoked", "polarity": -1,
+                "evidence": {"forward_n": (e.get("forward") or {}).get("n"), "forward_mean": (e.get("forward") or {}).get("mean")},
+            }
     ou = ((ai_metrics.get("net_ev_audit") or {}).get("online") or {}).get("online_vs_static") or {}
     if ou.get("status") and ou["status"] != "insufficient":
         out["online_updates"] = {

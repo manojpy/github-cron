@@ -55,6 +55,7 @@ from brain_report import (
     to_action_plan,
 )
 from brain_helpers import ACTION_PLAN_KEY
+from brain_layers import boundary_allows_apply
 
 # Backward-compatible alias for the core class (was `from brain import BrainEngine as BaseBrainEngine`).
 BaseBrainEngine = BrainCore
@@ -1203,9 +1204,16 @@ class BrainEngineV2(BrainCore):
                     "⚠️ No pending brain plan found\\.\n"
                     "Run a report first with `BRAIN_REPORT_ON_DEMAND=true`\\."
                 ))
-                return False
-            
+                return False   
             plan = json_loads(raw)
+            _layer_ok, _layer_why = boundary_allows_apply(str(getattr(cfg, "LAYER_BOUNDARY_MODE", "report")))
+            if not _layer_ok:
+                logger_run.warning(f"Plan NOT applied: research/validation/policy boundary violated ({_layer_why})")
+                await telegram_queue.send(escape_markdown_v2(
+                    f"⛔ Plan not applied: the research/validation/policy boundary check failed ({_layer_why}). "
+                    "Fix it, or set LAYER_BOUNDARY_MODE=report."
+                ))
+                return False
             applied = []
             applied_repair_ids: List[str] = []   # ledger repairs whose change really went live
             applied_config = False   # config overrides — loaded only at startup
