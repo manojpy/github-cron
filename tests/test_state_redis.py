@@ -496,12 +496,13 @@ def _row(pair="ETHUSD", key="ppo_cross_up", ts=None, **over):
     r.update(over)
     return r
 
-
 def _write(tmp_path, rows):
     d = tmp_path / "outcomes"
     d.mkdir()
-    (d / "2026-09-21.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
-
+    (d / "2026-09-21.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n",
+        encoding="utf-8",
+    )
 
 def test_retried_archive_write_is_deduplicated(tmp_path):
     r = _row()

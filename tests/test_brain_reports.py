@@ -341,7 +341,7 @@ def test_reads_the_real_archive_format(tmp_path, capsys):
                 mae=0.2, mfe=1.5, close_win=True, mfe_win=True, mae_loss=False, tp_first=True,
                 outcome_reason="tp", bonus_win=False, rr_achieved=1.5, win_weight=1.0,
                 net_pnl_pct=1.0, realized_cost_pct=0.1, adx_val=30.0, schema_version=OUTCOME_SCHEMA_VERSION)
-    with open(d / f"{day}.jsonl", "w") as f:
+    with open(d / f"{day}.jsonl", "w", encoding="utf-8") as f:
         for i in range(3):
             f.write(json.dumps({**base, "outcome_id": f"id{i}", "sid": f"s{i}"}) + "\n")
     assert ctr.main(["--data-dir", str(tmp_path), "--days", "5", "--json"]) == 0
@@ -354,14 +354,11 @@ def test_reads_the_real_archive_format(tmp_path, capsys):
 # ======================================================================
 """Reports are kept 7 days (exact, from the file name); outcomes keep their own limit."""
 
-
-
 def _mk(dirpath: Path, name: str) -> Path:
     dirpath.mkdir(parents=True, exist_ok=True)
     f = dirpath / name
-    f.write_text("x")
+    f.write_text("x", encoding="utf-8")
     return f
-
 
 def _report_name(age: timedelta) -> str:
     return (datetime.now(timezone.utc) - age).strftime("%Y-%m-%d_%H-%M") + ".md"
