@@ -85,13 +85,19 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: 🔑 Verify Secrets
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          DELTA_API_BASE: ${{ secrets.DELTA_API_BASE }}
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
           MISSING=()
-          [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
-          [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
-          [ -z "${{ secrets.REDIS_URL }}" ] && MISSING+=("REDIS_URL")
-          [ -z "${{ secrets.DELTA_API_BASE }}" ] && MISSING+=("DELTA_API_BASE")
-          [ -z "${{ secrets.DATA_REPO_TOKEN }}" ] && MISSING+=("DATA_REPO_TOKEN")
+          [ -z "$TELEGRAM_BOT_TOKEN" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
+          [ -z "$TELEGRAM_CHAT_ID" ] && MISSING+=("TELEGRAM_CHAT_ID")
+          [ -z "$REDIS_URL" ] && MISSING+=("REDIS_URL")
+          [ -z "$DELTA_API_BASE" ] && MISSING+=("DELTA_API_BASE")
+          [ -z "$DATA_REPO_TOKEN" ] && MISSING+=("DATA_REPO_TOKEN")
 
           if [ ${#MISSING[@]} -gt 0 ]; then
             echo "❌ Missing secrets: ${MISSING[*]}"
