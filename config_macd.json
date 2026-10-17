@@ -242,7 +242,7 @@
   "CHALLENGER_MIN_EV_LIFT": 0.02,
   "CHALLENGER_SHADOW_ONLY": true,
   "ZONE_MODE": "live",
-  "REGIME_GATE_MODE": "live",
+  "REGIME_GATE_MODE": "shadow",
   "ENSEMBLE_GATE_MODE": "shadow",
   "ENABLE_ML_EV_SHADOW": true,
   "ENABLE_ADAPTIVE_DEDUP_WINDOWS": false,
