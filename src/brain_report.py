@@ -695,7 +695,7 @@ def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
         do_now.append(f"Investigate the very low {wr:.0%} win rate (see section 04).")
     if F["gate"].get("stability") is False or F["gate"].get("risk") is False:
         do_now.append("Monitor active drift/drawdown warnings.")
-    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"• {x}" for x in do_now)))
+    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"�� {x}" for x in do_now)))
     watch: List[str] = []
     seen = set()
     for a in F["weak"]:
@@ -1294,14 +1294,17 @@ def _online_model_lines(rec: Optional[Dict[str, Any]]) -> List[str]:
     """Plain-text lines: has the online-updated model beaten the batch model it would replace?"""
     if not rec or not rec.get("mode"):
         return []
+
     names = {
         "online_better": "the online copy predicts better", "batch_better": "the batch model predicts better",
         "indistinguishable": "no clear difference yet", "insufficient": "not enough newly resolved trades yet",
     }
+    status = rec.get("status")
+    verdict = names.get(status, status) if isinstance(status, str) else status
     lines = [
         f"Mode: {rec['mode']}. Trades scored by both models: {rec.get('n_eval', 0)}; "
         f"the online copy has learned from {rec.get('n_updates', 0)}.",
-        f"Verdict: {names.get(rec.get('status'), rec.get('status'))}.",
+        f"Verdict: {verdict}.",
     ]
     if rec.get("mean_brier_gain") is not None:
         lines.append(
@@ -1650,7 +1653,7 @@ def build_brain_report_sections(recs: Dict[str, Any], cfg) -> Tuple[List[List["_
             sections.append(fn(F, cfg))
         except Exception as e:
             _report_section_failed(failed, name, e)
-            sections.append([_hdr(i, name), _p("⚠️ This section is unavailable (analysis error — see logs).")])
+            sections.append([_hdr(i, name), _p("⚠��� This section is unavailable (analysis error — see logs).")])
     return sections, stamp
 
 def render_report_messages(sections: List[List[_Piece]], stamp: str) -> List[str]:
