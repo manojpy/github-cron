@@ -57,7 +57,7 @@ jobs:
              src/gates.py src/alerts.py src/alert_advisor.py src/confluence_tier_report.py \
              src/config_base.py src/threshold_engine.py src/brain_layers.py src/plan_replay.py \
              src/threshold_stats.py src/threshold_analysis.py src/threshold_validation.py \
-             src/threshold_models.py src/threshold_quality.py src/encoding_gate.py src/threshold_repair.py \
+             src/threshold_models.py src/threshold_quality.py src/threshold_repair.py \
              src/brain.py src/brain_enhanced.py src/brain_engine.py src/brain_helpers.py \
              src/brain_report.py src/brain_recommend_baseline.py src/brain_recommend_full.py \
              src/health_server.py src/brain_audit.py src/outcome_storage.py src/learner.py \
@@ -215,7 +215,6 @@ jobs:
                 "/app/src/scoreboard.py"
                 "/app/src/rulemine.py"
                 "/app/src/feedback.py"
-                "/app/src/encoding_gate.py"
                 "/app/src/pathrecon.py"
                 "/app/src/plan_replay.py"
                 "/app/src/cython_functions*.so"
