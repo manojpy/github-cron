@@ -113,6 +113,8 @@ RUN python -m compileall -q -o 2 /app/src
 USER appuser
 
 ENV PYTHONUNBUFFERED=1 \
+    PYTHONUTF8=1 \
+    PYTHONIOENCODING=utf-8 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONOPTIMIZE=2 \
     NUMBA_CACHE_DIR=/tmp/numba_cache \
