@@ -60,6 +60,7 @@ from fetcher import (
 )
 
 from state import RedisStateStore, TokenBucket, _rc
+from brain_helpers import KILL_SWITCH_KEY
 
 from gates import GateResult, IndicatorCache
 import threshold_engine as engine
@@ -2325,7 +2326,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         if kill_switch_active_run is _SENTINEL_UNSET:
             try:
                 is_active = bool(await sdb._safe_redis_op(
-                    lambda: _rc(sdb._redis).exists("brain:kill_switch_active"),
+                    lambda: _rc(sdb._redis).exists(KILL_SWITCH_KEY),
                     2.0, "kill_switch_poll",
                 ))
             except Exception:

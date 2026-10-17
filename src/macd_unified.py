@@ -34,6 +34,7 @@ from indicators import (
     calculate_ichimoku_numpy,
 )
 # ── state / gates / alerts : trim to direct usage ─
+from brain_helpers import KILL_SWITCH_KEY
 
 from state import (
     _blanket_reset_pair, _clear_all_redis_states, _redis_key_inventory, build_products_map_from_cfg,
@@ -659,7 +660,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     async def _kill_switch_flag() -> bool:
         return bool(await state_db._safe_redis_op(
-            lambda: _rc(state_db._redis).exists("brain:kill_switch_active"),
+            lambda: _rc(state_db._redis).exists(KILL_SWITCH_KEY),
             2.0, "kill_switch_poll_runload",
         ))
 
@@ -1282,7 +1283,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 ttl = int(cfg.KILL_SWITCH_COOLDOWN_HOURS * 3600)
                 await state_db._safe_redis_op(
                     lambda: _rc(state_db._redis).set(
-                        "brain:kill_switch_active", json_dumps(ks_state), ex=ttl,
+                        KILL_SWITCH_KEY, json_dumps(ks_state), ex=ttl,
                     ),
                     2.0, "kill_switch_set",
                 )

@@ -1173,13 +1173,38 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
 
     # ── Execute deferred auto-actions. 'disable' always gets here; 'enable'
     # only survives the block above when the gate passed. ──
+    # Hard cap on simultaneously disabled keys. Counted from live state and
+    # kept up to date as this loop disables/enables, so one run cannot
+    # overshoot it. Re-enables are never blocked by the cap.
+    _max_disabled = int(getattr(cfg, "BRAIN_MAX_DISABLED_KEYS", 6))
+    try:
+        _disabled_now = set(await self.sdb.get_disabled_alert_keys())
+    except Exception as e:
+        logger.warning(f"Could not read disabled keys for cap check: {e}")
+        _disabled_now = set()
     for rec in recommendations:
         if not rec.get("pending_auto_action"):
             continue
         ak = rec.get("alert")
         action = rec.get("pending_action")
-        if not ak or not action:
+        if not ak or action not in ("disable", "enable"):
             continue
+        if (
+            action == "disable"
+            and ak not in _disabled_now
+            and len(_disabled_now) >= _max_disabled
+        ):
+            logger.warning(
+                f"Post-gate auto-disable SKIPPED for {ak}: "
+                f"{len(_disabled_now)} keys already disabled "
+                f"(cap BRAIN_MAX_DISABLED_KEYS={_max_disabled})"
+            )
+            rec["pending_auto_action"] = False
+            rec["message"] += (
+                f" [NOT APPLIED — disabled-key cap {_max_disabled} reached]"
+            )
+            continue
+        applied = False
         try:
             if action == "disable":
                 ok = await self.sdb.set_alert_key_disabled(ak, True)
@@ -1188,6 +1213,8 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
                         "[Pending action gate]", "[APPLIED]"
                     )
                     logger.info(f"🔒 Post-gate auto-disabled: {ak}")
+                    _disabled_now.add(ak)
+                    applied = True
             elif action == "enable":
                 ok = await self.sdb.set_alert_key_disabled(ak, False)
                 if ok:
@@ -1195,10 +1222,21 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
                         "[Pending action gate]", "[APPLIED]"
                     )
                     logger.info(f"🔓 Post-gate auto-re-enabled: {ak}")
+                    _disabled_now.discard(ak)
+                    applied = True
         except Exception as e:
             logger.warning(f"Post-gate auto-action failed for {ak}: {e}")
-        # Mark as consumed regardless of success
-        rec["pending_auto_action"] = False
+        if applied:
+            # Consumed only after the state write is confirmed.
+            rec["pending_auto_action"] = False
+        else:
+            # Write failed or returned False: keep it pending. Recommendations
+            # are re-derived every Brain run, so it is retried next run.
+            logger.warning(
+                f"Post-gate auto-{action} NOT applied for {ak}; "
+                f"stays pending for the next Brain run"
+            )
+            rec["message"] += " [NOT APPLIED — will retry next run]"
 
     _phase_mark("fdr_and_actionability")
 

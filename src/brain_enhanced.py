@@ -226,18 +226,20 @@ class BrainEngineV2(BrainCore):
             gate["risk_consecutive_losses"] = _ks_for_gate["consecutive_losses"]
             gate["risk_reason"] = _ks_for_gate.get("reason")
         except Exception as _e:
-            # A gate that crashes must not take dispatch down — fail-open,
-            # matching the rest of the risk checks (KillSwitch itself is
-            # called fail-open in macd_unified). Expose the error so a
-            # silent failure is still visible in the report.
+            # This gate only guards RISK-INCREASING actions (re-enables and
+            # config patches). If the risk check itself cannot be evaluated,
+            # that is "unknown", not "pass", so fail CLOSED. Protective
+            # disables never depend on this gate, and live dispatch is not
+            # affected (the dispatch kill switch has its own fail-open path
+            # in macd_unified). The error stays visible in the report.
             logging.getLogger("macd_bot").warning(
-                f"Risk gate evaluation failed, failing open: {_e}"
+                f"Risk gate evaluation failed, failing closed: {_e}"
             )
-            gate["risk"] = True
+            gate["risk"] = False
             gate["risk_window_hours"] = lookback_h
             gate["risk_drawdown_pct"] = None
             gate["risk_budget_pct"] = dd_budget
-            gate["risk_reason"] = f"gate error (fail-open): {_e}"
+            gate["risk_reason"] = f"gate error (fail-closed): {_e}"
 
         # ── Execution: cost assumptions must be non-trivial, or every EV
         # figure above is silently optimistic. ──

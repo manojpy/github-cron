@@ -2524,7 +2524,10 @@ class RedisStateStore:
                                 f"[{pair}] Outcome for {alert_key} has no confluence score/total; "
                                 f"stats updated but stream entry skipped"
                             )
-                        if stream_fields is not None and not getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                        if stream_fields is not None and (
+                            not getattr(cfg, "BRAIN_USE_FILE_STORAGE", False)
+                            or getattr(cfg, "ENABLE_OUTCOME_STREAM_TAIL", True)
+                        ):
                             write_pipe.xadd(
                                 RedisKeyPrefix.OUTCOME_LOG_STREAM,
                                 stream_fields,
@@ -2755,8 +2758,10 @@ class RedisStateStore:
                             and conf_total > 0
                         ):
                             conf_pct = (conf_score / conf_total) * 100.0
-
-                            if not getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                            if (
+                                not getattr(cfg, "BRAIN_USE_FILE_STORAGE", False)
+                                or getattr(cfg, "ENABLE_OUTCOME_STREAM_TAIL", True)
+                            ):
                                 shadow_stream_fields: Dict[StreamField, StreamField] = {
                                     "pair": str(pair),
                                     "alert_key": str(alert_key),

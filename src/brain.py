@@ -307,9 +307,11 @@ class BrainCore:
                 f"🎯 Calibration refresh: curves missing or older than "
                 f"{max_age_hr}h — rebuilding..."
             )
+
             # Tips are read BEFORE the rows: a row appended in between is in
-            # the rebuild AND folded once next run (harmless), whereas reading
-            # tips afterwards could silently skip rows.
+            # the rebuild AND folded again next run (a known, bounded overcount
+            # of one in one bucket), whereas reading tips afterwards could
+            # silently skip rows. Counting a row twice is the safer error.
             stream_tips = await self._stream_tips()
             real_rows, shadow_rows = await self._get_rows()
             n_real, n_shadow = len(real_rows), len(shadow_rows)
@@ -615,23 +617,8 @@ class BrainCore:
             except Exception:
                 return None
             self._ml_calib_cache_ts = now
-        return self._ml_calib_cache
 
-    async def check_calibration_gate(self, alert_key: str, conf_pct: float) -> Tuple[bool, Optional[float]]:
-        """Dispatch hook: (pass, calibrated_wr). Fail-open on any
-        missing/thin data — this gate blocks on evidence of
-        miscalibration, never on its own absence."""
-        if not getattr(cfg, "ENABLE_CALIBRATION_GATE", False):
-            return True, None
-        curve = await self._load_calibration_curve(alert_key)
-        if not curve:
-            return True, None
-        ok, cal_wr, _reason = engine.calibration_gate_decision(
-            curve, conf_pct, cfg.MIN_WIN_RATE,
-            min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
-            slack=getattr(cfg, "CALIBRATION_SLACK", 0.05),
-        )
-        return ok, cal_wr
+        return self._ml_calib_cache
 
     # ── Trade quality score (report-only) ───────────────────────────────
     async def _persist_quality_inputs(self, quality_inputs: Dict[str, Any]) -> None:
@@ -1034,23 +1021,6 @@ class BrainCore:
 
         return recent_rows, medium_rows, long_rows
 
-    # ── CUSUM drift detection ────────────────────────────────────────────
-    async def _load_or_create_cusum(self, alert_key: str) -> CUSUMDetector:
-        """Load persisted CUSUM state, or create a fresh detector."""
-        if alert_key in self._cusum_detectors:
-            return self._cusum_detectors[alert_key]
-        saved = await self.sdb.load_cusum_state(alert_key)
-        if saved:
-            det = CUSUMDetector.from_dict(saved)
-        else:
-            det = CUSUMDetector(
-                target_wr=cfg.MIN_WIN_RATE,
-                drift_delta=getattr(cfg, "BRAIN_CUSUM_DRIFT_DELTA", 0.10),
-                threshold=getattr(cfg, "BRAIN_CUSUM_THRESHOLD", 2.0),
-            )
-        self._cusum_detectors[alert_key] = det
-        return det
-
     async def _check_cusum_drift(self, real_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Run CUSUM over rows per alert_key, but only the ones not already
         fed in a previous report cycle — real_rows is a rolling window read
@@ -1076,6 +1046,12 @@ class BrainCore:
             )
             return drift_alerts
 
+        def _rid(r: Dict[str, Any]) -> str:
+            # Outcome identity. Different pairs share an entry_ts and can
+            # resolve in different runs, so a timestamp-only watermark would
+            # silently drop the late ones.
+            return f"{r.get('pair', '')}|{int(r.get('entry_ts', 0) or 0)}"
+
         to_save: List[Tuple[str, Dict[str, Any], int]] = []
         for alert_key, rows in by_alert.items():
             watermark, saved = bulk[alert_key]
@@ -1088,10 +1064,24 @@ class BrainCore:
                     )
                 )
             det = self._cusum_detectors[alert_key]
-            rows_sorted = sorted(
-                (r for r in rows if r.get("entry_ts", 0) > watermark),
-                key=lambda r: r.get("entry_ts", 0),
-            )
+            in_window = {_rid(r) for r in rows if r.get("entry_ts", 0)}
+            seen_saved = (saved or {}).get("seen")
+            if isinstance(seen_saved, list):
+                seen = set(seen_saved)
+                new_rows = [
+                    r for r in rows
+                    if r.get("entry_ts", 0) and _rid(r) not in seen
+                ]
+            else:
+                # Legacy state without a seen-list: apply the old watermark
+                # rule once and treat everything at or below it as consumed.
+                seen = {
+                    _rid(r) for r in rows
+                    if 0 < r.get("entry_ts", 0) <= watermark
+                }
+                new_rows = [r for r in rows if r.get("entry_ts", 0) > watermark]
+            rows_sorted = sorted(new_rows, key=lambda r: r.get("entry_ts", 0))
+
             # ── AUDIT: watermark sanity vs the data actually loaded ──
             wm_warning = audit.validate_cusum_watermark(
                 alert_key=alert_key,
@@ -1111,8 +1101,10 @@ class BrainCore:
                 continue
 
             last_consumed = watermark
+            consumed: List[str] = []
             for r in rows_sorted:
-                last_consumed = r.get("entry_ts", 0)
+                last_consumed = max(last_consumed, r.get("entry_ts", 0))
+                consumed.append(_rid(r))
                 # Deliberately binary: CUSUM detects edge DECAY. s_neg only
                 # accumulates on losses (x < mu), so bonus-weighting wins
                 # cannot change decay detection — keep raw win/loss here.
@@ -1134,8 +1126,11 @@ class BrainCore:
                         ),
                     })
                     break
-
-            to_save.append((alert_key, det.to_dict(), last_consumed))
+            _st = det.to_dict()
+            # Keep only ids still inside the analysis window, plus what was
+            # consumed just now, so the list stays bounded.
+            _st["seen"] = sorted((seen & in_window) | set(consumed))
+            to_save.append((alert_key, _st, last_consumed))
         await self.sdb.save_cusum_bulk(to_save)
         return drift_alerts
 
