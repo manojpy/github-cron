@@ -51,9 +51,9 @@ from feedback import load_open_positions, poll_feedback, release_closed_auto_pos
 from alerts import (
     TelegramQueue, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
     DEDUP_STATS, reset_dedup_stats, DLQ_STATS, reset_dlq_stats, replay_telegram_dlq, format_dedup_summary,
-    send_trade_close_notices,
+    send_trade_close_notices, _record_counterfactual_block,
 )
-from alert_registry import ALERT_KEYS, keys_for
+from alert_registry import ALERT_KEYS, BUY_ALERT_KEYS, keys_for
 
 _pair_eval_counter = 0
 _CLUSTER_CACHE_MISS = object()
@@ -219,11 +219,50 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         pct_floor = total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
         required = max(pct_floor, abs_floor)
         if score < required:
+
             logger_pair.debug(
                 f"[{pair_name}] Confluence gate blocked: {score:.1f}/{total:.1f} weighted score "
                 f"(need {required:.1f}, pct-floor={pct_floor:.1f}, "
                 f"abs-floor={abs_floor:.1f}) — skipping Phase-2 indicators"
-            )      
+            )
+            # Shadow-track what this gate blocks. Live behaviour is unchanged:
+            # nothing is dispatched, the pair is still reset and returned below.
+            if (
+                getattr(cfg, "SHADOW_TRACK_CONFLUENCE_BLOCKS", True)
+                and cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE
+                and not cfg.DRY_RUN_MODE
+            ):
+                try:
+                    _lp_kw: Dict[str, Any] = {}
+                    if last_processed_candles_run is not None:
+                        _lp_kw["last_processed"] = last_processed_candles_run.get(pair_name)
+                    _sh = await _eval_alerts(
+                        gr, data_5m, data_daily, reference_time, sdb, correlation_id,
+                        logger_pair, disabled_alert_keys=disabled_alert_keys_run, **_lp_kw,
+                    )
+                    if isinstance(_sh, tuple) and len(_sh) == 3 and isinstance(_sh[0], dict) and _sh[2]:
+                        _sh_ctx, _sh_raw = _sh[0], list(_sh[2])[:cfg.MAX_ALERTS_PER_PAIR]
+                        _sh_scores: Dict[str, Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]] = {}
+                        _sh_blocked: List[Tuple[str, str, str]] = []
+                        for _t, _e, _k in _sh_raw:
+                            _own = (
+                                (score_buy, total_buy, votes_buy) if _k in BUY_ALERT_KEYS
+                                else (score_sell, total_sell, votes_sell)
+                            )
+                            _own_req = max((_own[1] or 0.0) * (cfg.CONFLUENCE_MIN_PCT / 100.0), abs_floor)
+                            if _own[0] is not None and _own[0] < _own_req:
+                                _sh_blocked.append((_t, _e, _k))
+                                _sh_scores[_k] = _own
+                        if _sh_blocked:
+                            await _record_counterfactual_block(
+                                sdb, pair_name, _sh_blocked, gr.ts_curr, gr.close_curr,
+                                block_reason="confluence_gate",
+                                confluence_scores=_sh_scores,
+                                effective_score=score, effective_required=required,
+                                gr=gr, context=_sh_ctx, logger_pair=logger_pair,
+                            )
+                except Exception as _sh_err:
+                    logger_pair.debug(f"[{pair_name}] Early-gate shadow tracking failed: {_sh_err}")
             await _blanket_reset_pair(sdb, pair_name, logger_pair)
             return pair_name, {
                 "state": "NO_SIGNAL",
