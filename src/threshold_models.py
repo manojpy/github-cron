@@ -82,6 +82,18 @@ def _apply_scaler(X: List[List[float]], scaler: Optional[Dict[str, List[float]]]
         for row in X
     ]
 
+def derive_market_state_feature_names(rows: List[Row]) -> List[str]:
+    """Sorted feature names (vote:* and numeric ctx:*) present in `rows`."""
+    all_features: Set[str] = set()
+    for r in rows:
+        if r.get("votes"):
+            all_features.update(f"vote:{k}" for k in r["votes"])
+        if r.get("context"):
+            for k, v in r["context"].items():
+                if isinstance(v, (int, float)) and k not in _PRICE_LEVEL_CTX:
+                    all_features.add(f"ctx:{k}")
+    return sorted(all_features)
+
 def build_market_state_features(rows: List[Row], feature_names: Optional[List[str]] = None) -> Tuple[List[List[float]], List[float], List[str]]:
     """Extract full market-state feature matrix from rows.
 
@@ -89,16 +101,7 @@ def build_market_state_features(rows: List[Row], feature_names: Optional[List[st
     Returns (X, y, feature_names).
     """
     if feature_names is None:
-        all_features: Set[str] = set()
-        for r in rows:
-            if r.get("votes"):
-                all_features.update(f"vote:{k}" for k in r["votes"])
-            if r.get("context"):
-                for k, v in r["context"].items():
-                    if isinstance(v, (int, float)) and k not in _PRICE_LEVEL_CTX:
-                        all_features.add(f"ctx:{k}")
-        feature_names = sorted(all_features)
-
+        feature_names = derive_market_state_feature_names(rows)
     X: List[List[float]] = []
     y: List[float] = []
 
@@ -757,6 +760,120 @@ def online_update_beta(beta: List[float], x: List[float], y: float, lr: float = 
         step = lr * ((p - y) * v + l2 * b)
         out.append(b - max(-max_step, min(max_step, step)))
     return out
+
+ONLINE_STATE_VERSION = 1
+ONLINE_HISTORY_MAX = 8
+ONLINE_PAIRS_MAX = 400
+
+def _model_snapshot(m: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "trained_at": int(m.get("trained_at") or 0),
+        "feature_names": list(m["feature_names"]),
+        "scaler": m.get("scaler"),
+        "beta": [float(b) for b in m["beta"]],
+    }
+
+def _snapshot_vec(row: Row, snap: Dict[str, Any]) -> List[float]:
+    X, _y, _n = build_market_state_features([dict(row, win=bool(row.get("win")))], snap["feature_names"])
+    return _apply_scaler(X, snap.get("scaler"))[0]
+
+def online_challenger_step(state: Optional[Dict[str, Any]], champion: Optional[Dict[str, Any]], rows: List[Row], now: int, *, lag_sec: int = 14400, max_age_sec: int = 14 * 86400, min_eval: int = 60, max_drift: float = 1.0, z: float = 1.645) -> Dict[str, Any]:
+    """Prequential (test-then-train) comparison of an online-updated copy of the
+    market-state model against the batch champion that was being served.
+
+    For each newly resolved trade, in time order: score it with (a) the batch
+    champion that was current when the trade fired and (b) the online copy,
+    record the paired Brier difference (batch minus online, positive = online
+    better), THEN let the online copy learn from the trade with one capped
+    gradient step. Neither model ever scores a trade it has already seen.
+    Only trades at least `lag_sec` old are used, so they are resolved.
+    The online copy restarts from the current champion after `max_age_sec`.
+    Pure: returns {"state": new_state, "summary": {...}}; stores nothing.
+    status: no_champion / insufficient / online_better / batch_better / indistinguishable."""
+    from plan_replay import cluster_se
+
+    if not champion or not champion.get("valid") or not champion.get("beta") or not champion.get("feature_names"):
+        return {"state": state, "summary": {"status": "no_champion"}}
+    snap = _model_snapshot(champion)
+    st = state if isinstance(state, dict) and state.get("v") == ONLINE_STATE_VERSION else None
+    if st is not None:
+        base = st.get("base") or {}
+        if (now - int(st.get("started_at") or 0) > max_age_sec
+                or len(st.get("beta") or []) != len(base.get("beta") or [])
+                or not st.get("history")):
+            st = None
+    if st is None:
+        st = {
+            "v": ONLINE_STATE_VERSION, "base": snap, "beta": list(snap["beta"]),
+            "started_at": int(now), "last_ts": int(snap["trained_at"]), "n_updates": 0,
+            "history": [snap], "pairs": [], "promoted": False, "promoted_at": None,
+            "passes": 0, "last_pass_ts": 0,
+        }
+    hist = st["history"]
+    if int(hist[-1].get("trained_at") or 0) != snap["trained_at"]:
+        hist.append(snap)
+        del hist[:-ONLINE_HISTORY_MAX]
+
+    cutoff = int(now) - int(lag_sec)
+    fresh = sorted(
+        (r for r in rows if r.get("entry_ts") is not None and int(st["last_ts"]) < int(r["entry_ts"]) <= cutoff),
+        key=lambda r: int(r["entry_ts"]),
+    )
+    base = st["base"]
+    skipped = 0
+    for r in fresh:
+        ts = int(r["entry_ts"])
+        served = next((h for h in reversed(hist) if int(h.get("trained_at") or 0) <= ts), hist[0])
+        try:
+            p_ch = _sigmoid(sum(b * v for b, v in zip(served["beta"], _snapshot_vec(r, served))))
+            x_on = _snapshot_vec(r, base)
+            p_on = _sigmoid(sum(b * v for b, v in zip(st["beta"], x_on)))
+        except Exception:
+            skipped += 1
+            continue
+        y = 1.0 if r.get("win") else 0.0
+        st["pairs"].append([ts, round((p_ch - y) ** 2 - (p_on - y) ** 2, 6)])
+        st["beta"] = online_update_beta(st["beta"], x_on, y)
+        st["n_updates"] = int(st["n_updates"]) + 1
+    del st["pairs"][:-ONLINE_PAIRS_MAX]
+    if cutoff > int(st["last_ts"]):
+        st["last_ts"] = cutoff
+
+    vals = [float(p[1]) for p in st["pairs"]]
+    stamps = [float(p[0]) for p in st["pairs"]]
+    drift = max((abs(a - b) for a, b in zip(st["beta"], base["beta"])), default=0.0)
+    summary: Dict[str, Any] = {
+        "status": "insufficient", "n_eval": len(vals), "n_updates": int(st["n_updates"]),
+        "n_new": len(fresh) - skipped, "n_skipped": skipped,
+        "base_trained_at": int(base.get("trained_at") or 0),
+        "served_trained_at": int(hist[-1].get("trained_at") or 0),
+        "started_at": int(st["started_at"]), "max_coef_drift": round(drift, 4),
+        "drift_ok": drift <= float(max_drift),
+    }
+    if len(vals) >= int(min_eval):
+        mean = sum(vals) / len(vals)
+        se, nb = cluster_se(vals, stamps)
+        if se != float("inf"):
+            lo, hi = mean - z * se, mean + z * se
+            summary.update({
+                "mean_brier_gain": round(mean, 5), "lo": round(lo, 5), "hi": round(hi, 5), "n_blocks": nb,
+                "status": "online_better" if lo > 0 else "batch_better" if hi < 0 else "indistinguishable",
+            })
+    return {"state": st, "summary": summary}
+
+def online_model_for_serving(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The online copy, shaped like a persisted market-state model, but only
+    while it is flagged promoted. None otherwise."""
+    if not isinstance(state, dict) or not state.get("promoted"):
+        return None
+    base = state.get("base") or {}
+    if not state.get("beta") or not base.get("feature_names") or len(state["beta"]) != len(base.get("beta") or []):
+        return None
+    return {
+        "valid": True, "beta": list(state["beta"]), "feature_names": list(base["feature_names"]),
+        "scaler": base.get("scaler"), "trained_at": int(state.get("promoted_at") or 0),
+        "provenance": "online", "base_trained_at": int(base.get("trained_at") or 0),
+    }
 
 def net_ev_baseline_audit(rows: List[Row], horizon: int = 12, min_train: int = 100, min_test: int = 40, test_frac: float = 0.3, z: float = 1.645, default_cost_pct: float = 0.0) -> Dict[str, Any]:
     """Does the market-state model pick better trades than simple chronological

@@ -25,6 +25,8 @@ from brain_helpers import (
     CALIBRATION_CURVES_KEY,
     KILL_SWITCH_KEY,
     MARKET_STATE_MODEL_KEY,
+    ONLINE_MODEL_STATE_KEY,
+    FEATURE_DATASET_KEY,
     ML_CALIBRATION_KEY,
     QUALITY_INPUTS_KEY,
     _OVERRIDE_COOLDOWN_PREFIX,
@@ -62,6 +64,8 @@ class BrainCore:
         self._quality_cache_ts = 0.0
         self._market_model_cache: Optional[Dict[str, Any]] = None
         self._market_model_cache_ts = 0.0
+        self._online_state_cache: Optional[Dict[str, Any]] = None
+        self._online_state_cache_ts = 0.0
         self._cached_real_raw: Optional[List[Dict[str, str]]] = None
         self._ml_calib_cache: Optional[Dict[str, Any]] = None
         self._ml_calib_cache_ts = 0.0
@@ -423,6 +427,134 @@ class BrainCore:
             )
 
     async def _load_market_state_model(self) -> Optional[Dict[str, Any]]:
+        """The model dispatch scores with: the persisted batch model, unless
+        ONLINE_MODEL_MODE=live and the online copy has been promoted."""
+        batch = await self._load_batch_market_state_model()
+        if batch is not None and str(getattr(cfg, "ONLINE_MODEL_MODE", "shadow")) == "live":
+            served = await self._online_serving_model()
+            if served is not None:
+                return served
+        return batch
+
+    async def _load_online_model_state(self, fresh: bool = False) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        if not fresh and self._online_state_cache is not None and now - self._online_state_cache_ts <= 300:
+            return self._online_state_cache
+        if self.sdb.degraded or not self.sdb._redis:
+            return None
+        raw = await self.sdb.get_metadata(ONLINE_MODEL_STATE_KEY, timeout=5.0)
+        if not raw:
+            return None
+        try:
+            state = json_loads(raw)
+        except Exception:
+            return None
+        if not isinstance(state, dict):
+            return None
+        self._online_state_cache, self._online_state_cache_ts = state, now
+        return state
+
+    async def _online_serving_model(self) -> Optional[Dict[str, Any]]:
+        from threshold_models import online_model_for_serving
+        try:
+            return online_model_for_serving(await self._load_online_model_state())
+        except Exception:
+            return None
+
+    async def online_model_cycle(self, rows: List[Dict[str, Any]], champion: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Once per Brain report (never on the 15-minute alert path): learn from
+        newly resolved trades, compare the online copy with the batch model that
+        was being served, and apply the promotion gates. ONLINE_MODEL_MODE:
+        off = nothing; shadow = compare and record what WOULD be promoted;
+        live = a copy that passes the gates is served in place of the batch model.
+        Gates: enough paired trades, the lower bound of the Brier gain above zero,
+        bounded coefficient drift, and the same consecutive-pass streak rule as
+        weight challengers. Demotion is immediate when the batch model is
+        clearly better or the drift limit is broken."""
+        mode = str(getattr(cfg, "ONLINE_MODEL_MODE", "shadow"))
+        if mode == "off":
+            return {}
+        from threshold_models import online_challenger_step
+        now = int(time.time())
+        lag = int(getattr(cfg, "OUTCOME_LOOKAHEAD_CANDLES", 12)) * 900 + 3600
+        prev = await self._load_online_model_state(fresh=True)
+        res = online_challenger_step(
+            prev, champion, rows, now, lag_sec=lag,
+            max_age_sec=int(getattr(cfg, "ONLINE_MODEL_MAX_AGE_DAYS", 14)) * 86400,
+            min_eval=int(getattr(cfg, "ONLINE_MODEL_MIN_EVAL", 60)),
+            max_drift=float(getattr(cfg, "ONLINE_MODEL_MAX_DRIFT", 1.0)),
+        )
+        st, summary = res["state"], res["summary"]
+        summary["mode"] = mode
+        summary["min_passes"] = int(getattr(cfg, "CHALLENGER_MIN_CONSECUTIVE_PASSES", 3))
+        if st is None or summary.get("status") == "no_champion":
+            return summary
+        # st is the stored state updated in place, or a fresh one (promoted=False)
+        # after a restart from a new base, which therefore always demotes.
+        was_promoted = bool(prev and prev.get("promoted"))
+        status = summary.get("status")
+        drift_ok = bool(summary.get("drift_ok", True))
+        ok = status == "online_better" and drift_ok
+        min_passes = int(getattr(cfg, "CHALLENGER_MIN_CONSECUTIVE_PASSES", 3))
+        min_gap = int(getattr(cfg, "CHALLENGER_STREAK_MIN_GAP_SEC", 3600))
+        if ok:
+            if now - int(st.get("last_pass_ts") or 0) >= min_gap:
+                st["passes"] = int(st.get("passes") or 0) + 1
+                st["last_pass_ts"] = now
+        elif status != "insufficient" or not drift_ok:
+            st["passes"] = 0
+        summary["passes"] = int(st.get("passes") or 0)
+        summary["would_promote"] = bool(ok and int(st.get("passes") or 0) >= min_passes)
+        if st.get("promoted") and (status == "batch_better" or not drift_ok):
+            st["promoted"], st["promoted_at"] = False, None
+        if was_promoted and not st.get("promoted"):
+            summary["demoted"] = True
+        if mode == "live" and not st.get("promoted") and summary["would_promote"]:
+            st["promoted"], st["promoted_at"] = True, now
+            summary["promoted_now"] = True
+        summary["promoted"] = bool(st.get("promoted"))
+        try:
+            await self.sdb.set_metadata(ONLINE_MODEL_STATE_KEY, json_dumps(st), timeout=5.0, ttl=30 * 86400)
+            self._online_state_cache, self._online_state_cache_ts = st, time.time()
+        except Exception as e:
+            logging.getLogger("macd_bot").warning(f"Online model state save failed (non-fatal): {e}")
+        return summary
+
+    async def _cached_point_in_time_dataset(self, rows: List[Dict[str, Any]], cost_pct: float) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Point-in-time dataset with the Redis row cache (see
+        feature_store.build_point_in_time_dataset_cached). Falls back to a plain
+        build whenever the cache is off, Redis is unavailable, or anything fails."""
+        from feature_store import (
+            LABEL_HORIZONS, build_point_in_time_dataset, build_point_in_time_dataset_cached,
+            pack_dataset, unpack_dataset,
+        )
+        if not getattr(cfg, "ENABLE_FEATURE_DATASET_CACHE", True) or self.sdb.degraded or not self.sdb._redis:
+            return build_point_in_time_dataset(rows, default_cost_pct=cost_pct), {"enabled": False}
+        try:
+            raw = await self.sdb.get_metadata(FEATURE_DATASET_KEY, timeout=5.0)
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("ascii", "ignore")
+            cached = unpack_dataset(raw) if raw else None
+            ds, info = build_point_in_time_dataset_cached(rows, cached, LABEL_HORIZONS, cost_pct)
+        except Exception as e:
+            logging.getLogger("macd_bot").warning(f"Feature dataset cache failed, building without it: {e!r}")
+            return build_point_in_time_dataset(rows, default_cost_pct=cost_pct), {"enabled": True, "reason": "cache_error"}
+        info["enabled"] = True
+        info["persisted"] = False
+        if info.get("built"):
+            try:
+                blob = pack_dataset(ds, LABEL_HORIZONS, cost_pct)
+                if len(blob) <= int(getattr(cfg, "FEATURE_DATASET_MAX_BYTES", 3000000)):
+                    await self.sdb.set_metadata(FEATURE_DATASET_KEY, blob, timeout=8.0, ttl=30 * 86400)
+                    info["persisted"] = True
+                else:
+                    info["skipped"] = "too_large"
+                info["bytes"] = len(blob)
+            except Exception as e:
+                logging.getLogger("macd_bot").warning(f"Feature dataset cache save failed (non-fatal): {e!r}")
+        return ds, info
+
+    async def _load_batch_market_state_model(self) -> Optional[Dict[str, Any]]:
         now = time.time()
         if self._market_model_cache is None or now - self._market_model_cache_ts > 300:
             if self.sdb.degraded or not self.sdb._redis:

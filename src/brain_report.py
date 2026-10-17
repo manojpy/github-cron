@@ -695,7 +695,7 @@ def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
         do_now.append(f"Investigate the very low {wr:.0%} win rate (see section 04).")
     if F["gate"].get("stability") is False or F["gate"].get("risk") is False:
         do_now.append("Monitor active drift/drawdown warnings.")
-    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"• {x}" for x in do_now)))
+    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"��� {x}" for x in do_now)))
     watch: List[str] = []
     seen = set()
     for a in F["weak"]:
@@ -1083,6 +1083,10 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     if _vh_lines:
         out.append(_p("VOLATILITY AND TRADE PLANS — do regimes need different stops and horizons?"))
         out.extend(_c_split(_vh_lines))
+    _om_lines = _online_model_lines((F.get("ai") or {}).get("online_model"))
+    if _om_lines:
+        out.append(_p("ONLINE MODEL vs BATCH MODEL — does continuous learning help?"))
+        out.extend(_c_split(_om_lines))
     _fe_lines = _future_edge_lines((F.get("ai") or {}).get("future_edge_record"))
     if _fe_lines:
         out.append(_p("FUTURE EDGE SCORE — noise vs ignorance"))
@@ -1286,6 +1290,36 @@ def _hypothesis_lines(led: Optional[Dict[str, Any]]) -> List[str]:
         lines.append("Keeps flipping (treat as unproven): " + ", ".join(sorted(shaky)))
     return lines
 
+def _online_model_lines(rec: Optional[Dict[str, Any]]) -> List[str]:
+    """Plain-text lines: has the online-updated model beaten the batch model it would replace?"""
+    if not rec or not rec.get("mode"):
+        return []
+    names = {
+        "online_better": "the online copy predicts better", "batch_better": "the batch model predicts better",
+        "indistinguishable": "no clear difference yet", "insufficient": "not enough newly resolved trades yet",
+    }
+    lines = [
+        f"Mode: {rec['mode']}. Trades scored by both models: {rec.get('n_eval', 0)}; "
+        f"the online copy has learned from {rec.get('n_updates', 0)}.",
+        f"Verdict: {names.get(rec.get('status'), rec.get('status'))}.",
+    ]
+    if rec.get("mean_brier_gain") is not None:
+        lines.append(
+            f"Average Brier gain per trade {rec['mean_brier_gain']:+.4f} (90% range {rec['lo']:+.4f} to {rec['hi']:+.4f}); "
+            "positive means the online copy was closer to what happened."
+        )
+    if rec.get("max_coef_drift") is not None:
+        lines.append(f"Largest coefficient change from the starting model: {rec['max_coef_drift']} ({'within' if rec.get('drift_ok') else 'OVER'} the limit).")
+    if rec.get("promoted"):
+        lines.append("Being served in place of the batch model.")
+    elif rec.get("would_promote"):
+        lines.append("Would be promoted (shadow mode: nothing changed).")
+    else:
+        lines.append(f"Promotion needs {rec.get('min_passes', 3)} consecutive passing evaluations; passed so far: {rec.get('passes', 0)}.")
+    if rec.get("demoted"):
+        lines.append("Demoted this cycle.")
+    return lines
+
 def _future_edge_lines(rec: Optional[Dict[str, Any]]) -> List[str]:
     """Plain-text lines: noise vs ignorance, and whether the Future Edge Score has predicted anything."""
     if not rec or not rec.get("n"):
@@ -1413,6 +1447,16 @@ def _data_foundation_lines(cov: Optional[Dict[str, Any]]) -> List[str]:
         lines.append("Warning: rows from different feature-set versions are mixed; compare models only within one version.")
     if cov.get("leaked_keys"):
         lines.append(f"Warning: {cov['leaked_keys']} post-outcome fields were found among the features and removed.")
+    ch = cov.get("cache") or {}
+    if ch.get("enabled"):
+        if ch.get("verified") is False:
+            lines.append("Warning: the stored dataset failed its spot-check and was rebuilt from the archive.")
+        else:
+            lines.append(
+                f"Dataset cache: {ch.get('hit', 0)} rows reused, {ch.get('built', 0)} built this run"
+                + (" (spot-check passed)" if ch.get("verified") else "")
+                + (f"; not stored ({ch['skipped'].replace('_', ' ')})" if ch.get("skipped") else "") + "."
+            )
     weak = cov.get("mostly_empty_features") or []
     if weak:
         lines.append("Mostly-empty features: " + ", ".join(f"{n} ({z:.0%})" for n, z in weak))

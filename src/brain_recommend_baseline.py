@@ -9,7 +9,7 @@ from bot_config import cfg, json_dumps, json_loads, CONFLUENCE_WEIGHTS
 from state import _rc
 import threshold_engine as engine
 from threshold_quality import gate_shadow_comparison, prediction_track_record, future_edge_track_record
-from feature_store import build_point_in_time_dataset, dataset_coverage
+from feature_store import dataset_coverage
 from plan_replay import volatility_plan_study
 from hypothesis_gen import update_hypothesis_pool
 from brain_layers import cached_audit
@@ -1157,11 +1157,12 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
     # ── Data foundation: versioned point-in-time features + multi-horizon
     # labels. Counts only; nothing here changes a decision. ──
     try:
-        _ds = build_point_in_time_dataset(
+        _ds, _ds_cache = await self._cached_point_in_time_dataset(
             list(real_rows),
-            default_cost_pct=(float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100,
+            (float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100,
         )
-        ai_metrics["data_foundation"] = dataset_coverage(_ds)
+        ai_metrics["data_foundation"] = {**dataset_coverage(_ds), "cache": _ds_cache}
+
     except Exception as e:
         audit.record_analysis_exception("data_foundation", e)
 
@@ -1365,6 +1366,15 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
         ai_metrics["market_state_model"] = {
             k: v for k, v in ms_model.items() if k != "beta"
         }
+        # Online copy of the model vs the batch model that was being served.
+        # Own try/except: a failure here must not touch the batch refresh below.
+        try:
+            _champ = ms_model if ms_model.get("valid") else await self._load_batch_market_state_model()
+            _on = await self.online_model_cycle(real_rows, _champ)
+            if _on:
+                ai_metrics["online_model"] = _on
+        except Exception as e:
+            audit.record_analysis_exception("online_model", e)
         if ms_model.get("valid"):
             await self._persist_market_state_model(ms_model)
             # Persist ML calibration curve for dispatch-time lookup
