@@ -79,8 +79,10 @@ jobs:
             /tmp/data-repo/shadow \
             /tmp/data-repo/reports
 
-          # Avoid world-writable permissions. The owner retains write access;
-          # other users receive read/traverse access only.
+          # The container runs as appuser (uid 1000); the runner is uid 1001.
+          # outcome_storage.py probes for write access at import time, so hand
+          # the tree to uid 1000 instead of making it world-writable.
+          sudo chown -R 1000:1000 /tmp/data-repo
           chmod -R u+rwX,go+rX /tmp/data-repo
 
       - name: 🐳 Log in to GHCR
@@ -100,9 +102,13 @@ jobs:
           echo "🐳 Pulling commit-matched image: $IMAGE"
           START=$(date +%s)
 
-          # Fail closed if the exact image is unavailable.
-          # Do not silently run code from a different revision.
-          docker pull --quiet --platform linux/amd64 "$IMAGE"
+          # No sha image means no src/ change since the last build (build.yml is
+          # path-filtered), so :latest runs the same code. Warn and fall back.
+          if ! docker pull --quiet --platform linux/amd64 "$IMAGE"; then
+            echo "::warning::No image for ${GITHUB_SHA} — falling back to :latest"
+            IMAGE="$BASE:latest"
+            docker pull --quiet --platform linux/amd64 "$IMAGE"
+          fi
 
           echo "RUN_IMAGE=$IMAGE" >> "$GITHUB_ENV"
           echo "✅ Image ready in $(( $(date +%s) - START ))s"

@@ -37,7 +37,7 @@ jobs:
           import sys
 
           TEXT_EXTENSIONS = {
-              ".py", ".md", ".yml", ".yaml", ".json", ".txt",
+              ".py", ".pyx", ".md", ".yml", ".yaml", ".json", ".txt",
               ".rst", ".cfg", ".ini", ".toml", ".sh", ".bash",
           }
 
@@ -69,8 +69,8 @@ jobs:
               f"\u00f0\u0178{CP1252_CONT}{CP1252_CONT}",
               "\u00f0\u009f[\u0080-\u00bf][\u0080-\u00bf]",
               "\u00ef\u00bb\u00bf",
+              f"[\u00e0-\u00ef]{CP1252_CONT}{CP1252_CONT}",
           ]
-
           MOJIBAKE_RE = re.compile("|".join(MOJIBAKE_PATTERNS))
           MOJIBAKE_ALLOWLIST: set[str] = set()
 

@@ -18,14 +18,11 @@ permissions:
 
 jobs:
   replay:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion != 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: 📋 List candidate artifacts
-        # Skip on the fast path: a successful bot run has nothing for us to
-        # recover. Only a failed run can have left an unpushed-outcomes
-        # artifact behind. workflow_dispatch always proceeds (manual intent).
-        if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion != 'success'
         id: list
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -49,6 +49,7 @@ jobs:
           git clone --depth 1 \
             "https://github.com/manojpy/outcome-data.git" \
             /tmp/data-repo
+          echo '*.jsonl merge=union' >> /tmp/data-repo/.git/info/attributes
 
       - name: 🧹 Cleanup old archives
         env:

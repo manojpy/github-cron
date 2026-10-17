@@ -53,7 +53,6 @@ jobs:
     permissions:
       contents: read
       packages: read
-      actions: write
 
     steps:
       # PHASE 0: START THE IMAGE PULL FIRST
@@ -168,13 +167,34 @@ jobs:
         run: |
           START=$(date +%s)
 
+          # Token via GIT_ASKPASS, never in the remote URL: a URL credential is
+          # written to .git/config, and this folder is mounted into the bot
+          # container. The partial clone also fetches blobs lazily at checkout,
+          # so GIT_ASKPASS must stay exported for the whole step.
+          ASKPASS="$RUNNER_TEMP/git-askpass.sh"
+          trap 'rm -f "$ASKPASS"' EXIT
+
+          cat > "$ASKPASS" <<'EOF'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$DATA_REPO_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 700 "$ASKPASS"
+
+          export GIT_ASKPASS="$ASKPASS"
+          export GIT_TERMINAL_PROMPT=0
+
           # --filter=blob:none makes this a partial clone: only trees/commits are
           # downloaded up front, and file contents are fetched lazily for exactly
           # the paths that sparse-checkout materialises. Without it, --depth=1
           # still downloads EVERY file at the tip, whatever the sparse list says.
           git clone --depth=1 --no-checkout --filter=blob:none \
-            "https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git" \
+            "https://github.com/manojpy/outcome-data.git" \
             /tmp/data-repo
+          echo '*.jsonl merge=union' >> /tmp/data-repo/.git/info/attributes
 
           cd /tmp/data-repo
 
@@ -184,6 +204,7 @@ jobs:
             echo "::error::Branch 'main' not found in outcome-data repo"
             exit 1
           fi
+          echo '*.jsonl merge=union' >> .git/info/attributes
           git sparse-checkout init --no-cone
           {
             echo "brain_state.json"
@@ -485,9 +506,9 @@ jobs:
 
           if [ -f "logs/bot_output.log" ] && [ -s "logs/bot_output.log" ]; then
             echo "### 📄 Recent Log Output (last 50 lines)" >> $GITHUB_STEP_SUMMARY
-            echo '\`\`\`' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
             tail -n 50 logs/bot_output.log >> $GITHUB_STEP_SUMMARY
-            echo '\`\`\`' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
           else
             echo "⚠️ No logs captured" >> $GITHUB_STEP_SUMMARY
           fi
@@ -526,6 +547,26 @@ jobs:
             echo "::warning::Data repo not present — outcomes NOT persisted this run"
             exit 0
           fi
+
+          # Same GIT_ASKPASS pattern as the clone step. Needed for the push, the
+          # rebase fetch, and any lazy blob fetch (partial clone) done by
+          # `git diff --cached --stat` below.
+          ASKPASS="$RUNNER_TEMP/git-askpass.sh"
+          trap 'rm -f "$ASKPASS"' EXIT
+
+          cat > "$ASKPASS" <<'EOF'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$DATA_REPO_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 700 "$ASKPASS"
+
+          export GIT_ASKPASS="$ASKPASS"
+          export GIT_TERMINAL_PROMPT=0
+
           cd /tmp/data-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -578,9 +619,8 @@ jobs:
           # The cleanup workflow also pushes to this repo. If it landed between
           # our clone and now, a plain push is rejected as non-fast-forward and
           # this run's outcomes would be lost. Rebase onto the new tip and retry.
-          PUSH_URL="https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git"
           for attempt in 1 2 3 4 5; do
-            if git push "$PUSH_URL" HEAD:main; then
+            if git push origin HEAD:main; then
               echo "✅ Outcomes pushed (attempt ${attempt})"
               exit 0
             fi
@@ -589,7 +629,7 @@ jobs:
             fi
             echo "::warning::Push rejected (attempt ${attempt}/5) — rebasing onto latest main"
             sleep $(( attempt * 2 + RANDOM % 3 ))
-            if ! git pull --rebase --no-tags "$PUSH_URL" main; then
+            if ! git pull --rebase --no-tags origin main; then
               echo "::error::Rebase conflict — aborting; outcomes NOT persisted"
               git rebase --abort 2>/dev/null || true
               exit 1
