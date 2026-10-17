@@ -79,11 +79,17 @@ jobs:
             /tmp/data-repo/shadow \
             /tmp/data-repo/reports
 
-          # The container runs as appuser (uid 1000); the runner is uid 1001.
-          # outcome_storage.py probes for write access at import time, so hand
-          # the tree to uid 1000 instead of making it world-writable.
-          sudo chown -R 1000:1000 /tmp/data-repo
-          chmod -R u+rwX,go+rX /tmp/data-repo
+          # Container runs as appuser (uid 1000). Hand only the data dirs
+          # to that uid so the runner can still finish the step cleanly.
+          # (chmod without sudo after chown was the previous failure mode.)
+          sudo chown -R 1000:1000 \
+            /tmp/data-repo/outcomes \
+            /tmp/data-repo/shadow \
+            /tmp/data-repo/reports
+          sudo chmod -R u+rwX,go+rX \
+            /tmp/data-repo/outcomes \
+            /tmp/data-repo/shadow \
+            /tmp/data-repo/reports
 
       - name: 🐳 Log in to GHCR
         uses: docker/login-action@v4
