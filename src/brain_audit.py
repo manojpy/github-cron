@@ -64,15 +64,9 @@ class HealthStatus(str, Enum):
         }[self]
 
     @property
-    def allows_analysis(self) -> bool:
-        """Whether this status permits running the associated analysis."""
-        return self in (HealthStatus.OK, HealthStatus.DEGRADED)
-
-    @property
     def allows_recommendation(self) -> bool:
         """Whether this status permits emitting actionable recommendations."""
         return self == HealthStatus.OK
-
 
 class DataCoverage(str, Enum):
     FULL = "FULL"
@@ -161,10 +155,6 @@ class OutcomeReconciliation:
     shadow_loaded: int = 0
     status: HealthStatus = HealthStatus.OK
     notes: List[str] = field(default_factory=list)
-
-    @property
-    def is_consistent(self) -> bool:
-        return self.status in (HealthStatus.OK, HealthStatus.DEGRADED)
 
     def to_report_lines(self) -> List[str]:
         def _n(v: Optional[int]) -> str:
@@ -627,37 +617,6 @@ class BrainAuditLayer:
         lines.append("")
         return lines
 
-    def build_action_gate_summary(self, action_gate: Dict[str, Any]) -> List[str]:
-        """Build explicit action gate status for the report."""
-        lines: List[str] = []
-        actionable = action_gate.get("actionable", False)
-
-        checks = {
-            "data_quality": "≥100 trades logged",
-            "oos_prediction": "out-of-sample EV positive (P>0.70)",
-            "profitability": "net EV confident (P>0.85, P5 > -0.10)",
-            "stability": "no active CUSUM drift alarms",
-            "risk": "drawdown within kill-switch budget",
-            "execution": "fee/slippage assumptions configured",
-        }
-
-        passed = sum(1 for k in checks if action_gate.get(k, False))
-        total = len(checks)
-
-        icon = "🟢" if actionable else "🔴"
-        lines.append(
-            f"{icon} ACTION GATE: "
-            f"{'PASSED' if actionable else 'BLOCKED'} "
-            f"({passed}/{total} conditions met)"
-        )
-
-        if not actionable:
-            for key, label in checks.items():
-                status = action_gate.get(key, False)
-                check_icon = "✅" if status else "❌"
-                lines.append(f"   {check_icon} {label}")
-
-        return lines
 
     # ── Read-only accessors used by the layered Brain report ─────────
     def history_span(self) -> Optional[Tuple[float, int]]:
@@ -673,12 +632,6 @@ class BrainAuditLayer:
 
     def reconciliation_snapshot(self) -> Optional[OutcomeReconciliation]:
         return self._reconciliation
-
-    def suppressed_analysis_names(self) -> List[str]:
-        return list(self._suppressed_analyses)
-
-    def analysis_health_entries(self) -> List[AnalysisHealthEntry]:
-        return list(self._analysis_health.values())
 
     def statistical_confidence_label(self) -> str:
         """Plain-language confidence qualifier for the current sample.
@@ -712,114 +665,6 @@ class BrainAuditLayer:
             order = ["VERY LOW", "LOW", "MODERATE", "HIGH"]
             label = order[min(order.index(label), order.index(cap))]
         return label
-
-    def qualify_projection(self, metric_name: str, value_str: str) -> str:
-        """Replace 'projected' language with statistically honest phrasing."""
-        confidence = self.statistical_confidence_label()
-        if confidence in ("LOW", "VERY LOW"):
-            return (
-                f"{metric_name}: {value_str} "
-                f"(historical simulation estimate, {confidence} confidence "
-                f"— NOT a forecast)"
-            )
-        return f"{metric_name}: {value_str} (historical estimate)"
-
-    def qualify_verdict(self, net_ev: float, wr: float, n: int, p_ev_positive: float = 0.0) -> str:
-        """Statistically disciplined verdict instead of absolute claims."""
-        confidence = self.statistical_confidence_label()
-
-        if confidence == "VERY LOW":
-            if net_ev > 0:
-                return (
-                    f"⚠️ OBSERVED SAMPLE: Net EV {net_ev:+.2f}%/trade, "
-                    f"WR={wr:.0%} (n={n}).\n"
-                    f"   Statistical confidence: {confidence}.\n"
-                    f"   Conclusion: Sample is too small for a definitive "
-                    f"profitability claim. Accumulate more outcomes."
-                )
-            else:
-                return (
-                    f"⚠️ OBSERVED SAMPLE: Net EV {net_ev:+.2f}%/trade, "
-                    f"WR={wr:.0%} (n={n}).\n"
-                    f"   Statistical confidence: {confidence}.\n"
-                    f"   Conclusion: Current sample does not demonstrate "
-                    f"positive expectancy, but the sample is too small "
-                    f"to rule it out. Accumulate more outcomes."
-                )
-
-        if confidence == "LOW":
-            if net_ev > 0 and p_ev_positive >= 0.85:
-                return (
-                    f"⚠️ MARGINALLY POSITIVE: Net EV {net_ev:+.2f}%/trade, "
-                    f"WR={wr:.0%} (n={n}), P(EV>0)={p_ev_positive:.0%}.\n"
-                    f"   Statistical confidence: {confidence}.\n"
-                    f"   Conclusion: Suggestive of positive expectancy but "
-                    f"not yet conclusive."
-                )
-            elif net_ev > 0:
-                return (
-                    f"⚠️ THIN EVIDENCE: Net EV {net_ev:+.2f}%/trade, "
-                    f"WR={wr:.0%} (n={n}), P(EV>0)={p_ev_positive:.0%}.\n"
-                    f"   Statistical confidence: {confidence}.\n"
-                    f"   Conclusion: Positive point estimate but insufficient "
-                    f"statistical power to confirm."
-                )
-            else:
-                return (
-                    f"🟠 NEGATIVE SAMPLE: Net EV {net_ev:+.2f}%/trade, "
-                    f"WR={wr:.0%} (n={n}).\n"
-                    f"   Statistical confidence: {confidence}.\n"
-                    f"   Conclusion: Current sample does not demonstrate "
-                    f"positive expectancy."
-                )
-
-        # MODERATE or HIGH confidence
-        if net_ev > 0 and p_ev_positive >= 0.85:
-            return (
-                f"✅ PROFITABLE: Net EV {net_ev:+.2f}%/trade, "
-                f"WR={wr:.0%} (n={n}), P(EV>0)={p_ev_positive:.0%}.\n"
-                f"   Statistical confidence: {confidence}."
-            )
-        elif net_ev > 0:
-            return (
-                f"⚠️ MARGINALLY POSITIVE: Net EV {net_ev:+.2f}%/trade, "
-                f"WR={wr:.0%} (n={n}), P(EV>0)={p_ev_positive:.0%}.\n"
-                f"   Statistical confidence: {confidence}."
-            )
-        else:
-            return (
-                f"🔴 UNPROFITABLE: Net EV {net_ev:+.2f}%/trade, "
-                f"WR={wr:.0%} (n={n}).\n"
-                f"   Statistical confidence: {confidence}.\n"
-                f"   Conclusion: Costs exceed gains in the observed sample."
-            )
-
-    # ── Schema Migration Advisory ─────────────────────────────────────
-    def schema_migration_advisory(self, current_version: int, stale_count: int, migrated_count: int, unmigratable_count: int, total_archive_rows: int) -> Optional[str]:
-        """Advise on schema migration health. With the migration layer active,
-        stale rows are mapped forward rather than dropped. This advisory now
-        reports migration success and flags genuinely lost rows."""
-        if stale_count == 0 and migrated_count == 0:
-            return None
-
-        if unmigratable_count > 0:
-            pct_lost = unmigratable_count / max(total_archive_rows, 1) * 100
-            return (
-                f"⚠️ SCHEMA MIGRATION: {migrated_count} rows successfully "
-                f"migrated from v<{current_version}. "
-                f"{unmigratable_count} rows ({pct_lost:.0f}%) were genuinely "
-                f"unusable (missing win/pct_move/score) and discarded."
-            )
-
-        if migrated_count > 0:
-            return (
-                f"✅ SCHEMA MIGRATION: {migrated_count} historical rows "
-                f"migrated forward from v<{current_version}. "
-                f"Three-metric and R:R analyses will show reduced coverage "
-                f"for these rows (fields set to None)."
-            )
-
-        return None
 
     # ── Full Audit Summary ────────────────────────────────────────────
 

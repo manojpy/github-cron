@@ -315,19 +315,12 @@ class RedisStateStore:
     _pool_created_at: ClassVar[Dict[str, float]] = {}
     _pool_reuse_count: ClassVar[Dict[str, int]] = {}
     _pool_lock: ClassVar[Optional[asyncio.Lock]] = None
-    _script_reload_lock: ClassVar[Optional[asyncio.Lock]] = None
 
     @classmethod
     def _get_pool_lock(cls) -> asyncio.Lock:
         if cls._pool_lock is None:
             cls._pool_lock = asyncio.Lock()
         return cls._pool_lock
-
-    @classmethod
-    def _get_script_reload_lock(cls) -> asyncio.Lock:
-        if cls._script_reload_lock is None:
-            cls._script_reload_lock = asyncio.Lock()
-        return cls._script_reload_lock
 
     def __init__(self, redis_url: str):
         self.redis_url = redis_url
@@ -1227,10 +1220,6 @@ class RedisStateStore:
                 )
         return None
 
-    async def check_recent_alert(self, pair: str, alert_key: str, ts: int, window_sec: Optional[int] = None) -> bool:
-        """Boolean wrapper kept for existing callers: True only when the claim was taken."""
-        return (await self.claim_recent_alert(pair, alert_key, ts, window_sec)) is True
-
     async def batch_check_recent_alerts(self, pair: str, alert_keys: List[str], ts: int, window_sec: Optional[int] = None, windows: Optional[Dict[str, int]] = None) -> Dict[str, bool]:
         """Claim dedup windows for several alert keys on one pair in ONE Redis
         round-trip (pipeline). Each SET NX EX is still independently atomic —
@@ -1562,30 +1551,6 @@ class RedisStateStore:
         if confluence_votes is not None:
             await self.record_vote_count(alert_key, confluence_votes)
         return True
-
-    async def cancel_pending_outcome(self, pair: str, alert_key: str, entry_ts: int) -> bool:
-        """Remove a pending real outcome when the alert was never delivered.
-
-        A coalesced alert must not remain in the real-outcome population,
-        because no Telegram alert was actually delivered to the user.
-        """
-        if self.degraded or not self._redis:
-            return False
-
-        key = f"{RedisKeyPrefix.OUTCOME_PENDING}{pair}:{alert_key}:{entry_ts}"
-
-        try:
-            deleted = await asyncio.wait_for(
-                _rc(self._redis).delete(key),
-                timeout=2.0,
-            )
-            return bool(deleted)
-        except Exception as e:
-            logger.warning(
-                f"Failed to cancel pending outcome for "
-                f"{pair}:{alert_key}:{entry_ts}: {e}"
-            )
-            return False
 
     async def record_shadow_pending_outcome(
         self,
@@ -3231,59 +3196,6 @@ class RedisStateStore:
             return False
 
     # ── CUSUM state persistence ────────────────────────────────────
-    async def load_cusum_state(self, alert_key: str) -> Optional[Dict[str, Any]]:
-        """Load persisted CUSUM accumulator for one alert_key."""
-        if self.degraded or not self._redis:
-            return None
-        key = f"{RedisKeyPrefix.CUSUM_STATE}{alert_key}"
-        raw = await self._safe_redis_op(
-            lambda: _rc(self._redis).get(key), 2.0, f"cusum_load:{alert_key}",
-        )
-        if raw is None:
-            return None
-        try:
-            return json_loads(raw)
-        except Exception:
-            return None
-
-    async def save_cusum_state(self, alert_key: str, state: Dict[str, Any]) -> None:
-        if self.degraded or not self._redis:
-            return
-        key = f"{RedisKeyPrefix.CUSUM_STATE}{alert_key}"
-        try:
-            await self._safe_redis_op(
-                lambda: _rc(self._redis).set(key, json_dumps(state), ex=30 * 86400),
-                2.0, f"cusum_save:{alert_key}",
-            )
-        except Exception as e:
-            logger.warning(f"CUSUM state save failed for '{alert_key}': {e}")
-
-    async def load_cusum_watermark(self, alert_key: str) -> int:
-        """Last entry_ts already fed into this alert_key's CUSUM detector.
-        0 means nothing has been fed yet."""
-        if self.degraded or not self._redis:
-            return 0
-        key = f"{RedisKeyPrefix.CUSUM_WATERMARK}{alert_key}"
-        try:
-            raw = await self._safe_redis_op(
-                lambda: _rc(self._redis).get(key), 2.0, f"cusum_watermark_load:{alert_key}",
-            )
-            return int(raw) if raw else 0
-        except Exception:
-            return 0
-
-    async def save_cusum_watermark(self, alert_key: str, entry_ts: int) -> None:
-        if self.degraded or not self._redis:
-            return
-        key = f"{RedisKeyPrefix.CUSUM_WATERMARK}{alert_key}"
-        try:
-            await self._safe_redis_op(
-                lambda: _rc(self._redis).set(key, str(entry_ts), ex=30 * 86400),
-                2.0, f"cusum_watermark_save:{alert_key}",
-            )
-        except Exception as e:
-            logger.warning(f"CUSUM watermark save failed for '{alert_key}': {e}")
-
     async def load_cusum_bulk(self, alert_keys: List[str]) -> Optional[Dict[str, Tuple[int, Optional[Dict[str, Any]]]]]:
         """(watermark, persisted_state) for every alert_key in ONE pipelined
         round-trip. Returns None when the read fails or Redis is degraded:

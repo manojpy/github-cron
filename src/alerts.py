@@ -314,15 +314,6 @@ class TelegramQueue:
                     await asyncio.sleep(delay)
         return None
 
-def _clean_extra_text(extra: Optional[str]) -> str:
-    """Helper to strip emojis, OHLC data, and technical metadata."""
-    if not extra:
-        return ""
-    extra_clean = re.sub(r'[🟢🔴🔵🟣]', '', extra)  
-    extra_clean = re.sub(r'\(O:[\d.]+ H:[\d.]+ L:[\d.]+ C:[\d.]+\)', '', extra_clean)  
-    extra_clean = re.sub(r'\[i15=\d+,\s*[\d-]+\s+[\d:]+\s+IST\]', '', extra_clean)  
-    return extra_clean.strip()
-
 def _clean_setup_title(title: str) -> str:
     """Strip leading emoji/symbols so setup line reads:
     'Strong Reversal BUY, VWAP Cross(+2)' not '🟢🔄 Strong Reversal BUY'."""

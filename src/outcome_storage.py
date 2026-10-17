@@ -192,18 +192,6 @@ def load_recent_outcomes(days: int = 30, shadow: bool = False, hours: Optional[i
             continue
     return rows
 
-def save_brain_state(state: Dict[str, Any]) -> None:
-    path = os.path.join(_OUTCOME_DIR, "brain_state.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, default=str)
-
-def load_brain_state() -> Optional[Dict[str, Any]]:
-    path = os.path.join(_OUTCOME_DIR, "brain_state.json")
-    if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
 def save_report(markdown: str) -> str:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M")
     path = os.path.join(_OUTCOME_DIR, "reports", f"{ts}.md")

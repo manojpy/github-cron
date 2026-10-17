@@ -86,13 +86,6 @@ def alert_family_of(alert_key: str) -> str:
 
     return "Other"
 
-def _family_from_prefix(key: str) -> str:
-    for prefix, family in FAMILY_PREFIXES:
-        if key.startswith(prefix):
-            return family
-    return "Other"
-
-
 # ── the registry ─────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class AlertSpec:

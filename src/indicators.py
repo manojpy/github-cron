@@ -328,60 +328,6 @@ def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
         logger.error(f"RMA calculation failed: {e}")
         return np.full_like(data, np.nan) if data is not None else np.array([np.nan]) 
 
-def calculate_daily_rma11_bias(data_daily: Dict[str, np.ndarray], reference_time: int) -> str:
-    """
-    Determine daily timeframe bias based on RMA 11 band of high and low.
-    Returns: 'uptrend'  -> close > RMA(high,11)
-             'downtrend'-> close < RMA(low,11)
-             'neutral'  -> inside band or data insufficient.
-    """
-    if data_daily is None:
-        return "neutral"
-
-    close_arr = data_daily.get("close")
-    high_arr  = data_daily.get("high")
-    low_arr   = data_daily.get("low")
-    ts_arr    = data_daily.get("timestamp")
-
-    if close_arr is None or high_arr is None or low_arr is None:
-        return "neutral"
-
-    n = len(close_arr)
-    if n < 11:
-        return "neutral"
-
-    # Most recent closed daily candle (not future)
-    if ts_arr is not None and len(ts_arr) == n:
-        valid_mask = ts_arr <= reference_time
-        if not np.any(valid_mask):
-            return "neutral"
-        last_idx = int(np.where(valid_mask)[0][-1])
-    else:
-        last_idx = n - 1
-
-    if last_idx < 10:
-        return "neutral"
-
-    rma_high = calculate_rma_numpy(high_arr[:last_idx + 1], 11)
-    rma_low  = calculate_rma_numpy(low_arr[:last_idx + 1], 11)
-
-    if rma_high is None or rma_low is None or len(rma_high) == 0:
-        return "neutral"
-
-    current_close = float(close_arr[last_idx])
-    band_high     = float(rma_high[-1])
-    band_low      = float(rma_low[-1])
-
-    if np.isnan(band_high) or np.isnan(band_low) or band_high <= band_low:
-        return "neutral"
-
-    if current_close > band_high:
-        return "uptrend"
-    elif current_close < band_low:
-        return "downtrend"
-    else:
-        return "neutral"
-
 def calculate_ichimoku_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, conversion_periods: int = 9, base_periods: int = 26, span_b_periods: int = 52, displacement: int = 26) -> Dict[str, np.ndarray]:
     try:
         n = len(high)

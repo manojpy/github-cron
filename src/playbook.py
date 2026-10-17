@@ -42,7 +42,7 @@ import numpy as np
 from plan_replay import (
     EXIT_VARIANTS, Row, cluster_se, diagnose_row, evaluate_plan, has_path, plan_exit_suffix, replay_plan, select_plan,
 )
-from rulemine import mine_rules, rule_matches
+from rulemine import mine_rules
 
 PLAYBOOK_SCHEMA = 2
 # sdb metadata keys (written by learner.py, read by the advisor)
@@ -663,14 +663,6 @@ def playbook_lookup(
         e = entries.get(k)
         if e and (e.get("status") in SERVED_STATUSES + _NEGATIVE + ("PROMISING",) or e.get("restrict") or e.get("avoid_rules")):
             return {**e, "key": k, "playbook_version": blob.get("label"), "via_family": i > 0}
-    return None
-
-
-def matching_rule(entry: Optional[Mapping[str, Any]], ctx: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    """First 'do not take when ...' rule of an entry that matches this alert's context."""
-    for r in (entry or {}).get("avoid_rules") or []:
-        if rule_matches(r["rule"], ctx):
-            return r
     return None
 
 # ── Human-readable summary (plain text; the caller escapes for Telegram) ──

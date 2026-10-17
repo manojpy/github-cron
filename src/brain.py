@@ -821,22 +821,6 @@ class BrainCore:
         return result
 
     # ── Kill switch ──────────────────────────────────────────────────────
-    async def is_kill_switch_active(self) -> bool:
-        """Dispatch hook: poll every cycle. Fail-open on Redis outage is
-        consistent with the rest of the system — dispatch already cannot
-        function without Redis."""
-        if not getattr(cfg, "ENABLE_KILL_SWITCH", False):
-            return False
-        if self.sdb.degraded or not self.sdb._redis:
-            return False
-        try:
-            return bool(await self.sdb._safe_redis_op(
-                lambda: _rc(self.sdb._redis).exists(KILL_SWITCH_KEY),
-                2.0, "kill_switch_poll",
-            ))
-        except Exception:
-            return False
-
     async def clear_kill_switch(self) -> bool:
         """Manual reset after human review."""
         if self.sdb.degraded or not self.sdb._redis:

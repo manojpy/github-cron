@@ -463,11 +463,6 @@ class DataFetcher:
         # (a DataFetcher lives for exactly one run_once()).
         self._candle_futures: Dict[Tuple[Any, ...], "asyncio.Future[Optional[Dict[str, Any]]]"] = {}
     
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._external_session is not None:
-            return self._external_session
-        return await SessionManager.get_session()
-
     async def fetch_candles(self, symbol: str, resolution: str, limit: int, reference_time: int, expected_open_15: Optional[int] = None, for_confirmation: bool = False) -> Optional[Dict[str, Any]]:
         """Fetch candles, sharing one API call between identical requests in a run.
 
