@@ -589,7 +589,62 @@ def oos_permutation_importance(rows: List[Row], min_sample: int = 30, n_permutat
     results.sort(key=lambda x: -abs(float(x["importance_ev"])))
     return results
 
-def train_market_state_model(rows: List[Row], min_sample: int = 150, train_frac: float = 0.67, min_oos_p_ev_positive: float = 0.70) -> Dict[str, Any]:
+def market_state_horizon_check(rows: List[Row], train_frac: float = 0.67, min_kept: int = 8, min_train: int = 30, min_test: int = 15, default_cost_pct: Optional[float] = None, z: float = 1.645) -> Dict[str, Any]:
+    """Does the market-state model's edge hold at every label horizon?
+
+    For each horizon in feature_store.LABEL_HORIZONS (4, 6, 8, 12 candles) a
+    fresh model is fitted on the OLDER rows of the point-in-time dataset
+    (feature_store.chronological_split, purged for that horizon) to predict
+    whether the stop/target bracket replayed to that horizon ends net-positive.
+    The trades it would take on the NEWER rows (P >= 0.5) are then scored by
+    their mean net P&L at that horizon. A horizon counts as positive when that
+    mean is above zero. Descriptive: it never touches the served model."""
+    from feature_store import LABEL_HORIZONS, build_point_in_time_dataset, chronological_split
+
+    if default_cost_pct is None:
+        default_cost_pct = (
+            float(getattr(cfg, "BRAIN_FEE_PCT", 0.0006)) * 2
+            + float(getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003)) * 2
+        ) * 100.0
+    ds = build_point_in_time_dataset(rows, horizons=LABEL_HORIZONS, default_cost_pct=default_cost_pct)
+    names = ds.get("feature_names") or []
+    out: Dict[str, Any] = {"feature_hash": ds.get("feature_hash"), "horizons": {}, "n_positive": 0, "n_tested": 0}
+    for h in LABEL_HORIZONS:
+        usable = [r for r in ds["rows"] if (r["labels"].get(h) or {}).get("net") is not None]
+        train, test = chronological_split(usable, test_frac=1.0 - train_frac, max_horizon=h)
+        info: Dict[str, Any] = {"n_labelled": len(usable), "n_train": len(train), "n_test": len(test)}
+        out["horizons"][h] = info
+        if len(train) < min_train or len(test) < min_test:
+            info["status"] = "insufficient"
+            continue
+        X_tr = [r["x"] for r in train]
+        y_tr = [1.0 if r["labels"][h]["net"] > 0 else 0.0 for r in train]
+        scaler = _fit_scaler(X_tr, names)
+        X_tr = _apply_scaler(X_tr, scaler)
+        X_te = _apply_scaler([r["x"] for r in test], scaler)
+        beta = _train_logistic(X_tr, y_tr, [1.0] * len(X_tr), max_iter=800)
+        if not beta:
+            info["status"] = "training_failed"
+            continue
+        kept = [
+            float(r["labels"][h]["net"]) for r, x in zip(test, X_te)
+            if _sigmoid(sum(b * v for b, v in zip(beta, x))) >= 0.5
+        ]
+        info["n_kept"] = len(kept)
+        if len(kept) < min_kept:
+            info["status"] = "thin"
+            continue
+        mean = statistics.fmean(kept)
+        se = (statistics.stdev(kept) / math.sqrt(len(kept))) if len(kept) > 1 else 0.0
+        info["mean_net"] = round(mean, 4)
+        info["lower_net"] = round(mean - z * se, 4)
+        info["status"] = "positive" if mean > 0 else "negative"
+        out["n_tested"] += 1
+        if mean > 0:
+            out["n_positive"] += 1
+    return out
+
+def train_market_state_model(rows: List[Row], min_sample: int = 150, train_frac: float = 0.67, min_oos_p_ev_positive: float = 0.70, min_horizons_positive: int = 0) -> Dict[str, Any]:
     """Train the market-state logistic model (votes + numeric context +
     session + direction — Recommended.txt items #4/#9) on a purge/embargo
     -safe split, then decide whether to accept it purely on OOS
@@ -686,6 +741,15 @@ def train_market_state_model(rows: List[Row], min_sample: int = 150, train_frac:
         n_bins=10,
         min_sample=max(10, min_sample // 10),
     )
+    try:
+        horizon_check = market_state_horizon_check(rows, train_frac=train_frac)
+    except Exception as e:
+        horizon_check = {"status": "error", "error": repr(e), "n_positive": 0, "n_tested": 0}
+    if min_horizons_positive > 0 and int(horizon_check.get("n_positive", 0)) < int(min_horizons_positive):
+        return {
+            "valid": False, "error": "horizon_check_failed",
+            "horizon_check": horizon_check, "drift_check": drift_check,
+        }
 
     return {
         "valid": True,
@@ -704,6 +768,7 @@ def train_market_state_model(rows: List[Row], min_sample: int = 150, train_frac:
         "brier_skill": None if brier_skill is None else round(brier_skill, 4),
         "trained_at": int(time.time()),
         "drift_check": drift_check,
+        "horizon_check": horizon_check,
     }
 
 def predict_market_state_proba(model: Optional[Dict[str, Any]], votes: Optional[Dict[str, bool]], context: Optional[Dict[str, Any]], session: str = "unknown", direction: str = "buy") -> Optional[float]:

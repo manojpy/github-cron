@@ -1360,6 +1360,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             real_rows,
             min_sample=getattr(cfg, "MARKET_STATE_MODEL_MIN_SAMPLE", 150),
             min_oos_p_ev_positive=getattr(cfg, "MARKET_STATE_MODEL_MIN_OOS_P", 0.70),
+            min_horizons_positive=int(getattr(cfg, "MARKET_STATE_MIN_HORIZONS_POSITIVE", 0)),
         )
         if _nev_proof:
             ms_model["ev_baseline_proof"] = _nev_proof
@@ -1390,6 +1391,17 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                     f"on n_holdout={ms_model['n_holdout']}."
                 ),
             })
+            _hc = ms_model.get("horizon_check") or {}
+            if _hc.get("n_tested"):
+                recommendations.append({
+                    "type": "market_state_horizon_check",
+                    "severity": "low",
+                    "message": (
+                        f"🕒 Horizon check: model edge is positive at {_hc.get('n_positive', 0)} of "
+                        f"{_hc.get('n_tested', 0)} testable horizons (4/6/8/12 candles, newer trades only). "
+                        "Descriptive unless MARKET_STATE_MIN_HORIZONS_POSITIVE is above 0."
+                    ),
+                })
             # Surface ECE comparison
             ml_ece = ms_model.get("ml_ece")
             conf_ece = ai_metrics.get("calibration_ece_mean")

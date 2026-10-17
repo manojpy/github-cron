@@ -261,6 +261,10 @@ def _compute_win_weight(rr_achieved: float, is_win: bool) -> float:
 
 OUTCOME_WIN_LABEL = "Target Achieved"
 OUTCOME_LOSS_LABEL = "Stop loss Hit"
+OUTCOME_TIMEOUT_LABEL = "Timed out"
+
+
+
 
 def format_outcome_totals(source: str, stats: Optional[Dict[str, int]], icon: str = "") -> str:
     """One-line all-time Recorded/Shadowed totals, for example
@@ -270,11 +274,13 @@ def format_outcome_totals(source: str, stats: Optional[Dict[str, int]], icon: st
     total = int(s.get("total", 0))
     wins = int(s.get("wins", 0))
     losses = int(s.get("losses", 0))
+    timeouts = max(0, min(int(s.get("timeouts", 0)), losses))
     win_rate = (wins / total * 100.0) if total else 0.0
     prefix = f"{icon} " if icon else ""
     return (
         f"{prefix}{source} - {total}, {OUTCOME_WIN_LABEL} - {wins}, "
-        f"{OUTCOME_LOSS_LABEL} - {losses}, Win Rate - {win_rate:.0f}%"
+        f"{OUTCOME_LOSS_LABEL} - {losses - timeouts}, {OUTCOME_TIMEOUT_LABEL} - {timeouts}, "
+        f"Win Rate - {win_rate:.0f}%"
     )
 
 class RedisKeyPrefix:
@@ -2468,6 +2474,8 @@ class RedisStateStore:
                         fees_paid_pct = result.get("fees_paid_pct")
                         stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
                         write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
+                        if not win and result.get("outcome_class") == "timeout":
+                            write_pipe.hincrby(stats_key, "timeouts", 1)
                         write_pipe.expire(stats_key, stats_ttl)
                         session = _get_session_from_ts(entry_ts) if entry_ts else "dead"
                         session_stats_key = f"{stats_key}:{session}"
@@ -2737,6 +2745,8 @@ class RedisStateStore:
 
                         stats_key = f"{RedisKeyPrefix.SHADOW_STATS}{pair}:{alert_key}"
                         write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
+                        if not win and result.get("outcome_class") == "timeout":
+                            write_pipe.hincrby(stats_key, "timeouts", 1)
                         write_pipe.expire(stats_key, stats_ttl)
 
                         if (
@@ -2969,7 +2979,7 @@ class RedisStateStore:
         result is already present in ALERT_STATS/SHADOW_STATS, so there is no
         double-counting.
         """
-        empty = {"wins": 0, "losses": 0, "total": 0}
+        empty = {"wins": 0, "losses": 0, "timeouts": 0, "total": 0}
         out: Dict[str, Dict[str, int]] = {"Recorded": dict(empty), "Shadowed": dict(empty)}
 
         if self.degraded or not self._redis:
@@ -3006,6 +3016,7 @@ class RedisStateStore:
                         continue
                     out[label]["wins"] += int(data.get("wins", 0) or 0)
                     out[label]["losses"] += int(data.get("losses", 0) or 0)
+                    out[label]["timeouts"] += int(data.get("timeouts", 0) or 0)
 
             # 2. Add early-closed pending outcomes.
             pending_map = {RedisKeyPrefix.OUTCOME_PENDING: "Recorded", RedisKeyPrefix.SHADOW_PENDING: "Shadowed"}
