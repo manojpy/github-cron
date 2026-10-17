@@ -2948,7 +2948,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         f"[{pair_name}] 🧠 Rewardable override for {alert_key}: "
                         f"WR={failing_rate:.0%} below {cfg.MIN_WIN_RATE:.0%}, but {override_reason}"
                     )
-                    alert_extra = f"{alert_extra} | ⚠️ {override_reason}"
+                    alert_extra = f"{alert_extra} | override: {override_reason}"
                     surviving_alerts.append((alert_title, alert_extra, alert_key))
                     continue
 
