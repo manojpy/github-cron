@@ -13,13 +13,50 @@ on:
         required: false
         default: false
         type: boolean
+      confirm:
+        description: 'Type CONFIRM to allow wipe_all or squash_history (ignored for routine cleanup)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  actions: read   # the guard step lists bot runs
+
+concurrency:
+  group: cleanup-outcomes
+  cancel-in-progress: false
+
 jobs:
   cleanup:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - name: 🛑 Guard destructive options
+        env:
+          WIPE_ALL: ${{ inputs.wipe_all }}
+          SQUASH_HISTORY: ${{ inputs.squash_history }}
+          CONFIRM: ${{ inputs.confirm }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ "$WIPE_ALL" != "true" ] && [ "$SQUASH_HISTORY" != "true" ]; then
+            echo "Routine cleanup - no guard needed."
+            exit 0
+          fi
+          if [ "$CONFIRM" != "CONFIRM" ]; then
+            echo "::error::wipe_all / squash_history need the 'confirm' input set to exactly CONFIRM"
+            exit 1
+          fi
+          ACTIVE=$(gh run list --workflow run-bot.yml --json status \
+            --jq '[.[] | select(.status == "in_progress" or .status == "queued")] | length')
+          if [ "$ACTIVE" != "0" ]; then
+            echo "::error::${ACTIVE} bot run(s) active or queued - they push to the same data repo. Retry between runs."
+            exit 1
+          fi
+          echo "Guard passed"
 
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: '3.11'

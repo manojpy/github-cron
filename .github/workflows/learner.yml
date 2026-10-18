@@ -112,11 +112,14 @@ jobs:
           # path-filtered), so :latest runs the same code. Warn and fall back.
           if ! docker pull --quiet --platform linux/amd64 "$IMAGE"; then
             echo "::warning::No image for ${GITHUB_SHA} — falling back to :latest"
+            echo "⚠️ Ran on :latest because sha-${GITHUB_SHA} was not available" >> "$GITHUB_STEP_SUMMARY"
             IMAGE="$BASE:latest"
             docker pull --quiet --platform linux/amd64 "$IMAGE"
           fi
 
           echo "RUN_IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          DIGEST=$(docker image inspect -f '{{join .RepoDigests ", "}}' "$IMAGE" 2>/dev/null || true)
+          echo "🔖 Image identity: ${IMAGE} | digest: ${DIGEST:-n/a} | commit: ${GITHUB_SHA}"
           echo "✅ Image ready in $(( $(date +%s) - START ))s"
 
       - name: 🧠 Run learner
@@ -147,6 +150,10 @@ jobs:
           set +e
           docker run --rm \
             --platform linux/amd64 \
+            --security-opt=no-new-privileges \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m \
             --env-file "$ENV_FILE" \
             -e PYTHONPATH=/app/src \
             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \

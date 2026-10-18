@@ -96,11 +96,17 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ALERT_MSG: ${{ steps.check.outputs.alert_msg }}
+
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          RESP=$(curl -sS --max-time 20 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=${ALERT_MSG}" \
-            -o /dev/null -w "Telegram notify HTTP %{http_code}\n"
+            --data-urlencode "text=${ALERT_MSG}" || true)
+          if echo "$RESP" | grep -q '"ok":true'; then
+            echo "Telegram notify delivered"
+          else
+            echo "::error::Watchdog alert NOT delivered: ${RESP:0:200}"
+            exit 1
+          fi
 
       - name: 📋 Summary
         if: always()

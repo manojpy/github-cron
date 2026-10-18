@@ -258,7 +258,8 @@ jobs:
           if [ "$(cat /tmp/image-pull.rc 2>/dev/null || echo 1)" != "0" ]; then
             echo "::warning::Image for commit ${GITHUB_SHA} not available — trying :latest"
             cat /tmp/image-pull.log 2>/dev/null || true
-            IMAGE="$BASE:latest"
+            echo "⚠️ Ran on :latest because sha-${GITHUB_SHA} was not available" >> "$GITHUB_STEP_SUMMARY"
+            IMAGE="$BASE:latest", 
             if ! docker pull --quiet --platform linux/amd64 "$IMAGE"; then
               echo "::error::Neither sha-${GITHUB_SHA} nor :latest is available in the registry"
               exit 1
@@ -273,6 +274,8 @@ jobs:
           fi
           SIZE_MB=$(( $(docker image inspect -f '{{.Size}}' "$IMAGE") / 1048576 ))
           echo "✅ Image ready: pull ran $(( $(date +%s) - PULL_STARTED ))s in total, this step waited $(( $(date +%s) - WAIT_START ))s, ${SIZE_MB} MB on disk"
+          DIGEST=$(docker image inspect -f '{{join .RepoDigests ", "}}' "$IMAGE" 2>/dev/null || true)
+          echo "🔖 Image identity: ${IMAGE} | digest: ${DIGEST:-n/a} | commit: ${GITHUB_SHA}"
 
       - name: ✅ Apply Brain Plan (on-demand)
         if: inputs.apply_brain_plan == true

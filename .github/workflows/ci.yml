@@ -6,6 +6,9 @@ concurrency:
   group: "${{ github.workflow }}-${{ github.head_ref || github.ref }}"
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   static-checks:
     runs-on: ubuntu-latest
@@ -103,6 +106,51 @@ jobs:
           sys.exit(0 if ok else 1)
           PY
 
+  aot-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TELEGRAM_BOT_TOKEN: "123456:CI_DUMMY_TOKEN_FOR_TESTS"
+      TELEGRAM_CHAT_ID: "12345"
+      REDIS_URL: "redis://localhost:6379/0"
+      DELTA_API_BASE: "https://api.example.com"
+      PYTHONPATH: "src:."
+      NUMERIC_SELFTEST_JIT_CROSSCHECK: "true"
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build the Cython extension (same command as the Dockerfile)
+        run: python setup.py build_ext --inplace
+
+      - name: Numeric self-test on the AOT backend, cross-checked against Numba
+        run: |
+          python - <<'PY'
+          import sys
+          import aot_bridge
+          import numeric_selftest
+
+          aot_bridge.ensure_initialized()
+          if not aot_bridge.is_using_aot():
+              print("FAIL: AOT backend not active:", aot_bridge.get_fallback_reason())
+              sys.exit(1)
+
+          ok, failures = numeric_selftest.run_self_test()
+          for msg in failures:
+              print("FAIL:", msg)
+
+          sys.exit(0 if ok else 1)
+          PY
+
   actionlint:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -114,5 +162,5 @@ jobs:
 
       - name: Run actionlint
         run: |
-          bash <(curl -s https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
           ./actionlint -color

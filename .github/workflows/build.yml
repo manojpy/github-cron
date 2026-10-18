@@ -1,8 +1,7 @@
 name: Build AOT Image (Optimized Hybrid)
 
 on:
-  push:
-    branches: [ main ]
+  pull_request:
     paths:
       - 'src/**'
       - 'requirements.txt'
@@ -22,11 +21,12 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
   PYTHON_VERSION: "3.11"
+  CANDIDATE_IMAGE: macd-candidate:test
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write
@@ -97,16 +97,16 @@ jobs:
             org.opencontainers.image.description=AOT-compiled trading alert bot
             maintainer=${{ github.actor }}
 
-      # PHASE 2: BUILD & VERIFY
-      - name: 🔨 Build & Push Docker Image
+      # PHASE 2: BUILD A LOCAL CANDIDATE & VERIFY IT (nothing is pushed yet)
+      - name: 🔨 Build candidate image (local, not pushed)
         id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64
-          outputs: type=image,compression=zstd,force-compression=true,push=true
-          tags: ${{ steps.meta.outputs.tags }}
+          load: true
+          tags: ${{ env.CANDIDATE_IMAGE }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |        
             CYTHON_STRICT=1
@@ -125,7 +125,7 @@ jobs:
             -e PYTHONPATH=/app/src \
             -e TZ=Asia/Kolkata \
             -e REQUIRE_AOT=${{ env.REQUIRE_AOT }} \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            ${{ env.CANDIDATE_IMAGE }} \
             python << 'EOF'
           import sys
           import os
@@ -167,7 +167,7 @@ jobs:
       - name: ✅ Verify Required Files in Image
         run: |
           docker run --rm --platform linux/amd64 \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            ${{ env.CANDIDATE_IMAGE }} \
             bash -c '
               FILES=(
                 "/app/src/macd_unified.py"
@@ -233,7 +233,7 @@ jobs:
         if: inputs.skip_trivy != 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          image-ref: ${{ env.CANDIDATE_IMAGE }}
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
@@ -245,6 +245,35 @@ jobs:
         with:
           sarif_file: 'trivy-results.sarif'
           category: 'container-security'
+
+      - name: 🚦 Trivy gate (block on fixable CRITICAL findings)
+        if: inputs.skip_trivy != 'true'
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        with:
+          image-ref: ${{ env.CANDIDATE_IMAGE }}
+          format: 'table'
+          severity: 'CRITICAL'
+          ignore-unfixed: true
+          exit-code: '1'
+
+      # PHASE 3b: PUBLISH (only reached when every gate above passed)
+      - name: 🚀 Push verified image
+        if: github.event_name != 'pull_request'
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          outputs: type=image,compression=zstd,force-compression=true,push=true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            CYTHON_STRICT=1
+          cache-from: |
+            type=gha,scope=macd-aot-build
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          provenance: false
 
       # PHASE 4: BUILD SUMMARY
       - name: 📋 Generate Build Summary

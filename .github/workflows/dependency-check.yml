@@ -1,6 +1,6 @@
 name: 📦 Dependency Check
 
-# Weekly, read-only. Runs scripts/check_updates.py, then keeps ONE GitHub issue
+# Weekly (called by Cronjobs.org via workflow_dispatch), read-only. Runs scripts/check_updates.py, then keeps ONE GitHub issue
 # up to date with what could be bumped (and pings Telegram when that list changes).
 # It never edits a file or opens a pull request: you decide what to change.
 on:
@@ -42,6 +42,7 @@ jobs:
         env:
           HAS_UPDATES: ${{ steps.check.outputs.has_updates }}
           COUNT: ${{ steps.check.outputs.count }}
+          FAILED: ${{ steps.check.outputs.failed }}
         run: |
           LABEL="dependency-update"
           TITLE="📦 Dependency updates available"
@@ -63,23 +64,30 @@ jobs:
               NUM="${URL##*/}"
               CHANGED=true
             fi
+          elif [ "${FAILED:-0}" != "0" ]; then
+            # Some checks could not run, so an empty list proves nothing: leave the issue as it is.
+            echo "::warning::${FAILED} check(s) failed - not closing the dependency issue"
           elif [ -n "$NUM" ]; then
             gh issue close "$NUM" --comment "Nothing left to update as of $(date -u +%F)."
           fi
-
           echo "number=${NUM}" >> "$GITHUB_OUTPUT"
           echo "changed=${CHANGED}" >> "$GITHUB_OUTPUT"
           cat update_report.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: 📨 Tell me on Telegram (only when the list changed)
-        if: steps.issue.outputs.changed == 'true'
+      - name: 📨 Tell me on Telegram (list changed, or check incomplete)
+        if: steps.issue.outputs.changed == 'true' || steps.check.outputs.failed != '0'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           COUNT: ${{ steps.check.outputs.count }}
+          FAILED: ${{ steps.check.outputs.failed }}
           NUM: ${{ steps.issue.outputs.number }}
         run: |
-          MSG="📦 Dependency check: ${COUNT} item(s) need a decision"$'\n'"${{ github.server_url }}/${{ github.repository }}/issues/${NUM}"
+          if [ "${FAILED:-0}" != "0" ]; then
+            MSG="⚠️ Dependency check INCOMPLETE: ${FAILED} check(s) failed"$'\n'"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          else
+            MSG="📦 Dependency check: ${COUNT} item(s) need a decision"$'\n'"${{ github.server_url }}/${{ github.repository }}/issues/${NUM}"
+          fi
           RESP=$(curl -sS --max-time 20 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text=${MSG}" || true)
