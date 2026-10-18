@@ -2121,7 +2121,7 @@ if __name__ == "__main__":
     if not aot_bridge.is_using_aot():
         reason = aot_bridge.get_fallback_reason() or "Unknown"
         logger.warning("❌ AOT not available, using JIT fallback. Reason: %s", reason)
-        logger.warning("⚠�� Performance may be degraded. First run may be slow.")
+        logger.warning("⚠ Performance may be degraded. First run may be slow.")
 
         if os.getenv("REQUIRE_AOT", "false").lower() == "true":
             logger.critical("❌ REQUIRE_AOT=true but AOT unavailable - exiting")
