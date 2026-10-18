@@ -688,7 +688,7 @@ class _FakeRedisStateStore:
 
     async def set_metadata(self, key, value, ttl=None):
         self.written[key] = value
-
+        return True
 
 def _call(**kw):
     db = _FakeRedisStateStore()

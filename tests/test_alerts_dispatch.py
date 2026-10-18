@@ -544,6 +544,9 @@ class FakeRedis:
     def pipeline(self):
         return FakePipe(self.store, self.log)
 
+    async def mget(self, keys):
+        self.log.append("redis_execute")
+        return ["raw"] * len(keys)
 
 def _make_store(monkeypatch, log):
     sdb = object.__new__(RedisStateStore)
@@ -1000,6 +1003,9 @@ def _one_trade_store(rows, degraded=False):
     class _R:
         def pipeline(self, transaction=False):
             return _P()
+
+        async def mget(self, keys):
+            return [rows.get(k) for k in keys]
 
     s = object.__new__(state.RedisStateStore)
     s.degraded = degraded
