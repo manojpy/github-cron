@@ -24,6 +24,7 @@ import brain_recommend_baseline as _baseline
 from brain_helpers import (
     CALIBRATION_CURVES_KEY,
     KILL_SWITCH_KEY,
+    pick_family_leaf,
     MARKET_STATE_MODEL_KEY,
     ONLINE_MODEL_STATE_KEY,
     FEATURE_DATASET_KEY,
@@ -491,6 +492,13 @@ class BrainCore:
         summary["min_passes"] = int(getattr(cfg, "CHALLENGER_MIN_CONSECUTIVE_PASSES", 3))
         if st is None or summary.get("status") == "no_champion":
             return summary
+        # A restart from a new base builds a fresh state dict; carry the
+        # promotion/demotion history over so "last promoted" survives it.
+        if prev:
+            for _k in ("last_promoted_at", "last_demoted_at"):
+                if prev.get(_k) and not st.get(_k):
+                    st[_k] = prev[_k]
+
         # st is the stored state updated in place, or a fresh one (promoted=False)
         # after a restart from a new base, which therefore always demotes.
         was_promoted = bool(prev and prev.get("promoted"))
@@ -509,12 +517,17 @@ class BrainCore:
         summary["would_promote"] = bool(ok and int(st.get("passes") or 0) >= min_passes)
         if st.get("promoted") and (status == "batch_better" or not drift_ok):
             st["promoted"], st["promoted_at"] = False, None
+
         if was_promoted and not st.get("promoted"):
             summary["demoted"] = True
+            st["last_demoted_at"] = now
         if mode == "live" and not st.get("promoted") and summary["would_promote"]:
             st["promoted"], st["promoted_at"] = True, now
+            st["last_promoted_at"] = now
             summary["promoted_now"] = True
         summary["promoted"] = bool(st.get("promoted"))
+        summary["last_promoted_at"] = st.get("last_promoted_at")
+        summary["last_demoted_at"] = st.get("last_demoted_at")
         try:
             await self.sdb.set_metadata(ONLINE_MODEL_STATE_KEY, json_dumps(st), timeout=5.0, ttl=30 * 86400)
             self._online_state_cache, self._online_state_cache_ts = st, time.time()
@@ -697,10 +710,6 @@ class BrainCore:
         bundle = await self._load_quality_inputs()
         if not bundle:
             return None
-        ev_model_result = bundle.get("ev_by_alert", {}).get(alert_key)
-        if not ev_model_result:
-            return None
-        calibration_curve = await self._load_calibration_curve(alert_key)
         context = dict(live_context or {})
         context.setdefault("adx_val", adx_val)
 
@@ -712,6 +721,33 @@ class BrainCore:
             regime = "trending" if leaf_adx >= median_adx else "ranging"
         else:
             regime = "unknown"
+
+        ev_model_result = bundle.get("ev_by_alert", {}).get(alert_key)
+        family_pooled = False
+        if not ev_model_result:
+            # No EV model for this alert key (too few trades of its own):
+            # borrow its family's pooled evidence instead of returning no
+            # verdict. p_ev_positive stays a neutral 0.5 and nothing is
+            # marked OOS-validated, so the verdict stays conservative.
+            fam_leaf, fam_key = pick_family_leaf(
+                bundle.get("family_leaves"), alert_key, direction, regime,
+                int(getattr(cfg, "FAMILY_POOLING_MIN_SAMPLE", 25)),
+            )
+            if not fam_leaf:
+                return None
+            family_pooled = True
+            ev_model_result = {
+                "n": fam_leaf["n"],
+                "net_ev": fam_leaf["shrunk_net_ev"],
+                "ev_p5": fam_leaf["shrunk_net_ev"],
+                "p_ev_positive": 0.5,
+                "oos_validated": False,
+                "hierarchical_wr": fam_leaf["shrunk_wr"],
+                "net_ev_source": "family_pooled",
+                "net_ev_leaf_key": fam_key,
+                "net_ev_leaf_n": fam_leaf["n"],
+            }
+        calibration_curve = await self._load_calibration_curve(alert_key)
 
         ev_model_result = dict(ev_model_result)
         leaf_key = f"{pair}|{alert_key}|{direction}|{regime}"
@@ -748,7 +784,7 @@ class BrainCore:
 
             ev_model_result["net_ev_leaf_n"] = leaf["n"]
             ev_model_result["net_ev_leaf_key"] = leaf_key
-        else:
+        elif not family_pooled:
             ev_model_result["net_ev_source"] = "alert_baseline"
         row = {
             "pair": pair,

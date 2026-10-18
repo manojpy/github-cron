@@ -60,7 +60,7 @@ from fetcher import (
 )
 
 from state import RedisStateStore, TokenBucket, _rc
-from brain_helpers import KILL_SWITCH_KEY
+from brain_helpers import kill_switch_mode
 
 from gates import GateResult, IndicatorCache
 import threshold_engine as engine
@@ -2313,7 +2313,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     _, ts_curr, reference_time = gr.i15, gr.ts_curr, gr.reference_time
     _disabled_hits = context.pop("brain_disabled_hits", None) or []
 
-    if cfg.ENABLE_KILL_SWITCH and sdb and not sdb.degraded and sdb._redis:
+    if kill_switch_mode() == "live" and sdb and not sdb.degraded and sdb._redis:
         if kill_switch_active_run is _SENTINEL_UNSET:
             try:
                 is_active = bool(await sdb._safe_redis_op(

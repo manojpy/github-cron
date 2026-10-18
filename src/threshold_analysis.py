@@ -566,7 +566,7 @@ def layered_window_analysis(recent_rows: List[Row], medium_rows: List[Row], long
 
     return {"valid": bool(per_alert), "per_alert": per_alert}
 
-def hierarchical_combination_analysis(rows: List[Row], min_leaf_sample: int = 10, shrinkage_k: float = 20.0) -> Dict[str, Any]: 
+def hierarchical_combination_analysis(rows: List[Row], min_leaf_sample: int = 10, shrinkage_k: float = 20.0, family_min_sample: int = 25) -> Dict[str, Any]:
     if not rows:
         return {"valid": False}
 
@@ -647,8 +647,55 @@ def hierarchical_combination_analysis(rows: List[Row], min_leaf_sample: int = 10
             "alert_dir_baseline_net_ev": round(parent_dir["net_ev"], 4),
             "vs_alert_dir_baseline": round(shrunk["net_ev"] - parent_dir["net_ev"], 4),
         }
+    # ── Family pooling for rare alert keys ──
+    # Pools every alert key of one family so a key with almost no history of
+    # its own can borrow evidence from its siblings. Several keys of a family
+    # often fire on the same pair and candle and share one outcome, so rows
+    # are de-clustered first (one row per family+pair+direction+entry_ts).
+    fam_rows: List[Row] = []
+    seen_cluster: Set[Tuple[Any, ...]] = set()
+    for r in rows:
+        ts = r.get("entry_ts")
+        if ts is not None:
+            ck = (alert_family_of(r["alert_key"]), r.get("pair", "?"), r.get("direction", "?"), int(ts))
+            if ck in seen_cluster:
+                continue
+            seen_cluster.add(ck)
+        fam_rows.append(r)
+    by_fam_dir: DefaultDict[Tuple[str, str], List[Row]] = defaultdict(list)
+    by_fam_dir_reg: DefaultDict[Tuple[str, str, str], List[Row]] = defaultdict(list)
+    for r in fam_rows:
+        fam = alert_family_of(r["alert_key"])
+        d = r.get("direction", "?")
+        by_fam_dir[(fam, d)].append(r)
+        by_fam_dir_reg[(fam, d, _regime(r))].append(r)
+    fam_global = _raw(fam_rows)
+    family_leaves: Dict[str, Any] = {}
+    fam_dir_shrunk: Dict[Tuple[str, str], Dict[str, float]] = {}
+    for (fam, d), bucket in by_fam_dir.items():
+        raw = _raw(bucket)
+        if raw["n"] < family_min_sample:
+            continue
+        shrunk = _shrink(raw, fam_global)
+        fam_dir_shrunk[(fam, d)] = shrunk
+        family_leaves[f"{fam}|{d}|*"] = {
+            "family": fam, "direction": d, "regime": "*", "n": raw["n"],
+            "raw_wr": round(raw["wr"], 3), "shrunk_wr": round(shrunk["wr"], 3),
+            "raw_net_ev": round(raw["net_ev"], 4), "shrunk_net_ev": round(shrunk["net_ev"], 4),
+        }
+    for (fam, d, reg), bucket in by_fam_dir_reg.items():
+        raw = _raw(bucket)
+        parent = fam_dir_shrunk.get((fam, d))
+        if raw["n"] < family_min_sample or parent is None:
+            continue
+        shrunk = _shrink(raw, parent)
+        family_leaves[f"{fam}|{d}|{reg}"] = {
+            "family": fam, "direction": d, "regime": reg, "n": raw["n"],
+            "raw_wr": round(raw["wr"], 3), "shrunk_wr": round(shrunk["wr"], 3),
+            "raw_net_ev": round(raw["net_ev"], 4), "shrunk_net_ev": round(shrunk["net_ev"], 4),
+        }
 
-    return {"valid": bool(leaves), "median_adx": median_adx, "leaves": leaves}
+    return {"valid": bool(leaves), "median_adx": median_adx, "leaves": leaves, "family_leaves": family_leaves}
 
 def per_pair_thresholds(rows: List[Row], target_winrate: float = 0.55, min_sample: int = 30) -> Dict[str, Dict[str, Any]]:
     """Per-pair analogue of recommend_threshold(): groups rows by pair and

@@ -13,8 +13,8 @@ import threshold_engine as engine
 from plan_replay import build_plan_lab
 from alerts import escape_markdown_v2
 from state import format_outcome_totals
-from alert_registry import alert_family_of as _registry_family_of, pretty_alert as _pretty_alert
-from brain_helpers import multiple_testing_note
+from alert_registry import ALERT_KEYS, alert_family_of as _registry_family_of, pretty_alert as _pretty_alert
+from brain_helpers import multiple_testing_note, kill_switch_mode
 
 _PHASE_MIN_SAMPLES = {
     "weight_optimizer": 100,
@@ -175,6 +175,7 @@ def _collect_facts(recs: Dict[str, Any], cfg) -> Dict[str, Any]:
         "recon": audit.reconciliation_snapshot(),
         "coverage": audit.history_coverage(),
         "plan_lifecycle": recs.get("_plan_lifecycle") or {},
+        "recs_list": recs.get("recommendations", []) or [],
     }
     F["gate_ok"] = bool(F["gate"].get("actionable"))
     span = audit.history_span()
@@ -409,6 +410,18 @@ def _overall(F: Dict[str, Any]) -> str:
 
 def _fmt_days(d: Optional[float]) -> str:
     return "n/a" if d is None else f"{d:.1f} days"
+
+def _fmt_age(ts: Any) -> str:
+    """'14h ago' style age of a unix timestamp ('n/a' when unusable)."""
+    try:
+        secs = max(0.0, datetime.now(timezone.utc).timestamp() - float(ts))
+    except (TypeError, ValueError):
+        return "n/a"
+    if secs < 3600:
+        return f"{int(secs // 60)}m ago"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h ago"
+    return f"{int(secs // 86400)}d ago"
 
 def _fmt_span(d: Optional[float]) -> str:
     """Adjective form: '2.5-day' (for 'the current 2.5-day sample')."""
@@ -695,7 +708,7 @@ def _sec_do_now(F: Dict[str, Any], cfg) -> List[_Piece]:
         do_now.append(f"Investigate the very low {wr:.0%} win rate (see section 04).")
     if F["gate"].get("stability") is False or F["gate"].get("risk") is False:
         do_now.append("Monitor active drift/drawdown warnings.")
-    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"• {x}" for x in do_now)))
+    out.append(_p("🔴 DO NOW\n\n" + "\n".join(f"�� {x}" for x in do_now)))
     watch: List[str] = []
     seen = set()
     for a in F["weak"]:
@@ -1627,6 +1640,215 @@ def _sec_reasoning_chain(F: Dict[str, Any], cfg) -> List[_Piece]:
         out.append(_p(f"Reasoning chain unavailable: {type(e).__name__}"))
     return out
 
+_TRUSTED_MIN_REAL = 30      # real trades an alert key needs before its numbers are "trusted"
+_TRUSTED_MIN_SHADOW = 15    # plus this many shadow (counterfactual) trades
+
+def _health_rows(F: Dict[str, Any], cfg) -> List[Tuple[str, str, str]]:
+    """(icon, label, detail) rows describing the Brain's own learning
+    machinery (data, calibration, models, safety switches), not trading
+    results. Reads only what the report already holds. Each check is
+    isolated: one failing check shows as unavailable and never hides the rest."""
+    ai = F.get("ai") or {}
+    rows: List[Tuple[str, str, str]] = []
+
+    def add(icon: str, label: str, detail: str) -> None:
+        rows.append((icon, label, detail))
+
+    def guard(label: str, fn) -> None:
+        try:
+            fn()
+        except Exception as e:
+            logging.getLogger("macd_bot").warning(f"Brain health: '{label}' check failed: {type(e).__name__}: {e}")
+            add("⚪", label, "unavailable (check failed, see logs)")
+
+    def evidence() -> None:
+        n, n_sh = int(F.get("n", 0)), len(F.get("shadow_rows") or [])
+        days, req = F.get("days"), F.get("req_days")
+        # Thin evidence is "still learning", not a fault, so it is amber, never red.
+        icon = {"HIGH": "🟢", "MODERATE": "🟡"}.get(str(F.get("conf")), "🟠")
+        span = f"{days:.1f} of {req} days" if days is not None and req else "span unknown"
+        add(icon, "Evidence base", f"{n} real + {n_sh} shadow outcomes over {span}; confidence {F.get('conf')}")
+
+    def reconciliation() -> None:
+        rec = F.get("recon")
+        if rec is None:
+            add("⚪", "Outcome bookkeeping", "no reconciliation this run")
+            return
+        def _n(v: Any) -> str:
+            return "n/a" if v is None else str(v)
+        icon = rec.status.icon
+        detail = (
+            f"{_n(rec.loaded_by_brain)} loaded by Brain, {_n(rec.pending_count)} pending; "
+            f"this run resolved {_n(rec.resolved_this_run)}, archived {_n(rec.archived_this_run)}"
+        )
+        if rec.resolved_this_run is not None and rec.archived_this_run is not None \
+                and rec.resolved_this_run != rec.archived_this_run:
+            icon = "🟡" if icon == "🟢" else icon
+            detail += f" (gap of {abs(rec.resolved_this_run - rec.archived_this_run)})"
+        add(icon, "Outcome bookkeeping", detail)
+
+    def features() -> None:
+        df = ai.get("data_foundation")
+        if not df or not df.get("n"):
+            add("⚪", "Feature data", "dataset not built this run")
+            return
+        h = int(getattr(cfg, "OUTCOME_LOOKAHEAD_CANDLES", 12))
+        hz = df.get("horizons") or {}
+        entry = hz.get(h) or hz.get(str(h)) or {}
+        frac = entry.get("frac")
+        share = float(df.get("current_version_share") or 0.0)
+        notes = [f"{df.get('current_version')} on {share:.0%} of {df['n']} rows"]
+        if frac is not None:
+            notes.append(f"{h}-candle labels {frac:.0%}")
+        ok = not df.get("mixed_versions") and not df.get("leaked_keys") and (frac is None or frac >= 0.9)
+        if df.get("mixed_versions"):
+            notes.append("MIXED feature versions")
+        if df.get("leaked_keys"):
+            notes.append(f"{df['leaked_keys']} post-outcome fields removed")
+        if (df.get("cache") or {}).get("verified") is False:
+            ok = False
+            notes.append("cache failed spot-check, rebuilt")
+        add("🟢" if ok else "🟡", "Feature data", "; ".join(notes))
+
+    def calibration() -> None:
+        ece = ai.get("calibration_ece_mean")
+        saved = ai.get("calibration_persistence")
+        gate = "ON" if getattr(cfg, "ENABLE_CALIBRATION_GATE", False) else "OFF"
+        if ece is None:
+            add("⚪", "Calibration", f"no curve measured yet; gate {gate}")
+            return
+        icon = "🟢" if ece <= 0.10 else "🟡" if ece <= 0.20 else "🔴"
+        if saved == "FAILED":
+            icon = "🔴"
+        add(icon, "Calibration", f"error (ECE) {ece:.2f}, lower is better; curve saved: {saved or 'n/a'}; gate {gate}")
+
+    def online() -> None:
+        om = ai.get("online_model")
+        if not om or not om.get("mode"):
+            add("⚪", "Online model", "off or not run this report")
+            return
+        icon = {"online_better": "🟢", "indistinguishable": "🟡", "batch_better": "🟡"}.get(om.get("status"), "🟠")
+        parts = [f"{om['mode']} mode", f"{om.get('n_eval', 0)} paired trades"]
+        if om.get("mean_brier_gain") is not None:
+            parts.append(f"Brier gain vs batch {om['mean_brier_gain']:+.4f}")
+        parts.append(f"passes {om.get('passes', 0)}/{om.get('min_passes', 3)}")
+        parts.append("serving" if om.get("promoted") else "not serving")
+        parts.append(f"last promoted {_fmt_age(om['last_promoted_at'])}" if om.get("last_promoted_at") else "never promoted")
+        if om.get("last_demoted_at"):
+            parts.append(f"last demoted {_fmt_age(om['last_demoted_at'])}")
+        if om.get("demoted"):
+            icon = "🟡"
+            parts.append("DEMOTED this run")
+        add(icon, "Online model", "; ".join(parts))
+
+    def challenger() -> None:
+        if not getattr(cfg, "ENABLE_CHAMPION_CHALLENGER", False):
+            add("⚪", "Weight challenger", "off")
+            return
+        cp = ai.get("challenger_promotion")
+        if not cp:
+            add("⚪", "Weight challenger", "no challenger waiting")
+        elif cp.get("promoted"):
+            add("🟢", "Weight challenger", "promoted to champion this run")
+        else:
+            add("🟡", "Weight challenger", f"not promoted: {str(cp.get('reason', 'n/a')).replace('_', ' ')}")
+
+    def kill_switch() -> None:
+        mode = ai.get("kill_switch_mode") or kill_switch_mode(cfg)
+        if mode == "off":
+            add("⚪", "Kill switch", "off (alerts are not paused by a loss streak or drawdown)")
+            return
+        ks = ai.get("kill_switch")
+        if mode == "shadow":
+            log = ai.get("kill_switch_shadow_log") or []
+            history = (
+                f"; would have fired {len(log)} time(s), last {_fmt_age(log[0].get('ts'))}"
+                if log else "; has never fired"
+            )
+            if not ks:
+                add("⚪", "Kill switch", "shadow mode, not evaluated this run" + history)
+            elif ks.get("tripped"):
+                add("🟠", "Kill switch", f"shadow: WOULD be tripped now ({ks.get('reason', 'n/a')}), alerts still sent" + history)
+            else:
+                add("🟢", "Kill switch", f"shadow mode, not tripped (streak {ks.get('consecutive_losses', 'n/a')}, drawdown {ks.get('drawdown_pct', 'n/a')}%)" + history)
+            return
+        if not ks:
+            add("⚪", "Kill switch", "armed, not evaluated this run")
+        elif ks.get("tripped"):
+            add("🔴", "Kill switch", f"TRIPPED: {ks.get('reason', 'n/a')}")
+        else:
+            add("🟢", "Kill switch", f"armed, not tripped (streak {ks.get('consecutive_losses', 'n/a')}, drawdown {ks.get('drawdown_pct', 'n/a')}%)")
+
+    def drift() -> None:
+        if not F.get("n"):
+            add("⚪", "Edge-decay alarms", "no outcomes to monitor")
+            return
+        keys = sorted({r.get("alert") for r in (F.get("recs_list") or []) if r.get("type") == "cusum_drift" and r.get("alert")})
+        if keys or F.get("gate", {}).get("stability") is False:
+            shown = ", ".join(_pretty_alert(k) for k in keys[:4]) if keys else "see action gate"
+            add("🔴", "Edge-decay alarms", f"{len(keys)} alert key(s) flagged: {shown}")
+        else:
+            add("🟢", "Edge-decay alarms", "none active")
+
+    def disabled() -> None:
+        dk = ai.get("disabled_alert_keys")
+        if dk is None:
+            add("⚪", "Disabled alert keys", "not reported this run")
+            return
+        cap = int(getattr(cfg, "BRAIN_MAX_DISABLED_KEYS", 6))
+        icon = "🟢" if not dk else "🟡" if len(dk) < cap else "🔴"
+        names = (": " + ", ".join(_pretty_alert(k) for k in list(dk)[:5])) if dk else ""
+        add(icon, "Disabled alert keys", f"{len(dk)} of cap {cap}{names}")
+
+    def trust() -> None:
+        alerts = F.get("alerts") or []
+        total = len(ALERT_KEYS)
+        act_min = int(getattr(cfg, "BRAIN_AUTO_DISABLE_MIN_SAMPLE", 200))
+        shadow_n: Dict[str, int] = defaultdict(int)
+        for r in (F.get("shadow_rows") or []):
+            shadow_n[r.get("alert_key")] += 1
+        n_ev = sum(1 for a in alerts if a.get("ev") is not None)
+        n_trusted = sum(
+            1 for a in alerts
+            if a.get("n", 0) >= _TRUSTED_MIN_REAL and shadow_n.get(a.get("key"), 0) >= _TRUSTED_MIN_SHADOW
+        )
+        n_act = sum(1 for a in alerts if a.get("n", 0) >= act_min)
+        icon = "🟠" if n_trusted == 0 else "🟡" if n_trusted * 2 < max(len(alerts), 1) else "🟢"
+        add(icon, "Alert keys with evidence",
+            f"{len(alerts)} of {total} seen; {n_ev} usable EV (10+ real); "
+            f"{n_trusted} trusted ({_TRUSTED_MIN_REAL}+ real and {_TRUSTED_MIN_SHADOW}+ shadow); "
+            f"{n_act} ready to auto-act on ({act_min}+ real)")
+
+    for label, fn in (
+        ("Evidence base", evidence), ("Outcome bookkeeping", reconciliation), ("Feature data", features),
+        ("Calibration", calibration), ("Online model", online), ("Weight challenger", challenger),
+        ("Kill switch", kill_switch), ("Edge-decay alarms", drift), ("Disabled alert keys", disabled),
+        ("Alert keys with evidence", trust),
+    ):
+        guard(label, fn)
+    return rows
+
+def _health_overall(rows: Sequence[Tuple[str, str, str]]) -> str:
+    icons = {r[0] for r in rows}
+    if "🔴" in icons:
+        return "🔴 NEEDS ATTENTION — at least one item is failing, tripped or alarming (see the red line)."
+    if icons & {"🟡", "🟠"}:
+        return "🟡 LEARNING — working, but some parts still need more data or a look."
+    return "🟢 HEALTHY — every checked part of the learning machinery is working."
+
+def _sec_health(F: Dict[str, Any], cfg) -> List[_Piece]:
+    import textwrap
+    out = [_hdr(10, '🩺 BRAIN HEALTH — "IS THE LEARNING MACHINERY WORKING?"')]
+    out.append(_p("This checks the Brain's own machinery (data, calibration, models, safety switches), not trading results."))
+    rows = _health_rows(F, cfg)
+    lines: List[str] = []
+    for icon, label, detail in rows:
+        lines.append(f"{icon} {label}")
+        lines.extend(textwrap.wrap(detail, 38, initial_indent="   ", subsequent_indent="   "))
+    out.extend(_c_split(lines))
+    out.append(_p("OVERALL: " + _health_overall(rows)))
+    return out
+
 _REPORT_SECTIONS = (
     ("BRAIN DECISION", _sec_reasoning_chain),
     ("EXECUTIVE SUMMARY", _sec_summary),
@@ -1637,6 +1859,7 @@ _REPORT_SECTIONS = (
     ("ALERT SCORECARD", _sec_scorecard),
     ("SESSION ANALYSIS", _sec_sessions),
     ("ACTION GATE", _sec_gate),
+    ("BRAIN HEALTH", _sec_health),
 )
 
 def build_brain_report_sections(recs: Dict[str, Any], cfg) -> Tuple[List[List["_Piece"]], str]:

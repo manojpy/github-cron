@@ -4,7 +4,7 @@ Split out of the original module without logic changes; the original
 module remains as a facade re-exporting every name."""
 from __future__ import annotations
 from typing import Any, Dict, List, Optional
-from alert_registry import resolve_alert_config_path
+from alert_registry import resolve_alert_config_path, alert_family_of
 from bot_config import cfg
 import threshold_engine as engine
 
@@ -12,6 +12,8 @@ _OVERRIDE_COOLDOWN_PREFIX = "brain_override_cooldown:"
 CALIBRATION_CURVES_KEY = "brain:calibration_curves"
 QUALITY_INPUTS_KEY = "brain:quality_inputs"
 KILL_SWITCH_KEY = "brain:kill_switch_active"
+KILL_SWITCH_SHADOW_KEY = "brain:kill_switch_shadow_active"
+KILL_SWITCH_SHADOW_LOG_KEY = "brain:kill_switch_shadow_log"
 MARKET_STATE_MODEL_KEY = "brain:market_state_model"
 ONLINE_MODEL_STATE_KEY = "brain:online_model_state"
 FEATURE_DATASET_KEY = "brain:feature_dataset"
@@ -20,6 +22,92 @@ EXPERIMENT_LEDGER_KEY = "brain_experiment_ledger"
 HYPOTHESIS_LEDGER_KEY = "brain_hypothesis_ledger"
 HYPOTHESIS_POOL_KEY = "brain_hypothesis_pool"
 ACTION_PLAN_KEY = "brain_action_plan"
+
+def pick_family_leaf(family_leaves: Optional[Dict[str, Any]], alert_key: str, direction: str,
+                     regime: str, min_n: int):
+    """Family-pooled stand-in evidence for an alert key with no EV model.
+    Tries family|direction|regime, then family|direction|*; a pool below
+    min_n is ignored. Returns (leaf, leaf_key) or (None, None)."""
+    fam = alert_family_of(alert_key)
+    for reg in ((regime, "*") if regime not in ("*", "unknown") else ("*",)):
+        key = f"{fam}|{direction}|{reg}"
+        leaf = (family_leaves or {}).get(key)
+        if leaf and int(leaf.get("n", 0)) >= min_n:
+            return leaf, key
+    return None, None
+
+def kill_switch_mode(c=None) -> str:
+    """Effective kill-switch mode: 'off' | 'shadow' | 'live'.
+
+    KILL_SWITCH_MODE wins when it is 'shadow' or 'live'. When it is 'off'
+    the legacy ENABLE_KILL_SWITCH=true still means 'live', so existing
+    configs behave exactly as before."""
+    c = c or cfg
+    mode = str(getattr(c, "KILL_SWITCH_MODE", "off") or "off").lower()
+    if mode not in ("off", "shadow", "live"):
+        mode = "off"
+    if mode == "off" and getattr(c, "ENABLE_KILL_SWITCH", False):
+        return "live"
+    return mode
+
+async def record_kill_switch_shadow(sdb, ks_state: Dict[str, Any], cooldown_hours: float) -> bool:
+    """Shadow mode: remember that the kill switch WOULD have tripped.
+
+    Mirrors the live cooldown: the shadow key is set with SET NX for the
+    cooldown period, so one sustained breach is logged once, not once per
+    run. Returns True only for a NEW would-be trip. Never touches the live
+    key and never blocks anything. Redis trouble returns False."""
+    import time as _time
+    from bot_config import json_dumps
+    from state import _rc
+    if not getattr(sdb, "_redis", None) or getattr(sdb, "degraded", False):
+        return False
+    ttl = int(cooldown_hours * 3600)
+    event = {
+        "ts": int(_time.time()),
+        "reason": str(ks_state.get("reason", "n/a")),
+        "consecutive_losses": ks_state.get("consecutive_losses"),
+        "drawdown_pct": ks_state.get("drawdown_pct"),
+    }
+    try:
+        is_new = await sdb._safe_redis_op(
+            lambda: _rc(sdb._redis).set(KILL_SWITCH_SHADOW_KEY, json_dumps(event), ex=ttl, nx=True),
+            2.0, "kill_switch_shadow_set",
+        )
+        if not is_new:
+            return False
+        await sdb._safe_redis_op(
+            lambda: _rc(sdb._redis).lpush(KILL_SWITCH_SHADOW_LOG_KEY, json_dumps(event)),
+            2.0, "kill_switch_shadow_log",
+        )
+        await sdb._safe_redis_op(
+            lambda: _rc(sdb._redis).ltrim(KILL_SWITCH_SHADOW_LOG_KEY, 0, 99),
+            2.0, "kill_switch_shadow_trim",
+        )
+        return True
+    except Exception:
+        return False
+
+async def load_kill_switch_shadow_log(sdb) -> List[Dict[str, Any]]:
+    """Newest-first list of recorded would-be trips (empty on any failure)."""
+    from bot_config import json_loads
+    from state import _rc
+    if not getattr(sdb, "_redis", None) or getattr(sdb, "degraded", False):
+        return []
+    try:
+        raw = await sdb._safe_redis_op(
+            lambda: _rc(sdb._redis).lrange(KILL_SWITCH_SHADOW_LOG_KEY, 0, 99),
+            2.0, "kill_switch_shadow_read",
+        )
+        out: List[Dict[str, Any]] = []
+        for item in raw or []:
+            try:
+                out.append(json_loads(item))
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
 
 def count_brain_trials(ai_metrics: Dict[str, Any], n_recommendations: int) -> Dict[str, int]:
     """How many candidate hypotheses this Brain cycle examined (not just the

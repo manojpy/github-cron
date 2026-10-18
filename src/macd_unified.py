@@ -33,17 +33,14 @@ from indicators import (
     _normalize_samples, _prune_stale_samples, _oi_funding_gate_reason,
     calculate_ichimoku_numpy,
 )
-# ── state / gates / alerts : trim to direct usage ─
-from brain_helpers import KILL_SWITCH_KEY
-
 from state import (
     _blanket_reset_pair, _clear_all_redis_states, _redis_key_inventory, build_products_map_from_cfg,
     RedisKeyPrefix, RedisStateStore, RedisLock, _rc, format_outcome_totals,
 )
-
 from gates import GateResult, compute_confluence_score, _eval_gate, _resolve_pair_outcomes
 import threshold_engine as engine
 from brain_engine import BrainEngine
+from brain_helpers import kill_switch_mode, record_kill_switch_shadow
 
 _ALERT_ONLY_MODE: bool = False
 
@@ -687,7 +684,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             preloads.start("pair_thresholds", state_db.get_pair_thresholds)
         if cfg.ENABLE_PORTFOLIO_HEAT_GATE:
             preloads.start("heat_positions", _heat_positions)
-        if cfg.ENABLE_KILL_SWITCH:
+        if kill_switch_mode() == "live":
             preloads.start("kill_switch", _kill_switch_flag)
         preloads.start("last_processed",
                        lambda: state_db.get_last_processed_candle_ts_bulk(pairs_to_process))
@@ -1041,7 +1038,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             )
 
     kill_switch_active_run: bool = False
-    if cfg.ENABLE_KILL_SWITCH and state_db and not state_db.degraded and state_db._redis:
+    if kill_switch_mode() == "live" and state_db and not state_db.degraded and state_db._redis:
         try:
             kill_switch_active_run = bool(await preloads.take("kill_switch", _kill_switch_flag))
         except Exception as e:
@@ -1255,7 +1252,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     eval_elapsed = time.time() - eval_start
     logger_main.debug(f"Evaluation complete: {eval_elapsed:.1f}s")
     kill_switch_tripped_this_run = False
-    if (cfg.ENABLE_KILL_SWITCH and not kill_switch_active_run
+    _ks_mode = kill_switch_mode()
+    if (_ks_mode != "off" and not kill_switch_active_run
             and state_db and not state_db.degraded and state_db._redis):
         try:      
             from outcome_storage import load_recent_outcomes
@@ -1278,9 +1276,15 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                     ks_state["tripped"] = False
                     ks_state["reason"] = f"DOWNGRADED: {ks_state['reason']} (EV positive)"
 
-            if ks_state["tripped"]:
+            if ks_state["tripped"] and _ks_mode == "shadow":
+                if await record_kill_switch_shadow(state_db, ks_state, cfg.KILL_SWITCH_COOLDOWN_HOURS):
+                    logger_main.warning(
+                        f"🧠 Kill-switch would have fired (shadow, not blocking): {ks_state['reason']}"
+                    )
+            elif ks_state["tripped"]:
                 kill_switch_tripped_this_run = True
                 ttl = int(cfg.KILL_SWITCH_COOLDOWN_HOURS * 3600)
+
                 await state_db._safe_redis_op(
                     lambda: _rc(state_db._redis).set(
                         KILL_SWITCH_KEY, json_dumps(ks_state), ex=ttl,

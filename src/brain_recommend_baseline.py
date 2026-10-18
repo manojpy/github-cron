@@ -16,6 +16,7 @@ from brain_layers import cached_audit
 from brain_audit import get_audit, HealthStatus
 from brain_helpers import (
     KILL_SWITCH_KEY, _resolve_config_path,
+    kill_switch_mode, record_kill_switch_shadow, load_kill_switch_shadow_log,
     EXPERIMENT_LEDGER_KEY, HYPOTHESIS_POOL_KEY, count_brain_trials, update_experiment_ledger,
 )
 
@@ -47,6 +48,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
         recommendations.extend(drift_alerts)
 
     current_disabled_keys = await self.sdb.get_disabled_alert_keys()
+    ai_metrics["disabled_alert_keys"] = sorted(current_disabled_keys)
     auto_disable_min = getattr(cfg, "BRAIN_AUTO_DISABLE_MIN_SAMPLE", 500)
     auto_disable_on = getattr(cfg, "BRAIN_AUTO_DISABLE_ENABLED", False)
     recency_on = getattr(cfg, "ENABLE_RECENCY_WEIGHTING", False)
@@ -398,7 +400,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
         # against the same rows. On a 2-day archive it burns ~15s to
         # produce a statistic the audit layer already knows is
         # unreliable. Consult can_run() first; if it says the sample
-        # or history is insufficient, record the skip and move on. ──
+        # or history is insufficient, record the skip and move on. ���─
         _mc_allowed, _mc_reason = audit.can_run("monte_carlo")
         if _mc_allowed:
             _mc_seed = int(
@@ -538,6 +540,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                     real_rows,
                     min_leaf_sample=getattr(cfg, "HIERARCHICAL_MIN_LEAF_SAMPLE", 15),
                     shrinkage_k=getattr(cfg, "HIERARCHICAL_SHRINKAGE_K", 20.0),
+                    family_min_sample=getattr(cfg, "FAMILY_POOLING_MIN_SAMPLE", 25),
                 )
                 _elapsed_hca = (time.time() - _t0_hca) * 1000
                 if hca.get("valid"):
@@ -1347,6 +1350,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             "regime_info": rb,
             "hierarchical_leaves": hca.get("leaves", {}) if hca.get("valid") else {},
             "hierarchical_median_adx": hca.get("median_adx"),
+            "family_leaves": hca.get("family_leaves", {}),
             "regime_gate": regime_gate_blob if regime_gate_blob.get("valid") else {},
             "zone_profiles": zone_blob,
             "mae_mfe_profiles": mae_mfe_profiles,
@@ -1463,7 +1467,8 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                 )
 
     # ── Kill switch: fast-failure stop (streak / rolling drawdown) ──
-    if getattr(cfg, "ENABLE_KILL_SWITCH", False):
+    _ks_mode = kill_switch_mode()
+    if _ks_mode != "off":
         ks = engine.KillSwitch(
             max_consecutive_losses=getattr(cfg, "KILL_SWITCH_MAX_CONSECUTIVE_LOSSES", 6),
             max_drawdown_pct=getattr(cfg, "KILL_SWITCH_MAX_DRAWDOWN_PCT", 3.0),
@@ -1473,7 +1478,22 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
         )
         ks_state = ks.evaluate(real_rows)
         ai_metrics["kill_switch"] = ks_state
-        if ks_state["tripped"]:
+        ai_metrics["kill_switch_mode"] = _ks_mode
+        if _ks_mode == "shadow":
+            if ks_state["tripped"]:
+                await record_kill_switch_shadow(
+                    self.sdb, ks_state, getattr(cfg, "KILL_SWITCH_COOLDOWN_HOURS", 12),
+                )
+                recommendations.append({
+                    "type": "kill_switch_shadow",
+                    "severity": "warning",
+                    "message": (
+                        f"🧠 Kill-switch would have fired (shadow, not blocking): "
+                        f"{ks_state['reason']}"
+                    ),
+                })
+            ai_metrics["kill_switch_shadow_log"] = await load_kill_switch_shadow_log(self.sdb)
+        elif ks_state["tripped"]:
             ttl = int(getattr(cfg, "KILL_SWITCH_COOLDOWN_HOURS", 12) * 3600)
             if self.sdb._redis and not self.sdb.degraded:
                 await self.sdb._safe_redis_op(                   
