@@ -4,8 +4,6 @@ name: 📦 Dependency Check
 # up to date with what could be bumped (and pings Telegram when that list changes).
 # It never edits a file or opens a pull request: you decide what to change.
 on:
-  schedule:
-    - cron: "30 3 * * 1"      # Mondays 03:30 UTC = 09:00 IST
   workflow_dispatch:
 
 concurrency:
