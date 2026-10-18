@@ -60,8 +60,7 @@ from fetcher import (
 )
 
 from state import RedisStateStore, TokenBucket, _rc
-from brain_helpers import kill_switch_mode
-
+from brain_helpers import KILL_SWITCH_KEY, kill_switch_mode
 from gates import GateResult, IndicatorCache
 import threshold_engine as engine
 

@@ -40,7 +40,7 @@ from state import (
 from gates import GateResult, compute_confluence_score, _eval_gate, _resolve_pair_outcomes
 import threshold_engine as engine
 from brain_engine import BrainEngine
-from brain_helpers import kill_switch_mode, record_kill_switch_shadow
+from brain_helpers import KILL_SWITCH_KEY, kill_switch_mode, record_kill_switch_shadow
 
 _ALERT_ONLY_MODE: bool = False
 
