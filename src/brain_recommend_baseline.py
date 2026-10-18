@@ -400,7 +400,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
         # against the same rows. On a 2-day archive it burns ~15s to
         # produce a statistic the audit layer already knows is
         # unreliable. Consult can_run() first; if it says the sample
-        # or history is insufficient, record the skip and move on. ���─
+        # or history is insufficient, record the skip and move on.
         _mc_allowed, _mc_reason = audit.can_run("monte_carlo")
         if _mc_allowed:
             _mc_seed = int(
