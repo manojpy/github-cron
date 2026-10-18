@@ -459,11 +459,11 @@ class BrainEngineV2(BrainCore):
                     f"Brain plan {plan_id}: unexpected lifecycle transition {prev!r} -> {status!r}"
                 )
             hist.append(event)
-            await self.sdb.set_metadata(
+            _hist_ok = await self.sdb.set_metadata(
                 PLAN_HISTORY_KEY, json_dumps(hist[-PLAN_HISTORY_MAX:]),
                 ttl=365 * 86400,
             )
-            await self.sdb.set_metadata(
+            _state_ok = await self.sdb.set_metadata(
                 PLAN_STATE_KEY,
                 json_dumps({
                     "plan_id": plan_id, "state": status, "from": prev,
@@ -471,6 +471,10 @@ class BrainEngineV2(BrainCore):
                 }),
                 ttl=365 * 86400,
             )
+            if not (_hist_ok and _state_ok):
+                logging.getLogger("macd_bot").warning(
+                    f"Plan lifecycle event {plan_id}:{status} was not fully recorded (Redis write failed)"
+                )
         except Exception as e:
             logging.getLogger("macd_bot").debug(f"Plan history write failed (non-fatal): {e}")
 
@@ -695,9 +699,11 @@ class BrainEngineV2(BrainCore):
                 try:
                     counter_raw = await self.sdb.get_metadata("brain_plan_counter")
                     counter = int(counter_raw or 0) + 1
-                    await self.sdb.set_metadata(
+                    if not await self.sdb.set_metadata(
                         "brain_plan_counter", str(counter), ttl=365 * 86400
-                    )
+                    ):
+                        # An unsaved counter would hand the same PLAN id to the next plan.
+                        raise RuntimeError("brain_plan_counter write failed")
                     plan_id = f"PLAN-{counter:03d}"
                 except Exception:
                     plan_id = f"PLAN-{int(time.time())}"
@@ -792,11 +798,18 @@ class BrainEngineV2(BrainCore):
                 except Exception as e:
                     logging.getLogger("macd_bot").debug(f"Previous plan lookup failed (non-fatal): {e}")
 
-            await self.sdb.set_metadata(
+            if not await self.sdb.set_metadata(
                 "brain_pending_plan",
                 json_dumps(plan_data),
                 ttl=7 * 86400
-            )
+            ):
+                # apply_pending_plan applies whatever is stored, so a failed write
+                # would leave an OLDER plan in place under this report's plan id.
+                logging.getLogger("macd_bot").warning(
+                    f"Brain plan {plan_data.get('plan_id')} was NOT stored (Redis write failed); "
+                    "any older pending plan is still in Redis"
+                )
+                return
             if plan_data.get("plan_id"):
                 await self._record_plan_event(
                     str(plan_data["plan_id"]),
@@ -1404,7 +1417,12 @@ class BrainEngineV2(BrainCore):
                     plan.get("plan_id"), snap_overrides, snap_disabled, snap_weights,
                 )
                 # Clear the pending plan
-                await self.sdb.set_metadata("brain_pending_plan", "{}", ttl=60)
+                if not await self.sdb.set_metadata("brain_pending_plan", "{}", ttl=60):
+                    logger_run.warning(
+                        "Pending plan was NOT cleared after apply (Redis write failed); "
+                        "running --apply-brain again would re-apply it"
+                    )
+                    msg += "\n⚠️ Pending plan could not be cleared: do not apply again"
                 await telegram_queue.send(escape_markdown_v2(msg))
                 return True
             else:
