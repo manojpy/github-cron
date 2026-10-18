@@ -114,7 +114,7 @@ Results appear in Telegram and in the workflow summary / artifacts.
 
 ## ⏰ Scheduling
 
-Only `workflow_dispatch` is declared in `run-bot.yml`, `watchdog.yml`, `learner.yml`, `cleanup-outcomes.yml` and `dependency-check.yml`.
+Only `workflow_dispatch` is declared in `run-bot.yml`, `watchdog.yml`, `learner.yml`, `cleanup-outcomes.yml` and `dependency-check.yml`. This is intentional: timing comes from Cronjobs.org, which is more punctual than GitHub's own cron queue. Do not add a `schedule:` block on top of it, or you will get double runs.
 
 The bot run takes `TRIGGER_TIMESTAMP` (set when the workflow step starts) as its reference time and logs it in IST. If that timestamp is more than 10 minutes away from the current time, the bot falls back to the current time.
 
