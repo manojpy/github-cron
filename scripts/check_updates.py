@@ -143,8 +143,7 @@ def dry_run(req_lines: List[str], py_version: str) -> Tuple[bool, str]:
             "-r", str(req_file),
         ]
         try:
-
-p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=240)
+            p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=240)
         except subprocess.TimeoutExpired:
             return False, "pip dry-run timed out"
         if p.returncode == 0:
