@@ -96,14 +96,14 @@ def test_confidence_is_capped_by_history_span():
 def test_all_nine_sections_in_order_and_fit_telegram():
     msgs = _report(_rows__brain_report_v2(_SPEC))
     text = _plain(msgs)
-    positions = [text.index(f"{i:02d} │") for i in range(1, 10)]  # 01..09
+    positions = [text.index(f"{i:02d} │") for i in range(1, 11)]  # 01..10
     assert positions == sorted(positions)
     assert "BRAIN REPORT" in msgs[0] and "END OF BRAIN REPORT" in _plain(msgs[-1:])
     assert all(len(m) <= 4096 for m in msgs)
     # Human pack ends after section 06; context starts at 07
     assert text.index("06 │") < text.index("CONTEXT (sessions") < text.index("07 │")
 
-    for gone in ("10 │", "11 │", "12 │", "13 │", "14 │", "15 │", "16 │"):
+    for gone in ("11 │", "12 │", "13 │", "14 │", "15 │", "16 │"):
         assert gone not in text
 
 def test_counterfactual_candidates_beat_control_shown_in_what_to_do_now():
@@ -249,8 +249,8 @@ def test_report_is_archived_as_markdown_and_still_sent(monkeypatch):
     assert len(saved) == 1 and len(sent) >= 1
     md = saved[0]
     assert md.startswith("# 🧠 Brain Report")
-    # Slim trader report: 9 sections (includes BRAIN DECISION)
-    assert len(re.findall(r"^## \d\d │", md, re.M)) == 9
+    # Slim trader report: 10 sections (includes BRAIN DECISION and BRAIN HEALTH)
+    assert len(re.findall(r"^## \d\d │", md, re.M)) == 10
     assert md.count("```") % 2 == 0
     assert not re.search(r"\\[.\-()!+=|]", md)           # no Telegram MarkdownV2 escaping in the file
     assert (
