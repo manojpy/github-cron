@@ -21,7 +21,7 @@ Usage:   python3 scripts/check_updates.py [--report update_report.md]
 Needs:   Python 3.9+, `pip install packaging`, network access. Optional GITHUB_TOKEN raises
          the GitHub API rate limit.
 Output:  Markdown on stdout and in the report file. With $GITHUB_OUTPUT set it also writes
-         has_updates=true|false and count=<n>. Exit code is 0 unless the script itself breaks.
+         has_updates=true|false, count=<n> and failed=<n>. Exit code is 0 unless the script itself breaks.
 """
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ ROOT = Path(__file__).resolve().parent.parent
 MIN_AGE_DAYS = 180          # a new Python / Debian must be this old before it is recommended
 EOL_WARN_DAYS = 365         # warn when the current Python is closer than this to its EOL
 USER_AGENT = "github-cron-update-check"
-
+FAILURES: List[str] = []    # checks that could not complete; never to be read as "nothing to update"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 def http_json(url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 20.0) -> Any:
@@ -175,8 +175,10 @@ def check_requirements(py_version: str) -> Tuple[List[str], int]:
         try:
             latest = latest_stable(r["name"], py_version)
         except Exception as e:
+            FAILURES.append(f"PyPI lookup for {r['name']}")
             out.append(f"- `{r['name']}`: PyPI lookup failed ({e})")
             continue
+
         if latest is None:
             continue
         r["latest"] = latest
@@ -355,8 +357,10 @@ def check_actions() -> Tuple[List[str], int]:
         try:
             rel = http_json(f"https://api.github.com/repos/{repo}/releases/latest", headers=headers)
         except Exception as e:
+            FAILURES.append(f"GitHub release lookup for {repo}")
             rows.append(f"- `{repo}@{ref}`: lookup failed ({e})")
             continue
+
         tag = (rel or {}).get("tag_name", "")
         tm = re.match(r"v?(\d+)", tag)
         if tm and int(tm.group(1)) > int(m.group(1)):
@@ -373,6 +377,7 @@ def section(title: str, fn) -> Tuple[List[str], int, Any]:
         extra = res[2] if len(res) > 2 else None
         return [f"## {title}", *lines, ""], n, extra
     except Exception as e:  # one failing check must not hide the others
+        FAILURES.append(title)
         return [f"## {title}", f"⚠️ Check failed: {e}", ""], 0, None
 
 
@@ -400,17 +405,25 @@ def main() -> int:
         lines, n, _ = section(title, fn)
         report += lines
         total += n
-    report.append(f"**{total} item(s) need a decision.**" if total else "**Nothing to change.**")
-
+    
+    if total:
+        report.append(f"**{total} item(s) need a decision.**")
+    elif FAILURES:
+        report.append("**No updates found, but the check is incomplete.**")
+    else:
+        report.append("**Nothing to change.**")
+    if FAILURES:
+        report.append("")
+        report.append(f"> ⚠️ **INCOMPLETE: {len(FAILURES)} check(s) could not run** ({'; '.join(FAILURES)}). "
+                      "Missing findings above do not mean there is nothing to update.")
     text = "\n".join(report) + "\n"
     Path(args.report).write_text(text, encoding="utf-8")
     print(text)
     gh_out = os.environ.get("GITHUB_OUTPUT")
     if gh_out:
         with open(gh_out, "a", encoding="utf-8") as fh:
-            fh.write(f"has_updates={'true' if total else 'false'}\ncount={total}\n")
+            fh.write(f"has_updates={'true' if total else 'false'}\ncount={total}\nfailed={len(FAILURES)}\n")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
