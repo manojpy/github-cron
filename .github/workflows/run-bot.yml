@@ -259,7 +259,8 @@ jobs:
             echo "::warning::Image for commit ${GITHUB_SHA} not available — trying :latest"
             cat /tmp/image-pull.log 2>/dev/null || true
             echo "⚠️ Ran on :latest because sha-${GITHUB_SHA} was not available" >> "$GITHUB_STEP_SUMMARY"
-            IMAGE="$BASE:latest", 
+            IMAGE="$BASE:latest"
+
             if ! docker pull --quiet --platform linux/amd64 "$IMAGE"; then
               echo "::error::Neither sha-${GITHUB_SHA} nor :latest is available in the registry"
               exit 1

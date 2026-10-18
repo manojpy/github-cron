@@ -1,6 +1,13 @@
 name: Build AOT Image (Optimized Hybrid)
-
 on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'requirements.txt'
+      - 'Dockerfile'
+      - 'setup.py'
+      - '.github/workflows/build.yml'
   pull_request:
     paths:
       - 'src/**'
