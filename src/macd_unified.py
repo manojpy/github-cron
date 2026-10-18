@@ -1554,8 +1554,8 @@ async def run_once() -> Optional[bool]:
                     clear_shadow_stats=True,
                     clear_outcome_streams=True,
                     clear_daily_cache=True,
+                    clear_brain_derived=True,
                 )
-
                 parts = []
                 if st: parts.append(f"States: {st}")
                 if dd: parts.append(f"Dedups: {dd}")
@@ -2121,7 +2121,7 @@ if __name__ == "__main__":
     if not aot_bridge.is_using_aot():
         reason = aot_bridge.get_fallback_reason() or "Unknown"
         logger.warning("❌ AOT not available, using JIT fallback. Reason: %s", reason)
-        logger.warning("⚠️ Performance may be degraded. First run may be slow.")
+        logger.warning("⚠�� Performance may be degraded. First run may be slow.")
 
         if os.getenv("REQUIRE_AOT", "false").lower() == "true":
             logger.critical("❌ REQUIRE_AOT=true but AOT unavailable - exiting")

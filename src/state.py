@@ -124,7 +124,7 @@ async def _redis_key_inventory(sdb: "RedisStateStore", max_keys: int = 20000) ->
     await _flush()
     return inventory
 
-async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger: logging.Logger, *, clear_active_states: bool = True, clear_dedups: bool = True, clear_pending_outcomes: bool = True, clear_shadow_pending: bool = True, clear_alert_stats: bool = False, clear_shadow_stats: bool = False, clear_outcome_streams: bool = False, clear_daily_cache: bool = False) -> Tuple[int, int, int, int, int, int, int, int, int]:
+async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger: logging.Logger, *, clear_active_states: bool = True, clear_dedups: bool = True, clear_pending_outcomes: bool = True, clear_shadow_pending: bool = True, clear_alert_stats: bool = False, clear_shadow_stats: bool = False, clear_outcome_streams: bool = False, clear_daily_cache: bool = False, clear_brain_derived: bool = False) -> Tuple[int, int, int, int, int, int, int, int, int]:
     if sdb.degraded or not sdb._redis:
         logger.warning("Redis degraded — skipping mass state purge")
         return 0, 0, 0, 0, 0, 0, 0, 0, 0
@@ -138,6 +138,7 @@ async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger
     deleted_shadow_hiconf = 0
     deleted_streams = 0
     deleted_daily_cache = 0
+    deleted_brain_derived = 0
 
     async def _scan_keys_with_timeout(match: str, count: int = 100, timeout: float = 10.0) -> List[str]:
         """Safely consume an async scan_iter with a timeout to prevent runaway loops."""
@@ -206,6 +207,27 @@ async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger
                 f"{RedisKeyPrefix.METADATA}daily_cache:*", count=200
             )
             deleted_daily_cache = await _batch_unlink(daily_cache_keys)
+
+        if clear_brain_derived:
+            # State the Brain derived from the outcomes just wiped. Left behind, old CUSUM
+            # alarms keep blocking the action gate and old history keeps showing in reports.
+            # Standing decisions (config override, disabled keys, weights, kill switch) are NOT touched.
+            derived_keys = []
+            for prefix in (
+                RedisKeyPrefix.CUSUM_STATE,
+                RedisKeyPrefix.CUSUM_WATERMARK,
+                RedisKeyPrefix.VOTE_COUNT_HISTORY,
+                RedisKeyPrefix.THRESHOLD_HISTORY,
+            ):
+                derived_keys += await _scan_keys_with_timeout(f"{prefix}*", count=200)
+            derived_keys += [
+                "brain:kill_switch_shadow_active",
+                "brain:kill_switch_shadow_log",
+                f"{RedisKeyPrefix.METADATA}brain_plan_history",
+                f"{RedisKeyPrefix.METADATA}brain_plan_state",
+            ]
+            deleted_brain_derived = await _batch_unlink(derived_keys)
+            logger.info(f"🧹 Brain-derived state cleared: {deleted_brain_derived} key(s)")
 
         logger.info(
             f"🧹 MASS RESET complete | "
