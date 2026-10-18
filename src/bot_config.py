@@ -159,6 +159,7 @@ class BotConfig(BaseModel):
     OUTCOME_RR_TARGET: float = Field(default=2.0, ge=1.0, le=5.0) 
     OUTCOME_BONUS_RR: float = Field(default=3.0, ge=2.0, le=10.0) 
     OUTCOME_BONUS_WEIGHT: float = Field(default=1.5, ge=1.0, le=3.0) 
+    OUTCOME_TIMEOUT_WIN_WEIGHT: float = Field(default=0.5, ge=0.0, le=1.0, description="Weight of a timed-out win (neither target nor stop hit; closed on the right side of the fill) in weighted win rate and model training. A real target win weighs 1.0 or more.") 
     ENABLE_SESSION_FILTER: bool = Field(default=False, description="If true, alerts are also checked against a pair:alert_key:session win-rate (session = asian/london/ny/dead per IST trading hours). Blocks alongside the existing pair:alert_key MIN_WIN_RATE check — whichever of the two is lower decides. Requires ENABLE_WIN_RATE_FILTER")
     MIN_WIN_RATE_SESSION_SAMPLE: int = Field(default=15, ge=1, description="Minimum resolved-outcome sample size for a pair:alert_key:session combo before its win rate is trusted enough to block dispatch")
     ENABLE_BRAIN: bool = Field(default=False, description="Master switch for the Brain analysis/shadow-mode/reporting layer. Requires ENABLE_WIN_RATE_FILTER to be meaningful")

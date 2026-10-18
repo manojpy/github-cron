@@ -237,18 +237,21 @@ def build_products_map_from_cfg() -> Dict[str, dict]:
     )
     return products_map
 
-def _compute_win_weight(rr_achieved: float, is_win: bool) -> float:
+def _compute_win_weight(rr_achieved: float, is_win: bool, timed_out: bool = False) -> float:
     """Continuous bonus weighting for a resolved outcome.
-
     Loss -> 0.0.
     Win at or below R:R target -> 1.0.
     Win between target and bonus R:R -> linearly interpolated from 1.0
         up to cfg.OUTCOME_BONUS_WEIGHT (replaces the old flat step where
         a 2.99R trade got nothing and 3.0R jumped to full bonus).
     Win at or above bonus R:R -> capped at cfg.OUTCOME_BONUS_WEIGHT.
+    Timed-out win (neither target nor stop reached, closed on the right side
+        of the fill) -> cfg.OUTCOME_TIMEOUT_WIN_WEIGHT, below a real target win.
     """
     if not is_win:
         return 0.0
+    if timed_out:
+        return float(getattr(cfg, "OUTCOME_TIMEOUT_WIN_WEIGHT", 0.5))
     target = cfg.OUTCOME_RR_TARGET
     bonus = cfg.OUTCOME_BONUS_RR
     cap = cfg.OUTCOME_BONUS_WEIGHT
@@ -275,11 +278,14 @@ def format_outcome_totals(source: str, stats: Optional[Dict[str, int]], icon: st
     wins = int(s.get("wins", 0))
     losses = int(s.get("losses", 0))
     timeouts = max(0, min(int(s.get("timeouts", 0)), losses))
+    timeout_wins = max(0, min(int(s.get("timeout_wins", 0)), wins))
     win_rate = (wins / total * 100.0) if total else 0.0
     prefix = f"{icon} " if icon else ""
     return (
-        f"{prefix}{source} - {total}, {OUTCOME_WIN_LABEL} - {wins}, "
-        f"{OUTCOME_LOSS_LABEL} - {losses - timeouts}, {OUTCOME_TIMEOUT_LABEL} - {timeouts}, "
+        f"{prefix}{source} - {total}, {OUTCOME_WIN_LABEL} - {wins - timeout_wins}, "
+        f"{OUTCOME_LOSS_LABEL} - {losses - timeouts}, "
+        f"{OUTCOME_TIMEOUT_LABEL} - {timeouts + timeout_wins}"
+        f"{f' ({timeout_wins} won)' if timeout_wins else ''}, "
         f"Win Rate - {win_rate:.0f}%"
     )
 
@@ -1898,14 +1904,18 @@ class RedisStateStore:
                 win = True       # hit TP, never hit SL
             elif mae_loss and not mfe_win:
                 win = False      # hit SL, never hit TP
+            elif outcome_class == "timeout":
+                # Neither target nor stop was reached in the window: the
+                # horizon close versus the FILL price decides. Long wins above
+                # the fill, short wins below it (a flat close is a loss).
+                win = pct_move > 0 if is_buy else pct_move < 0
             else:
-                win = close_win  # neither hit, or ambiguous → fall back to close
+                win = close_win  # ambiguous → fall back to close
         elif primary_metric == "net_pnl_pct":
             win = net_pnl_pct > 0
         else:
             win = close_win
-
-        win_weight = _compute_win_weight(rr_achieved, win)
+        win_weight = _compute_win_weight(rr_achieved, win, timed_out=(outcome_class == "timeout"))
         return {
             "alert_key": key.split(":")[-2],
             "direction": direction,
@@ -2439,8 +2449,8 @@ class RedisStateStore:
                         fees_paid_pct = result.get("fees_paid_pct")
                         stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
                         write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
-                        if not win and result.get("outcome_class") == "timeout":
-                            write_pipe.hincrby(stats_key, "timeouts", 1)
+                        if result.get("outcome_class") == "timeout":
+                            write_pipe.hincrby(stats_key, "timeout_wins" if win else "timeouts", 1)
                         write_pipe.expire(stats_key, stats_ttl)
                         session = _get_session_from_ts(entry_ts) if entry_ts else "dead"
                         session_stats_key = f"{stats_key}:{session}"
@@ -2713,8 +2723,8 @@ class RedisStateStore:
 
                         stats_key = f"{RedisKeyPrefix.SHADOW_STATS}{pair}:{alert_key}"
                         write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
-                        if not win and result.get("outcome_class") == "timeout":
-                            write_pipe.hincrby(stats_key, "timeouts", 1)
+                        if result.get("outcome_class") == "timeout":
+                            write_pipe.hincrby(stats_key, "timeout_wins" if win else "timeouts", 1)
                         write_pipe.expire(stats_key, stats_ttl)
 
                         if (
@@ -2949,7 +2959,7 @@ class RedisStateStore:
         result is already present in ALERT_STATS/SHADOW_STATS, so there is no
         double-counting.
         """
-        empty = {"wins": 0, "losses": 0, "timeouts": 0, "total": 0}
+        empty = {"wins": 0, "losses": 0, "timeouts": 0, "timeout_wins": 0, "total": 0}
         out: Dict[str, Dict[str, int]] = {"Recorded": dict(empty), "Shadowed": dict(empty)}
 
         if self.degraded or not self._redis:
@@ -2987,6 +2997,7 @@ class RedisStateStore:
                     out[label]["wins"] += int(data.get("wins", 0) or 0)
                     out[label]["losses"] += int(data.get("losses", 0) or 0)
                     out[label]["timeouts"] += int(data.get("timeouts", 0) or 0)
+                    out[label]["timeout_wins"] += int(data.get("timeout_wins", 0) or 0)
 
             # 2. Add early-closed pending outcomes.
             pending_map = {RedisKeyPrefix.OUTCOME_PENDING: "Recorded", RedisKeyPrefix.SHADOW_PENDING: "Shadowed"}
