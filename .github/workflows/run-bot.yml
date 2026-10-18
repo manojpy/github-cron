@@ -21,7 +21,7 @@ on:
         default: false
         type: boolean
       clear_redis:
-        description: '🧹 Clear ALL Redis keys'
+        description: '🧹 Clear outcomes + Brain-derived state (keeps config, weights, kill switch)'
         required: false
         default: false
         type: boolean
