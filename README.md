@@ -37,10 +37,11 @@ High-performance cryptocurrency trading alert bot with AOT/Cython/Numba compilat
 | Cleanup outcomes | `cleanup-outcomes.yml` | Cronjobs.org → `workflow_dispatch` | Daily at 02:00 (timezone as set on the Cronjobs.org job) |
 | Redis audit | `redis-audit.yml` | `workflow_run` after the Learner completes | Chained, once per Learner run |
 | Replay un-pushed outcomes | `replay-outcomes.yml` | `workflow_run` after the bot run completes | Does work only after a non-successful bot run |
-| Build AOT image | `build.yml` | Push to `main` (src / Dockerfile / requirements) + weekly GitHub `schedule` (`0 2 * * 0`, Sunday 02:00 UTC) + manual | On code change and weekly |
+| Build AOT image | `build.yml` | Push to `main` (src / Dockerfile / requirements) + pull request (build and test only, nothing pushed) + weekly GitHub `schedule` (`0 2 * * 0`, Sunday 02:00 UTC) + manual | On code change and weekly |
+| Dependency check | `dependency-check.yml` | Cronjobs.org → `workflow_dispatch` | Weekly (read-only report) |
 | CI | `ci.yml` | Push, pull request, manual | On code change |
 
-`build.yml` is the only workflow with a GitHub `schedule`. Learner, Watchdog and Cleanup have **no** GitHub schedule, so if Cronjobs.org stops calling them nothing else will.
+`build.yml` is the only workflow with a GitHub `schedule`. Learner, Watchdog, Cleanup and Dependency check have **no** GitHub schedule, so if Cronjobs.org stops calling them nothing else will.
 
 ### Overlap and ordering
 
@@ -113,7 +114,7 @@ Results appear in Telegram and in the workflow summary / artifacts.
 
 ## ⏰ Scheduling
 
-Only `workflow_dispatch` is declared in `run-bot.yml`, `watchdog.yml`, `learner.yml` and `cleanup-outcomes.yml`. This is intentional: timing comes from Cronjobs.org, which is more punctual than GitHub's own cron queue. Do not add a `schedule:` block on top of it, or you will get double runs.
+Only `workflow_dispatch` is declared in `run-bot.yml`, `watchdog.yml`, `learner.yml`, `cleanup-outcomes.yml` and `dependency-check.yml`.
 
 The bot run takes `TRIGGER_TIMESTAMP` (set when the workflow step starts) as its reference time and logs it in IST. If that timestamp is more than 10 minutes away from the current time, the bot falls back to the current time.
 
