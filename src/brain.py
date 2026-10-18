@@ -1611,7 +1611,7 @@ class BrainCore:
         report_key = f"brain_report:{int(time.time())}"
         if self.sdb._redis and not self.sdb.degraded:
             await self.sdb._safe_redis_op(
-                lambda: _rc(self.sdb._redis).set(report_key, json_dumps(recs), ex=30 * 86400),
+                lambda: _rc(self.sdb._redis).set(report_key, json_dumps(recs), ex=3 * 86400),
                 2.0, f"brain_report_persist:{report_key}",
             )
 

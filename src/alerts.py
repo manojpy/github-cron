@@ -1473,8 +1473,6 @@ async def dispatch_combined_alerts(payloads: List[AlertPayload], telegram_queue:
             combined_success = False
             break
 
-            break
-
     if sent_payloads:
         if all_changes and not await sdb.atomic_batch_update(all_changes):
             # atomic_batch_update reports failure by returning False (it never

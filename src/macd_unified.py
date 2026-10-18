@@ -1710,11 +1710,16 @@ async def run_once() -> Optional[bool]:
             lock = None
             lock_acquired = False
         else:
-            lock = RedisLock(sdb._redis, "macd_bot_run")
+            lock = RedisLock(sdb._redis, "macd_bot_run", owner=sdb)
             lock_acquired = await lock.acquire(timeout=5.0)
+            if not lock_acquired and lock.error:
+                await asyncio.sleep(1.0)
+                lock_acquired = await lock.acquire(timeout=5.0)   # one retry on a Redis error only
             if not lock_acquired:
                 logger_run.warning(
-                    "⚠️ Another instance is running (Redis lock held) - exiting gracefully"
+                    "⚠️ Could not take the run lock "
+                    + ("(Redis error)" if lock.error else "(another instance is running)")
+                    + " - exiting gracefully"
                 )
                 return None
 

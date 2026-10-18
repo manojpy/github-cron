@@ -710,14 +710,16 @@ class RedisStateStore:
             parser=lambda r: r if r else None,
         )
 
-    async def set_metadata(self, key: str, value: str, timeout: float = 2.0, ttl: Optional[int] = None) -> None:
+    async def set_metadata(self, key: str, value: str, timeout: float = 2.0, ttl: Optional[int] = None) -> bool:
+        """True only when Redis confirmed the write. False on any failure or
+        when the store is degraded (callers must not assume success)."""
         if ttl is None:
             ttl = (
                 DURABLE_METADATA_TTL_SEC
                 if key in DURABLE_METADATA_KEYS
                 else self.metadata_expiry_seconds
             )
-        await self._safe_redis_op(
+        result = await self._safe_redis_op(
             lambda: _rc(self._redis).set(
                 f"{self.meta_prefix}{key}",
                 value,
@@ -726,6 +728,7 @@ class RedisStateStore:
             timeout,
             f"set_metadata {key}",
         )
+        return bool(result)
 
     async def _read_raw_config_override(self) -> Dict[str, Any]:
         """Parses the config_override metadata blob without applying it.
@@ -783,7 +786,9 @@ class RedisStateStore:
         override = await self._read_raw_config_override()
         override[field] = value
         try:
-            await self.set_metadata(CONFIG_OVERRIDE_METADATA_KEY, json_dumps(override))
+            if not await self.set_metadata(CONFIG_OVERRIDE_METADATA_KEY, json_dumps(override)):
+                logger.warning(f"Failed to write config_override field '{field}': Redis write did not complete")
+                return False
         except Exception as e:
             logger.warning(f"Failed to write config_override field '{field}': {e}")
             return False
@@ -798,7 +803,9 @@ class RedisStateStore:
             return True
         override.pop(field, None)
         try:
-            await self.set_metadata(CONFIG_OVERRIDE_METADATA_KEY, json_dumps(override))
+            if not await self.set_metadata(CONFIG_OVERRIDE_METADATA_KEY, json_dumps(override)):
+                logger.warning(f"Failed to remove config_override field '{field}': Redis write did not complete")
+                return False
         except Exception as e:
             logger.warning(f"Failed to remove config_override field '{field}': {e}")
             return False
@@ -819,7 +826,7 @@ class RedisStateStore:
         """{'disabled_at': {alert_key: ts}, 'reenabled_at': {alert_key: ts}}.
         Missing or malformed data returns empty maps."""
         empty: Dict[str, Dict[str, float]] = {"disabled_at": {}, "reenabled_at": {}}
-        raw = await self.get_metadata(BRAIN_KEY_HISTORY_METADATA_KEY)
+        raw = await self.get_durable_metadata(BRAIN_KEY_HISTORY_METADATA_KEY)
         if not raw:
             return empty
         try:
@@ -846,10 +853,13 @@ class RedisStateStore:
         else:
             current.discard(alert_key)
         try:
-            await self.set_metadata(BRAIN_DISABLED_KEYS_METADATA_KEY, json_dumps(sorted(current)))
+            if not await self.set_metadata(BRAIN_DISABLED_KEYS_METADATA_KEY, json_dumps(sorted(current))):
+                logger.warning(f"Failed to update disabled-key set for '{alert_key}': Redis write did not complete")
+                return False
         except Exception as e:
             logger.warning(f"Failed to update disabled-key set for '{alert_key}': {e}")
             return False
+
         # Best-effort: record the transition time. A failure here must not
         # undo or fail the disable/enable itself.
         try:
@@ -898,7 +908,9 @@ class RedisStateStore:
         current = await self.get_pair_thresholds()
         current[pair] = value
         try:
-            await self.set_metadata(PAIR_THRESHOLDS_METADATA_KEY, json_dumps(current))
+            if not await self.set_metadata(PAIR_THRESHOLDS_METADATA_KEY, json_dumps(current)):
+                logger.warning(f"Failed to update pair threshold for '{pair}': Redis write did not complete")
+                return False
         except Exception as e:
             logger.warning(f"Failed to update pair threshold for '{pair}': {e}")
             return False
@@ -942,8 +954,7 @@ class RedisStateStore:
         if self.degraded or not self._redis:
             return False
         try:
-            await self.set_metadata("dynamic_weights", json_dumps(weights), ttl=ttl)
-            return True
+            return await self.set_metadata("dynamic_weights", json_dumps(weights), ttl=ttl)
         except Exception as e:
             logger.warning(f"Failed to persist dynamic_weights: {e}")
             return False
@@ -966,8 +977,7 @@ class RedisStateStore:
             return False
         try:
             payload = {"weights": weights, "meta": meta or {}, "stored_at": int(time.time())}
-            await self.set_metadata("challenger_weights", json_dumps(payload), ttl=ttl)
-            return True
+            return await self.set_metadata("challenger_weights", json_dumps(payload), ttl=ttl)
         except Exception as e:
             logger.warning(f"Failed to persist challenger_weights: {e}")
             return False
@@ -1011,10 +1021,12 @@ class RedisStateStore:
         if not self._redis or self.degraded or not keys:
             return {k: None for k in keys}
         try:
-            async with self._redis.pipeline() as pipe:
-                for k in keys:
-                    pipe.get(f"{self.meta_prefix}{k}")         
-                values = await asyncio.wait_for(_execute_pipeline(pipe), timeout=timeout)
+            values = await asyncio.wait_for(
+                _rc(self._redis).mget([f"{self.meta_prefix}{k}" for k in keys]),
+                timeout=timeout,
+            )
+            if values is None or len(values) != len(keys):
+                raise RedisError("MGET returned an incomplete response")
             return {k: v for k, v in zip(keys, values)}
         except Exception as e:
             logger.error(f"batch_get_metadata failed for {len(keys)} keys: {e}")
@@ -1027,8 +1039,13 @@ class RedisStateStore:
         try:
             async with self._redis.pipeline() as pipe:
                 for k, v in items.items():
-                    pipe.set(f"{self.meta_prefix}{k}", v,
-                              ex=ttl if ttl is not None else self.metadata_expiry_seconds)
+                    pipe.set(
+                        f"{self.meta_prefix}{k}", v,
+                        ex=ttl if ttl is not None else (
+                            DURABLE_METADATA_TTL_SEC if k in DURABLE_METADATA_KEYS
+                            else self.metadata_expiry_seconds
+                        ),
+                    )
                 await asyncio.wait_for(_execute_pipeline(pipe), timeout=timeout)
             return True
         except Exception as e:
@@ -1161,10 +1178,17 @@ class RedisStateStore:
             return None
         recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
         effective_window = window_sec if window_sec is not None else cfg.ALERT_DEDUP_WINDOW_SEC
+        claim_value = f"{ts}:{self._claim_token}"   # "ts:token" so a later release can verify ownership
         for attempt in (1, 2):
             try:
-                # Value is "ts:token" so a later release can verify ownership.
-                claim_value = f"{ts}:{self._claim_token}"
+                if attempt == 2:
+                    # Attempt 1 may have landed with only its reply lost. If the key
+                    # already holds exactly OUR claim, this is not a duplicate.
+                    existing = await asyncio.wait_for(self._redis.get(recent_key), timeout=2.0)
+                    if existing is not None and (
+                        existing.decode() if isinstance(existing, (bytes, bytearray)) else str(existing)
+                    ) == claim_value:
+                        return True
                 result = await asyncio.wait_for(
                     self._redis.set(recent_key, claim_value, nx=True, ex=effective_window),
                     timeout=3.0
@@ -1179,11 +1203,25 @@ class RedisStateStore:
                 )
         return None
 
-    # Coalesce claim keyed on CANDLE time, not wall-clock. The stored value is the
-    
+    # Delete a dedup claim only when its value ends with this run's token.
+    RELEASE_CLAIM_LUA = """
+    local v = redis.call("GET", KEYS[1])
+    if v and string.sub(v, -string.len(ARGV[1])) == ARGV[1] then
+        return redis.call("DEL", KEYS[1])
+    end
+    return 0
+    """
+
+    # Coalesce claim keyed on CANDLE time, not wall-clock. The stored value is
+    # "candle_ts:token"; a claim is a duplicate when the new candle is not at
+    # least ARGV[3] seconds newer. A value equal to our own claim means a
+    # retry after a lost reply, so it counts as ours.
     COALESCE_CLAIM_LUA = """
     local prev = redis.call("GET", KEYS[1])
     if prev then
+        if prev == ARGV[1] then
+            return 1
+        end
         local prev_sep = string.find(prev, ":", 1, true)
         local prev_ts = tonumber(prev_sep and string.sub(prev, 1, prev_sep - 1) or prev)
         local arg_sep = string.find(ARGV[1], ":", 1, true)
@@ -1271,26 +1309,13 @@ class RedisStateStore:
             return
         recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
         try:
-            raw = await asyncio.wait_for(_rc(self._redis).get(recent_key), timeout=1.0)
-            if raw is None:
-                return
-            val = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
-            # Two stored formats are accepted:
-            #   "{ts}:{token}"  — written by this version; release only when
-            #                     the token matches this run.
-            #   "{ts}"          — legacy value written before tokens existed.
-            #                     Ownership cannot be proven either way, so we
-            #                     take the conservative interpretation for a
-            #                     one-candle migration window: this run created
-            #                     the only entry that could match, therefore
-            #                     releasing it is correct. Remove this branch
-            #                     once all state stores are known to hold
-            #                     only token-bearing values.
-            if ":" in val:
-                _, token = val.rsplit(":", 1)
-                if token != self._claim_token:
-                    return  # belongs to another run — leave it alone
-            await asyncio.wait_for(_rc(self._redis).delete(recent_key), timeout=1.0)
+            # One atomic round trip: delete only if the stored value ends with OUR token.
+            await asyncio.wait_for(
+                cast(Awaitable[Any], _rc(self._redis).eval(
+                    self.RELEASE_CLAIM_LUA, 1, recent_key, f":{self._claim_token}",
+                )),
+                timeout=2.0,
+            )
         except Exception as e:
             logger.warning(f"Failed to release dedup claim for {pair}:{alert_key}: {e}")
 
@@ -1300,22 +1325,15 @@ class RedisStateStore:
         if self.degraded or not self._redis or not alert_keys:
             return
         try:
-            async with self._redis.pipeline() as pipe:
+            async with self._redis.pipeline(transaction=False) as pipe:
                 for alert_key in alert_keys:
                     recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
-                    pipe.get(recent_key)
-                values = await asyncio.wait_for(_execute_pipeline(pipe), timeout=2.0)
-            to_delete: List[str] = []
-            for alert_key, raw in zip(alert_keys, values or []):
-                if raw is None:
-                    continue
-                val = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
-                if val.endswith(f":{self._claim_token}"):
-                    to_delete.append(f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}")
-            if to_delete:
-                await asyncio.wait_for(_rc(self._redis).delete(*to_delete), timeout=2.0)
+                    pipe.eval(self.RELEASE_CLAIM_LUA, 1, recent_key, f":{self._claim_token}")
+                results = await asyncio.wait_for(_execute_pipeline(pipe), timeout=2.0)
+            released = sum(int(r or 0) for r in (results or []))
+            if released:
                 logger.info(
-                    f"Released {len(to_delete)} partial claim(s) for {pair} "
+                    f"Released {released} partial claim(s) for {pair} "
                     f"after batch failure (token={self._claim_token})"
                 )
         except Exception as e:
@@ -1432,14 +1450,7 @@ class RedisStateStore:
 
     async def dlq_set_attempts(self, key: str, entry: Dict[str, Any], attempts: int) -> bool:
         """Persist an incremented attempt counter (keeps the remaining TTL)."""
-        if self.degraded or not self._redis:
-            return False
-        entry = dict(entry, attempts=int(attempts))
-        result = await self._safe_redis_op(
-            lambda: _rc(self._redis).set(key, json_dumps(entry), xx=True, keepttl=True),
-            2.0, "dlq_set_attempts",
-        )
-        return bool(result)
+        return await self.dlq_save_entry(key, dict(entry, attempts=int(attempts)))
 
     async def dlq_save_entry(self, key: str, entry: Dict[str, Any]) -> bool:
         """Persist a modified DLQ entry in place (keeps the remaining TTL, never
@@ -1646,11 +1657,15 @@ class RedisStateStore:
                 )
         except Exception as e:
             logger.warning(f"Vote-count history save failed for '{alert_key}': {e}")
+        finally:
+            self.__dict__.get("_vote_hist_cache", {}).pop(alert_key, None)
 
     async def get_vote_count_history(self, alert_key: str) -> List[int]:
         if self.degraded or not self._redis:
             return []
-
+        cache = self.__dict__.setdefault("_vote_hist_cache", {})
+        if alert_key in cache:
+            return list(cache[alert_key])
         key = f"{RedisKeyPrefix.VOTE_COUNT_HISTORY}{alert_key}"
 
         try:
@@ -1663,8 +1678,10 @@ class RedisStateStore:
                 2.0,
                 f"vote_count_load:{alert_key}",
             )
-
-            return [int(x) for x in raw_list] if raw_list else []
+            parsed = [int(x) for x in raw_list] if raw_list else []
+            if raw_list is not None:           # None = Redis failed: do not cache
+                cache[alert_key] = parsed
+            return list(parsed)
         except Exception:
             return []
 
@@ -2207,10 +2224,9 @@ class RedisStateStore:
             )
             if not keys:
                 return None
-            async with self._redis.pipeline() as pipe:
-                for k in keys:
-                    pipe.get(k)
-                raws = await asyncio.wait_for(_execute_pipeline(pipe), timeout=2.0)
+            raws = await asyncio.wait_for(_rc(self._redis).mget(keys), timeout=2.0)
+            if raws is None or len(raws) != len(keys):
+                return None
             best: Optional[Dict[str, Any]] = None
             for k, raw in zip(keys, raws):
                 if not raw:
@@ -2340,13 +2356,8 @@ class RedisStateStore:
         if not keys:
             return
         try:
-            async with self._redis.pipeline() as read_pipe:
-                for key in keys:
-                    read_pipe.get(key)
-                raw_values = await asyncio.wait_for(
-                    _execute_pipeline(read_pipe),
-                    timeout=2.0,
-                )
+            raw_values = await asyncio.wait_for(_rc(self._redis).mget(keys), timeout=2.0)
+
         except Exception as e:
             logger_pair.warning(f"Failed to batch-fetch pending outcomes for {pair}: {e}")
             return
@@ -2398,7 +2409,7 @@ class RedisStateStore:
                                 # Stop or target already hit: the trade is over for the
                                 # one-active-trade rule. The row stays until its normal
                                 # horizon resolution, so the Brain statistics are unchanged.
-                                _closed = self._early_close_payload(raw, data_15m, i15)
+                                _closed = _fin_json if _fin_new else None
 
                                 if _closed is not None:
                                     write_pipe.set(key, _closed, keepttl=True)
@@ -2678,7 +2689,7 @@ class RedisStateStore:
                         )
                         if skip_reason:
                             if skip_reason == "not_ready" and raw and cfg.ENABLE_TRADE_CLOSE_NOTICE:
-                                _closed = self._early_close_payload(raw, data_15m, i15)
+                                _closed = _fin_json if _fin_new else None
                                 if _closed is not None:
                                     write_pipe.set(key, _closed, keepttl=True)
                                     pending_writes += 1
@@ -2922,7 +2933,7 @@ class RedisStateStore:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not alert_keys:
             return {k: (None, 0) for k in alert_keys}
         try:
-            async with _rc(self._redis).pipeline() as pipe:
+            async with _rc(self._redis).pipeline(transaction=False) as pipe:
                 for ak in alert_keys:
                     pipe.hgetall(f"{RedisKeyPrefix.ALERT_STATS}{pair}:{ak}")
                 raw_results = await asyncio.wait_for(_execute_pipeline(pipe), timeout=timeout)
@@ -2972,11 +2983,13 @@ class RedisStateStore:
             for prefix, label in prefix_map.items():
 
                 async def _consume(p: str = prefix) -> List[str]:
-                    return [k async for k in self._redis.scan_iter(match=f"{p}*", count=200)]  # type: ignore[union-attr]
+                    return [k async for k in self._redis.scan_iter(match=f"{p}*", count=2000)]  # type: ignore[union-attr]
 
                 try:
                     collected = await asyncio.wait_for(_consume(), timeout=8.0)
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"get_cumulative_outcome_stats: scan of '{prefix}*' failed ({e}) — totals are PARTIAL")
+                    out[label]["partial"] = 1
                     collected = []
 
                 # Base key = exactly one ":" after the statistics prefix.
@@ -2985,8 +2998,7 @@ class RedisStateStore:
 
                 if not base_keys:
                     continue
-
-                async with _rc(self._redis).pipeline() as pipe:
+                async with _rc(self._redis).pipeline(transaction=False) as pipe:
                     for k in base_keys:
                         pipe.hgetall(k)
                     rows = await asyncio.wait_for(_execute_pipeline(pipe), timeout=5.0)
@@ -3006,17 +3018,14 @@ class RedisStateStore:
                 try:
                     pending_keys = [k async for k in self._redis.scan_iter(match=f"{prefix}*", count=2000)]  # type: ignore[union-attr]
                 except Exception as e:
-                    logger.debug(f"Pending outcome scan failed for {label}: {e}")
+                    logger.warning(f"get_cumulative_outcome_stats: pending scan for {label} failed ({e}) — totals are PARTIAL")
+                    out[label]["partial"] = 1
                     continue
 
                 if not pending_keys:
                     continue
 
-                async with _rc(self._redis).pipeline() as pipe:
-                    for key in pending_keys:
-                        pipe.get(key)
-                    pending_rows = await asyncio.wait_for(_execute_pipeline(pipe), timeout=5.0)
-
+                pending_rows = await asyncio.wait_for(_rc(self._redis).mget(pending_keys), timeout=5.0)
                 for raw in pending_rows:
                     if not raw:
                         continue
@@ -3217,7 +3226,7 @@ class RedisStateStore:
         if self.degraded or not self._redis:
             return None
         try:
-            async with self._redis.pipeline() as pipe:
+            async with self._redis.pipeline(transaction=False) as pipe:
                 for ak in alert_keys:
                     pipe.get(f"{RedisKeyPrefix.CUSUM_WATERMARK}{ak}")
                     pipe.get(f"{RedisKeyPrefix.CUSUM_STATE}{ak}")
@@ -3302,8 +3311,10 @@ class RedisLock:
         return 0
     end
     """
-    def __init__(self, redis_client: Optional[redis.Redis], lock_key: str, expire: int | None = None):
+    def __init__(self, redis_client: Optional[redis.Redis], lock_key: str, expire: int | None = None, owner: Optional["RedisStateStore"] = None):
         self.redis = redis_client
+        self.owner = owner          # when given, the CURRENT client of this store is always used
+        self.error = False          # True when the last acquire() failed for a Redis reason, not because the lock is held
         self.lock_key = f"{RedisKeyPrefix.LOCK}{lock_key}"
         self.expire = expire or cfg.REDIS_LOCK_EXPIRY
         self.token: Optional[str] = None
@@ -3311,18 +3322,25 @@ class RedisLock:
         self.acquired_by_me = False
         self.last_extend_time = time.monotonic() 
 
-    async def acquire(self, timeout: float = 5.0) -> bool:  
-        if not self.redis:
+    def _client(self) -> Optional[redis.Redis]:
+        if self.owner is not None and self.owner._redis is not None:
+            return self.owner._redis
+        return self.redis
+
+    async def acquire(self, timeout: float = 5.0) -> bool:
+        self.error = False
+        client = self._client()
+        if not client:
             logger.warning("Redis not available; cannot acquire lock")
+            self.error = True
             return False
-        
+
         try:
             token = str(uuid.uuid4())
             ok = await asyncio.wait_for(
-                self.redis.set(self.lock_key, token, nx=True, ex=self.expire),
+                client.set(self.lock_key, token, nx=True, ex=self.expire),
                 timeout=timeout,
-            )
-            
+            )      
             if ok:
                 self.token = token
                 self.acquired_by_me = True
@@ -3335,22 +3353,24 @@ class RedisLock:
                 return True
 
             logger.warning(f"Could not acquire Redis lock (held): {self.lock_key}")
-            return False
-            
+            return False      
         except asyncio.TimeoutError:
             logger.error(f"Timeout acquiring lock {self.lock_key} after {timeout}s")
+            self.error = True
             return False
         except Exception as e:
             logger.error(f"Redis lock acquisition failed: {e}")
+            self.error = True
             return False
 
     async def extend(self, timeout: float = 3.0) -> bool:
-        if not self.token or not self.redis or not self.acquired_by_me:
+        client = self._client()
+        if not self.token or not client or not self.acquired_by_me:
             self.lost = True
             return False
         try:
             result = await asyncio.wait_for(
-                cast(Awaitable[Any], self.redis.eval(
+                cast(Awaitable[Any], client.eval(
                     self.EXTEND_LUA,
                     1,
                     self.lock_key,
@@ -3404,11 +3424,12 @@ class RedisLock:
         return should_extend
    
     async def release(self, timeout: float = 3.0) -> None:
-        if not self.token or not self.redis or not self.acquired_by_me:
+        client = self._client()
+        if not self.token or not client or not self.acquired_by_me:
             return
         try:
             result = await asyncio.wait_for(
-                cast(Awaitable[Any], self.redis.eval(
+                cast(Awaitable[Any], client.eval(
                     self.RELEASE_LUA, 1, self.lock_key, self.token,
                 )),
                 timeout=timeout,

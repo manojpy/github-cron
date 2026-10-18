@@ -963,22 +963,31 @@ class BrainEngineV2(BrainCore):
                 fail = f"ev_lift={float(ch_ev)-float(base_ev):.4f}<{min_lift}"
 
             if fail is not None:
+                reset_ok = False
                 if streak > 0:
-                    await self.sdb.set_metadata(
+                    reset_ok = await self.sdb.set_metadata(
                         CHALLENGER_STREAK_KEY,
                         json_dumps({"stored_at": stored_at, "streak": 0, "last_ts": now_ts}),
                         ttl=30 * 86400,
                     )
-                return {"promoted": False, "reason": fail, "streak_reset": streak > 0}
+                    if not reset_ok:
+                        # The old streak is still stored: a later pass would continue it
+                        # as if the passes were consecutive.
+                        logging.getLogger("macd_bot").warning(
+                            "Challenger streak reset was NOT persisted (Redis write failed)"
+                        )
+                return {"promoted": False, "reason": fail, "streak_reset": streak > 0 and bool(reset_ok)}
 
             # All gates passed this evaluation. Count it at most once per gap.
             if now_ts - int(streak_state.get("last_ts") or 0) >= min_gap:
                 streak += 1
-                await self.sdb.set_metadata(
+                if not await self.sdb.set_metadata(
                     CHALLENGER_STREAK_KEY,
                     json_dumps({"stored_at": stored_at, "streak": streak, "last_ts": now_ts}),
                     ttl=30 * 86400,
-                )
+                ):
+                    # Never promote on a pass that could not be recorded.
+                    return {"promoted": False, "reason": "streak_write_failed", "streak": streak - 1}
             if streak < min_passes:
                 return {
                     "promoted": False,
@@ -1001,11 +1010,10 @@ class BrainEngineV2(BrainCore):
 
     async def _store_apply_snapshots(self, snaps: List[Dict[str, Any]]) -> bool:
         try:
-            await self.sdb.set_metadata(
+            return await self.sdb.set_metadata(
                 APPLY_SNAPSHOT_KEY, json_dumps(snaps[-APPLY_SNAPSHOT_MAX:]),
                 ttl=365 * 86400,
             )
-            return True
         except Exception as e:
             logging.getLogger("macd_bot").debug(f"Apply-snapshot write failed (non-fatal): {e}")
             return False
