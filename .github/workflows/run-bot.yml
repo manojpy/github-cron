@@ -204,7 +204,6 @@ jobs:
             echo "::error::Branch 'main' not found in outcome-data repo"
             exit 1
           fi
-          echo '*.jsonl merge=union' >> .git/info/attributes
           git sparse-checkout init --no-cone
           {
             echo "brain_state.json"
