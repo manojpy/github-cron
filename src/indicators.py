@@ -1712,7 +1712,9 @@ def _validate_atr_arrays(atr_short: np.ndarray, atr_long: np.ndarray, expected_l
     
     return True, None
 
-def _pullback_continuation_state(o, h, l, c, ts, atr, ppohist, rsi, i15, is_buy, trend_ok, cfg_obj, reversal_now=False):
+def _pullback_continuation_state(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
+    ts: np.ndarray, atr: np.ndarray, ppohist: np.ndarray, rsi: np.ndarray, i15: int,
+    is_buy: bool, trend_ok: bool, cfg_obj: BotConfig, reversal_now: bool = False) -> Tuple[str, Dict[str, Any]]:
     """Stateless Trend -> Pullback Exhaustion -> Confirmed Continuation detector.
 
     Recomputed from closed candles <= i15 on every run (no Redis state, so no
