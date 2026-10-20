@@ -3615,7 +3615,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         # ══════════════════════════════════════════════════════════════
         # IMMEDIATE MODE  →  legacy per-pair Telegram send (unchanged logic)
-        # ══════════════════════════════════════════════���═══════════════
+        # ═════════════════════════════════════════════════════════════
         async def _refund_alert_budget(n: int) -> None:
             """Undo the optimistic budget reservation when a send does not go out."""
             if n > 0 and alerts_sent_ref is not None and alerts_sent_lock is not None:
