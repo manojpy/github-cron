@@ -1053,10 +1053,66 @@ def test_get_active_trade_ignores_closed_rows_and_picks_newest():
         _one_trade_store(rows, degraded=True).get_active_trade("BTCUSD")
     ) is None
 
-
 def test_record_status_line_text():
     line = A._record_status_line(
         "IGNORED", {"pair": "BTCUSD", "direction": "buy", "entry_ts": 1_000_000}
     )
     assert line.startswith("⏭ Ignored") and "BTCUSD buy" in line
     assert A._record_status_line("RECORDED", None).startswith("📝 Recorded")
+
+# ======================================================================
+# pullback-continuation detector
+# ======================================================================
+def _pb_cfg(**over):
+    base = dict(
+        PULLBACK_LOOKBACK_CANDLES=24, PULLBACK_IMPULSE_LOOKBACK_CANDLES=24,
+        PULLBACK_MIN_IMPULSE_ATR=2.0, PULLBACK_MIN_DEPTH_ATR=0.8,
+        PULLBACK_MIN_RETRACE=0.2, PULLBACK_MAX_RETRACE=0.786, PULLBACK_MIN_BARS=2,
+        PULLBACK_MAX_AGE_BARS=8, PULLBACK_EXHAUSTION_MIN_VOTES=2,
+        PULLBACK_REJECTION_WICK_RATIO=0.4, PULLBACK_TRIGGER_BUFFER_ATR=0.0,
+        PULLBACK_CONFIRM_WINDOW_BARS=1,
+    )
+    base.update(over)
+    return NS(**base)
+
+def _pb_series(extra_closes=()):
+    closes = list(np.linspace(100, 120, 21)) + [118, 116, 114.5, 113.5, 113.0, 113.8, 114.6, 115.4]
+    closes += list(extra_closes)
+    c = np.array(closes, float)
+    o = np.r_[c[0], c[:-1]]
+    h = np.maximum(o, c) + 0.1
+    low = np.minimum(o, c) - 0.1
+    n = len(c)
+    n_tail = n - 26
+    ph = np.r_[np.linspace(0, 2, 21), np.linspace(1.8, -1, 5), np.linspace(-0.8, 0.5, n_tail)]
+    rsi = np.r_[np.linspace(50, 75, 21), np.linspace(70, 45, 5), np.linspace(47, 55, n_tail)]
+    return o, h, low, c, np.arange(n) * 900, np.full(n, 1.0), ph, rsi
+
+def test_pullback_detector_sequence_and_buy_sell_symmetry():
+    o, h, low, c, ts, atr, ph, rsi = _pb_series()
+    cfg_o = _pb_cfg()
+    buy = [A._pullback_continuation_state(o, h, low, c, ts, atr, ph, rsi, i, True, True, cfg_o)[0]
+           for i in range(24, 29)]
+    sell = [A._pullback_continuation_state(-o, -low, -h, -c, ts, atr, -ph, -rsi, i, False, True, cfg_o)[0]
+            for i in range(24, 29)]
+    assert buy == ["pullback", "pullback", "exhaustion", "confirmed", "confirmed"]
+    assert sell == buy
+    assert A._pullback_continuation_state(
+        o, h, low, c, ts, atr, ph, rsi, 27, True, False, cfg_o)[0] == "none"
+
+def test_pullback_confirm_window_and_invalidation():
+    o, h, low, c, ts, atr, ph, rsi = _pb_series(extra_closes=[115.0])
+    strict, wide = _pb_cfg(), _pb_cfg(PULLBACK_CONFIRM_WINDOW_BARS=2)
+    i = 29   # bar 29 closes below bar 28's close, so it is not a trigger itself
+    ph2, rsi2 = ph.copy(), rsi.copy()
+    ph2[i], rsi2[i] = ph[i - 1] + 0.1, rsi[i - 1] + 1.0
+    st_strict = A._pullback_continuation_state(o, h, low, c, ts, atr, ph2, rsi2, i, True, True, strict)[0]
+    st_wide = A._pullback_continuation_state(o, h, low, c, ts, atr, ph2, rsi2, i, True, True, wide)[0]
+    assert st_strict == "exhaustion" and st_wide == "confirmed"
+    c2 = c.copy()
+    c2[24:27] = [99.0, 98.0, 98.5]   # pullback breaks the impulse start
+    o2 = np.r_[c2[0], c2[:-1]]
+    h2, l2 = np.maximum(o2, c2) + 0.1, np.minimum(o2, c2) - 0.1
+    assert A._pullback_continuation_state(o2, h2, l2, c2, ts, atr, ph, rsi, 26, True, True, strict)[0] == "invalid"
+
+
