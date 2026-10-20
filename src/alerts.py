@@ -3753,7 +3753,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
                     if reconfirmed is None:
                         logger_pair.warning(
-                            f"[{pair_name}] Confirmation inconclusive �� alert suppressed this run, "
+                            f"[{pair_name}] Confirmation inconclusive — alert suppressed this run, "
                             f"dedup key RELEASED so it can retry next run"
                         )
                         await _release_dedup_claims()
