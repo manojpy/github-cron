@@ -1712,6 +1712,116 @@ def _validate_atr_arrays(atr_short: np.ndarray, atr_long: np.ndarray, expected_l
     
     return True, None
 
+def _pullback_continuation_state(o, h, l, c, ts, atr, ppohist, rsi, i15, is_buy, trend_ok, cfg_obj, reversal_now=False):
+    """Stateless Trend -> Pullback Exhaustion -> Confirmed Continuation detector.
+
+    Recomputed from closed candles <= i15 on every run (no Redis state, so no
+    drift between cron runs and no look-ahead). SELL is evaluated by mirroring
+    the arrays so a single BUY implementation serves both sides.
+
+    Returns (state, info). state is one of:
+      "none"       no valid trend-aligned pullback
+      "pullback"   pullback in progress, exhaustion not yet evidenced
+      "exhaustion" momentum fading, trigger not yet closed (WATCH)
+      "confirmed"  trigger candle closed in the trend direction
+      "invalid"    pullback broke the impulse start (structure failed)
+    info carries levels/ratios for messages and logs (empty for "none").
+    """
+    none = ("none", {})
+    if not trend_ok:
+        return none
+    lb = int(cfg_obj.PULLBACK_LOOKBACK_CANDLES)
+    if i15 < 3 or i15 >= len(c) or i15 - lb < 0:
+        return none
+    if is_buy:
+        oo, hh, ll, cc, ph, rr = o, h, l, c, ppohist, rsi
+    else:
+        oo, hh, ll, cc, ph, rr = -o, -l, -h, -c, -ppohist, -rsi
+    a = atr[i15]
+    if not np.isfinite(a) or a <= 0:
+        return none
+    lo_idx = i15 - lb
+    win_h = hh[lo_idx:i15]
+    if len(win_h) < 3 or not np.all(np.isfinite(win_h)):
+        return none
+    # impulse top: most recent highest high before the current candle
+    ih = lo_idx + int(len(win_h) - 1 - np.argmax(win_h[::-1]))
+    if i15 - ih < int(cfg_obj.PULLBACK_MIN_BARS):
+        return none
+    seg_l = ll[ih + 1:i15 + 1]
+    if len(seg_l) == 0 or not np.all(np.isfinite(seg_l)):
+        return none
+    il = ih + 1 + int(len(seg_l) - 1 - np.argmin(seg_l[::-1]))   # pullback low
+    if il - ih < int(cfg_obj.PULLBACK_MIN_BARS):
+        return none
+    top = float(hh[ih])
+    low = float(ll[il])
+    imp_lo = max(0, ih - int(cfg_obj.PULLBACK_IMPULSE_LOOKBACK_CANDLES))
+    imp_l = ll[imp_lo:ih + 1]
+    if len(imp_l) == 0 or not np.all(np.isfinite(imp_l)):
+        return none
+    start = float(np.min(imp_l))
+    impulse = top - start
+    depth = top - low
+    if impulse < float(cfg_obj.PULLBACK_MIN_IMPULSE_ATR) * a:
+        return none
+    if depth < float(cfg_obj.PULLBACK_MIN_DEPTH_ATR) * a:
+        return none
+    sign = 1.0 if is_buy else -1.0
+    info: Dict[str, Any] = {
+        "is_buy": bool(is_buy),
+        "low_ts": int(ts[il]),
+        "low_idx": int(il),
+        "age_bars": int(i15 - il),
+        "depth_atr": round(depth / a, 2),
+        "retrace": round(depth / impulse, 3),
+        "invalidation": float(sign * start),
+        "impulse_top": float(sign * top),
+        "pullback_low": float(sign * low),
+        "votes": [],
+        "trigger": None,
+    }
+    if low <= start:
+        return "invalid", info
+    if depth / impulse > float(cfg_obj.PULLBACK_MAX_RETRACE) or depth / impulse < float(cfg_obj.PULLBACK_MIN_RETRACE):
+        return none
+    if i15 - il > int(cfg_obj.PULLBACK_MAX_AGE_BARS):
+        return none
+
+    # ── exhaustion votes (closed candles only) ──
+    votes: List[str] = []
+    wick_min = float(cfg_obj.PULLBACK_REJECTION_WICK_RATIO)
+    rejected = bool(reversal_now)
+    for k in range(max(il, i15 - 2), i15 + 1):
+        rng = hh[k] - ll[k]
+        if np.isfinite(rng) and rng > 0:
+            lower_wick = min(oo[k], cc[k]) - ll[k]
+            if lower_wick / rng >= wick_min:
+                rejected = True
+    if rejected:
+        votes.append("rejection")
+    ph_seg = ph[ih:i15 + 1]
+    if (np.all(np.isfinite(ph_seg)) and len(ph_seg) >= 2
+            and ph[i15] > ph[i15 - 1] and ph[i15] > float(np.min(ph_seg)) and ph[ih] > float(np.min(ph_seg))):
+        votes.append("ppo_hist_turn")
+    rr_seg = rr[ih:i15 + 1]
+    if (np.all(np.isfinite(rr_seg)) and len(rr_seg) >= 2
+            and rr[i15] > rr[i15 - 1] and rr[i15] > float(np.min(rr_seg))):
+        votes.append("rsi_turn")
+    info["votes"] = votes
+    exhausted = len(votes) >= int(cfg_obj.PULLBACK_EXHAUSTION_MIN_VOTES)
+
+    # ── trigger: close above the highest high since the pullback low ──
+    trig_seg = hh[il:i15]
+    if len(trig_seg) and np.all(np.isfinite(trig_seg)):
+        trigger = float(np.max(trig_seg)) + float(cfg_obj.PULLBACK_TRIGGER_BUFFER_ATR) * a
+        info["trigger"] = float(sign * trigger)
+        if exhausted and il < i15 and cc[i15] > trigger and cc[i15] > oo[i15]:
+            return "confirmed", info
+    if exhausted:
+        return "exhaustion", info
+    return "pullback", info
+
 def _prior_leg_direction(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray, end_idx: int, lookback: int) -> int:
     first = end_idx - lookback
     if end_idx < 0 or first < 0 or end_idx >= len(closes):

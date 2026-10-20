@@ -279,6 +279,21 @@ class BotConfig(BaseModel):
     FIB_REVERSAL_VOL_SPIKE_MULT: float = Field(default=1.3, ge=1.0, le=5.0, description="Touch candle's volume must exceed its volume EMA by this multiple to count as an exhaustion/reversal spike") 
     FIB_REVERSAL_MAX_DIVERGENCE_AGE_BARS: int = Field(default=50, ge=5, le=500, description="Max bars between the anchor swing and the prior swing for divergence comparison")
     FIB_REVERSAL_MAJOR_SWING_LENGTH: int = Field(default=50, ge=2, le=200, description="Fallback only when no minor pivot exists...")
+    ENABLE_PULLBACK_CONTINUATION: bool = Field(default=False, description="Master toggle for the trend-aligned pullback-continuation layer (Trend -> Pullback Exhaustion -> Confirmed Continuation). When True, reversal-family and RMA/PPO histogram-reversal alerts are tagged when they fire as a confirmed pullback continuation, and an informational WATCH message can be sent. Existing alert conditions are never loosened. False = layer fully off")
+    PULLBACK_REQUIRE_CONFIRMED: bool = Field(default=False, description="Restrict-only gate mode: if True, the host alerts (strong_reversal, choch, fib_reversal, ob_reversal, dynamic_flow_cross, hist_rma, ppohist) fire only when the pullback setup is CONFIRMED. If False (default) they fire as today and are merely tagged")
+    PULLBACK_SEND_WATCH: bool = Field(default=True, description="Send a separate, non-actionable WATCH Telegram message when a pullback shows exhaustion but the trigger candle has not closed yet")
+    PULLBACK_WATCH_DEDUP_SEC: int = Field(default=10800, ge=900, le=86400, description="Dedup window for one WATCH message per pair/direction/pullback-low candle")
+    PULLBACK_LOOKBACK_CANDLES: int = Field(default=24, ge=8, le=96, description="Closed 15m candles scanned back from the current candle for the impulse top and the pullback low")
+    PULLBACK_IMPULSE_LOOKBACK_CANDLES: int = Field(default=24, ge=8, le=96, description="Candles before the impulse top searched for the impulse start (swing low for BUY, swing high for SELL); that level is also the invalidation level")
+    PULLBACK_MIN_IMPULSE_ATR: float = Field(default=2.0, ge=0.5, le=20.0, description="Minimum size of the trend leg before the pullback, in ATR_SHORT multiples")
+    PULLBACK_MIN_DEPTH_ATR: float = Field(default=0.8, ge=0.2, le=10.0, description="Minimum pullback depth in ATR_SHORT multiples, so tiny wiggles are not treated as pullbacks")
+    PULLBACK_MIN_RETRACE: float = Field(default=0.2, ge=0.05, le=0.9, description="Minimum pullback depth as a fraction of the preceding trend leg")
+    PULLBACK_MAX_RETRACE: float = Field(default=0.786, ge=0.2, le=0.99, description="Maximum pullback depth as a fraction of the preceding trend leg. Deeper pullbacks are treated as a weak trend and not tagged")
+    PULLBACK_MIN_BARS: int = Field(default=2, ge=1, le=20, description="Minimum candles between the impulse top and the pullback low")
+    PULLBACK_MAX_AGE_BARS: int = Field(default=8, ge=1, le=48, description="A setup expires when the pullback low is more than this many candles old")
+    PULLBACK_EXHAUSTION_MIN_VOTES: int = Field(default=2, ge=1, le=3, description="Exhaustion votes needed out of 3: rejection wick/pattern, PPO histogram turning up off its pullback trough, RSI turning up")
+    PULLBACK_REJECTION_WICK_RATIO: float = Field(default=0.40, ge=0.1, le=0.9, description="Lower-wick (BUY) / upper-wick (SELL) share of the candle range that counts as a rejection candle")
+    PULLBACK_TRIGGER_BUFFER_ATR: float = Field(default=0.0, ge=0.0, le=2.0, description="Extra distance (ATR_SHORT multiples) the trigger candle must close beyond the pullback trigger level")
     EVAL_CONCURRENCY_LIMIT: int = Field(default=2, ge=1, le=30, description="Max pairs evaluated concurrently")
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
@@ -612,6 +627,12 @@ class BotConfig(BaseModel):
             raise ValueError(
                 f'HIST_RMA_FAST ({self.HIST_RMA_FAST}) must be strictly less than '
                 f'HIST_RMA_SLOW ({self.HIST_RMA_SLOW})'
+            )
+
+        if self.PULLBACK_MIN_RETRACE >= self.PULLBACK_MAX_RETRACE:
+            raise ValueError(
+                f'PULLBACK_MIN_RETRACE ({self.PULLBACK_MIN_RETRACE}) must be strictly less than '
+                f'PULLBACK_MAX_RETRACE ({self.PULLBACK_MAX_RETRACE})'
             )
 
         if self.RMA_CLOUD_ENABLED and self.RMA_CLOUD_FAST_PERIOD >= self.RMA_50_PERIOD:

@@ -67,7 +67,7 @@ import threshold_engine as engine
 from indicators import (
     calculate_alert_indicators_numpy, validate_indicators_dict, validate_vwap_cross,
     validate_cloud_cross, validate_conversion_cross, validate_equilibrium_cross,
-    _fib_reversal_confluence_vote,
+    _fib_reversal_confluence_vote, _pullback_continuation_state,
 )
 from threshold_engine import hash_config_state
 from feature_store import FEATURE_SET_VERSION
@@ -590,8 +590,7 @@ async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, a
         except Exception as e:
             logger_pair.debug(f"Why-rejected log failed ({block_reason}): {e}")
 
-
-def build_rich_pair_msg(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], setup_line: str, advice: PairAdvice, primary_emoji: Optional[str] = None, record_line: Optional[str] = None) -> str:
+def build_rich_pair_msg(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], setup_line: str, advice: PairAdvice, primary_emoji: Optional[str] = None, record_line: Optional[str] = None, pullback_line: Optional[str] = None) -> str:
     """Structured Telegram body (MarkdownV2-escaped) WITHOUT bias/datetime footer."""
     side_word = "BUY" if direction.lower() == "buy" else "SELL"
     header_emoji = (primary_emoji or "").strip() or ("🟢" if side_word == "BUY" else "🔴")
@@ -600,6 +599,7 @@ def build_rich_pair_msg(*, pair: str, direction: str, price: Any, ts: int, score
         f"{header_emoji} {pair} — {side_word} | {_format_price(price)}{_fmt_score(score, total)}",
         f"🎯 Conviction {conv} | {advice.label}",
         setup_line,
+        *([pullback_line] if pullback_line else []),
         advice.brain_line,
         advice.edge_line,
         advice.why_line,
@@ -640,7 +640,8 @@ def _record_status_line(status: str, active: Optional[Dict[str, Any]]) -> str:
         return f"⏸ Cooldown — target recently hit, not recorded until the {resume} candle"
     return "📝 Recorded as trade"
 
-def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], items: List[Tuple[str, str]], keys: List[str], tq_by_key: Dict[str, Optional[Dict[str, Any]]], votes: Optional[Dict[str, bool]], required: Optional[float], bias_context: Optional[BiasContext], logger_pair: logging.Logger, pb_by_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None, adx_val: Optional[float] = None, record_line: Optional[str] = None) -> Tuple[str, Optional[str]]:
+
+def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], items: List[Tuple[str, str]], keys: List[str], tq_by_key: Dict[str, Optional[Dict[str, Any]]], votes: Optional[Dict[str, bool]], required: Optional[float], bias_context: Optional[BiasContext], logger_pair: logging.Logger, pb_by_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None, adx_val: Optional[float] = None, record_line: Optional[str] = None, pullback_line: Optional[str] = None) -> Tuple[str, Optional[str]]:
     """Build the rich body for one pair/direction and return (body, verdict).
     Never raises: any failure degrades to a plain header + setup line (verdict
     None) so an alert is never lost to a formatting bug."""
@@ -686,6 +687,7 @@ def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int
             setup_line=_combined_setup_line(s_items), advice=advice,
             primary_emoji=_leading_emoji(s_items[0][0]),
             record_line=record_line,
+            pullback_line=pullback_line,
         )
         return body, advice.verdict
     except Exception as e:
@@ -1617,6 +1619,80 @@ def validate_alert_definitions() -> None:
 
 validate_alert_definitions()
 
+# Alerts that can host the pullback-continuation tag / gate. Their own
+# conditions are never changed; the layer only tags or (optionally) restricts.
+_PULLBACK_HOST_KEYS = frozenset({
+    "strong_reversal_buy", "strong_reversal_sell",
+    "choch_buy", "choch_sell",
+    "fib_reversal_buy", "fib_reversal_sell",
+    "ob_reversal_buy", "ob_reversal_sell",
+    "dynamic_flow_cross_buy", "dynamic_flow_cross_sell",
+    "hist_rma_buy", "hist_rma_sell",
+    "ppohist_buy", "ppohist_sell",
+})
+
+
+def _pullback_levels_text(info: Dict[str, Any]) -> str:
+    trig, inv = info.get("trigger"), info.get("invalidation")
+    parts = [f"pullback {info.get('depth_atr', 0):.1f} ATR ({info.get('retrace', 0) * 100:.0f}% of last leg)"]
+    if isinstance(trig, (int, float)):
+        parts.append(f"trigger {_fmt_num(trig)}")
+    if isinstance(inv, (int, float)):
+        parts.append(f"invalid beyond {_fmt_num(inv)}")
+    return " | ".join(parts)
+
+
+def pullback_message_line(context: Dict[str, Any], direction: str, keys: List[str]) -> Optional[str]:
+    """Telegram line for a batch whose host alert fired on a CONFIRMED pullback."""
+    if not cfg.ENABLE_PULLBACK_CONTINUATION or not any(k in _PULLBACK_HOST_KEYS for k in keys):
+        return None
+    side = "buy" if direction == "buy" else "sell"
+    if context.get(f"pullback_state_{side}") != "confirmed":
+        return None
+    info = context.get(f"pullback_info_{side}") or {}
+    return f"↩ Pullback continuation ✓ ({', '.join(info.get('votes', []))}) | {_pullback_levels_text(info)}"
+
+
+async def send_pullback_watch(context: Dict[str, Any], gr: GateResult, sdb: RedisStateStore, telegram_queue: "TelegramQueue", logger_pair: logging.Logger) -> int:
+    """Informational WATCH: pullback shows exhaustion, trigger candle not closed yet.
+    Never recorded as a trade and never touches alert state. One message per
+    pair/direction/pullback-low candle (Redis claim), skipped in dry-run."""
+    if not (cfg.ENABLE_PULLBACK_CONTINUATION and cfg.PULLBACK_SEND_WATCH) or cfg.DRY_RUN_MODE:
+        return 0
+    if not sdb or sdb.degraded:
+        return 0
+    sent = 0
+    for side in ("buy", "sell"):
+        if context.get(f"pullback_state_{side}") != "exhaustion":
+            continue
+        info = context.get(f"pullback_info_{side}") or {}
+        claim = await sdb.claim_recent_alert(
+            gr.pair_name, f"pbwatch_{side}_{info.get('low_ts')}", gr.ts_curr,
+            window_sec=int(cfg.PULLBACK_WATCH_DEDUP_SEC),
+        )
+        if claim is not True:
+            continue
+        word = "BUY" if side == "buy" else "SELL"
+        trend = "uptrend" if side == "buy" else "downtrend"
+        lines = [
+            f"👀 {gr.pair_name} — {word} WATCH (not a signal yet)",
+            f"Pullback in the {trend} is losing momentum ({', '.join(info.get('votes', []))}).",
+            _pullback_levels_text(info),
+            f"Waits for a 15m close beyond the trigger. Price {_format_price(gr.close_curr)}",
+            f"⏰ {format_ist_time(gr.ts_curr, '%d-%m-%Y %H:%M IST')}",
+        ]
+        ok = False
+        try:
+            ok = bool(await telegram_queue.send("\n".join(escape_markdown_v2(x) for x in lines)))
+        except Exception as e:
+            logger_pair.warning(f"[{gr.pair_name}] pullback WATCH send failed: {e}")
+        if ok:
+            sent += 1
+        else:
+            await sdb.release_recent_alert(gr.pair_name, f"pbwatch_{side}_{info.get('low_ts')}")
+    return sent
+
+
 async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[Dict[str, np.ndarray]],
     reference_time: int, sdb: RedisStateStore, correlation_id: str, logger_pair: logging.Logger,
     disabled_alert_keys: Optional[Set[str]] = None,
@@ -1947,6 +2023,24 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "dynamic_flow_cross_buy": dynamic_flow_cross_buy, "dynamic_flow_cross_sell": dynamic_flow_cross_sell,
             "dynamic_flow_cross_reason": dynamic_flow_cross_reason,
         }
+        context["pullback_state_buy"] = context["pullback_state_sell"] = "none"
+        context["pullback_info_buy"] = context["pullback_info_sell"] = {}
+        if cfg.ENABLE_PULLBACK_CONTINUATION and gr.atr_short_arr is not None:
+            try:
+                _pb_ppohist = np.asarray(ppo_gate_arr, dtype=float) - np.asarray(ppo_gate_signal_arr, dtype=float)
+                for _side, _is_buy, _trend, _rev in (
+                    ("buy", True, buy_trend_common_relaxed, reversal_bullish),
+                    ("sell", False, sell_trend_common_relaxed, reversal_bearish),
+                ):
+                    _st, _inf = _pullback_continuation_state(
+                        data_15m.open, data_15m.high, data_15m.low, data_15m.close, data_15m.ts,
+                        gr.atr_short_arr, _pb_ppohist, smooth_rsi, i15, _is_buy, bool(_trend), cfg,
+                        reversal_now=bool(_rev),
+                    )
+                    context[f"pullback_state_{_side}"] = _st
+                    context[f"pullback_info_{_side}"] = _inf
+            except Exception as _pb_err:
+                logger_pair.debug(f"[{pair_name}] pullback state failed: {_pb_err}", exc_info=cfg.DEBUG_MODE)
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev, "ema_curr": rsi_ema_curr, "ema_prev": rsi_ema_prev}
@@ -2147,6 +2241,14 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     logger_pair.debug(f"Alert extra_fn failed for {alert_key}: {e}", exc_info=cfg.DEBUG_MODE)
                     extra = f"(Error: {str(e)[:100]})"
 
+                if (cfg.ENABLE_PULLBACK_CONTINUATION and cfg.PULLBACK_REQUIRE_CONFIRMED
+                        and alert_key in _PULLBACK_HOST_KEYS):
+                    _pb_side = "buy" if alert_key in BUY_ALERT_KEYS else "sell"
+                    if context.get(f"pullback_state_{_pb_side}") != "confirmed":
+                        if cfg.DEBUG_MODE:
+                            logger_pair.debug(f"Skipping {alert_key}: pullback not confirmed "
+                                              f"(state={context.get(f'pullback_state_{_pb_side}')})")
+                        continue
                 if _brain_disabled:
                     # Never dispatched: handed to the dispatch stage, which
                     # shadow-tracks it as "brain_disabled".
@@ -3356,6 +3458,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 bias_context=bias_context,
                 logger_pair=logger_pair,
                 record_line=record_line,
+                pullback_line=pullback_message_line(context, direction, keys),
             )
             msg_body = msg
 
@@ -3512,7 +3615,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         # ══════════════════════════════════════════════════════════════
         # IMMEDIATE MODE  →  legacy per-pair Telegram send (unchanged logic)
-        # ══════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════���═══════════════
         async def _refund_alert_budget(n: int) -> None:
             """Undo the optimistic budget reservation when a send does not go out."""
             if n > 0 and alerts_sent_ref is not None and alerts_sent_lock is not None:
@@ -3583,6 +3686,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 bias_context=bias_context,
                 logger_pair=logger_pair,
                 record_line=record_line,
+                pullback_line=pullback_message_line(context, direction, keys),
             )
             # Footer: candle OPEN time (e.g. 16:00 for the 16:00-16:15 candle,
             # delivered ~16:16). The timestamp is always present; the bias

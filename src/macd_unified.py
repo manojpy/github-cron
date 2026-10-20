@@ -49,7 +49,7 @@ from feedback import load_open_positions, poll_feedback, release_closed_auto_pos
 from alerts import (
     TelegramQueue, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
     DEDUP_STATS, reset_dedup_stats, DLQ_STATS, reset_dlq_stats, replay_telegram_dlq, format_dedup_summary,
-    send_trade_close_notices, _record_counterfactual_block,
+    send_trade_close_notices, _record_counterfactual_block, send_pullback_watch,
 )
 from alert_registry import ALERT_KEYS, BUY_ALERT_KEYS, keys_for
 
@@ -183,10 +183,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             pair_n, summary = cast(Tuple[str, Dict[str, Any]], gr_result)
             return pair_n, summary, None
         gr = cast(GateResult, gr_result)
-
     reversal_eligible = (
         (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT
-         or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT)
+         or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT
+         or cfg.ENABLE_PULLBACK_CONTINUATION)
         and (gr.buy_trend_common_relaxed or gr.sell_trend_common_relaxed)
     )
     gate_passed = gr.buy_common or gr.sell_common or reversal_eligible
@@ -349,6 +349,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             Tuple[Dict[str, Any], Dict[str, bool], List[Tuple[str, str, str]]],
             alert_result,
         )
+        if cfg.ENABLE_PULLBACK_CONTINUATION:
+            await send_pullback_watch(context, gr, sdb, telegram_queue, logger_pair)
         return await _apply_and_dispatch_alerts(
             gr, context, conditional_states, raw_alerts, sdb, telegram_queue, fetcher, symbol,
             correlation_id, logger_pair, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
