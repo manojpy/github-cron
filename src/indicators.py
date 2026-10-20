@@ -1729,7 +1729,7 @@ def _pullback_continuation_state(o: np.ndarray, h: np.ndarray, l: np.ndarray, c:
       "invalid"    pullback broke the impulse start (structure failed)
     info carries levels/ratios for messages and logs (empty for "none").
     """
-    none = ("none", {})
+    none: Tuple[str, Dict[str, Any]] = ("none", {})
     if not trend_ok:
         return none
     lb = int(cfg_obj.PULLBACK_LOOKBACK_CANDLES)
