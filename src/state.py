@@ -1049,7 +1049,7 @@ class RedisStateStore:
             )
             if values is None or len(values) != len(keys):
                 raise RedisError("MGET returned an incomplete response")
-            return {k: v for k, v in zip(keys, values)}
+            return {k: v for k, v in zip(keys, cast(List[Optional[str]], values))}
         except Exception as e:
             logger.error(f"batch_get_metadata failed for {len(keys)} keys: {e}")
             return {k: None for k in keys}
@@ -2378,8 +2378,7 @@ class RedisStateStore:
         if not keys:
             return
         try:
-            raw_values = await asyncio.wait_for(_rc(self._redis).mget(keys), timeout=2.0)
-
+            raw_values = cast(List[Optional[str]], await asyncio.wait_for(_rc(self._redis).mget(keys), timeout=2.0))
         except Exception as e:
             logger_pair.warning(f"Failed to batch-fetch pending outcomes for {pair}: {e}")
             return
@@ -2678,10 +2677,10 @@ class RedisStateStore:
         if not keys:
             return
         try:
-            raw_values = await asyncio.wait_for(
+            raw_values = cast(List[Optional[str]], await asyncio.wait_for(
                 _rc(self._redis).mget(keys),
                 timeout=2.0,
-            )
+            ))
         except Exception as e:
             logger_pair.warning(
                 f"Failed to batch-fetch shadow pending outcomes for {pair}: {e}"

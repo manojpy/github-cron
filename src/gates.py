@@ -967,6 +967,15 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             return pair_name, {
                 "state": "NO_SIGNAL",
                 "ts": int(time.time()),
+                # Directional facts the macro-context builder needs when this pair
+                # is the macro reference (BTC) and its gate exits early.
+                "macro_ref": {
+                    "confirmation_buy": bool(confirmation_buy),
+                    "confirmation_sell": bool(confirmation_sell),
+                    "adx_ok": bool(adx_ok),
+                    "close": float(close_curr),
+                    "open": float(open_curr),
+                },
                 "summary": {
                     "alerts": 0,
                     "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",

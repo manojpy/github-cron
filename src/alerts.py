@@ -1652,23 +1652,31 @@ def pullback_message_line(context: Dict[str, Any], direction: str, keys: List[st
     info = context.get(f"pullback_info_{side}") or {}
     return f"↩ Pullback continuation ✓ ({', '.join(info.get('votes', []))}) | {_pullback_levels_text(info)}"
 
+# Pullback WATCH entries gathered during evaluation and sent as ONE message after the
+# real alerts: (pair, dedup_key, escaped_block). One process = one run, so a module
+# list is safe; it is emptied by flush_pullback_watch().
+_PULLBACK_WATCH_QUEUE: List[Tuple[str, str, str]] = []
+
 
 async def send_pullback_watch(context: Dict[str, Any], gr: GateResult, sdb: RedisStateStore, telegram_queue: "TelegramQueue", logger_pair: logging.Logger) -> int:
     """Informational WATCH: pullback shows exhaustion, trigger candle not closed yet.
-    Never recorded as a trade and never touches alert state. One message per
-    pair/direction/pullback-low candle (Redis claim), skipped in dry-run."""
+    Queues (does not send) one entry per pair/direction/pullback-low candle after a
+    Redis claim; flush_pullback_watch() sends them together once the real alerts are out.
+    Never recorded as a trade and never touches alert state. Skipped in dry-run."""
     if not (cfg.ENABLE_PULLBACK_CONTINUATION and cfg.PULLBACK_SEND_WATCH) or cfg.DRY_RUN_MODE:
         return 0
     if not sdb or sdb.degraded:
         return 0
-    sent = 0
+    queued = 0
     for side in ("buy", "sell"):
         if context.get(f"pullback_state_{side}") != "exhaustion":
             continue
+        if len(_PULLBACK_WATCH_QUEUE) >= int(cfg.PULLBACK_WATCH_MAX_PER_RUN):
+            break      # no claim taken, so the setup is offered again next run
         info = context.get(f"pullback_info_{side}") or {}
+        dedup_key = f"pbwatch_{side}_{info.get('low_ts')}"
         claim = await sdb.claim_recent_alert(
-            gr.pair_name, f"pbwatch_{side}_{info.get('low_ts')}", gr.ts_curr,
-            window_sec=int(cfg.PULLBACK_WATCH_DEDUP_SEC),
+            gr.pair_name, dedup_key, gr.ts_curr, window_sec=int(cfg.PULLBACK_WATCH_DEDUP_SEC),
         )
         if claim is not True:
             continue
@@ -1681,17 +1689,45 @@ async def send_pullback_watch(context: Dict[str, Any], gr: GateResult, sdb: Redi
             f"Waits for a 15m close beyond the trigger. Price {_format_price(gr.close_curr)}",
             f"⏰ {format_ist_time(gr.ts_curr, '%d-%m-%Y %H:%M IST')}",
         ]
-        ok = False
-        try:
-            ok = bool(await telegram_queue.send("\n".join(escape_markdown_v2(x) for x in lines)))
-        except Exception as e:
-            logger_pair.warning(f"[{gr.pair_name}] pullback WATCH send failed: {e}")
-        if ok:
-            sent += 1
-        else:
-            await sdb.release_recent_alert(gr.pair_name, f"pbwatch_{side}_{info.get('low_ts')}")
-    return sent
+        _PULLBACK_WATCH_QUEUE.append(
+            (gr.pair_name, dedup_key, "\n".join(escape_markdown_v2(x) for x in lines))
+        )
+        queued += 1
+    return queued
 
+async def flush_pullback_watch(sdb: RedisStateStore, telegram_queue: "TelegramQueue", logger_run: logging.Logger, suppress: bool = False) -> int:
+    """Send the queued WATCH entries as one (or, if long, a few) messages. A failed
+    send or a suppressed flush (kill switch) releases the claims so nothing is lost
+    silently. Never raises."""
+    items = list(_PULLBACK_WATCH_QUEUE)
+    _PULLBACK_WATCH_QUEUE.clear()
+    if not items:
+        return 0
+    chunks: List[List[Tuple[str, str, str]]] = [[]]
+    size = 0
+    for it in items:
+        if chunks[-1] and size + len(it[2]) + 2 > 3800:
+            chunks.append([])
+            size = 0
+        chunks[-1].append(it)
+        size += len(it[2]) + 2
+    sent = 0
+    for chunk in chunks:
+        ok = False
+        if not suppress:
+            try:
+                ok = bool(await telegram_queue.send("\n\n".join(b for _, _, b in chunk)))
+            except Exception as e:
+                logger_run.warning(f"pullback WATCH send failed: {e}")
+        if ok:
+            sent += len(chunk)
+        else:
+            for pair, dedup_key, _ in chunk:
+                try:
+                    await sdb.release_recent_alert(pair, dedup_key)
+                except Exception as e:
+                    logger_run.debug(f"[{pair}] pullback WATCH claim release failed: {e}")
+    return sent
 
 async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[Dict[str, np.ndarray]],
     reference_time: int, sdb: RedisStateStore, correlation_id: str, logger_pair: logging.Logger,
@@ -3717,7 +3753,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
                     if reconfirmed is None:
                         logger_pair.warning(
-                            f"[{pair_name}] Confirmation inconclusive — alert suppressed this run, "
+                            f"[{pair_name}] Confirmation inconclusive �� alert suppressed this run, "
                             f"dedup key RELEASED so it can retry next run"
                         )
                         await _release_dedup_claims()

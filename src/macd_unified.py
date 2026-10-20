@@ -49,7 +49,7 @@ from feedback import load_open_positions, poll_feedback, release_closed_auto_pos
 from alerts import (
     TelegramQueue, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
     DEDUP_STATS, reset_dedup_stats, DLQ_STATS, reset_dlq_stats, replay_telegram_dlq, format_dedup_summary,
-    send_trade_close_notices, _record_counterfactual_block, send_pullback_watch,
+    send_trade_close_notices, _record_counterfactual_block, send_pullback_watch, flush_pullback_watch,
 )
 from alert_registry import ALERT_KEYS, BUY_ALERT_KEYS, keys_for
 
@@ -930,7 +930,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 _expected_cadence_hr = float(
                     getattr(cfg, "CALIBRATION_REFRESH_MAX_AGE_HOURS", 2.0)
                 )
-                if built_age_hr is not None and built_age_hr >= _expected_cadence_hr:
+
+                if built_age_hr is not None and built_age_hr > _expected_cadence_hr + 0.5:
                     _missed_cycles = int(built_age_hr // _expected_cadence_hr) - 1
                     if built_age_hr >= (_expected_cadence_hr * 2):
                         logger_main.error(
@@ -1129,17 +1130,20 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                     # and ENABLE_MACRO_CONTEXT_GATE on, this avoids evaluating
                     # BTC's gate a second time in the same run.
                     _cached_btc = gate_cache.get(ref_pair, _CLUSTER_CACHE_MISS)
-                    if (
-                        _cached_btc is not _CLUSTER_CACHE_MISS
-                        and _cached_btc is not None
-                        and not isinstance(_cached_btc, tuple)
-                    ):
+                    if _cached_btc is not _CLUSTER_CACHE_MISS and _cached_btc is not None:
+                        # A cached early-exit tuple is reused too: re-evaluating it
+                        # would repeat the same work and the same Redis reset.
                         btc_gr = _cached_btc
                     else:
                         btc_gr = await _eval_gate(
                             ref_pair, btc_15m, btc_5m, btc_daily, state_db, correlation_id, reference_time, btc_oi,
                             resolve_outcomes=False,
                         )
+                    _mref = (
+                        btc_gr[1].get("macro_ref")
+                        if isinstance(btc_gr, tuple) and len(btc_gr) == 2 and isinstance(btc_gr[1], dict)
+                        else None
+                    )
                     if btc_gr is not None and not isinstance(btc_gr, tuple):
                         btc_context = BtcMacroContext(
                             confirmation_buy=btc_gr.confirmation_buy,
@@ -1148,6 +1152,22 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                             close=btc_gr.c,
                             open=btc_gr.o,
                             closes=btc_15m.close,
+                        )
+                    elif _mref:
+                        # BTC's own gate exited early (NO_SIGNAL) but still knows its
+                        # cloud direction and ADX state: that is all the macro modifier uses.
+                        btc_context = BtcMacroContext(
+                            confirmation_buy=bool(_mref["confirmation_buy"]),
+                            confirmation_sell=bool(_mref["confirmation_sell"]),
+                            adx_ok=bool(_mref["adx_ok"]),
+                            close=float(_mref["close"]),
+                            open=float(_mref["open"]),
+                            closes=btc_15m.close,
+                        )
+                        logger_main.info(
+                            f"Macro context: {ref_pair} built from its early-exit gate "
+                            f"(cloud buy={btc_context.confirmation_buy} sell={btc_context.confirmation_sell} "
+                            f"adx_ok={btc_context.adx_ok})"
                         )
                     else:
                         _cached_kind = (
@@ -1345,6 +1365,14 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         )
         if sent:
             logger_main.info(f"🎯 Batch dispatch delivered {sent} alert(s)")
+    # Pullback WATCH entries go out AFTER the real alerts, in one message.
+    if cfg.ENABLE_PULLBACK_CONTINUATION:
+        _w = await flush_pullback_watch(
+            state_db, telegram_queue, logger_main,
+            suppress=bool(kill_switch_active_run or kill_switch_tripped_this_run),
+        )
+        if _w:
+            logger_main.info(f"👀 Pullback WATCH: {_w} setup(s) sent in one message")
     # A Recorded trade that hit target/stop is no longer an open position: free its
     # heat-gate slot now instead of holding it for the full PORTFOLIO_POSITION_MAX_AGE_MIN.
     # Must run BEFORE send_trade_close_notices, which clears trade_close_events.
