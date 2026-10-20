@@ -447,9 +447,6 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
     except Exception as e:
         logger_main.error(f"Error in {p_name} evaluation: {e}", exc_info=False)
         return None
-    
-    finally:
-        pass
 
 async def _compute_directional_cluster(prepared_tasks: List[Tuple[str, str, Dict[str, Any]]], state_db: RedisStateStore, correlation_id: str, reference_time: int, oi_gate_data: Optional[Dict[str, Dict[str, Any]]], parsed_cache: Optional[Dict[str, Any]] = None) -> Tuple[Optional[ClusterContext], Dict[str, Any]]:
     """Pre-pass that returns both a ClusterContext and a gate cache mapping

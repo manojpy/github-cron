@@ -189,6 +189,14 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
                     except (ValueError, TypeError):
                         retry_val = 5
                     wait_sec = min(retry_val, Constants.CIRCUIT_BREAKER_MAX_WAIT)
+                    if wait_sec > Constants.MAX_USEFUL_RETRY_AFTER_SEC:
+                        # A 15m candle is stale long before this wait ends and the
+                        # sleep would hold the whole fetch phase open. Give up now.
+                        logger.warning(
+                            f"Rate limited (429) | URL: {url[:80]} | Retry-After {wait_sec}s "
+                            f"exceeds {Constants.MAX_USEFUL_RETRY_AFTER_SEC}s - not waiting"
+                        )
+                        return None
                     jitter = random.uniform(0.1, 0.5)
                     total_wait = wait_sec + jitter             
                     retry_stats[RetryCategory.RATE_LIMIT] += 1
@@ -702,12 +710,38 @@ class DataFetcher:
                 )
                 all_tasks.append(task)
                 task_metadata.append((symbol, resolution))
-        results = await asyncio.wait_for(
-            asyncio.gather(*all_tasks, return_exceptions=True),
-            timeout=cfg.FETCH_PHASE_TIMEOUT_SEC
-        )
-        
+
+        # asyncio.wait (not wait_for(gather)): when the phase budget runs out,
+        # every fetch that already finished is kept and only the stragglers are
+        # dropped. wait_for(gather) would raise and discard ALL pairs' candles,
+        # so one slow request would cost the whole 15-minute cycle.
+        work = [asyncio.ensure_future(t) for t in all_tasks]
+        _done, pending = await asyncio.wait(work, timeout=cfg.FETCH_PHASE_TIMEOUT_SEC)
+        if pending:
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            # fetch_candles shields the shared fetch, so cancel those too;
+            # the done-callback then forgets them and nothing keeps running.
+            stuck = [fut for fut in self._candle_futures.values() if not fut.done()]
+            for fut in stuck:
+                fut.cancel()
+            if stuck:
+                await asyncio.gather(*stuck, return_exceptions=True)
+            late = [task_metadata[i][0] + "/" + task_metadata[i][1]
+                    for i, t in enumerate(work) if t in pending]
+            logger.warning(
+                f"Fetch phase budget ({cfg.FETCH_PHASE_TIMEOUT_SEC}s) reached - "
+                f"{len(pending)}/{len(work)} request(s) dropped: {late[:10]}"
+            )
+        results = [
+            (None if t.cancelled() else (t.exception() or t.result()))
+            if t.done() else None
+            for t in work
+        ]
+
         output: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {}
+
         success_count = 0
         
         for (symbol, resolution), result in zip(task_metadata, results):

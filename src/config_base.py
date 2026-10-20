@@ -128,6 +128,7 @@ class Constants:
     RSI_SIGNAL_CROSS_MAX_BUY = 65
     RSI_SIGNAL_CROSS_MIN_SELL = 35
     CIRCUIT_BREAKER_MAX_WAIT = 300
+    MAX_USEFUL_RETRY_AFTER_SEC = 20     # longest 429 Retry-After a candle fetch will sit out
     INFINITY_CLAMP = 1e8
     VWAP_MAX_DISTANCE_PCT = 2.0
     INTER_BATCH_DELAY: float = 0.5
