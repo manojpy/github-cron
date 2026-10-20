@@ -28,7 +28,7 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Tuple
 from bot_config import cfg, json_dumps
 from alert_registry import alert_family_of, pretty_alert
 from alerts import TelegramQueue, escape_markdown_v2
