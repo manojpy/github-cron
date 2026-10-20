@@ -28,7 +28,7 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Awaitable, cast
 from bot_config import cfg, json_dumps
 from alert_registry import alert_family_of, pretty_alert
 from alerts import TelegramQueue, escape_markdown_v2
@@ -250,7 +250,10 @@ async def _strict_get(sdb: RedisStateStore, key: str) -> Optional[str]:
     rc = sdb._redis
     if rc is None:
         raise RuntimeError("learner: Redis client not connected")
-    return await asyncio.wait_for(rc.get(f"{sdb.meta_prefix}{key}"), timeout=5.0)
+    return await asyncio.wait_for(
+        cast(Awaitable[Optional[str]], rc.get(f"{sdb.meta_prefix}{key}")),
+        timeout=5.0,
+    )
 
 async def _strict_set_many(sdb: RedisStateStore, items: List[Tuple[str, str]], ttl: int) -> None:
     """All keys written in one MULTI/EXEC; any failure raises, so the learner never half-writes."""
@@ -260,7 +263,7 @@ async def _strict_set_many(sdb: RedisStateStore, items: List[Tuple[str, str]], t
     async with rc.pipeline(transaction=True) as pipe:
         for key, value in items:
             pipe.set(f"{sdb.meta_prefix}{key}", value, ex=ttl)
-        await asyncio.wait_for(pipe.execute(), timeout=10.0)
+        await asyncio.wait_for(cast(Awaitable[Any], pipe.execute()), timeout=10.0)
 
 async def run(args: argparse.Namespace) -> int:
     data_dir = args.data_dir or os.environ.get("OUTCOME_DATA_DIR") or ""
