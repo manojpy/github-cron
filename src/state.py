@@ -377,6 +377,9 @@ class RedisStateStore:
         self.recovery_attempts: int = 0
         self.recovery_successes: int = 0
         self._claim_token: str = uuid.uuid4().hex[:12]
+        # Per-run caches (one RedisStateStore instance per bot run).
+        self._pair_thresholds_cache: Optional[Dict[str, float]] = None
+        self._cooldown_cache: Dict[Tuple[str, str], Optional[int]] = {}
 
         if cfg.DEBUG_MODE and logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -659,11 +662,29 @@ class RedisStateStore:
         }
         if self.degraded or not self._redis:
             return snapshot
+
+        # Prefer sectioned INFO (smaller payload). Fall back to full INFO if
+        # the server rejects the section argument.
         info = await self._safe_redis_op(
-            lambda: _rc(self._redis).info(),
+            lambda: _rc(self._redis).info("stats"),
             2.0,
-            "info",
+            "info_stats",
         )
+        mem = await self._safe_redis_op(
+            lambda: _rc(self._redis).info("memory"),
+            2.0,
+            "info_memory",
+        )
+        if not isinstance(info, dict):
+            info = {}
+        if isinstance(mem, dict):
+            info = {**info, **mem}
+        if not info:
+            info = await self._safe_redis_op(
+                lambda: _rc(self._redis).info(),
+                2.0,
+                "info",
+            )
         if not isinstance(info, dict):
             return snapshot
         total_commands = info.get("total_commands_processed")
@@ -905,20 +926,29 @@ class RedisStateStore:
 
     async def get_pair_thresholds(self) -> Dict[str, float]:
         """All pair -> confluence-abs-score-floor overrides currently stored,
-        as learned/written by the brain. Missing or malformed data returns {}."""
+        as learned/written by the brain. Missing or malformed data returns {}.
+        Cached for the lifetime of this RedisStateStore instance (one bot run)."""
+        if self._pair_thresholds_cache is not None:
+            return self._pair_thresholds_cache
 
         raw = await self.get_durable_metadata(PAIR_THRESHOLDS_METADATA_KEY)
         if not raw:
-            return {}
+            self._pair_thresholds_cache = {}
+            return self._pair_thresholds_cache
         try:
             data = json_loads(raw)
         except (JSONDecodeError, TypeError, ValueError) as e:
             logger.warning(f"Ignoring malformed {PAIR_THRESHOLDS_METADATA_KEY} in Redis: {e}")
-            return {}
+            self._pair_thresholds_cache = {}
+            return self._pair_thresholds_cache
         if not isinstance(data, dict):
             logger.warning(f"Ignoring {PAIR_THRESHOLDS_METADATA_KEY} in Redis: not a JSON object")
-            return {}
-        return {k: float(v) for k, v in data.items() if isinstance(v, (int, float))}
+            self._pair_thresholds_cache = {}
+            return self._pair_thresholds_cache
+        self._pair_thresholds_cache = {
+            k: float(v) for k, v in data.items() if isinstance(v, (int, float))
+        }
+        return self._pair_thresholds_cache
 
     async def get_pair_threshold(self, pair: str) -> Optional[float]:
         """Single pair's stored abs-score floor, or None if not set — caller
@@ -927,15 +957,19 @@ class RedisStateStore:
         return thresholds.get(pair)
 
     async def set_pair_threshold(self, pair: str, value: float) -> bool:
-        current = await self.get_pair_thresholds()
+        current = dict(await self.get_pair_thresholds())
         current[pair] = value
         try:
             if not await self.set_metadata(PAIR_THRESHOLDS_METADATA_KEY, json_dumps(current)):
-                logger.warning(f"Failed to update pair threshold for '{pair}': Redis write did not complete")
+                logger.warning(
+                    f"Failed to update pair threshold for '{pair}': Redis write did not complete"
+                )
                 return False
         except Exception as e:
             logger.warning(f"Failed to update pair threshold for '{pair}': {e}")
             return False
+        # Keep the run cache in sync with what we just wrote.
+        self._pair_thresholds_cache = current
         return True
 
     async def get_dynamic_weights(self) -> Optional[Dict[str, float]]:
@@ -1059,10 +1093,12 @@ class RedisStateStore:
         if not self._redis or self.degraded or not items:
             return True
         try:
-            async with self._redis.pipeline() as pipe:
+            # Independent SETs — no MULTI/EXEC needed.
+            async with self._redis.pipeline(transaction=False) as pipe:
                 for k, v in items.items():
                     pipe.set(
-                        f"{self.meta_prefix}{k}", v,
+                        f"{self.meta_prefix}{k}",
+                        v,
                         ex=ttl if ttl is not None else (
                             DURABLE_METADATA_TTL_SEC if k in DURABLE_METADATA_KEYS
                             else self.metadata_expiry_seconds
@@ -1286,10 +1322,15 @@ class RedisStateStore:
                 )
         return None
 
-    async def batch_check_recent_alerts(self, pair: str, alert_keys: List[str], ts: int, window_sec: Optional[int] = None, windows: Optional[Dict[str, int]] = None) -> Dict[str, bool]:
+    async def batch_check_recent_alerts(self, pair: str, alert_keys: List[str], ts: int, window_sec: Optional[int] = None, windows: Optional[Dict[str, int]] = None) -> Optional[Dict[str, bool]]:
         """Claim dedup windows for several alert keys on one pair in ONE Redis
         round-trip (pipeline). Each SET NX EX is still independently atomic —
-        this only batches the network round-trip, not the semantics."""
+        this only batches the network round-trip, not the semantics.
+
+        Returns:
+            dict  — alert_key -> True (claim taken) / False (genuine duplicate)
+            None  — Redis degraded or errored (caller must fail closed; not a duplicate)
+        """
         if not alert_keys:
             return {}
         if self.degraded:
@@ -1297,21 +1338,24 @@ class RedisStateStore:
                 f"batch_check_recent_alerts: Redis degraded — failing closed for {pair} "
                 f"(no dedup claim possible, {len(alert_keys)} alert(s) blocked)"
             )
-            return {k: False for k in alert_keys}
+            return None
         if not self._redis:
             logger.critical(
                 f"batch_check_recent_alerts: degraded=False but _redis is None (state desync) — "
                 f"failing closed for {pair}, these alerts will be blocked"
             )
-            return {k: False for k in alert_keys}
+            return None
         effective_window = window_sec if window_sec is not None else cfg.ALERT_DEDUP_WINDOW_SEC
         try:
             claim_value = f"{ts}:{self._claim_token}"
-            async with self._redis.pipeline() as pipe:
+            # Independent SET NX — no need for MULTI/EXEC overhead.
+            async with self._redis.pipeline(transaction=False) as pipe:
                 for alert_key in alert_keys:
                     recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
                     pipe.set(
-                        recent_key, claim_value, nx=True,
+                        recent_key,
+                        claim_value,
+                        nx=True,
                         ex=int((windows or {}).get(alert_key, effective_window)),
                     )
                 results = await asyncio.wait_for(_execute_pipeline(pipe), timeout=3.0)
@@ -1321,7 +1365,7 @@ class RedisStateStore:
             # Partial pipeline success is possible. Recover by releasing only
             # the claims that belong to THIS run (matched by token).
             await self._release_own_claims(pair, alert_keys)
-            return {k: False for k in alert_keys}  # fail-closed after cleanup
+            return None  # fail-closed — do NOT treat as duplicates
 
     async def release_recent_alert(self, pair: str, alert_key: str) -> None:
         """Undo a dedup claim if the message didn't actually get delivered.
@@ -2279,7 +2323,8 @@ class RedisStateStore:
     async def in_trade_cooldown(self, pair: str, entry_ts: int, source: str = "Recorded") -> Optional[int]:
         """Return the target-hit candle ts when `entry_ts` is inside the pair's
         re-entry cooldown for `source` ('Recorded' or 'Shadowed'), else None.
-        Fails open (Redis problem = no cooldown)."""
+        Fails open (Redis problem = no cooldown). Cached per (pair, source)
+        for the rest of this run."""
         n = int(getattr(cfg, "TRADE_CLOSE_COOLDOWN_CANDLES", 0))
         if (
             n <= 0
@@ -2288,18 +2333,32 @@ class RedisStateStore:
             or not self._redis
         ):
             return None
-        try:
-            raw = await asyncio.wait_for(
-                _rc(self._redis).get(self._cooldown_key(pair, source)),
-
-                timeout=2.0,
-            )
-            if raw is None:
+        cache_key = (pair, source)
+        if cache_key in self._cooldown_cache:
+            hit_ts = self._cooldown_cache[cache_key]
+        else:
+            try:
+                raw = await asyncio.wait_for(
+                    _rc(self._redis).get(self._cooldown_key(pair, source)),
+                    timeout=2.0,
+                )
+                hit_ts = int(raw) if raw is not None else None
+            except Exception:
                 return None
-            hit_ts = int(raw)
-        except Exception:
+            self._cooldown_cache[cache_key] = hit_ts
+        if hit_ts is None:
             return None
         return hit_ts if int(entry_ts) <= hit_ts + n * 900 else None
+
+    # Set cooldown only if the new hit_ts is >= the stored value (never move backwards).
+    _COOLDOWN_SET_MAX_LUA = """
+    local cur = redis.call("GET", KEYS[1])
+    if cur and tonumber(cur) and tonumber(cur) >= tonumber(ARGV[1]) then
+        return 0
+    end
+    redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
+    return 1
+    """
 
     async def _start_trade_cooldown(self, pair: str, hit_ts: int, logger_pair: logging.Logger, source: str = "Recorded") -> None:
         if self.degraded or not self._redis:
@@ -2307,13 +2366,23 @@ class RedisStateStore:
         key = self._cooldown_key(pair, source)
         ttl = int((int(cfg.TRADE_CLOSE_COOLDOWN_CANDLES) + 4) * 900)
         try:
-            raw = await asyncio.wait_for(_rc(self._redis).get(key), timeout=2.0)
-            if raw is not None and int(raw) >= int(hit_ts):
-                return  # never move the cooldown backwards
             await asyncio.wait_for(
-                _rc(self._redis).set(key, str(int(hit_ts)), ex=ttl), timeout=2.0
-
+                cast(
+                    Awaitable[Any],
+                    _rc(self._redis).eval(
+                        self._COOLDOWN_SET_MAX_LUA,
+                        1,
+                        key,
+                        str(int(hit_ts)),
+                        str(ttl),
+                    ),
+                ),
+                timeout=2.0,
             )
+            # Keep run cache consistent with the write.
+            prev = self._cooldown_cache.get((pair, source))
+            if prev is None or int(hit_ts) >= int(prev):
+                self._cooldown_cache[(pair, source)] = int(hit_ts)
         except Exception as e:
             logger_pair.warning(f"[{pair}] Could not start trade cooldown: {e}")
 
@@ -2974,6 +3043,48 @@ class RedisStateStore:
         except Exception as e:
             logger.warning(f"batch_get_alert_win_rates({pair}) failed for {len(alert_keys)} keys: {e}")
             return {k: (None, 0) for k in alert_keys}
+
+    async def batch_get_alert_win_rates_session(self, pair: str, alert_keys: List[str], session: str, timeout: float = 3.0) -> Dict[str, Tuple[Optional[float], int]]:
+        """Session-scoped twin of batch_get_alert_win_rates — one pipeline."""
+        if (
+            self.degraded
+            or not cfg.ENABLE_WIN_RATE_FILTER
+            or not getattr(cfg, "ENABLE_SESSION_FILTER", False)
+            or not alert_keys
+        ):
+            return {k: (None, 0) for k in alert_keys}
+        min_sample = int(getattr(cfg, "MIN_WIN_RATE_SESSION_SAMPLE", 15))
+        try:
+            async with _rc(self._redis).pipeline(transaction=False) as pipe:
+                for ak in alert_keys:
+                    pipe.hgetall(f"{RedisKeyPrefix.ALERT_STATS}{pair}:{ak}:{session}")
+                raw_results = await asyncio.wait_for(
+                    _execute_pipeline(pipe), timeout=timeout
+                )
+            out: Dict[str, Tuple[Optional[float], int]] = {}
+            for ak, data in zip(alert_keys, raw_results):
+                if not data:
+                    out[ak] = (None, 0)
+                    continue
+                wins = int(data.get("wins", 0))
+                losses = int(data.get("losses", 0))
+                total = wins + losses
+                if total < min_sample:
+                    out[ak] = (None, total)
+                else:
+                    out[ak] = (wins / total, total)
+            return out
+        except Exception as e:
+            logger.warning(
+                f"batch_get_alert_win_rates_session({pair}, {session}) "
+                f"failed for {len(alert_keys)} keys: {e}"
+            )
+            return {k: (None, 0) for k in alert_keys}
+
+
+
+
+
 
     async def get_cumulative_outcome_stats(self) -> Dict[str, Dict[str, int]]:
         """Return cumulative Recorded/Shadowed outcome totals.

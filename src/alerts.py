@@ -2800,25 +2800,36 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         # Structured Telegram metadata (filled during quality pass; used at send)
         alert_tq_by_key: Dict[str, Optional[Dict[str, Any]]] = {}
         alert_pb_by_key: Dict[str, Optional[Dict[str, Any]]] = {}
-
         if alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER:
             alert_keys_to_check = [ak for _, _, ak in alerts_to_send]
             win_rate_map = await sdb.batch_get_alert_win_rates(
                 pair_name, alert_keys_to_check, timeout=3.0
             )
-            current_session = _get_session_from_ts(ts_curr) if getattr(cfg, "ENABLE_SESSION_FILTER", False) else None
+            current_session = (
+                _get_session_from_ts(ts_curr)
+                if getattr(cfg, "ENABLE_SESSION_FILTER", False)
+                else None
+            )
+            session_win_rate_map: Dict[str, Tuple[Optional[float], int]] = {}
+            if current_session is not None:
+                session_win_rate_map = await sdb.batch_get_alert_win_rates_session(
+                    pair_name, alert_keys_to_check, current_session, timeout=3.0
+                )
             surviving_alerts = []
-          
+
             for alert_title, alert_extra, alert_key in alerts_to_send:
                 direction = "buy" if alert_key in BUY_ALERT_KEYS else "sell"
                 win_rate, sample = win_rate_map.get(alert_key, (None, 0))
                 failing_rate, fail_note = None, None
                 if win_rate is not None and win_rate < cfg.MIN_WIN_RATE:
                     failing_rate = win_rate
-                    fail_note = f"{win_rate:.0%} over {sample} samples (need >= {cfg.MIN_WIN_RATE:.0%})"
+                    fail_note = (
+                        f"{win_rate:.0%} over {sample} samples "
+                        f"(need >= {cfg.MIN_WIN_RATE:.0%})"
+                    )
                 if current_session is not None:
-                    session_win_rate, session_sample = await sdb.get_alert_win_rate_session(
-                        pair_name, alert_key, current_session
+                    session_win_rate, session_sample = session_win_rate_map.get(
+                        alert_key, (None, 0)
                     )
                     if session_win_rate is not None and session_win_rate < cfg.MIN_WIN_RATE:
                         if failing_rate is None or session_win_rate < failing_rate:
@@ -2827,7 +2838,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 f"{session_win_rate:.0%} in {current_session} session over "
                                 f"{session_sample} samples (need >= {cfg.MIN_WIN_RATE:.0%})"
                             )
-
                 alert_score, alert_total, alert_votes = _confluence_for(alert_key)
                 
                 # ── Calibration gate (independent of the win-rate filter) ──
@@ -3418,7 +3428,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         ),
                     },
                 }, None
-
         elif alerts_to_send:
             keys_to_check = [alert_key for _, _, alert_key in alerts_to_send]
             if getattr(sdb, "degraded", False) and await sdb.maybe_recover_from_degraded():
@@ -3427,10 +3436,30 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     f"[{pair_name}] Redis recovered mid-run — dedup claims proceed"
                 )
             claim_results = await sdb.batch_check_recent_alerts(
-
-                pair_name, keys_to_check, ts_curr,
+                pair_name,
+                keys_to_check,
+                ts_curr,
                 windows=await sdb.get_adaptive_dedup_windows(),
             )
+            if claim_results is None:
+                # Redis error: not a real duplicate. Leave candle unprocessed
+                # so a later run can retry (same pattern as coalesce claim).
+                logger_pair.warning(
+                    f"[{pair_name}] batch dedup claim failed (Redis error/degraded) — "
+                    f"alert not sent; candle NOT marked processed"
+                )
+                return pair_name, {
+                    "state": "SUPPRESSED_DEDUP_ERROR",
+                    "ts": int(time.time()),
+                    "summary": {
+                        "alerts": 0,
+                        "future_cloud": (
+                            "green" if cloud_up else "red" if cloud_down else "neutral"
+                        ),
+                        "hist_rma": round(hist_curr, 4),
+                        "suppression": "Dedup claim failed (Redis) — candle left open for retry",
+                    },
+                }, None
             deduped_alerts = []
             for alert_title, alert_extra, alert_key in alerts_to_send:
                 if not claim_results.get(alert_key, False):
