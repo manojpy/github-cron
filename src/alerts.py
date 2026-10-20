@@ -2076,7 +2076,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     context[f"pullback_state_{_side}"] = _st
                     context[f"pullback_info_{_side}"] = _inf
             except Exception as _pb_err:
-                logger_pair.debug(f"[{pair_name}] pullback state failed: {_pb_err}", exc_info=cfg.DEBUG_MODE)
+                logger_pair.warning(f"[{pair_name}] pullback state failed: {_pb_err}", exc_info=cfg.DEBUG_MODE)
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev, "ema_curr": rsi_ema_curr, "ema_prev": rsi_ema_prev}
@@ -2284,7 +2284,14 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                         if cfg.DEBUG_MODE:
                             logger_pair.debug(f"Skipping {alert_key}: pullback not confirmed "
                                               f"(state={context.get(f'pullback_state_{_pb_side}')})")
+                        if not _brain_disabled:
+                            # Shadow-tracked at dispatch as "pullback_unconfirmed" so the
+                            # gate's effect can be measured instead of invisible.
+                            context.setdefault("pullback_unconfirmed_hits", []).append(
+                                (def_.title, extra, def_.key)
+                            )
                         continue
+
                 if _brain_disabled:
                     # Never dispatched: handed to the dispatch stage, which
                     # shadow-tracks it as "brain_disabled".
@@ -2447,6 +2454,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     pair_name = gr.pair_name
     _, ts_curr, reference_time = gr.i15, gr.ts_curr, gr.reference_time
     _disabled_hits = context.pop("brain_disabled_hits", None) or []
+    _pb_hits = context.pop("pullback_unconfirmed_hits", None) or []
 
     if kill_switch_mode() == "live" and sdb and not sdb.degraded and sdb._redis:
         if kill_switch_active_run is _SENTINEL_UNSET:
@@ -2576,7 +2584,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             capped_alerts = raw_alerts
 
         alerts_to_send = capped_alerts[:cfg.MAX_ALERTS_PER_PAIR]
-        if _disabled_hits:
+        if _disabled_hits or _pb_hits:
             _dis_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
             if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
                 _pair_floor = (
@@ -2585,13 +2593,21 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 )
                 if _pair_floor is not None:
                     _dis_floor = _pair_floor
-
             _dis_pass = _disabled_hits_passing_confluence(_disabled_hits, _confluence_for, _dis_floor)
             if _dis_pass:
                 await _record_counterfactual_block(
                     sdb, pair_name, _dis_pass, ts_curr, close_curr,
                     block_reason="brain_disabled",
                     confluence_scores={ak: _confluence_for(ak) for _, _, ak in _dis_pass},
+                    gr=gr, context=context,
+                    logger_pair=logger_pair,
+                )
+            _pb_pass = _disabled_hits_passing_confluence(_pb_hits, _confluence_for, _dis_floor)
+            if _pb_pass:
+                await _record_counterfactual_block(
+                    sdb, pair_name, _pb_pass, ts_curr, close_curr,
+                    block_reason="pullback_unconfirmed",
+                    confluence_scores={ak: _confluence_for(ak) for _, _, ak in _pb_pass},
                     gr=gr, context=context,
                     logger_pair=logger_pair,
                 )

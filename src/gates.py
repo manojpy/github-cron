@@ -937,11 +937,9 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             and effective_cpr_ok
             and trend_gate_ok_sell
         )
-
         reversal_candidate = (
             (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT
-             or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT
-             or cfg.ENABLE_PULLBACK_CONTINUATION)
+             or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT)
             and (buy_trend_common_relaxed or sell_trend_common_relaxed)
         )
         if not buy_common and not sell_common and not reversal_candidate:

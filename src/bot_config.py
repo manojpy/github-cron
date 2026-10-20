@@ -295,6 +295,7 @@ class BotConfig(BaseModel):
     PULLBACK_EXHAUSTION_MIN_VOTES: int = Field(default=2, ge=1, le=3, description="Exhaustion votes needed out of 3: rejection wick/pattern, PPO histogram turning up off its pullback trough, RSI turning up")
     PULLBACK_REJECTION_WICK_RATIO: float = Field(default=0.40, ge=0.1, le=0.9, description="Lower-wick (BUY) / upper-wick (SELL) share of the candle range that counts as a rejection candle")
     PULLBACK_TRIGGER_BUFFER_ATR: float = Field(default=0.0, ge=0.0, le=2.0, description="Extra distance (ATR_SHORT multiples) the trigger candle must close beyond the pullback trigger level")
+    PULLBACK_CONFIRM_WINDOW_BARS: int = Field(default=1, ge=1, le=4, description="A trigger close on any of the last N candles confirms the setup. 1 = the current candle only (strict). 2 lets a host alert that fires one candle after the trigger still be tagged")
     EVAL_CONCURRENCY_LIMIT: int = Field(default=2, ge=1, le=30, description="Max pairs evaluated concurrently")
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    

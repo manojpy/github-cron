@@ -1794,7 +1794,7 @@ def _pullback_continuation_state(o: np.ndarray, h: np.ndarray, l: np.ndarray, c:
     votes: List[str] = []
     wick_min = float(cfg_obj.PULLBACK_REJECTION_WICK_RATIO)
     rejected = bool(reversal_now)
-    for k in range(max(il, i15 - 2), i15 + 1):
+    for k in range(il, min(il + 2, i15 + 1)):    # pullback-low candle and the one after it
         rng = hh[k] - ll[k]
         if np.isfinite(rng) and rng > 0:
             lower_wick = min(oo[k], cc[k]) - ll[k]
@@ -1816,10 +1816,18 @@ def _pullback_continuation_state(o: np.ndarray, h: np.ndarray, l: np.ndarray, c:
     # ── trigger: close above the highest high since the pullback low ──
     trig_seg = hh[il:i15]
     if len(trig_seg) and np.all(np.isfinite(trig_seg)):
-        trigger = float(np.max(trig_seg)) + float(cfg_obj.PULLBACK_TRIGGER_BUFFER_ATR) * a
+        buf = float(cfg_obj.PULLBACK_TRIGGER_BUFFER_ATR) * a
+        trigger = float(np.max(trig_seg)) + buf
         info["trigger"] = float(sign * trigger)
-        if exhausted and il < i15 and cc[i15] > trigger and cc[i15] > oo[i15]:
-            return "confirmed", info
+        if exhausted:
+            # A trigger close on any of the last PULLBACK_CONFIRM_WINDOW_BARS candles counts
+            # (1 = current candle only). Each candle uses the highest high before it.
+            win = int(cfg_obj.PULLBACK_CONFIRM_WINDOW_BARS)
+            for k in range(max(il + 1, i15 - win + 1), i15 + 1):
+                trig_k = float(np.max(hh[il:k])) + buf
+                if cc[k] > trig_k and cc[k] > oo[k]:
+                    return "confirmed", info
+
     if exhausted:
         return "exhaustion", info
     return "pullback", info
