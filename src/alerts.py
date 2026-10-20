@@ -3426,11 +3426,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 logger_pair.info(
                     f"[{pair_name}] Redis recovered mid-run — dedup claims proceed"
                 )
-            claim_results = await sdb.batch_check_recent_alerts(
-
-                pair_name, keys_to_check, ts_curr,
-                windows=await sdb.get_adaptive_dedup_windows(),
-            )
+            claim_results = await sdb.batch_check_recent_alerts(pair_name, keys_to_check, ts_curr, windows=await sdb.get_adaptive_dedup_windows())
+            if claim_results is None:
+                logger_pair.error(f"[{pair_name}] Dedup claim failed; suppressing this dispatch attempt so it can be retried")
+                return None
             deduped_alerts = []
             for alert_title, alert_extra, alert_key in alerts_to_send:
                 if not claim_results.get(alert_key, False):

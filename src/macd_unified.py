@@ -1332,9 +1332,14 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             continue
         if r is None:
             continue
-        # r is now (pair_name, summary_dict, payload_or_none)
         if isinstance(r, tuple) and len(r) >= 2:
-            valid_results.append((r[0], r[1]))
+            pair_name, summary = r[0], r[1]
+            if isinstance(summary, dict) and summary.get("state") == "SUPPRESSED_DEDUP_ERROR":
+                if pair_name not in deferred_pairs:
+                    deferred_pairs.append(pair_name)
+                logger_main.warning(f"[{pair_name}] Deferred: dedup claim failed; candle remains eligible for retry")
+                continue
+            valid_results.append((pair_name, summary))
             if len(r) >= 3 and r[2] is not None:
                 batched_payloads.append(r[2])
 

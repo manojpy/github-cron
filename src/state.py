@@ -1286,7 +1286,7 @@ class RedisStateStore:
                 )
         return None
 
-    async def batch_check_recent_alerts(self, pair: str, alert_keys: List[str], ts: int, window_sec: Optional[int] = None, windows: Optional[Dict[str, int]] = None) -> Dict[str, bool]:
+    async def batch_check_recent_alerts(self, pair: str, alert_keys: List[str], ts: int, window_sec: Optional[int] = None, windows: Optional[Dict[str, int]] = None) -> Optional[Dict[str, bool]]:
         """Claim dedup windows for several alert keys on one pair in ONE Redis
         round-trip (pipeline). Each SET NX EX is still independently atomic —
         this only batches the network round-trip, not the semantics."""
@@ -1303,7 +1303,7 @@ class RedisStateStore:
                 f"batch_check_recent_alerts: degraded=False but _redis is None (state desync) — "
                 f"failing closed for {pair}, these alerts will be blocked"
             )
-            return {k: False for k in alert_keys}
+            return None
         effective_window = window_sec if window_sec is not None else cfg.ALERT_DEDUP_WINDOW_SEC
         try:
             claim_value = f"{ts}:{self._claim_token}"
@@ -1315,13 +1315,13 @@ class RedisStateStore:
                         ex=int((windows or {}).get(alert_key, effective_window)),
                     )
                 results = await asyncio.wait_for(_execute_pipeline(pipe), timeout=3.0)
+            if not isinstance(results, (list, tuple)) or len(results) != len(alert_keys):
+                raise RuntimeError(f"Dedup pipeline returned {len(results) if isinstance(results, (list, tuple)) else 'invalid'} results for {len(alert_keys)} alert keys")
             return {k: bool(r) for k, r in zip(alert_keys, results)}
         except Exception as e:
             logger.error(f"batch_check_recent_alerts FAILED for {pair} ({alert_keys}): {e}")
-            # Partial pipeline success is possible. Recover by releasing only
-            # the claims that belong to THIS run (matched by token).
             await self._release_own_claims(pair, alert_keys)
-            return {k: False for k in alert_keys}  # fail-closed after cleanup
+            return None
 
     async def release_recent_alert(self, pair: str, alert_key: str) -> None:
         """Undo a dedup claim if the message didn't actually get delivered.
@@ -2976,6 +2976,24 @@ class RedisStateStore:
             return {k: (None, 0) for k in alert_keys}
 
     async def get_cumulative_outcome_stats(self) -> Dict[str, Dict[str, int]]:
+        """Return cached cumulative outcome totals; refresh at most every 30 minutes."""
+        if self.degraded or not self._redis:
+            return await self._get_cumulative_outcome_stats_uncached()
+        cache_key = "macd:cumulative_outcome_stats:v1"
+        raw = await self._safe_redis_op(lambda: _rc(self._redis).get(cache_key), 2.0, "cumulative_stats_cache_get")
+        if raw:
+            try:
+                cached = json_loads(raw)
+                if isinstance(cached, dict) and all(isinstance(cached.get(k), dict) for k in ("Recorded", "Shadowed")):
+                    return cached
+            except Exception:
+                logger.warning("Cumulative outcome stats cache is invalid; recalculating")
+        stats = await self._get_cumulative_outcome_stats_uncached()
+        if not self.degraded and self._redis:
+            await self._safe_redis_op(lambda: _rc(self._redis).set(cache_key, json_dumps(stats), ex=1800), 2.0, "cumulative_stats_cache_set")
+        return stats
+
+    async def _get_cumulative_outcome_stats_uncached(self) -> Dict[str, Dict[str, int]]:
         """Return cumulative Recorded/Shadowed outcome totals.
 
         Counts:
