@@ -1461,7 +1461,7 @@ class BrainEngineV2(BrainCore):
             # handler below falls back to the base technical report.
             recs["_plan_lifecycle"] = await self._load_plan_lifecycle()
             try:
-                recs["_outcome_totals"] = await self.sdb.get_cumulative_outcome_stats()
+                recs["_outcome_totals"] = await self.sdb.get_cumulative_outcome_stats(force=True)
             except Exception as e:
                 logger_run.debug(f"Outcome totals unavailable for Brain report: {e}")
             sections, stamp = build_brain_report_sections(recs, cfg)

@@ -3426,10 +3426,33 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 logger_pair.info(
                     f"[{pair_name}] Redis recovered mid-run — dedup claims proceed"
                 )
-            claim_results = await sdb.batch_check_recent_alerts(pair_name, keys_to_check, ts_curr, windows=await sdb.get_adaptive_dedup_windows())
+            claim_results = await sdb.batch_check_recent_alerts(
+                pair_name, keys_to_check, ts_curr,
+                windows=await sdb.get_adaptive_dedup_windows(),
+            )
             if claim_results is None:
-                logger_pair.error(f"[{pair_name}] Dedup claim failed; suppressing this dispatch attempt so it can be retried")
-                return None
+                # Redis error/degraded: not a real duplicate. Do not mark the
+                # candle processed, so a re-evaluation of this candle can retry.
+                logger_pair.warning(
+                    f"[{pair_name}] Dedup claim failed (Redis error/degraded) — "
+                    f"alerts not sent; candle NOT marked processed"
+                )
+                return pair_name, {
+                    "state": "SUPPRESSED_DEDUP_ERROR",
+                    "ts": int(time.time()),
+                    "summary": {
+                        "alerts": 0,
+                        "future_cloud": (
+                            "green"
+                            if cloud_up
+                            else "red"
+                            if cloud_down
+                            else "neutral"
+                        ),
+                        "hist_rma": round(hist_curr, 4),
+                        "suppression": "Dedup claim failed (Redis) — candle left open for retry",
+                    },
+                }, None
             deduped_alerts = []
             for alert_title, alert_extra, alert_key in alerts_to_send:
                 if not claim_results.get(alert_key, False):
