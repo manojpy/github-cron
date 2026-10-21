@@ -2157,6 +2157,14 @@ class RedisStateStore:
             row["bonus_win"] = result.get("bonus_win")
             row["rr_achieved"] = result.get("rr_achieved")
             row["win_weight"] = result.get("win_weight")
+            # The path up to the hit candle is exactly what the outcome was graded on,
+            # so these are the real values, not guesses. The full 12-candle path
+            # (path / mfe_candle / mae_candle) stays empty: it does not exist.
+            row["mae"] = result.get("mae")
+            row["mfe"] = result.get("mfe")
+            row["close_win"] = result.get("close_win", result.get("win"))
+            row["mfe_win"] = result.get("mfe_win")
+            row["mae_loss"] = result.get("mae_loss")
         if shadow:
             row["shadow"] = True
             row["adx_val"] = _ctx.get("adx_val")
