@@ -3,7 +3,6 @@
 # =============================================================================
 
 # ---------- STAGE 1: UV INSTALLER ----------
-# ---------- STAGE 1: UV INSTALLER ----------
 FROM python:3.11-slim-bookworm AS uv-installer
 
 RUN pip install --no-cache-dir uv==0.13.1
@@ -95,8 +94,9 @@ RUN useradd --uid 1000 --no-log-init -m appuser && \
 
 WORKDIR /app/src
 
-# Copy Virtual Environment from deps-builder
+# Copy the pruned Virtual Environment from runtime-venv
 COPY --from=runtime-venv /opt/venv /opt/venv
+
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy compiled Cython extension (filename carries the ABI tag, e.g. .cpython-311-x86_64-linux-gnu.so)
