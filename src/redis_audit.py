@@ -52,6 +52,7 @@ FAMILIES: List[Tuple[str, str, str]] = [
     ("shadow_pending", "shadow_pending:", "ttl_required"),
     ("shadow_stats", "shadow_stats:", "ttl_required"),
     ("shadow_hiconf", "shadow_hiconf:", "ttl_required"),
+    ("outcome_totals", "outcome_totals:", "ttl_required"),
     ("brain_cusum_watermark", "brain_cusum_watermark:", "ttl_required"),
     ("brain_cusum", "brain_cusum:", "ttl_required"),
     ("brain_threshold_history", "brain_threshold_history:", "ttl_required"),

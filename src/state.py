@@ -185,10 +185,11 @@ async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger
         if clear_alert_stats:
             alert_stats_keys = await _scan_keys_with_timeout(f"{RedisKeyPrefix.ALERT_STATS}*", count=100)
             deleted_alert_stats = await _batch_unlink(alert_stats_keys)
-
+            await _batch_unlink([f"{RedisKeyPrefix.OUTCOME_TOTALS}Recorded"])
         if clear_shadow_stats:
             shadow_stats_keys = await _scan_keys_with_timeout(f"{RedisKeyPrefix.SHADOW_STATS}*", count=100)
             deleted_shadow_stats = await _batch_unlink(shadow_stats_keys)
+            await _batch_unlink([f"{RedisKeyPrefix.OUTCOME_TOTALS}Shadowed"])
             hiconf_keys = await _scan_keys_with_timeout(f"{RedisKeyPrefix.SHADOW_HICONF_STATS}*", count=100)
             deleted_shadow_hiconf = await _batch_unlink(hiconf_keys)
 
@@ -325,6 +326,7 @@ class RedisKeyPrefix:
     SHADOW_STATS = "shadow_stats:"
     SHADOW_LOG_STREAM = "shadow_log_stream"
     SHADOW_HICONF_STATS = "shadow_hiconf:"
+    OUTCOME_TOTALS = "outcome_totals:"
     BRAIN_RUN_COUNTER = "brain_run_counter"
     CUSUM_STATE = "brain_cusum:"
     CUSUM_WATERMARK = "brain_cusum_watermark:"
@@ -2488,6 +2490,11 @@ class RedisStateStore:
                         if result.get("outcome_class") == "timeout":
                             write_pipe.hincrby(stats_key, "timeout_wins" if win else "timeouts", 1)
                         write_pipe.expire(stats_key, stats_ttl)
+                        totals_key = f"{RedisKeyPrefix.OUTCOME_TOTALS}Recorded"
+                        write_pipe.hincrby(totals_key, "wins" if win else "losses", 1)
+                        if result.get("outcome_class") == "timeout":
+                            write_pipe.hincrby(totals_key, "timeout_wins" if win else "timeouts", 1)
+                        write_pipe.expire(totals_key, stats_ttl)
                         session = _get_session_from_ts(entry_ts) if entry_ts else "dead"
                         session_stats_key = f"{stats_key}:{session}"
                         write_pipe.hincrby(session_stats_key, "wins" if win else "losses", 1)
@@ -2762,6 +2769,11 @@ class RedisStateStore:
                         if result.get("outcome_class") == "timeout":
                             write_pipe.hincrby(stats_key, "timeout_wins" if win else "timeouts", 1)
                         write_pipe.expire(stats_key, stats_ttl)
+                        totals_key = f"{RedisKeyPrefix.OUTCOME_TOTALS}Shadowed"
+                        write_pipe.hincrby(totals_key, "wins" if win else "losses", 1)
+                        if result.get("outcome_class") == "timeout":
+                            write_pipe.hincrby(totals_key, "timeout_wins" if win else "timeouts", 1)
+                        write_pipe.expire(totals_key, stats_ttl)
 
                         if (
                             conf_score is not None
@@ -2979,45 +2991,24 @@ class RedisStateStore:
             logger.warning(f"batch_get_alert_win_rates({pair}) failed for {len(alert_keys)} keys: {e}")
             return {k: (None, 0) for k in alert_keys}
 
-    async def get_cumulative_outcome_stats(self, max_age_sec: int = 3600, force: bool = False) -> Dict[str, Dict[str, int]]:
-        """Cached wrapper: the full SCAN + HGETALL pass runs at most once per max_age_sec."""
-        if self.degraded or not self._redis:
-            return await self._compute_cumulative_outcome_stats()
-        cache_key = "cumulative_outcome_stats_cache"
-        if not force:
-            raw = await self.get_metadata(cache_key)
-            if raw:
-                try:
-                    cached = json_loads(raw)
-                    data = cached.get("data")
-                    if (
-                        isinstance(data, dict)
-                        and isinstance(data.get("Recorded"), dict)
-                        and isinstance(data.get("Shadowed"), dict)
-                        and time.time() - float(cached.get("ts", 0)) < max_age_sec
-                    ):
-                        return data
-                except Exception:
-                    logger.warning("Cumulative outcome stats cache invalid; recalculating")
-        stats = await self._compute_cumulative_outcome_stats()
-        if not any(v.get("partial") for v in stats.values()):
-            await self.set_metadata(cache_key, json_dumps({"ts": time.time(), "data": stats}), ttl=86400)
-        return stats
+    OUTCOME_TOTALS_FIELDS: ClassVar[Tuple[str, ...]] = ("wins", "losses", "timeouts", "timeout_wins")
+    OUTCOME_TOTALS_RECONCILE_SEC: ClassVar[int] = 86400
 
-    async def _compute_cumulative_outcome_stats(self) -> Dict[str, Dict[str, int]]:
+    async def get_cumulative_outcome_stats(self, force: bool = False) -> Dict[str, Dict[str, int]]:
         """Return cumulative Recorded/Shadowed outcome totals.
-        Counts:
-        1. Fully resolved outcomes already stored in ALERT_STATS/SHADOW_STATS.
-        2. Pending outcomes that have already been closed early because their
-           target or stop was hit before the normal 12-candle horizon.
 
-        A pending row is counted here only when it has ``closed_reason``.
-        Still-open pending trades are not counted.
+        Resolved outcomes come from two small running-total hashes
+        (OUTCOME_TOTALS:Recorded / :Shadowed) that the resolvers HINCRBY in the same
+        MULTI pipeline that writes the per-key stats, so they always move together.
+        The hashes are rebuilt from a full SCAN + HGETALL pass over the stats keys
+        when they are missing or older than OUTCOME_TOTALS_RECONCILE_SEC (or when
+        force=True). That pass also drops stats keys that have expired, which is
+        what the old per-run scan did implicitly.
 
-        Closed pending rows are counted only until the normal resolver processes
-        them. Once resolved, they are deleted from the pending set and their
-        result is already present in ALERT_STATS/SHADOW_STATS, so there is no
-        double-counting.
+        Pending trades already closed early (they carry ``closed_reason``) are added
+        on top until the normal resolver processes them; once resolved, the result is
+        in the totals and the pending row is deleted in the same pipeline, so nothing
+        is counted twice. Still-open pending trades are not counted.
         """
         empty = {"wins": 0, "losses": 0, "timeouts": 0, "timeout_wins": 0, "total": 0}
         out: Dict[str, Dict[str, int]] = {"Recorded": dict(empty), "Shadowed": dict(empty)}
@@ -3025,79 +3016,35 @@ class RedisStateStore:
         if self.degraded or not self._redis:
             return out
 
-        prefix_map = {RedisKeyPrefix.ALERT_STATS: "Recorded", RedisKeyPrefix.SHADOW_STATS: "Shadowed"}
-
+        labels = ("Recorded", "Shadowed")
         try:
-            # 1. Count fully resolved outcomes already written to statistics.
-            for prefix, label in prefix_map.items():
-
-                async def _consume(p: str = prefix) -> List[str]:
-                    return [k async for k in self._redis.scan_iter(match=f"{p}*", count=2000)]  # type: ignore[union-attr]
-
-                try:
-                    collected = await asyncio.wait_for(_consume(), timeout=8.0)
-                except Exception as e:
-                    logger.warning(f"get_cumulative_outcome_stats: scan of '{prefix}*' failed ({e}) — totals are PARTIAL")
-                    out[label]["partial"] = 1
-                    collected = []
-
-                # Base key = exactly one ":" after the statistics prefix.
-                # Session-scoped keys contain an additional ":" and must not be counted.
-                base_keys = [k for k in collected if str(k)[len(prefix):].count(":") == 1]
-
-                if not base_keys:
-                    continue
+            rows: Dict[str, Dict[str, Any]] = {}
+            if not force:
                 async with _rc(self._redis).pipeline(transaction=False) as pipe:
-                    for k in base_keys:
-                        pipe.hgetall(k)
-                    rows = await asyncio.wait_for(_execute_pipeline(pipe), timeout=5.0)
+                    for label in labels:
+                        pipe.hgetall(f"{RedisKeyPrefix.OUTCOME_TOTALS}{label}")
+                    fetched = await asyncio.wait_for(_execute_pipeline(pipe), timeout=3.0)
+                rows = dict(zip(labels, fetched))
 
-                for data in rows:
-                    if not data:
-                        continue
-                    out[label]["wins"] += int(data.get("wins", 0) or 0)
-                    out[label]["losses"] += int(data.get("losses", 0) or 0)
-                    out[label]["timeouts"] += int(data.get("timeouts", 0) or 0)
-                    out[label]["timeout_wins"] += int(data.get("timeout_wins", 0) or 0)
+            now = time.time()
+            stale = force or any(
+                not rows.get(label)
+                or (now - float(rows[label].get("_seeded_ts", 0) or 0)) > self.OUTCOME_TOTALS_RECONCILE_SEC
+                for label in labels
+            )
+            if stale:
+                rows = await self._reseed_outcome_totals(now)
 
-            # 2. Add early-closed pending outcomes.
-            pending_map = {RedisKeyPrefix.OUTCOME_PENDING: "Recorded", RedisKeyPrefix.SHADOW_PENDING: "Shadowed"}
-
-            for prefix, label in pending_map.items():
-                try:
-                    pending_keys = [k async for k in self._redis.scan_iter(match=f"{prefix}*", count=2000)]  # type: ignore[union-attr]
-                except Exception as e:
-                    logger.warning(f"get_cumulative_outcome_stats: pending scan for {label} failed ({e}) — totals are PARTIAL")
+            for label in labels:
+                data = rows.get(label) or {}
+                for field in self.OUTCOME_TOTALS_FIELDS:
+                    out[label][field] = int(data.get(field, 0) or 0)
+                if data.get("partial"):
                     out[label]["partial"] = 1
-                    continue
 
-                if not pending_keys:
-                    continue
+            await self._add_early_closed_pending(out)
 
-                pending_rows = await asyncio.wait_for(_rc(self._redis).mget(pending_keys), timeout=5.0)
-                for raw in pending_rows:
-                    if not raw:
-                        continue
-
-                    try:
-                        data = json_loads(raw)
-                    except Exception:
-                        continue
-
-                    # Only count trades whose TP/SL has actually been hit.
-                    closed_reason = str(data.get("closed_reason") or "").lower()
-
-                    if not closed_reason:
-                        continue
-
-                    if closed_reason == "target":
-                        out[label]["wins"] += 1
-                    elif closed_reason in ("stop", "both"):
-                        # "both" means TP and SL were touched inside the same candle.
-                        out[label]["losses"] += 1
-
-            # 3. Recalculate totals after adding early-closed outcomes.
-            for label in ("Recorded", "Shadowed"):
+            for label in labels:
                 out[label]["total"] = out[label]["wins"] + out[label]["losses"]
 
         except Exception as e:
@@ -3105,6 +3052,92 @@ class RedisStateStore:
 
         return out
 
+    async def _reseed_outcome_totals(self, now: float) -> Dict[str, Dict[str, Any]]:
+        """Full SCAN + HGETALL over the stats keys (the expensive pass). Stores the
+        result in the running-total hashes unless a scan failed, in which case the
+        partial result is returned for display but NOT stored."""
+        prefix_map = {"Recorded": RedisKeyPrefix.ALERT_STATS, "Shadowed": RedisKeyPrefix.SHADOW_STATS}
+        result: Dict[str, Dict[str, Any]] = {}
+
+        for label, prefix in prefix_map.items():
+            totals: Dict[str, Any] = {f: 0 for f in self.OUTCOME_TOTALS_FIELDS}
+
+            async def _consume(p: str = prefix) -> List[str]:
+                return [k async for k in self._redis.scan_iter(match=f"{p}*", count=2000)]  # type: ignore[union-attr]
+
+            try:
+                collected = await asyncio.wait_for(_consume(), timeout=8.0)
+            except Exception as e:
+                logger.warning(f"get_cumulative_outcome_stats: scan of '{prefix}*' failed ({e}) — totals are PARTIAL")
+                totals["partial"] = 1
+                result[label] = totals
+                continue
+
+            # Base key = exactly one ":" after the statistics prefix.
+            # Session-scoped keys contain an additional ":" and must not be counted.
+            base_keys = [k for k in collected if str(k)[len(prefix):].count(":") == 1]
+            if base_keys:
+                async with _rc(self._redis).pipeline(transaction=False) as pipe:
+                    for k in base_keys:
+                        pipe.hgetall(k)
+                    stat_rows = await asyncio.wait_for(_execute_pipeline(pipe), timeout=5.0)
+                for data in stat_rows:
+                    if not data:
+                        continue
+                    for field in self.OUTCOME_TOTALS_FIELDS:
+                        totals[field] += int(data.get(field, 0) or 0)
+            result[label] = totals
+
+        if not any(v.get("partial") for v in result.values()):
+            stats_ttl = max(cfg.STATE_EXPIRY_DAYS * 86400, 7 * 86400)
+            try:
+                async with self._redis.pipeline() as pipe:  # type: ignore[union-attr]
+                    for label, totals in result.items():
+                        key = f"{RedisKeyPrefix.OUTCOME_TOTALS}{label}"
+                        pipe.hset(key, mapping={**totals, "_seeded_ts": int(now)})
+                        pipe.expire(key, stats_ttl)
+                    await asyncio.wait_for(_execute_pipeline(pipe), timeout=3.0)
+            except Exception as e:
+                logger.warning(f"get_cumulative_outcome_stats: could not store running totals ({e}); will retry next run")
+        return result
+
+    async def _add_early_closed_pending(self, out: Dict[str, Dict[str, int]]) -> None:
+        """Add pending trades whose TP/SL was already hit (closed_reason set) to `out`."""
+        pending_map = {RedisKeyPrefix.OUTCOME_PENDING: "Recorded", RedisKeyPrefix.SHADOW_PENDING: "Shadowed"}
+
+        for prefix, label in pending_map.items():
+            try:
+                pending_keys = [k async for k in self._redis.scan_iter(match=f"{prefix}*", count=2000)]  # type: ignore[union-attr]
+            except Exception as e:
+                logger.warning(f"get_cumulative_outcome_stats: pending scan for {label} failed ({e}) — totals are PARTIAL")
+                out[label]["partial"] = 1
+                continue
+
+            if not pending_keys:
+                continue
+
+            pending_rows = await asyncio.wait_for(_rc(self._redis).mget(pending_keys), timeout=5.0)
+            for raw in pending_rows:
+                if not raw:
+                    continue
+
+                try:
+                    data = json_loads(raw)
+                except Exception:
+                    continue
+
+                # Only count trades whose TP/SL has actually been hit.
+                closed_reason = str(data.get("closed_reason") or "").lower()
+
+                if not closed_reason:
+                    continue
+
+                if closed_reason == "target":
+                    out[label]["wins"] += 1
+                elif closed_reason in ("stop", "both"):
+                    # "both" means TP and SL were touched inside the same candle.
+                    out[label]["losses"] += 1
+    
     async def batch_get_all_alert_states(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, bool]:
         if not self._redis or self.degraded or not alert_keys:
             return {k: False for k in alert_keys}
