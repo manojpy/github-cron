@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       skip_trivy:
-        description: 'Skip Trivy scan (faster build)'
+        description: 'Skip Trivy gate (use if the vulnerability DB download fails)'
         required: false
         default: 'false'
 
