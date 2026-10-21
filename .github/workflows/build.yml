@@ -32,12 +32,11 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
       packages: write
-      security-events: write
 
     steps:
       # PHASE 1: SETUP
@@ -55,7 +54,7 @@ jobs:
         id: mypy
         continue-on-error: true
         run: |
-          pip install --quiet mypy==1.14.1
+          pip install --quiet mypy==1.14.1 pyflakes
           pip install --quiet -r requirements.txt
           echo "## 🔎 mypy Type Check" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
@@ -70,7 +69,12 @@ jobs:
              src/health_server.py src/brain_audit.py src/outcome_storage.py src/learner.py \
              src/apply_config_override.py src/hypothesis_gen.py src/archive_reader.py src/repair_ledger.py src/playbook.py \
              src/rulemine.py src/feature_store.py src/scoreboard.py src/feedback.py src/pathrecon.py \
+             src/redis_audit.py src/cleanup_outcomes.py \
             --ignore-missing-imports 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "## 🔎 pyflakes" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          python -m pyflakes src/*.py 2>&1 | tee -a $GITHUB_STEP_SUMMARY || true
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "ℹ️ Non-blocking for now -- see PR description before flipping to blocking." >> $GITHUB_STEP_SUMMARY
 
@@ -207,9 +211,7 @@ jobs:
                 "/app/src/health_server.py"
                 "/app/src/brain_audit.py"
                 "/app/src/brain.py"
-                "/app/src/health_server.py"
                 "/app/src/brain_enhanced.py"   
-                "/app/src/brain_audit.py" 
                 "/app/src/repair_ledger.py"
                 "/app/src/hypothesis_gen.py"
                 "/app/src/brain_layers.py"
@@ -224,6 +226,8 @@ jobs:
                 "/app/src/feedback.py"
                 "/app/src/pathrecon.py"
                 "/app/src/plan_replay.py"
+                "/app/src/redis_audit.py"
+                "/app/src/cleanup_outcomes.py"
                 "/app/src/cython_functions*.so"
               )
               for file in "${FILES[@]}"; do
@@ -236,23 +240,6 @@ jobs:
             '
 
       # PHASE 3: SECURITY SCANNING
-      - name: 🛡️ Run Trivy Vulnerability Scan
-        if: inputs.skip_trivy != 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
-        with:
-          image-ref: ${{ env.CANDIDATE_IMAGE }}
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
-          exit-code: '0'
-
-      - name: 📤 Upload Trivy Results to GitHub Security
-        if: success() && inputs.skip_trivy != 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: 'trivy-results.sarif'
-          category: 'container-security'
-
       - name: 🚦 Trivy gate (block on fixable CRITICAL findings)
         if: inputs.skip_trivy != 'true'
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
@@ -293,8 +280,3 @@ jobs:
           echo "| **Status** | ${{ job.status == 'success' && '✅ Success' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Image** | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-
-      # PHASE 5: CLEANUP
-      - name: 🧹 Cleanup
-        if: always()
-        run: rm -f trivy-results.sarif

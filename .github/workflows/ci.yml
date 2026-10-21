@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   static-checks:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       PYTHONUTF8: "1"
@@ -66,7 +66,7 @@ jobs:
             src/brain.py src/brain_enhanced.py src/brain_engine.py src/repair_ledger.py || true
 
   unit-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       TELEGRAM_BOT_TOKEN: "123456:CI_DUMMY_TOKEN_FOR_TESTS"
@@ -107,7 +107,7 @@ jobs:
           PY
 
   aot-parity:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
       TELEGRAM_BOT_TOKEN: "123456:CI_DUMMY_TOKEN_FOR_TESTS"
@@ -152,7 +152,7 @@ jobs:
           PY
 
   actionlint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
       SHELLCHECK_OPTS: "--severity=warning"
