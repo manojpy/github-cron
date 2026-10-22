@@ -692,7 +692,7 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             data_15m["volume"], cfg.VOLUME_EMA_LENGTH
         )
 
-        # ── Trend gates ──
+        # ── Trend gates ─��
         if cfg.ENABLE_PPO_GATE:
             pg, pgs = calculate_ppo_numpy(
                 close_15m, cfg.PPO_GATE_FAST, cfg.PPO_GATE_SLOW, cfg.PPO_GATE_SIGNAL
@@ -1876,8 +1876,10 @@ def _pullback_continuation_state(o: np.ndarray, h: np.ndarray, l: np.ndarray, c:
             and rr[i15] > rr[i15 - 1] and rr[i15] > float(np.min(rr_seg))):
         votes.append("rsi_turn")
     info["votes"] = votes
-    exhausted = len(votes) >= int(cfg_obj.PULLBACK_EXHAUSTION_MIN_VOTES)
-
+    exhausted = (
+        len(votes) >= int(cfg_obj.PULLBACK_EXHAUSTION_MIN_VOTES)
+        and (i15 - il) >= int(getattr(cfg_obj, "PULLBACK_MIN_BARS_AFTER_LOW", 0))
+    )
     # ── trigger: close above the highest high since the pullback low ──
     trig_seg = hh[il:i15]
     if len(trig_seg) and np.all(np.isfinite(trig_seg)):
