@@ -69,7 +69,6 @@ class BotConfig(BaseModel):
     TCP_CONN_LIMIT: int = 16
     TCP_CONN_LIMIT_PER_HOST: int = 16
     TELEGRAM_RETRIES: int = 3
-    TELEGRAM_BACKOFF_BASE: float = 2.0
     MEMORY_LIMIT_BYTES: int = 400_000_000
     STATE_EXPIRY_DAYS: int = 11
     LOG_LEVEL: str = "INFO"
@@ -168,7 +167,6 @@ class BotConfig(BaseModel):
     BRAIN_REWARDABLE_MIN_CONFLUENCE_PCT: float = Field(default=80.0, ge=50.0, le=100.0, description="Min confluence % required for a win-rate-rejected alert to be eligible for a rewardable override")
     BRAIN_REWARDABLE_MIN_SHADOW_SAMPLE: int = Field(default=10, ge=3, description="Min resolved shadow samples in the high-confluence bucket for this alert_key before an override is trusted")
     BRAIN_REWARDABLE_MIN_SHADOW_WR: float = Field(default=0.60, ge=0.5, le=1.0, description="Shadow win rate required in the high-confluence bucket to allow rewardable overrides through")
-    BRAIN_CONFLUENCE_BUCKET_PCT: float = Field(default=10.0, ge=1.0, le=50.0, description="Bucket width (in confluence %) used when the brain scans for a better CONFLUENCE_MIN_PCT in its report")
     BRAIN_REPORT_STREAM_SAMPLE: int = Field(default=5000, ge=100, le=50000, description="Max recent OUTCOME_LOG_STREAM/SHADOW_LOG_STREAM entries the brain reads per report")
     BRAIN_ALERT_DISABLE_THRESHOLD_WR: float = Field(default=0.40, ge=0.0, le=1.0, description="Pooled win rate (across all pairs) below which the brain recommends disabling an alert_key entirely in its report")
     BRAIN_OVERRIDE_COOLDOWN_SECONDS: int = Field(default=14400, ge=600, le=86400, description="Min seconds between rewardable overrides for the same alert_key")
@@ -361,9 +359,7 @@ class BotConfig(BaseModel):
     BRAIN_EV_GATE_P_THRESHOLD: float = Field(default=0.85, ge=0.5, le=1.0, description="Min P(EV>0) required for a threshold to clear the EV gate")
     BRAIN_EV_GATE_P5_FLOOR: float = Field(default=-0.10, ge=-1.0, le=0.0, description="5th-percentile EV must be above this for the EV gate to pass")
     BRAIN_ACTION_GATE_ENABLED: bool = Field(default=True, description="If True, config patches are suppressed unless the multi-layer action gate passes")
-    BRAIN_AUDIT_ENABLED: bool = Field(default=True, description="Master switch for the Brain Audit Layer — data quality gating, analysis health tracking, outcome reconciliation")
     BRAIN_AUDIT_MIN_ROWS_FOR_RECOMMENDATION: int = Field(default=100, ge=20, le=1000, description="Minimum resolved rows before any recommendation can reach ACTIONABLE tier")
-    BRAIN_AUDIT_MIN_HISTORY_RATIO: float = Field(default=0.10, ge=0.01, le=1.0, description="Minimum ratio of actual_history_days / requested_history_days before multi-window analyses run")
     OOD_MIN_HISTORY: int = Field(default=10, ge=5, le=100, description="Min historical samples before OOD gate activates")
     OOD_MARGIN: int = Field(default=2, ge=0, le=10, description="Extra votes allowed beyond 5th-95th percentile before flagging as OOD")
     OOD_RELAXED_MODE: bool = Field(default=True, description="If True, use margin-based OOD check (tolerant of small deviations); if False, use strict percentile check")
