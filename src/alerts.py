@@ -162,18 +162,24 @@ class TelegramQueue:
         attempt (20s POST timeout + margin). The loops stop on their own first."""
         return cls._send_deadline_sec() + 25.0
 
-    async def _send_impl(self, message: str) -> bool:
+    async def _post_message(self, params: Dict[str, Any]) -> Optional[int]:
+        """POST one sendMessage request with the shared retry / 429 / plain-text
+        fallback policy. Single implementation behind send() and send_with_markup().
+
+        Returns the Telegram message_id (0 when Telegram accepted the message but
+        the id could not be read) on delivery, or None when the message was NOT
+        delivered. Only None is a failure: callers test `is not None`."""
         await self.token_bucket.acquire()
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-        params = {"chat_id": self.chat_id, "text": message, "parse_mode": "MarkdownV2"}
+        params = dict(params)
         session = await SessionManager.get_session()
         deadline = time.monotonic() + self._send_deadline_sec()
         for attempt in range(1, cfg.TELEGRAM_RETRIES + 1):
             if shutdown_event.is_set():
-                return False
+                return None
             if time.monotonic() >= deadline:
                 logger.warning("Telegram send deadline reached before attempt — parking via caller")
-                return False
+                return None
             try:
                 async with session.post(url, data=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                     if resp.status == 429:
@@ -182,7 +188,7 @@ class TelegramQueue:
                             # 429 = Telegram rejected the request, nothing was delivered,
                             # so failing into the DLQ here cannot create a duplicate.
                             logger.warning(f"Telegram 429 Retry-After={wait_sec}s exceeds send deadline")
-                            return False
+                            return None
                         await asyncio.sleep(wait_sec + random.uniform(0.1, 0.5))
                         continue
                     if resp.status == 200:
@@ -191,11 +197,13 @@ class TelegramQueue:
                         except Exception:
                             # 200 with an unreadable body: Telegram accepted it.
                             # Retrying here would risk a duplicate message.
-                            return True
+                            return 0
                         if isinstance(_body, dict) and _body.get("ok") is False:
                             logger.error(f"Telegram returned HTTP 200 with ok=false: {_body}")
-                            return False
-                        return True
+                            return None
+                        if isinstance(_body, dict):
+                            return (_body.get("result") or {}).get("message_id") or 0
+                        return 0
                     if resp.status in (400, 401, 403, 404):
                         response_text = await resp.text()
                         try:
@@ -215,7 +223,7 @@ class TelegramQueue:
                             params.pop("parse_mode", None)
                             params["text"] = re.sub(r"\\(.)", r"\1", str(params["text"]))
                             continue
-                        return False
+                        return None
                     raise Exception(f"Telegram API error {resp.status}")
 
             except Exception as e:
@@ -224,7 +232,11 @@ class TelegramQueue:
                     delay = compute_backoff(1.0, attempt)
                     logger.debug(f"Retrying Telegram request in {delay:.1f}s (attempt {attempt})...")
                     await asyncio.sleep(delay)
-        return False
+        return None
+
+    async def _send_impl(self, message: str) -> bool:
+        params = {"chat_id": self.chat_id, "text": message, "parse_mode": "MarkdownV2"}
+        return (await self._post_message(params)) is not None
 
     async def send_with_markup(self, message: str, reply_markup: Dict[str, Any]) -> Optional[int]:
         """Like send(), but attaches an inline keyboard and returns the sent
@@ -246,72 +258,11 @@ class TelegramQueue:
             return None
 
     async def _send_impl_with_markup(self, message: str, reply_markup: Dict[str, Any]) -> Optional[int]:
-        await self.token_bucket.acquire()
-        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         params = {
             "chat_id": self.chat_id, "text": message, "parse_mode": "MarkdownV2",
             "reply_markup": json_dumps(reply_markup),
         }
-        session = await SessionManager.get_session()
-        deadline = time.monotonic() + self._send_deadline_sec()
-        for attempt in range(1, cfg.TELEGRAM_RETRIES + 1):
-            if shutdown_event.is_set():
-                return None
-            if time.monotonic() >= deadline:
-                logger.warning("Telegram send_with_markup deadline reached before attempt")
-                return None
-            try:
-                async with session.post(url, data=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                    if resp.status == 429:
-                        wait_sec = min(int(resp.headers.get("Retry-After", 1)), Constants.CIRCUIT_BREAKER_MAX_WAIT)
-                        if time.monotonic() + wait_sec >= deadline:
-                            logger.warning(f"Telegram 429 Retry-After={wait_sec}s exceeds send deadline")
-                            return None
-                        await asyncio.sleep(wait_sec + random.uniform(0.1, 0.5))
-                        continue
-                    if resp.status == 200:
-                        try:
-                            data = await resp.json(content_type=None)
-                        except Exception:
-                            # 200 with an unreadable body: Telegram accepted it. Retrying
-                            # would duplicate the message. 0 = delivered, id unknown
-                            # (callers only test `is not None`).
-                            return 0
-                        if isinstance(data, dict) and data.get("ok") is False:
-                            logger.error(f"Telegram returned HTTP 200 with ok=false: {data}")
-                            return None
-                        if isinstance(data, dict):
-                            return (data.get("result") or {}).get("message_id")
-                        return 0             
-                    if resp.status in (400, 401, 403, 404):
-                        response_text = await resp.text()
-                        try:
-                            response_json = json.loads(response_text)
-                            description = response_json.get("description", response_text)
-                        except Exception:
-                            description = response_text
-                        
-                        logger.error(
-                            f"Telegram API error {resp.status}: {description} | "
-                            f"chat_id={getattr(self, 'chat_id', '?')}"
-                        )
-                        if (resp.status == 400 and "parse entities" in str(description).lower()
-                                and params.get("parse_mode")):
-                            # Same safeguard as _send_impl: resend once as plain text
-                            # instead of losing an alert over a formatting bug.
-                            params.pop("parse_mode", None)
-                            params["text"] = re.sub(r"\\(.)", r"\1", str(params["text"]))
-                            continue
-                        return None
-                    raise Exception(f"Telegram API error {resp.status}")
-
-            except Exception as e:
-                logger.warning(f"Telegram send_with_markup attempt {attempt} failed: {e}")
-                if attempt < cfg.TELEGRAM_RETRIES:
-                    delay = compute_backoff(1.0, attempt)
-                    logger.debug(f"Retrying Telegram request in {delay:.1f}s (attempt {attempt})...")
-                    await asyncio.sleep(delay)
-        return None
+        return await self._post_message(params)
 
 def _clean_setup_title(title: str) -> str:
     """Strip leading emoji/symbols so setup line reads:

@@ -10,6 +10,7 @@ import uuid
 import argparse
 import psutil
 import gc
+import hashlib
 
 from typing import Dict, Any, Optional, Tuple, Set, List, Sequence, Callable, Awaitable, cast 
 
@@ -54,6 +55,7 @@ from alerts import (
 from alert_registry import ALERT_KEYS, BUY_ALERT_KEYS, keys_for
 
 _pair_eval_counter = 0
+STALE_NOTICE_COOLDOWN_SEC = 7200   # repeat a stale-candle Telegram notice at most every 2h
 _CLUSTER_CACHE_MISS = object()
 LAST_CANDLE_OK_THIS_RUN: Dict[str, int] = {}
 
@@ -1418,7 +1420,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     # Always log on every run so operators see the current win-rate snapshot
     # even when no trade resolved this cycle.
     try:
-        cum = await state_db.get_cumulative_outcome_stats()
+        cum = await state_db.get_cumulative_outcome_stats(reuse_prescan=True)
         for source in ("Recorded", "Shadowed"):
             icon = "📝" if source == "Recorded" else "👁"
             logger_main.info(format_outcome_totals(source, cum.get(source), icon))
@@ -1933,10 +1935,18 @@ async def run_once() -> Optional[bool]:
             )
             if candle_freshness["stale"] and sdb and not sdb.degraded:
                 try:
-                    await telegram_queue.send(escape_markdown_v2(
-                        f"🕒 {cfg.BOT_NAME}: no fresh candle for {len(candle_freshness['stale'])} pair(s): "
-                        f"{', '.join(candle_freshness['stale'][:8])}"
-                    ))
+                    # One Telegram notice per distinct stale set per cooldown window:
+                    # a pair that stays dead (delisted, API gap) used to message every
+                    # 15 minutes. A change in the set gets a new signature, so a newly
+                    # stale pair is still reported straight away.
+                    _stale_sig = hashlib.sha1(
+                        ",".join(sorted(candle_freshness["stale"])).encode("utf-8")
+                    ).hexdigest()[:10]
+                    if await sdb.claim_notice(f"stale_candles:{_stale_sig}", STALE_NOTICE_COOLDOWN_SEC):
+                        await telegram_queue.send(escape_markdown_v2(
+                            f"🕒 {cfg.BOT_NAME}: no fresh candle for {len(candle_freshness['stale'])} pair(s): "
+                            f"{', '.join(candle_freshness['stale'][:8])}"
+                        ))
                 except Exception:
                     pass
             if candle_freshness["stale"]:
@@ -2047,8 +2057,13 @@ async def run_once() -> Optional[bool]:
         return False
 
     except asyncio.CancelledError:
-        logger_run.warning("❌ Run cancelled (shutdown signal received)")
-        return False
+        # Re-raise: asyncio.timeout() in main_with_cleanup cancels this task when
+        # RUN_TIMEOUT_SECONDS expires and can only turn that cancellation into its
+        # TimeoutError if it propagates. Swallowing it here made the hard-deadline
+        # handler dead code and logged a deadline hit as "shutdown signal received".
+        # The finally block below still runs the full resource cleanup.
+        logger_run.warning("❌ Run cancelled (hard deadline or shutdown) - cleaning up")
+        raise
 
     except Exception as e:
         logger_run.exception(f"❌ Fatal error in run_once: {e}")

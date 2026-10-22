@@ -1133,6 +1133,24 @@ class RedisStateStore:
 
     LAST_SUCCESSFUL_CANDLES_KEY = "last_successful_candles"
 
+    async def claim_notice(self, name: str, ttl_sec: int) -> bool:
+        """Once-per-`ttl_sec` claim for an operator notice (SET NX EX).
+
+        True = this caller owns the claim and should send the notice. False = the
+        notice was already sent inside the window, or Redis could not answer (the
+        two cannot be told apart through _safe_redis_op; Redis trouble already has
+        its own degraded-mode notice, so a lost reminder is the safe side).
+        Returns True when Redis is unavailable from the start: with no claim store
+        there is nothing to throttle against and the notice should go out."""
+        if self.degraded or not self._redis:
+            return True
+        key = f"{self.meta_prefix}notice:{name}"
+        res = await self._safe_redis_op(
+            lambda: _rc(self._redis).set(key, "1", nx=True, ex=int(ttl_sec)),
+            2.0, f"claim_notice:{name}",
+        )
+        return bool(res)
+
     async def merge_last_successful_candles(self, updates: Dict[str, int]) -> Dict[str, int]:
         """Merge this run's per-pair 'last successfully evaluated candle' into
         the persisted map (1 GET + 1 SET per run, never goes backwards) and
@@ -2556,7 +2574,7 @@ class RedisStateStore:
                         ):
                             write_pipe.xadd(
                                 RedisKeyPrefix.OUTCOME_LOG_STREAM,
-                                stream_fields,
+                                cast(Any, stream_fields),
                                 maxlen=2000,
                                 approximate=True,
                             )
@@ -2828,7 +2846,7 @@ class RedisStateStore:
                                 }
                                 write_pipe.xadd(
                                     RedisKeyPrefix.SHADOW_LOG_STREAM,
-                                    shadow_stream_fields,
+                                    cast(Any, shadow_stream_fields),
                                     maxlen=2000,
                                     approximate=True,
                                 )
@@ -3002,7 +3020,7 @@ class RedisStateStore:
     OUTCOME_TOTALS_FIELDS: ClassVar[Tuple[str, ...]] = ("wins", "losses", "timeouts", "timeout_wins")
     OUTCOME_TOTALS_RECONCILE_SEC: ClassVar[int] = 86400
 
-    async def get_cumulative_outcome_stats(self, force: bool = False) -> Dict[str, Dict[str, int]]:
+    async def get_cumulative_outcome_stats(self, force: bool = False, reuse_prescan: bool = False) -> Dict[str, Dict[str, int]]:
         """Return cumulative Recorded/Shadowed outcome totals.
 
         Resolved outcomes come from two small running-total hashes
@@ -3017,6 +3035,12 @@ class RedisStateStore:
         on top until the normal resolver processes them; once resolved, the result is
         in the totals and the pending row is deleted in the same pipeline, so nothing
         is counted twice. Still-open pending trades are not counted.
+
+        reuse_prescan=True takes the pending-key lists from the run-level pre-scan
+        (see process_pairs_with_workers) instead of walking the whole keyspace again
+        for each pending family. Keys resolved since the pre-scan are simply missing
+        from the MGET and skipped; trades opened after it are open, not early-closed,
+        so the totals are the same. Falls back to SCAN when no pre-scan was stored.
         """
         empty = {"wins": 0, "losses": 0, "timeouts": 0, "timeout_wins": 0, "total": 0}
         out: Dict[str, Dict[str, int]] = {"Recorded": dict(empty), "Shadowed": dict(empty)}
@@ -3050,7 +3074,7 @@ class RedisStateStore:
                 if data.get("partial"):
                     out[label]["partial"] = 1
 
-            await self._add_early_closed_pending(out)
+            await self._add_early_closed_pending(out, reuse_prescan=reuse_prescan)
 
             for label in labels:
                 out[label]["total"] = out[label]["wins"] + out[label]["losses"]
@@ -3111,13 +3135,21 @@ class RedisStateStore:
                 logger.warning(f"get_cumulative_outcome_stats: could not store running totals ({e}); will retry next run")
         return result
 
-    async def _add_early_closed_pending(self, out: Dict[str, Dict[str, int]]) -> None:
+    async def _add_early_closed_pending(self, out: Dict[str, Dict[str, int]], reuse_prescan: bool = False) -> None:
         """Add pending trades whose TP/SL was already hit (closed_reason set) to `out`."""
         pending_map = {RedisKeyPrefix.OUTCOME_PENDING: "Recorded", RedisKeyPrefix.SHADOW_PENDING: "Shadowed"}
+        prescan_attr = {
+            RedisKeyPrefix.OUTCOME_PENDING: "_pending_outcome_keys_by_pair",
+            RedisKeyPrefix.SHADOW_PENDING: "_shadow_pending_outcome_keys_by_pair",
+        }
 
         for prefix, label in pending_map.items():
             try:
-                pending_keys = [k async for k in self._redis.scan_iter(match=f"{prefix}*", count=2000)]  # type: ignore[union-attr]
+                prescan = getattr(self, prescan_attr[prefix], None) if reuse_prescan else None
+                if prescan is not None:
+                    pending_keys = [k for keys in prescan.values() for k in keys]
+                else:
+                    pending_keys = [k async for k in self._redis.scan_iter(match=f"{prefix}*", count=2000)]  # type: ignore[union-attr]
             except Exception as e:
                 logger.warning(f"get_cumulative_outcome_stats: pending scan for {label} failed ({e}) — totals are PARTIAL")
                 out[label]["partial"] = 1

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import glob
+import re
 import time
 import threading
 from datetime import datetime, timezone
@@ -90,6 +91,8 @@ for _sub in ("outcomes", "shadow", "reports"):
 _write_locks: Dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
 
+_DAY_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.jsonl$")
+
 def _get_lock(subdir: str) -> threading.Lock:
     with _locks_guard:
         if subdir not in _write_locks:
@@ -160,7 +163,17 @@ def load_recent_outcomes(days: int = 30, shadow: bool = False, hours: Optional[i
     pattern = os.path.join(_OUTCOME_DIR, subdir, "*.jsonl")
     files = sorted(glob.glob(pattern), reverse=True)
     seen_ids: set = set()   # `_stream_id` dedup, mirrors archive_reader
+    # Files are named for the UTC day a row was WRITTEN, and a row is never written
+    # before its entry day, so a row with entry_ts >= cutoff cannot sit in a file
+    # dated before the cutoff's UTC day. File mtime cannot be used for this: a
+    # checkout stamps every file with the checkout time, so on a full-archive run
+    # (185 days) the old mtime test never fired and the whole archive was parsed
+    # synchronously on the event loop just to read the last day or so.
+    cutoff_day = datetime.fromtimestamp(cutoff, timezone.utc).strftime("%Y-%m-%d")
     for path in files:
+        _name = os.path.basename(path)
+        if _DAY_FILE_RE.match(_name) and _name[:10] < cutoff_day:
+            break      # newest-first: every remaining file is older still
         try:
             ftime = os.path.getmtime(path)
             if ftime < cutoff and len(rows) > 1000:

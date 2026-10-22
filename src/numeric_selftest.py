@@ -95,6 +95,40 @@ def _ref_dynamic_flow(src: List[float], basis: List[float], dist: List[float], f
 
     return direction_out, line_out
 
+def _ref_pine_ema(data: List[float], length: int) -> List[float]:
+    """Pine ta.ema: seeded with the first finite value (not an SMA)."""
+    alpha = 2.0 / (length + 1)
+    out = [float("nan")] * len(data)
+    prev = None
+    for i, v in enumerate(data):
+        if v != v:                      # NaN keeps the last value, like ema_loop_pine
+            if prev is not None:
+                out[i] = prev
+            continue
+        prev = v if prev is None else alpha * v + (1.0 - alpha) * prev
+        out[i] = prev
+    return out
+
+def _ref_cirrus(close: List[float], t: int, m: float) -> Tuple[List[float], List[float]]:
+    """Independent Pine reference for Cirrus Cloud: smoothrngX1 then rngfiltx1x1.
+    Returns (smooth_range, range_filter)."""
+    diff = [float("nan")] + [abs(close[i] - close[i - 1]) for i in range(1, len(close))]
+    sm = _ref_pine_ema(_ref_pine_ema(diff, t), 2 * t - 1)
+    rng = [v * m if v == v else float("nan") for v in sm]
+    prev = 0.0
+    filt: List[float] = []
+    for x, r in zip(close, rng):
+        if x != x or r != r:
+            filt.append(float("nan"))
+            prev = 0.0
+            continue
+        if x > prev:
+            prev = prev if (x - r) < prev else (x - r)
+        else:
+            prev = prev if (x + r) > prev else (x + r)
+        filt.append(prev)
+    return rng, filt
+
 # ---------------------------------------------------------------------------
 # Deterministic synthetic fixtures -- no RNG, must be byte-identical every run
 # ---------------------------------------------------------------------------
@@ -177,6 +211,14 @@ def run_self_test() -> Tuple[bool, List[str]]:
     _check("dynamic_flow_direction_loop.direction (trend)", actual_dir, expected_dir, failures)
     _check("dynamic_flow_direction_loop.line (trend)", actual_line, expected_line, failures)
 
+    # Cirrus Cloud kernels (smoothrng_loop / range_filter_loop) vs the Pine reference.
+    for _t, _m in ((22, 9.0), (15, 5.0)):
+        _exp_rng, _exp_filt = _ref_cirrus(close.tolist(), _t, _m)
+        _act_rng = aot_bridge.smoothrng_loop(close, _t, _m)
+        _check(f"smoothrng_loop (trend, t={_t})", _act_rng, _exp_rng, failures)
+        _act_filt = aot_bridge.range_filter_loop(close, _act_rng)
+        _check(f"range_filter_loop (trend, t={_t})", _act_filt, _exp_filt, failures)
+
     # --- Analytic invariants on the degenerate flat fixture ---
     flat_atr = aot_bridge.calculate_atr_rma(flat_h, flat_l, flat_c, period)
     flat_atr_tail = flat_atr[period:]
@@ -212,6 +254,14 @@ def run_self_test() -> Tuple[bool, List[str]]:
         jit_ppo, jit_ppo_sig = jit_ref.calculate_ppo_core(close, 12, 26, 9)
         _check("AOT vs JIT: calculate_ppo_core.ppo", aot_ppo, jit_ppo, failures)
         _check("AOT vs JIT: calculate_ppo_core.signal", aot_ppo_sig, jit_ppo_sig, failures)
+
+        for _t, _m in ((22, 9.0), (15, 5.0)):
+            _aot_rng = aot_bridge.smoothrng_loop(close, _t, _m)
+            _jit_rng = jit_ref.smoothrng_loop(close, _t, _m)
+            _check(f"AOT vs JIT: smoothrng_loop (t={_t})", _aot_rng, _jit_rng, failures)
+            _check(f"AOT vs JIT: range_filter_loop (t={_t})",
+                   aot_bridge.range_filter_loop(close, _aot_rng),
+                   jit_ref.range_filter_loop(close, _jit_rng), failures)
 
         jit_dfr_dir, jit_dfr_line = jit_ref.dynamic_flow_direction_loop(hlc3, dfr_basis, dfr_dist, 3.0)
         _check("AOT vs JIT: dynamic_flow_direction_loop.direction", actual_dir, jit_dfr_dir, failures)
