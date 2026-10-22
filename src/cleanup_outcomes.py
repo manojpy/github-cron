@@ -46,13 +46,14 @@ def get_dir_size(path: Path) -> int:
         pass
     return total
 
-def format_size(bytes: int) -> str:
+def format_size(num_bytes: float) -> str:
     """Convert bytes to human-readable format."""
+    size = float(num_bytes)
     for unit in ["B", "KB", "MB", "GB"]:
-        if bytes < 1024.0:
-            return f"{bytes:.2f} {unit}"
-        bytes /= 1024.0
-    return f"{bytes:.2f} TB"
+        if size < 1024.0:
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} TB"
 
 def cleanup_by_age(data_dir: Path, max_age_days: int, dry_run: bool = False, reports_max_age_days: int = 7) -> int:
     """Remove files older than max_age_days (reports/*.md use their own,

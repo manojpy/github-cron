@@ -3102,7 +3102,9 @@ class RedisStateStore:
                 async with self._redis.pipeline() as pipe:  # type: ignore[union-attr]
                     for label, totals in result.items():
                         key = f"{RedisKeyPrefix.OUTCOME_TOTALS}{label}"
-                        pipe.hset(key, mapping={**totals, "_seeded_ts": int(now)})
+                        seed_map: Dict[Any, Any] = {f: int(v) for f, v in totals.items()}
+                        seed_map["_seeded_ts"] = int(now)
+                        pipe.hset(key, mapping=seed_map)
                         pipe.expire(key, stats_ttl)
                     await asyncio.wait_for(_execute_pipeline(pipe), timeout=3.0)
             except Exception as e:
