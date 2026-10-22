@@ -87,6 +87,7 @@ CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "base_trend": 3.0,
     "ichimoku_cloud": 2.0,
     "rma_cloud": 2.0,
+    "cirrus_cloud": 2.0,
     "dynamic_flow_ribbon": 2.0,
     "ppo_cross": 2.0,
     "rsi_guard": 2.0,
@@ -197,17 +198,22 @@ class ClusterContext:
 
 @dataclass
 class BiasContext:
-    """Same-run Ichimoku directional-bias snapshot across the whole pair
-    universe (23/65/130/65 on 15m by default — see BIAS_ICHIMOKU_* config),
+    """Same-run directional-bias snapshot across the whole pair universe,
     computed via a pre-pass before Phase-3 dispatch (see
-    _compute_bias_context in macd_unified.py). Purely a cosmetic header
+    compute_bias_context in macd_unified.py). Purely a cosmetic header
     prepended to every outgoing Telegram message this run — see
     cfg.ENABLE_BIAS_HEADER. Never gates or filters an alert.
-    A pair counts as:
+    With cfg.BIAS_USE_CIRRUS (default) a pair counts as:
+      up      - Cirrus Cloud Trend Up on the last closed 15m candle
+      down    - Cirrus Cloud Trend Down on the last closed 15m candle
+      neutral - filters equal (no trend either way)
+      (pairs whose Cirrus filters are not yet valid are skipped)
+    With BIAS_USE_CIRRUS=False the legacy Ichimoku rule applies
+    (23/65/130/65 — see BIAS_ICHIMOKU_* config):
       up      - last closed 15m close above the cloud AND future cloud green
       down    - last closed 15m close below the cloud AND future cloud red
-      neutral - everything else (inside the cloud, NaN cloud, or a
-                mismatched price/future-cloud combination)"""
+      neutral - everything else"""
+
     up_count: int
     down_count: int
     neutral_count: int

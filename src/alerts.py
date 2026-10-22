@@ -4152,6 +4152,11 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 if not rsi_guard_ok_sell:
                     reasons.append(f"RSI Guard sell: RSI({rsi_guard_smooth_curr:.2f}) >= EMA({rsi_guard_ema_curr:.2f})")
 
+            if cfg.CIRRUS_CLOUD_ENABLED:
+                if gr.cirrus_ok_buy is not True:
+                    reasons.append(f"Cirrus Cloud buy veto: {'not ready (warmup/NaN)' if gr.cirrus_ok_buy is None else 'trend not Up'}")
+                if gr.cirrus_ok_sell is not True:
+                    reasons.append(f"Cirrus Cloud sell veto: {'not ready (warmup/NaN)' if gr.cirrus_ok_sell is None else 'trend not Down'}")
             if cfg.RMA_CLOUD_ENABLED:
                 if not rma_cloud_ok_buy:
                     reasons.append(f"RMA Cloud buy: RMA{cfg.RMA_CLOUD_FAST_PERIOD}({rma_cloud_fast_curr:.2f}) <= RMA{cfg.RMA_50_PERIOD}({rma50_15_val:.2f})")
@@ -4168,10 +4173,14 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 if not ichimoku_gate_ok_sell:
                     reasons.append("Ichimoku Cloud sell: price not below cloud / future not red (vote)")
 
+            _cg_need = (
+                "Cirrus Cloud veto AND (Ichimoku cloud OR Dynamic Flow)"
+                if cfg.CIRRUS_CLOUD_ENABLED else "ANY enabled vote true (Ichimoku/RMA cloud)"
+            )
             if not cloud_group_ok_buy:
-                reasons.append("Cloud group buy: need ANY enabled vote true (Ichimoku/RMA cloud) — all disagree or abstain")
+                reasons.append(f"Cloud group buy: need {_cg_need} — not met")
             if not cloud_group_ok_sell:
-                reasons.append("Cloud group sell: need ANY enabled vote true (Ichimoku/RMA cloud) — all disagree or abstain")
+                reasons.append(f"Cloud group sell: need {_cg_need} — not met")
             if not oscillator_group_ok_buy:
                 reasons.append(f"Oscillator group buy: need {Constants.OSCILLATOR_GROUP_MIN_VOTES}-of-3 (PPO/RSI/TK) — not met")
             if not oscillator_group_ok_sell:

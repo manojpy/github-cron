@@ -13,6 +13,7 @@ from aot_bridge import (
     vwap_daily_loop_safe, rolling_min_max_numba, rolling_mean_numba,
     calculate_ppo_core, calculate_rsi_core, calculate_atr_rma,
     calculate_adx_core, percentile_rank_numba, dynamic_flow_direction_loop,
+    smoothrng_loop, range_filter_loop,
 )
 
 def validate_indicator_array(arr: Optional[np.ndarray], name: str, min_valid_values: int = 1) -> Tuple[bool, Optional[str]]:
@@ -408,6 +409,53 @@ def calculate_dynamic_flow_ribbon_numpy(high: np.ndarray, low: np.ndarray, close
         nan_arr = np.full(n, np.nan, dtype=np.float64)
         return nan_arr, nan_arr.copy()
 
+def calculate_cirrus_cloud_numpy(close: np.ndarray, x1: int = 22, x2: float = 9.0,
+                                 x3: int = 15, x4: float = 5.0) -> Dict[str, np.ndarray]:
+    """Cirrus Cloud — exact port of the Pine indicator (uses close only).
+
+        smoothrngX1(x, t, m) => ta.ema(ta.ema(|x - x[1]|, t), 2t-1) * m
+        filtx1  = rngfiltx1x1(close, smoothrngX1(close, x1, x2))
+        filtx12 = rngfiltx1x1(close, smoothrngX1(close, x3, x4))
+        trend_up = filtx1 < filtx12 ;  trend_dn = filtx1 > filtx12
+
+    'valid' is True where both filters are finite; trend flags are False
+    wherever valid is False, so callers must fail closed on valid == False.
+    """
+    try:
+        c = np.ascontiguousarray(close, dtype=np.float64)
+        n = len(c)
+        if n == 0:
+            raise ValueError("Empty input array for Cirrus Cloud")
+
+        smrngx1x = smoothrng_loop(c, int(x1), float(x2))
+        smrngx1x2 = smoothrng_loop(c, int(x3), float(x4))
+        filtx1 = range_filter_loop(c, smrngx1x)
+        filtx12 = range_filter_loop(c, smrngx1x2)
+
+        valid = np.isfinite(filtx1) & np.isfinite(filtx12)
+        return {
+            'filtx1': filtx1,
+            'filtx12': filtx12,
+            'trend_up': valid & (filtx1 < filtx12),
+            'trend_dn': valid & (filtx1 > filtx12),
+            'valid': valid,
+            'smrngx1x': smrngx1x,
+            'smrngx1x2': smrngx1x2,
+        }
+    except Exception as e:
+        logger.error(f"Cirrus Cloud calculation failed: {e}", exc_info=True)
+        n = len(close) if close is not None else 1
+        return {
+            'filtx1': np.full(n, np.nan, dtype=np.float64),
+            'filtx12': np.full(n, np.nan, dtype=np.float64),
+            'trend_up': np.zeros(n, dtype=bool),
+            'trend_dn': np.zeros(n, dtype=bool),
+            'valid': np.zeros(n, dtype=bool),
+            'smrngx1x': np.full(n, np.nan, dtype=np.float64),
+            'smrngx1x2': np.full(n, np.nan, dtype=np.float64),
+        }
+
+
 def calculate_rsi_guard_numpy(close: np.ndarray, rsi_len: int, kalman_len: int, ema_len: int) -> Tuple[np.ndarray, np.ndarray]:
     try:
         if close is None or len(close) < rsi_len + kalman_len + ema_len:
@@ -467,7 +515,9 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.sanitize_array_numba(test_data, 50.0)
         _ = aot_bridge.percentile_rank_numba(test_data, 75, 50, 10, False)
         _ = aot_bridge.dynamic_flow_direction_loop(test_data, test_data, test_data * 0.01, 1.0) 
-      
+        _ = aot_bridge.smoothrng_loop(test_data, 22, 9.0)
+        _ = aot_bridge.range_filter_loop(test_data, test_data * 0.01)
+
         warmup_elapsed = time.time() - warmup_start
         logger.info(f"✅ JIT warmup complete ({warmup_elapsed:.2f}s)")
 
@@ -664,10 +714,25 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['rsi_guard_smooth'] = np.full(n_15m, np.nan, dtype=np.float64)
             results['rsi_guard_ema'] = np.full(n_15m, np.nan, dtype=np.float64)
 
-        if cfg.RMA_CLOUD_ENABLED:
+        # RMA fast leg is still needed by the RMA-cloud momentum vote even when the
+        # RMA cloud itself is replaced by Cirrus (RMA_CLOUD_ENABLED=False).
+        if cfg.RMA_CLOUD_ENABLED or cfg.ENABLE_RMA_CLOUD_MOMENTUM_VOTE:
             results['rma_cloud_fast_15'] = calculate_rma_numpy(close_15m, cfg.RMA_CLOUD_FAST_PERIOD)
         else:
             results['rma_cloud_fast_15'] = np.full(n_15m, np.nan, dtype=np.float64)
+
+        # ── Cirrus Cloud — veto gate of the cloud group ──
+        if cfg.CIRRUS_CLOUD_ENABLED:
+            _cirrus = calculate_cirrus_cloud_numpy(
+                close_15m, cfg.CIRRUS_X1, cfg.CIRRUS_X2, cfg.CIRRUS_X3, cfg.CIRRUS_X4
+            )
+            results['cirrus_trend_up_15'] = _cirrus['trend_up']
+            results['cirrus_trend_dn_15'] = _cirrus['trend_dn']
+            results['cirrus_valid_15'] = _cirrus['valid']
+        else:
+            results['cirrus_trend_up_15'] = np.zeros(n_15m, dtype=bool)
+            results['cirrus_trend_dn_15'] = np.zeros(n_15m, dtype=bool)
+            results['cirrus_valid_15'] = np.zeros(n_15m, dtype=bool)
 
         # ── Dynamic Flow Ribbon (BigBeluga) — third cloud-group trend gate ──
         if cfg.DYNAMIC_FLOW_RIBBON_ENABLED:

@@ -223,7 +223,13 @@ def dynamic_flow_direction_loop(src: np.ndarray, basis: np.ndarray,
                                 factor: float) -> Tuple[np.ndarray, np.ndarray]:
     return _dispatch["dynamic_flow_direction_loop"](src, basis, dist, factor)
 
+def smoothrng_loop(x: np.ndarray, t: int, m: float) -> np.ndarray:
+    """Cirrus Cloud smooth range: ta.ema(ta.ema(|x-x[1]|, t), 2t-1) * m (Pine-exact)."""
+    return _dispatch["smoothrng_loop"](x, t, m)
 
+def range_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
+    """Cirrus Cloud recursive range filter (Pine rngfiltx1x1)."""
+    return _dispatch["range_filter_loop"](x, r)
 # ─────────────────────────────────────────────────────────────────────
 # COMPLETENESS CHECK — catches a forgotten wrapper at import time
 # ──────────────────────────────────────────────────────────────────────

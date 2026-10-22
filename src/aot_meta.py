@@ -26,9 +26,8 @@ without reintroducing that cost on every run.
 numba_functions_shared.py and aot_build.py both import SOURCE_VERSION from
 here too, so there is exactly one place to update it.
 """
-
-SOURCE_VERSION = "2026-09-02.1"
-# Guards added to ema_loop, ema_loop_pine, ema_loop_alpha, calculate_rsi_core,
+SOURCE_VERSION = "2026-10-22.1"
+# 2026-10-22.1: added smoothrng_loop + range_filter_loop (Cirrus Cloud).
 # true_range_numba, percentile_rank_numba, calculate_atr_rma, calculate_adx_core.
 # Cython calculate_adx_core reordered (previous version smoothed zero-arrays
 # and returned TR-smoothed-to-ADX; now computes DX correctly).
@@ -49,4 +48,7 @@ AOT_FUNCTION_NAMES = [
     'calculate_adx_core',
     'percentile_rank_numba',
     'dynamic_flow_direction_loop',
+    'smoothrng_loop',
+    'range_filter_loop',
 ]
+

@@ -42,6 +42,7 @@ VOTE_LABELS = {
     "base_trend": "trend",
     "ichimoku_cloud": "Ichimoku cloud",
     "rma_cloud": "RMA cloud",
+    "cirrus_cloud": "Cirrus cloud",
     "dynamic_flow_ribbon": "market flow",
     "ppo_cross": "PPO cross",
     "rsi_guard": "RSI",

@@ -533,7 +533,7 @@ def true_range_numba(double[:] high, double[:] low, double[:] close):
 
     return tr_np
 
-# ═════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════���════════════════════════
 # 12. calculate_atr_rma
 # ══════════════════════════════════════════════════════════════════════
 
@@ -725,6 +725,90 @@ def dynamic_flow_direction_loop(double[:] src, double[:] basis,
     return dir_np, line_np
 
 # ══════════════════════════════════════════════════════════════════════
+# 16. smoothrng_loop — Pine ta.ema(ta.ema(|close - close[1]|, t), 2t-1) * m
+#     Pine ta.ema seeds on the FIRST value -> ema_loop_pine (never ema_loop)
+# ══════════════════════════════════════════════════════════════════════
+def smoothrng_loop(double[:] x, int t, double m):
+    cdef int n = x.shape[0]
+    cdef int i
+    cdef int wper
+    cdef np.ndarray diff_np
+    cdef double[:] diff_arr
+    cdef np.ndarray avrng
+    cdef np.ndarray smoothrng
+    cdef np.ndarray out_np
+    cdef double[:] out
+    cdef double[:] sm
+
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
+
+    diff_np = np.empty(n, dtype=np.float64)
+    diff_arr = diff_np
+    diff_arr[0] = np.nan
+    for i in range(1, n):
+        if isnan(x[i]) or isnan(x[i - 1]):
+            diff_arr[i] = np.nan
+        else:
+            diff_arr[i] = fabs(x[i] - x[i - 1])
+
+    wper = t * 2 - 1
+    avrng = ema_loop_pine(diff_np, <double>t)
+    smoothrng = ema_loop_pine(avrng, <double>wper)
+    sm = smoothrng
+
+    out_np = np.empty(n, dtype=np.float64)
+    out = out_np
+    for i in range(n):
+        if isnan(sm[i]):
+            out[i] = np.nan
+        else:
+            out[i] = sm[i] * m
+    return out_np
+
+# ══════════════════════════════════════════════════════════════════════
+# 17. range_filter_loop — Pine rngfiltx1x1 (na in -> na out, next nz == 0)
+# ══════════════════════════════════════════════════════════════════════
+def range_filter_loop(double[:] x, double[:] r):
+    cdef int n = x.shape[0]
+    cdef np.ndarray out_np = np.full(n, np.nan, dtype=np.float64)
+    cdef double[:] out = out_np
+    cdef int i
+    cdef double curr_x, curr_r, prev_filt
+
+    if n == 0:
+        return out_np
+
+    prev_filt = 0.0
+
+    for i in range(n):
+        curr_x = x[i]
+        curr_r = r[i]
+
+        if isnan(curr_x) or isnan(curr_r):
+            out[i] = np.nan
+            prev_filt = 0.0
+            continue
+
+        if curr_x > prev_filt:
+            if curr_x - curr_r < prev_filt:
+                pass
+            else:
+                prev_filt = curr_x - curr_r
+        else:
+            if curr_x + curr_r > prev_filt:
+                pass
+            else:
+                prev_filt = curr_x + curr_r
+
+        out[i] = prev_filt
+    return out_np
+
+# ══════════════════════════════════════════════════════════════════════
+# EXPORT REGISTRY (replaces Numba EXPORT_CONFIG)
+# ══════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════
 # EXPORT REGISTRY (replaces Numba EXPORT_CONFIG)
 # ══════════════════════════════════════════════════════════════════════
 EXPORTED_FUNCTION_NAMES = [
@@ -743,6 +827,8 @@ EXPORTED_FUNCTION_NAMES = [
     "calculate_adx_core",
     "percentile_rank_numba",
     "dynamic_flow_direction_loop",
+    "smoothrng_loop",
+    "range_filter_loop",
 ]
 
 from aot_meta import (  # noqa: E402

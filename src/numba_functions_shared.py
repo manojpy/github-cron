@@ -41,6 +41,9 @@ SIG_ATR_RMA          = f8[:](f8[:], f8[:], f8[:], i4)
 SIG_ADX_CORE         = f8[:](f8[:], f8[:], f8[:], i4, i4)
 SIG_PERCENTILE_RANK  = f8(f8[:], i4, i4, i4, types.boolean)
 SIG_DFR_DIRECTION    = types.Tuple((f8[:], f8[:]))(f8[:], f8[:], f8[:], f8)
+SIG_SMOOTH_RNG       = f8[:](f8[:], i4, f8)
+SIG_RANGE_FILTER     = f8[:](f8[:], f8[:])
+
 
 @njit(SIG_SANITIZE_ARRAY, nogil=True, cache=True)
 def sanitize_array_numba(arr, default):
@@ -605,6 +608,79 @@ def dynamic_flow_direction_loop(src, basis, dist, factor):
     return direction_out, line_out
 
 #=====================================================
+# Cirrus Cloud kernels (Pine: smoothrngX1 / rngfiltx1x1)
+#=====================================================
+@njit(SIG_SMOOTH_RNG, nogil=True, cache=True)
+def smoothrng_loop(x, t, m):
+    """Pine: ta.ema(ta.ema(math.abs(x - x[1]), t), 2*t - 1) * m
+
+    ta.ema in Pine is seeded with the FIRST source value (not an SMA), so this
+    uses ema_loop_pine (never ema_loop). abs(x - x[1]) is na on bar 0.
+    """
+    n = len(x)
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
+
+    diff_arr = np.empty(n, dtype=np.float64)
+    diff_arr[0] = np.nan
+    for i in range(1, n):
+        if np.isnan(x[i]) or np.isnan(x[i - 1]):
+            diff_arr[i] = np.nan
+        else:
+            diff_arr[i] = abs(x[i] - x[i - 1])
+
+    wper = t * 2 - 1
+    avrng = ema_loop_pine(diff_arr, float(t))
+    smoothrng = ema_loop_pine(avrng, float(wper))
+
+    out = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        val = smoothrng[i]
+        out[i] = np.nan if np.isnan(val) else val * m
+    return out
+
+@njit(SIG_RANGE_FILTER, nogil=True, cache=True)
+def range_filter_loop(x, r):
+    """Pine rngfiltx1x1:
+        x > nz(prev) ? (x - r < nz(prev) ? nz(prev) : x - r)
+                     : (x + r > nz(prev) ? nz(prev) : x + r)
+    A na input gives a na output, and the next bar sees nz(na) == 0.
+    """
+    n = len(x)
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n == 0:
+        return out
+
+    prev_filt = 0.0
+    for i in range(n):
+        curr_x = x[i]
+        curr_r = r[i]
+
+        if np.isnan(curr_x) or np.isnan(curr_r):
+            out[i] = np.nan
+            prev_filt = 0.0
+            continue
+
+        if curr_x > prev_filt:
+            if curr_x - curr_r < prev_filt:
+                pass
+            else:
+                prev_filt = curr_x - curr_r
+        else:
+            if curr_x + curr_r > prev_filt:
+                pass
+            else:
+                prev_filt = curr_x + curr_r
+
+        out[i] = prev_filt
+    return out
+
+#=====================================================
+# AOT EXPORT CONFIGURATION
+#=====================================================
+
+
+#=====================================================
 # AOT EXPORT CONFIGURATION
 #=====================================================
 
@@ -624,6 +700,8 @@ EXPORT_CONFIG = {
     'calculate_adx_core':    SIG_ADX_CORE,
     'percentile_rank_numba': SIG_PERCENTILE_RANK,
     'dynamic_flow_direction_loop': SIG_DFR_DIRECTION,
+    'smoothrng_loop':        SIG_SMOOTH_RNG,
+    'range_filter_loop':     SIG_RANGE_FILTER,
 }
 
 from aot_meta import (  # noqa: E402

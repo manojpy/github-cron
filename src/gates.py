@@ -191,11 +191,54 @@ class GateResult:
     vwap_momentum_ok_buy: Optional[bool] = None
     vwap_momentum_ok_sell: Optional[bool] = None
 
+    # -- Cirrus Cloud (veto of the cloud group + confluence vote) --
+    cirrus_ok_buy: Optional[bool] = None
+    cirrus_ok_sell: Optional[bool] = None
+
     # -- Dynamic Flow Ribbon (optional, cloud-group vote + confluence vote) --
     dynamic_flow_ok_buy: Optional[bool] = None
     dynamic_flow_ok_sell: Optional[bool] = None
     dynamic_flow_cross_up: bool = False
     dynamic_flow_cross_down: bool = False 
+
+def _cloud_group_decision(cirrus_ok: Optional[bool], ichimoku_ok: Optional[bool],
+                          flow_ok: Optional[bool], rma_ok: Optional[bool]) -> bool:
+    """Cloud-group verdict for one direction.
+
+    CIRRUS_CLOUD_ENABLED (default): Cirrus Cloud has VETO power.
+        cloud_group_ok = cirrus_ok  AND  (ichimoku_ok OR dynamic_flow_ok)
+      * Cirrus must be exactly True (Trend Up for buy / Trend Down for sell);
+        None (warmup / NaN) fails closed.
+      * Of the two supporting clouds only the ENABLED ones count; one True is
+        enough. If both are enabled but both abstain (None) or both disagree -> False.
+      * If neither supporting cloud is enabled, Cirrus alone decides.
+      * The RMA cloud takes no part.
+    CIRRUS_CLOUD_ENABLED=False: legacy strict majority of the enabled
+    Ichimoku / RMA / Dynamic Flow votes (unchanged behaviour).
+    """
+    if cfg.CIRRUS_CLOUD_ENABLED:
+        if cirrus_ok is not True:
+            return False
+        support = []
+        if cfg.ICHIMOKU_CLOUD_ENABLED:
+            support.append(ichimoku_ok)
+        if cfg.DYNAMIC_FLOW_RIBBON_ENABLED:
+            support.append(flow_ok)
+        if not support:
+            return True
+        return any(v is True for v in support)
+
+    votes = []
+    if cfg.ICHIMOKU_CLOUD_ENABLED:
+        votes.append(ichimoku_ok)
+    if cfg.RMA_CLOUD_ENABLED:
+        votes.append(rma_ok)
+    if cfg.DYNAMIC_FLOW_RIBBON_ENABLED:
+        votes.append(flow_ok)
+    active = [v for v in votes if v is not None]
+    if active:
+        return sum(1 for v in active if v) > (len(active) / 2.0)
+    return not (cfg.RMA_CLOUD_ENABLED or cfg.ICHIMOKU_CLOUD_ENABLED or cfg.DYNAMIC_FLOW_RIBBON_ENABLED)
 
 def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, float, Dict[str, bool]]:
     weights = CONFLUENCE_WEIGHTS 
@@ -205,6 +248,7 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, flo
     base_trend    = gr.base_buy_trend if is_buy else gr.base_sell_trend
     ichimoku_ok   = gr.ichimoku_gate_ok_buy if is_buy else gr.ichimoku_gate_ok_sell
     rma_cloud_ok  = gr.rma_cloud_ok_buy if is_buy else gr.rma_cloud_ok_sell
+    cirrus_ok     = gr.cirrus_ok_buy if is_buy else gr.cirrus_ok_sell
     dynamic_flow_ok = gr.dynamic_flow_ok_buy if is_buy else gr.dynamic_flow_ok_sell
     ppo_cross_ok  = gr.ppo_gate_ok_buy if is_buy else gr.ppo_gate_ok_sell
     rsi_guard_ok  = gr.rsi_guard_ok_buy if is_buy else gr.rsi_guard_ok_sell
@@ -222,6 +266,12 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, flo
         total += w
         votes["ichimoku_cloud"] = bool(ichimoku_ok)
         if ichimoku_ok: score += w
+
+    if cfg.CIRRUS_CLOUD_ENABLED and cirrus_ok is not None:
+        w = weights["cirrus_cloud"]
+        total += w
+        votes["cirrus_cloud"] = bool(cirrus_ok)
+        if cirrus_ok: score += w
 
     if cfg.RMA_CLOUD_ENABLED and rma_cloud_ok is not None:
         w = weights["rma_cloud"]
@@ -773,8 +823,18 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             dynamic_flow_ok_buy = None
             dynamic_flow_ok_sell = None
 
+        # Cirrus Cloud veto vote. None = disabled or not yet valid (warmup/NaN);
+        # _cloud_group_decision treats None as a FAIL for the veto.
+        if cfg.CIRRUS_CLOUD_ENABLED and bool(gate_indicators["cirrus_valid_15"][i15]):
+            cirrus_ok_buy = bool(gate_indicators["cirrus_trend_up_15"][i15])
+            cirrus_ok_sell = bool(gate_indicators["cirrus_trend_dn_15"][i15])
+        else:
+            cirrus_ok_buy = None
+            cirrus_ok_sell = None
+
         dynamic_flow_cross_up = False
         dynamic_flow_cross_down = False
+
         if cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT and cfg.DYNAMIC_FLOW_RIBBON_ENABLED and i15 >= 1:
             dynamic_flow_line_curr = dynamic_flow_line_arr[i15]
             dynamic_flow_line_prev = dynamic_flow_line_arr[i15 - 1]
@@ -834,58 +894,27 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             vwap_momentum_ok_buy = None
             vwap_momentum_ok_sell = None
 
-        cloud_group_enabled = cfg.RMA_CLOUD_ENABLED or cfg.ICHIMOKU_CLOUD_ENABLED or cfg.DYNAMIC_FLOW_RIBBON_ENABLED
         oscillator_group_enabled = cfg.ENABLE_PPO_GATE or cfg.RSI_GUARD_ENABLED or cfg.ICHIMOKU_TK_GUARD_ENABLED
 
-        # ── Cloud group buy ──
-        cloud_votes_buy = []
-        if cfg.ICHIMOKU_CLOUD_ENABLED:
-            cloud_votes_buy.append(ichimoku_gate_ok_buy)
-        if cfg.RMA_CLOUD_ENABLED:
-            cloud_votes_buy.append(rma_cloud_ok_buy)
-        if cfg.DYNAMIC_FLOW_RIBBON_ENABLED:
-            cloud_votes_buy.append(dynamic_flow_ok_buy)
-
-        active_cloud_votes_buy = [v for v in cloud_votes_buy if v is not None]
-        true_votes_buy = sum(1 for v in active_cloud_votes_buy if v)
-
-        if active_cloud_votes_buy:
-            # Strict majority: > half of active votes must be true
-            cloud_group_ok_buy = true_votes_buy > (len(active_cloud_votes_buy) / 2.0)
-            if not cloud_group_ok_buy and cfg.DEBUG_MODE:
-                logger_pair.debug(
-                    f"[{pair_name}] Cloud group buy blocked "
-                    f"(Ichimoku={ichimoku_gate_ok_buy}, RMA={rma_cloud_ok_buy}, DynamicFlow={dynamic_flow_ok_buy})"
-                )
-        elif not cloud_group_enabled:
-            cloud_group_ok_buy = True
-        else:
-            cloud_group_ok_buy = False
-
-        # ── Cloud group sell ──
-        cloud_votes_sell = []
-        if cfg.ICHIMOKU_CLOUD_ENABLED:
-            cloud_votes_sell.append(ichimoku_gate_ok_sell)
-        if cfg.RMA_CLOUD_ENABLED:
-            cloud_votes_sell.append(rma_cloud_ok_sell)
-        if cfg.DYNAMIC_FLOW_RIBBON_ENABLED:
-            cloud_votes_sell.append(dynamic_flow_ok_sell)
-
-        active_cloud_votes_sell = [v for v in cloud_votes_sell if v is not None]
-        true_votes_sell = sum(1 for v in active_cloud_votes_sell if v)
-
-        if active_cloud_votes_sell:
-            # Strict majority: > half of active votes must be true
-            cloud_group_ok_sell = true_votes_sell > (len(active_cloud_votes_sell) / 2.0)
-            if not cloud_group_ok_sell and cfg.DEBUG_MODE:
-                logger_pair.debug(
-                    f"[{pair_name}] Cloud group sell blocked "
-                    f"(Ichimoku={ichimoku_gate_ok_sell}, RMA={rma_cloud_ok_sell}, DynamicFlow={dynamic_flow_ok_sell})"
-                )
-        elif not cloud_group_enabled:
-            cloud_group_ok_sell = True
-        else:
-            cloud_group_ok_sell = False
+        # ── Cloud group: Cirrus veto AND (Ichimoku OR Dynamic Flow) ──
+        cloud_group_ok_buy = _cloud_group_decision(
+            cirrus_ok_buy, ichimoku_gate_ok_buy, dynamic_flow_ok_buy, rma_cloud_ok_buy
+        )
+        cloud_group_ok_sell = _cloud_group_decision(
+            cirrus_ok_sell, ichimoku_gate_ok_sell, dynamic_flow_ok_sell, rma_cloud_ok_sell
+        )
+        if cfg.DEBUG_MODE and not cloud_group_ok_buy:
+            logger_pair.debug(
+                f"[{pair_name}] Cloud group buy blocked "
+                f"(Cirrus={cirrus_ok_buy}, Ichimoku={ichimoku_gate_ok_buy}, "
+                f"DynamicFlow={dynamic_flow_ok_buy}, RMA={rma_cloud_ok_buy})"
+            )
+        if cfg.DEBUG_MODE and not cloud_group_ok_sell:
+            logger_pair.debug(
+                f"[{pair_name}] Cloud group sell blocked "
+                f"(Cirrus={cirrus_ok_sell}, Ichimoku={ichimoku_gate_ok_sell}, "
+                f"DynamicFlow={dynamic_flow_ok_sell}, RMA={rma_cloud_ok_sell})"
+            )
 
         confirmation_buy = cloud_group_ok_buy
         confirmation_sell = cloud_group_ok_sell
@@ -1065,6 +1094,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             rma_cloud_fast_curr=rma_cloud_fast_curr,
             rma_cloud_ok_buy=rma_cloud_ok_buy, rma_cloud_ok_sell=rma_cloud_ok_sell,
             dynamic_flow_ok_buy=dynamic_flow_ok_buy, dynamic_flow_ok_sell=dynamic_flow_ok_sell,
+            cirrus_ok_buy=cirrus_ok_buy, cirrus_ok_sell=cirrus_ok_sell,
             trend_gate_ok_buy=trend_gate_ok_buy, trend_gate_ok_sell=trend_gate_ok_sell,
             adx_val=adx_val, adx_adaptive_threshold=adx_adaptive_threshold, adx_ok=adx_ok,
             rvol_bypass_ok=rvol_bypass_ok, rvol_ok=rvol_ok, adaptive_rvol_check=adaptive_rvol_check,

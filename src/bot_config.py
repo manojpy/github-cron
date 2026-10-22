@@ -208,7 +208,7 @@ class BotConfig(BaseModel):
     ICHIMOKU_TK_CONVERSION_PERIODS: int = Field(default=23, ge=1, le=300, description="Tenkan (conversion) length used for TK guard + cross alerts, independent of cloud conversion length")
     ICHIMOKU_TK_BASE_PERIODS: int = Field(default=65, ge=1, le=400, description="Kijun (base) length used for TK guard + cross alerts, independent of cloud base length")
     ICHIMOKU_TK_GUARD_ENABLED: bool = Field(default=True, description="Require 15m Tenkan(conversion) vs Kijun(base) alignment: buy needs conversion>=base, sell needs conversion<=base")
-    ENABLE_BIAS_HEADER: bool = Field(default=True, description="Prepend a pair-universe Ichimoku directional-bias header (cosmetic only, does not gate alerts) to every outgoing Telegram message")
+    ENABLE_BIAS_HEADER: bool = Field(default=True, description="Prepend a pair-universe directional-bias header (Cirrus Cloud, or Ichimoku when BIAS_USE_CIRRUS=False; cosmetic only, does not gate alerts) to every outgoing Telegram message")
     ALERT_TAKE_MIN_CONVICTION: float = Field(default=70.0, ge=0.0, le=100.0, description="Telegram alert verdict: conviction % at or above which an alert reads TAKE")
     ALERT_WATCH_MIN_CONVICTION: float = Field(default=50.0, ge=0.0, le=100.0, description="Telegram alert verdict: conviction % at or above which an alert reads WATCH (below = AVOID)")
     ALERT_SHADOW_CONVICTION_CAP: float = Field(default=55.0, ge=0.0, le=100.0, description="Conviction ceiling while the only evidence is SHADOW/INSUFFICIENT, so nothing reads TAKE before it has real results")
@@ -249,6 +249,12 @@ class BotConfig(BaseModel):
     BIAS_ICHIMOKU_DISPLACEMENT: int = Field(default=65, ge=1, le=400, description="Forward displacement for the bias-header cloud")
     RMA_CLOUD_ENABLED: bool = Field(default=True, description="Enable RMA(fast)/RMA(50) 15m cloud as trend gate; green (buy) when RMA_fast>RMA50, red (sell) when RMA_fast<RMA50. Reuses the existing RMA50(15m)/RMA_50_PERIOD used for base trend.")
     RMA_CLOUD_FAST_PERIOD: int = Field(default=20, ge=2, le=200, description="RMA Cloud fast period (15m). Slow leg reuses RMA_50_PERIOD.")
+    CIRRUS_CLOUD_ENABLED: bool = Field(default=True, description="Cirrus Cloud (Pine port) as the VETO of the cloud group: buy needs Trend Up, sell needs Trend Down, AND at least one of Ichimoku cloud / Dynamic Flow Ribbon agreeing. When True the RMA-cloud vote is no longer part of the cloud group")
+    CIRRUS_X1: int = Field(default=22, ge=1, le=200, description="Cirrus Cloud slow range EMA length (Pine x1)")
+    CIRRUS_X2: float = Field(default=9.0, gt=0.0, le=100.0, description="Cirrus Cloud slow range multiplier (Pine x2)")
+    CIRRUS_X3: int = Field(default=15, ge=1, le=200, description="Cirrus Cloud fast range EMA length (Pine x3)")
+    CIRRUS_X4: float = Field(default=5.0, gt=0.0, le=100.0, description="Cirrus Cloud fast range multiplier (Pine x4)")
+    BIAS_USE_CIRRUS: bool = Field(default=True, description="Base the pair-universe bias header on Cirrus Cloud (Trend Up / Trend Down / neutral) instead of the standalone Ichimoku cloud (BIAS_ICHIMOKU_*). False restores the Ichimoku bias")
     DYNAMIC_FLOW_RIBBON_ENABLED: bool = Field(default=True, description="Enable the 15m Dynamic Flow Ribbon (BigBeluga) as a third cloud-group trend gate alongside Ichimoku Cloud and RMA Cloud; green (buy) when the band-flip direction is bullish, red (sell) when bearish")
     DYNAMIC_FLOW_FACTOR: float = Field(default=3.0, ge=0.1, le=20.0, description="Dynamic Flow Ribbon band-width multiplier (Pine 'Length' input) — bands sit at basis \u00b1 factor*dist")
     DYNAMIC_FLOW_BASIS_LENGTH: int = Field(default=15, ge=2, le=200, description="Dynamic Flow Ribbon basis EMA period (15m, applied to hlc3)")
@@ -767,7 +773,10 @@ class BotConfig(BaseModel):
                 self.ICHIMOKU_TK_BASE_PERIODS - 1 if self.ICHIMOKU_TK_GUARD_ENABLED else 0,
             'BIAS_ICHIMOKU cloud (SPANB+DISPLACEMENT-2)':
                 self.BIAS_ICHIMOKU_SPANB_PERIODS + self.BIAS_ICHIMOKU_DISPLACEMENT - 2
-                if self.ENABLE_BIAS_HEADER else 0,
+                if (self.ENABLE_BIAS_HEADER and not self.BIAS_USE_CIRRUS) else 0,
+            'CIRRUS cloud (3 x slowest EMA span to settle)':
+                3 * (2 * max(self.CIRRUS_X1, self.CIRRUS_X3) - 1)
+                if (self.CIRRUS_CLOUD_ENABLED or (self.ENABLE_BIAS_HEADER and self.BIAS_USE_CIRRUS)) else 0,
             'RSI_GUARD (RSI+KALMAN+EMA lengths)':
                 self.RSI_GUARD_RSI_LEN + self.RSI_GUARD_KALMAN_LEN + self.RSI_GUARD_EMA_LEN
                 if self.RSI_GUARD_ENABLED else 0,

@@ -31,7 +31,7 @@ from fetcher import (
 from indicators import (
     get_utc_date_key, should_reset_daily_state, warmup_if_needed,
     _normalize_samples, _prune_stale_samples, _oi_funding_gate_reason,
-    calculate_ichimoku_numpy,
+    calculate_ichimoku_numpy, calculate_cirrus_cloud_numpy,
 )
 from state import (
     _blanket_reset_pair, _clear_all_redis_states, _redis_key_inventory, build_products_map_from_cfg,
@@ -502,8 +502,9 @@ async def _compute_directional_cluster(prepared_tasks: List[Tuple[str, str, Dict
     ), gate_cache
 
 async def compute_bias_context(prepared_tasks: List[Tuple[str, str, Dict[str, Any]]], reference_time: int, parsed_cache: Optional[Dict[str, Any]] = None) -> Optional[BiasContext]:
-    """Pair-universe Ichimoku directional-bias pre-pass (23/65/130/65 on 15m
-    by default — see cfg.BIAS_ICHIMOKU*). Cosmetic only: feeds the header
+    """Pair-universe directional-bias pre-pass on 15m: Cirrus Cloud by default
+    (cfg.BIAS_USE_CIRRUS), or the standalone Ichimoku 23/65/130/65 cloud
+    (cfg.BIAS_ICHIMOKU*) when BIAS_USE_CIRRUS=False. Cosmetic only: feeds the header
     line prepended to every outgoing alert this run (cfg.ENABLE_BIAS_HEADER);
     never gates or filters an alert. See BiasContext docstring for the
     per-pair up/down/neutral classification rule."""
@@ -519,6 +520,20 @@ async def compute_bias_context(prepared_tasks: List[Tuple[str, str, Dict[str, An
 
             i15 = get_last_closed_index_from_array(pd_15m.ts, 15, reference_time, p_name)
             if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
+                continue
+            if cfg.BIAS_USE_CIRRUS:
+                cirrus = calculate_cirrus_cloud_numpy(
+                    pd_15m.close, cfg.CIRRUS_X1, cfg.CIRRUS_X2, cfg.CIRRUS_X3, cfg.CIRRUS_X4
+                )
+                if not bool(cirrus['valid'][i15]):
+                    continue
+                counted += 1
+                if bool(cirrus['trend_up'][i15]):
+                    up += 1
+                elif bool(cirrus['trend_dn'][i15]):
+                    down += 1
+                else:
+                    neutral += 1
                 continue
 
             ichimoku = calculate_ichimoku_numpy(
