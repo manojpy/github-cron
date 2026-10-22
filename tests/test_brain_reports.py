@@ -478,7 +478,7 @@ def test_jsonl_round_trip_filters_signal_only_rows(tmp_path, monkeypatch):
     for sub in ("outcomes", "shadow"):
         (tmp_path / sub).mkdir()
     monkeypatch.setattr(outcome_storage, "_OUTCOME_DIR", str(tmp_path))
-    now = 1_900_000_000
+    now = int(time.time())
     monkeypatch.setattr(outcome_storage.time, "time", lambda: now)
     # pre-resolution shadow row (no `win`) + resolved outcome row
     outcome_storage.append_outcome({"pair": "BTCUSD", "alert_key": "vwap_buy", "entry_ts": now}, shadow=True)
