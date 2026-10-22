@@ -692,7 +692,7 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             data_15m["volume"], cfg.VOLUME_EMA_LENGTH
         )
 
-        # ── Trend gates ─��
+        # ── Trend gates ─
         if cfg.ENABLE_PPO_GATE:
             pg, pgs = calculate_ppo_numpy(
                 close_15m, cfg.PPO_GATE_FAST, cfg.PPO_GATE_SLOW, cfg.PPO_GATE_SIGNAL
