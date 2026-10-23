@@ -68,7 +68,7 @@ jobs:
              src/brain_report.py src/brain_recommend_baseline.py src/brain_recommend_full.py \
              src/health_server.py src/brain_audit.py src/outcome_storage.py src/learner.py \
              src/apply_config_override.py src/hypothesis_gen.py src/archive_reader.py src/repair_ledger.py src/playbook.py \
-             src/rulemine.py src/feature_store.py src/scoreboard.py src/feedback.py src/pathrecon.py \
+             src/rulemine.py src/feature_store.py src/scoreboard.py src/feedback.py src/pathrecon.py src/autopsy.py \
              src/redis_audit.py src/cleanup_outcomes.py \
             --ignore-missing-imports 2>&1 | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
@@ -225,6 +225,7 @@ jobs:
                 "/app/src/rulemine.py"
                 "/app/src/feedback.py"
                 "/app/src/pathrecon.py"
+                "/app/src/autopsy.py"
                 "/app/src/plan_replay.py"
                 "/app/src/redis_audit.py"
                 "/app/src/cleanup_outcomes.py"
