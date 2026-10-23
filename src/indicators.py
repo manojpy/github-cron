@@ -2121,8 +2121,10 @@ def _tl_value(line, x):
     _, _, k2, p2, slope = line
     return p2 + slope * (x - k2)
 
-
-def _trendline_events(o, h, l, c, ts, atr_arr, i15, cfg_obj):
+def _trendline_events(
+    o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray, ts: np.ndarray,
+    atr_arr: np.ndarray, i15: Optional[int], cfg_obj: Any,
+) -> Tuple[Dict[str, bool], Dict[str, str]]:
     """Evaluate trendline break / bounce / retest on the closed candle i15.
 
     Returns (events, reasons): both dicts keyed by the six alert keys in
