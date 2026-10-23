@@ -2653,11 +2653,21 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         if alerts_to_send and getattr(cfg, "ENABLE_MACRO_CONTEXT_GATE", False) and macro_context is not None:
             btc_bearish = macro_context.confirmation_sell and macro_context.adx_ok
             btc_bullish = macro_context.confirmation_buy and macro_context.adx_ok
-            if (is_buy_batch and btc_bearish) or (not is_buy_batch and btc_bullish):
-                corr = rolling_correlation(
-                    _pct_returns(data_15m.close), _pct_returns(macro_context.closes),
-                    window=Constants.MACRO_CORR_WINDOW,
-                )
+            macro_opposed = (is_buy_batch and btc_bearish) or (not is_buy_batch and btc_bullish)
+            # Measure correlation / relative strength for EVERY batch, not only the
+            # opposed ones, so the Brain has an unopposed baseline to compare the
+            # opposed trades against. Only an opposed batch gets a multiplier != 1.0,
+            # so live behaviour is unchanged.
+            corr = rolling_correlation(
+                _pct_returns(data_15m.close), _pct_returns(macro_context.closes),
+                window=Constants.MACRO_CORR_WINDOW,
+            )
+            relative_strength = None
+            if o not in (None, 0) and macro_context.open not in (None, 0):
+                alt_return_15m = (c - o) / o
+                btc_return_15m = (macro_context.close - macro_context.open) / macro_context.open
+                relative_strength = alt_return_15m - btc_return_15m
+            if macro_opposed:
                 if not np.isnan(corr):
                     if corr < Constants.MACRO_CORR_LOW:
                         macro_multiplier = 1.0
@@ -2665,26 +2675,21 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         macro_multiplier = Constants.MACRO_MULT_MODERATE
                     else:
                         macro_multiplier = Constants.MACRO_MULT_FULL
+                if relative_strength is not None and relative_strength > 0:
+                    macro_multiplier = max(1.0, macro_multiplier * Constants.MACRO_RS_EASE_FACTOR)
 
-                relative_strength = None
-                if o not in (None, 0) and macro_context.open not in (None, 0):
-                    alt_return_15m = (c - o) / o
-                    btc_return_15m = (macro_context.close - macro_context.open) / macro_context.open
-                    relative_strength = alt_return_15m - btc_return_15m
-                    if relative_strength > 0:
-                        macro_multiplier = max(1.0, macro_multiplier * Constants.MACRO_RS_EASE_FACTOR)
-
-                macro_shadow = {
-                    "correlation": None if np.isnan(corr) else round(corr, 3),
-                    "relative_strength": None if relative_strength is None else round(relative_strength, 5),
-                    "multiplier": round(macro_multiplier, 3),
-                    "btc_bullish": btc_bullish, "btc_bearish": btc_bearish,
-                }
-                logger_pair.info(
-                    f"[{pair_name}] 🌐 Macro context: corr={macro_shadow['correlation']}, "
-                    f"RS={macro_shadow['relative_strength']}, multiplier={macro_multiplier:.2f}"
-                    f"{' [LIVE]' if getattr(cfg, 'MACRO_CONTEXT_LIVE', False) else ' (SHADOW ONLY)'}"
-                )
+            macro_shadow = {
+                "correlation": None if np.isnan(corr) else round(corr, 3),
+                "relative_strength": None if relative_strength is None else round(relative_strength, 5),
+                "multiplier": round(macro_multiplier, 3),
+                "btc_bullish": btc_bullish, "btc_bearish": btc_bearish,
+                "opposed": macro_opposed,
+            }
+            logger_pair.info(
+                f"[{pair_name}] 🌐 Macro context: opposed={macro_opposed}, corr={macro_shadow['correlation']}, "
+                f"RS={macro_shadow['relative_strength']}, multiplier={macro_multiplier:.2f}"
+                f"{' [LIVE]' if getattr(cfg, 'MACRO_CONTEXT_LIVE', False) else ' (SHADOW ONLY)'}"
+            )
 
         # ── Existing confluence gate, but with macro multiplier ─────────────
         if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
@@ -2704,6 +2709,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     req = req * macro_multiplier
                 return req
 
+            def _macro_adjusted_required(req: float) -> float:
+                # Requirement as the macro modifier would set it. `req` already carries
+                # the multiplier when MACRO_CONTEXT_LIVE; in shadow it does not, which
+                # made would_block just repeat the plain confluence verdict.
+                return req if getattr(cfg, "MACRO_CONTEXT_LIVE", False) else req * macro_multiplier
+
             # Keep the alerts this gate rejects so the counterfactual recorder
             # below can still shadow them after alerts_to_send is cleared.
             _confluence_blocked_alerts: Optional[List[Tuple[str, str, str]]] = None
@@ -2711,7 +2722,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
                 required = _required_confluence(confluence_total)
                 if macro_shadow is not None:
-                    macro_shadow["would_block"] = confluence_score < required
+                    macro_shadow["would_block"] = confluence_score < _macro_adjusted_required(required)
                 if confluence_score < required:
                     logger_pair.info(
                         f"[{pair_name}] Confluence gate blocked: {confluence_score:.1f}/{confluence_total:.1f} "
@@ -2742,7 +2753,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             if _to_record and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
                 required = _required_confluence(confluence_total)
                 if macro_shadow is not None:
-                    macro_shadow["would_block"] = confluence_score < required
+                    macro_shadow["would_block"] = confluence_score < _macro_adjusted_required(required)
                 if confluence_score < required:
                     if _confluence_blocked_alerts is None:
                         logger_pair.info(
