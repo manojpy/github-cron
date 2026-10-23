@@ -771,7 +771,11 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
     an = F["anatomy"] or {}
     be = 1.0 / (1.0 + an["rr"]) if an.get("rr") else None
     out = [_hdr(4, '📊 PROFITABILITY — "ARE WE ACTUALLY MAKING MONEY?"')]
-    wr_verdict = ("🔴 Very poor" if be and wr < be * 0.5 else "🔴 Below break-even" if be and wr < be
+    # Break-even (1/(1+rr)) is a target-before-stop rate, so compare the target-hit
+    # rate to it, not the headline WR (which also counts profitable timeouts).
+    _cnt, _known = an.get("counts") or {}, an.get("known") or 0
+    tp_rate = (_cnt.get("target", 0) / _known) if _known else wr
+    wr_verdict = ("🔴 Very poor" if be and tp_rate < be * 0.5 else "🔴 Below break-even" if be and tp_rate < be
                   else "🟢 At/above break-even" if be else "⚪")
     dd, bud = F["dd"], F["dd_budget"]
     dd_win = F["gate"].get("risk_window_hours", 24)
