@@ -444,23 +444,39 @@ def calculate_rsi_core(close, period):
 
     return rsi
 
-
 @njit(SIG_TRUE_RANGE, nogil=True, cache=True)
 def true_range_numba(high, low, close):
     n = len(close)
     if n == 0:
         return np.empty(0, dtype=np.float64)
+        
     tr = np.empty(n, dtype=np.float64)
-    tr[0] = high[0] - low[0]
+    
+    # Bar 0 has no close[1]
+    h0, l0 = high[0], low[0]
+    if np.isnan(h0) or np.isnan(l0):
+        tr[0] = np.nan
+    else:
+        tr[0] = h0 - l0
+        
     for i in range(1, n):
         h = high[i]
         l = low[i]
         c = close[i - 1]
+        
+        # Pine parity: math.max(na, x) == na. Explicitly propagate NaN.
+        if np.isnan(h) or np.isnan(l) or np.isnan(c):
+            tr[i] = np.nan
+            continue
+            
         tr1 = h - l
         tr2 = abs(h - c)
         tr3 = abs(l - c)
+        
+        # NaNs are filtered above, so standard max() is completely safe 
+        # and won't suffer from backend-specific fmax swallowing.
         tr[i] = max(tr1, tr2, tr3)
-
+        
     return tr
 
 @njit(SIG_ATR_RMA, nogil=True, cache=True)

@@ -518,22 +518,37 @@ def true_range_numba(double[:] high, double[:] low, double[:] close):
     cdef double[:] tr = tr_np
     cdef int i
     cdef double h, l, c, tr1, tr2, tr3
+
     if n == 0:
         return np.empty(0, dtype=np.float64)
-    tr[0] = high[0] - low[0]
+        
+    h = high[0]
+    l = low[0]
+    if isnan(h) or isnan(l):
+        tr[0] = np.nan
+    else:
+        tr[0] = h - l
 
     for i in range(1, n):
         h = high[i]
         l = low[i]
         c = close[i - 1]
+        
+        # Pine parity: math.max(na, x) == na. Explicitly propagate NaN.
+        if isnan(h) or isnan(l) or isnan(c):
+            tr[i] = np.nan
+            continue
+            
         tr1 = h - l
         tr2 = fabs(h - c)
         tr3 = fabs(l - c)
+        
+        # Safe to use fmax now because NaNs are explicitly filtered out
         tr[i] = fmax(tr1, fmax(tr2, tr3))
-
+        
     return tr_np
 
-# ════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════���═══════════════════════
 # 12. calculate_atr_rma
 # ══════════════════════════════════════════════════════════════════════
 
