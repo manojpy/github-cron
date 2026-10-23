@@ -2116,10 +2116,41 @@ def _tl_line_at(pivots: List[Tuple[int, float]], n: int, t: int, min_slope_pct: 
         return None
     return k1, p1, k2, p2, slope
 
-
 def _tl_value(line, x):
-    _, _, k2, p2, slope = line
-    return p2 + slope * (x - k2)
+    return line[3] + line[4] * (x - line[2])
+
+
+def _tl_quality(line, is_res: bool, h, l, c, atr_arr, t: int, cfg_obj) -> Optional[int]:
+    """Quality check for a line, judged on bars up to and including t.
+
+    Returns the touch count (the 2 anchors + extra touches) or None if the line
+    is rejected: too old, closed through between its anchors and t, or fewer
+    touches than TRENDLINE_MIN_TOUCHES. A touch is a non-anchor bar whose wick
+    came within TRENDLINE_TOUCH_ATR_MULT*ATR of the line without closing through
+    it; touches closer than 3 bars to the previous counted one are one touch.
+    """
+    k1, k2 = line[0], line[2]
+    if t - k2 > int(cfg_obj.TRENDLINE_MAX_AGE_BARS):
+        return None
+    idx = np.arange(k1 + 1, t + 1)
+    idx = idx[(idx != k2)]
+    if idx.size == 0:
+        return 2 if int(cfg_obj.TRENDLINE_MIN_TOUCHES) <= 2 else None
+    lv = _tl_value(line, idx)
+    if is_res:
+        through = c[idx] > lv
+        near = h[idx] >= lv - float(cfg_obj.TRENDLINE_TOUCH_ATR_MULT) * atr_arr[idx]
+    else:
+        through = c[idx] < lv
+        near = l[idx] <= lv + float(cfg_obj.TRENDLINE_TOUCH_ATR_MULT) * atr_arr[idx]
+    if bool(cfg_obj.TRENDLINE_REJECT_VIOLATED) and bool(np.any(through)):
+        return None
+    touches, last = 2, -10
+    for pos in np.nonzero(near & ~through & np.isfinite(atr_arr[idx]))[0]:
+        if int(idx[pos]) - last >= 3:
+            touches += 1
+            last = int(idx[pos])
+    return touches if touches >= int(cfg_obj.TRENDLINE_MIN_TOUCHES) else None
 
 def _trendline_events(
     o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray, ts: np.ndarray,
@@ -2161,14 +2192,31 @@ def _trendline_events(
     pierce = float(cfg_obj.TRENDLINE_BOUNCE_MAX_PIERCE_ATR) * a_now
     retest_touch = float(cfg_obj.TRENDLINE_RETEST_ATR_MULT) * a_now
     min_break = float(cfg_obj.TRENDLINE_BREAK_MIN_ATR) * a_now
+    max_break = float(cfg_obj.TRENDLINE_BREAK_MAX_ATR) * a_now
+    rng_now = float(h[i15] - l[i15])
+    if rng_now > 1e-12 and np.isfinite(o[i15]):
+        body_ratio_now = abs(float(c[i15] - o[i15])) / rng_now
+        close_pos_up = float(c[i15] - l[i15]) / rng_now     # 1.0 = closed on the high
+        close_pos_dn = float(h[i15] - c[i15]) / rng_now     # 1.0 = closed on the low
+    else:
+        body_ratio_now = close_pos_up = close_pos_dn = 0.0
+    min_body = float(cfg_obj.TRENDLINE_BREAK_MIN_BODY_RATIO)
+    min_pos = float(cfg_obj.TRENDLINE_REJECT_MIN_CLOSE_POS)
     max_bars = int(cfg_obj.TRENDLINE_RETEST_MAX_BARS)
     pair = PAIR_ID.get() or "?"
+
+    def _get_line(piv, is_res, t):
+        """Newest line known at bar t that also passes the quality check."""
+        ln = _tl_line_at(piv, n, t, min_slope, ref)
+        if ln is None:
+            return None
+        touches = _tl_quality(ln, is_res, h, l, c, atr_arr, t, cfg_obj)
+        return None if touches is None else ln + (touches,)
 
     def _desc(line, kind):
         slope = line[4]
         return (f"{'rising' if slope > 0 else 'falling' if slope < 0 else 'flat'} {kind} "
-                f"(anchors {i15 - line[0]} and {i15 - line[2]} bars ago)")
-
+                f"({line[5]} touches, newest anchor {i15 - line[2]} bars ago)")
     for is_buy in (True, False):
         side = "buy" if is_buy else "sell"
         # BUY events use: break -> resistance (highs); bounce/retest-of-break -> see below.
@@ -2177,13 +2225,15 @@ def _trendline_events(
 
         # ── BREAK: close crosses the line, previous close was on the other side ──
         piv = res_pivots if is_buy else sup_pivots
-        line = _tl_line_at(piv, n, i15 - 1, min_slope, ref)
+        line = _get_line(piv, is_buy, i15 - 1)
         if line is not None:
             lp, lc = _tl_value(line, i15 - 1), _tl_value(line, i15)
             if is_buy:
-                crossed = c[i15 - 1] <= lp and c[i15] > lc and (c[i15] - lc) >= min_break
+                crossed = (c[i15 - 1] <= lp and c[i15] > lc and min_break <= (c[i15] - lc) <= max_break
+                           and body_ratio_now >= min_body)
             else:
-                crossed = c[i15 - 1] >= lp and c[i15] < lc and (lc - c[i15]) >= min_break
+                crossed = (c[i15 - 1] >= lp and c[i15] < lc and min_break <= (lc - c[i15]) <= max_break
+                           and body_ratio_now >= min_body)
             if crossed:
                 key = f"tl_break_{side}"
                 events[key] = True
@@ -2192,7 +2242,7 @@ def _trendline_events(
 
         # ── BOUNCE: wick reaches the line and the close rejects back to the trend side ──
         piv = sup_pivots if is_buy else res_pivots
-        line = _tl_line_at(piv, n, i15 - 1, min_slope, ref)
+        line = _get_line(piv, not is_buy, i15 - 1)
         if line is not None:
             lp, lc = _tl_value(line, i15 - 1), _tl_value(line, i15)
             if is_buy:
@@ -2203,7 +2253,8 @@ def _trendline_events(
                 held_before = c[i15 - 1] < lp
                 touched = h[i15] >= lc - touch and h[i15] <= lc + pierce
                 closed_ok = c[i15] < lc
-            if held_before and touched and closed_ok:
+            pos_ok = (close_pos_up if is_buy else close_pos_dn) >= min_pos
+            if held_before and touched and closed_ok and pos_ok:
                 key = f"tl_bounce_{side}"
                 events[key] = True
                 reasons[key] = (f"Rejected {_desc(line, kind_sup if is_buy else kind_res)} "
@@ -2213,7 +2264,7 @@ def _trendline_events(
         piv = res_pivots if is_buy else sup_pivots
         j_lo = max(start + 2 * n + 3, i15 - max_bars)
         for j in range(i15 - 1, j_lo - 1, -1):
-            bl = _tl_line_at(piv, n, j - 1, min_slope, ref)
+            bl = _get_line(piv, is_buy, j - 1)
             if bl is None:
                 continue
             bp, bc = _tl_value(bl, j - 1), _tl_value(bl, j)
@@ -2238,9 +2289,11 @@ def _trendline_events(
                 if not (held and untouched and np.all(np.isfinite(atr_mid))):
                     break
             if is_buy:
-                ok = (l[i15] <= lc + retest_touch and l[i15] >= lc - pierce and c[i15] > lc)
+                ok = (l[i15] <= lc + retest_touch and l[i15] >= lc - pierce and c[i15] > lc
+                      and close_pos_up >= min_pos)
             else:
-                ok = (h[i15] >= lc - retest_touch and h[i15] <= lc + pierce and c[i15] < lc)
+                ok = (h[i15] >= lc - retest_touch and h[i15] <= lc + pierce and c[i15] < lc
+                      and close_pos_dn >= min_pos)
             if ok:
                 key = f"tl_retest_{side}"
                 events[key] = True
