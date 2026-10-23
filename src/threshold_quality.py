@@ -857,6 +857,11 @@ def prediction_track_record(rows: List[Row], min_n: int = 30, n_bins: int = 5, m
         brier = sum((p - y) ** 2 for p, y in pairs) / n
         brier_base = sum((base - y) ** 2 for _, y in pairs) / n
         skill = (1.0 - brier / brier_base) if brier_base > 1e-12 else None
+        # Log loss punishes confident wrong calls far harder than Brier does.
+        _eps = 1e-6
+        _clip = lambda q: min(1.0 - _eps, max(_eps, q))  # noqa: E731
+        log_loss = -sum(y * math.log(_clip(p)) + (1.0 - y) * math.log(1.0 - _clip(p)) for p, y in pairs) / n
+        log_loss_base = -sum(y * math.log(_clip(base)) + (1.0 - y) * math.log(1.0 - _clip(base)) for _, y in pairs) / n
         bins: List[Dict[str, Any]] = []
         ece = 0.0
         for b in range(n_bins):
@@ -881,6 +886,7 @@ def prediction_track_record(rows: List[Row], min_n: int = 30, n_bins: int = 5, m
             "n": n, "base_rate": round(base, 4), "brier": round(brier, 5),
             "brier_baseline": round(brier_base, 5),
             "brier_skill": None if skill is None else round(skill, 4),
+            "log_loss": round(log_loss, 4), "log_loss_baseline": round(log_loss_base, 4),
             "ece": round(ece, 4), "bins": bins, "status": status,
         }
 

@@ -41,7 +41,7 @@ LAYER_OF: Dict[str, str] = {
     "playbook": RESEARCH, "threshold_stats": RESEARCH, "threshold_analysis": RESEARCH,
     "threshold_models": RESEARCH, "threshold_quality": RESEARCH, "threshold_repair": RESEARCH,
     "threshold_engine": RESEARCH, "archive_reader": RESEARCH, "scoreboard": RESEARCH,
-    "confluence_tier_report": RESEARCH, "learner": RESEARCH,
+    "confluence_tier_report": RESEARCH, "learner": RESEARCH, "autopsy": RESEARCH,
     "brain_recommend_baseline": RESEARCH, "brain_recommend_full": RESEARCH,
     # ── validation ──
     "threshold_validation": VALIDATION, "repair_ledger": VALIDATION, "brain_audit": VALIDATION,
@@ -59,7 +59,7 @@ LAYER_OF: Dict[str, str] = {
 
 # Modules that must be pure computation: no Redis, no state store, no files.
 PURE = frozenset({
-    "feature_store", "hypothesis_gen", "plan_replay", "rulemine", "threshold_stats",
+    "feature_store", "hypothesis_gen", "plan_replay", "rulemine", "autopsy", "threshold_stats",
     "threshold_analysis", "threshold_models", "threshold_quality", "threshold_repair",
     "threshold_validation",
 })

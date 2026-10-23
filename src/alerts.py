@@ -592,7 +592,7 @@ def _record_status_line(status: str, active: Optional[Dict[str, Any]]) -> str:
     return "📝 Recorded as trade"
 
 
-def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], items: List[Tuple[str, str]], keys: List[str], tq_by_key: Dict[str, Optional[Dict[str, Any]]], votes: Optional[Dict[str, bool]], required: Optional[float], bias_context: Optional[BiasContext], logger_pair: logging.Logger, pb_by_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None, adx_val: Optional[float] = None, record_line: Optional[str] = None, pullback_line: Optional[str] = None) -> Tuple[str, Optional[str]]:
+def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], items: List[Tuple[str, str]], keys: List[str], tq_by_key: Dict[str, Optional[Dict[str, Any]]], votes: Optional[Dict[str, bool]], required: Optional[float], bias_context: Optional[BiasContext], logger_pair: logging.Logger, pb_by_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None, adx_val: Optional[float] = None, record_line: Optional[str] = None, pullback_line: Optional[str] = None, decision_sink: Optional[Dict[str, Any]] = None) -> Tuple[str, Optional[str]]:
     """Build the rich body for one pair/direction and return (body, verdict).
     Never raises: any failure degrades to a plain header + setup line (verdict
     None) so an alert is never lost to a formatting bug."""
@@ -633,6 +633,14 @@ def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int
                 "adx": adx_val,
             },
         )
+        if decision_sink is not None:
+            decision_sink.update({
+                "verdict": advice.verdict,
+                "conviction": advice.conviction,
+                "confidence": advice.confidence,
+                "qualifier": advice.qualifier or None,
+                "keys": list(s_keys),
+            })
         body = build_rich_pair_msg(
             pair=pair, direction=direction, price=price, ts=ts, score=score, total=total,
             setup_line=_combined_setup_line(s_items), advice=advice,
@@ -3295,6 +3303,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     "gate_shadow": _gate_shadow_for(alert_key),
                     "playbook_seen": _playbook_seen_for(alert_key),
                     "prediction_seen": _prediction_seen_for(alert_key),
+                    "advisor_seen": (dict(advisor_seen) if advisor_seen else None),
                     "co_fired_keys": (
                         [ak for _, _, ak in alerts_to_send if ak != alert_key]
                         if cfg.ENABLE_SINGLE_ACTIVE_TRADE else None
@@ -3506,6 +3515,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         record_status = "RECORDED"
         record_active: Optional[Dict[str, Any]] = None
         record_line: Optional[str] = None
+        # Verdict + conviction exactly as shown on Telegram; stored with the trade
+        # (context["advisor_seen"]) before the outcome exists, so the Trust Meter can
+        # later grade them. Filled by build_pair_msg_and_verdict(decision_sink=...).
+        advisor_seen: Dict[str, Any] = {}
         if alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER and cfg.ENABLE_TRADE_CLOSE_NOTICE:
             _cd_fn = getattr(sdb, "in_trade_cooldown", None)
             _cd_hit = await _cd_fn(pair_name, ts_curr) if _cd_fn else None
@@ -3556,6 +3569,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 logger_pair=logger_pair,
                 record_line=record_line,
                 pullback_line=pullback_message_line(context, direction, keys),
+                decision_sink=advisor_seen,
             )
             msg_body = msg
 
@@ -3784,6 +3798,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 logger_pair=logger_pair,
                 record_line=record_line,
                 pullback_line=pullback_message_line(context, direction, keys),
+                decision_sink=advisor_seen,
             )
             # Footer: candle OPEN time (e.g. 16:00 for the 16:00-16:15 candle,
             # delivered ~16:16). The timestamp is always present; the bias

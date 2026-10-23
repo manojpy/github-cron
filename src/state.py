@@ -363,6 +363,8 @@ class RedisStateStore:
         self.metadata_expiry_seconds = 7 * 86400
         self._pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None
         self._shadow_pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None
+        # pair -> (entry_ts, confluence ratio, redis key) of the shadow trade created this run
+        self._shadow_registered_this_run: Dict[str, Tuple[int, float, str]] = {}
         self._dlq_empty_at_start: bool = False
         self._dlq_pushed_this_run: bool = False
         self.trade_close_events: List[Dict[str, Any]] = []
@@ -1626,12 +1628,19 @@ class RedisStateStore:
         confluence_total: Optional[float] = None,
         confluence_votes: Optional[Dict[str, bool]] = None,
         context: Optional[Dict[str, Any]] = None,
+
     ) -> str:
-        """Returns one of: 'created', 'disabled', 'failed'.
+        """Returns one of: 'created', 'disabled', 'failed', 'skipped_active'.
 
         Shadow trades are registered even while the pair is inside the live
         cooldown; the row's context carries `cooldown_active` (and the hit
-        candle in `cooldown_hit_ts`) so reports can include or exclude them."""
+        candle in `cooldown_hit_ts`) so reports can include or exclude them.
+
+        One open shadow trade per pair (ENABLE_SINGLE_ACTIVE_SHADOW): while a
+        shadow trade for the pair has neither hit its stop/target nor reached
+        its horizon, later signals are not registered, because they would be the
+        same market move counted again. Inside ONE candle several alert keys can
+        fire; the one with the highest confluence ratio represents the candle."""
         if self.degraded or not getattr(cfg, "ENABLE_BRAIN", False):
             return "disabled"
 
@@ -1641,6 +1650,25 @@ class RedisStateStore:
         cooldown_active = _cd_hit is not None
 
         key = f"{RedisKeyPrefix.SHADOW_PENDING}{pair}:{alert_key}:{entry_ts}"
+        ratio = (
+            float(confluence_score) / float(confluence_total)
+            if confluence_score is not None and confluence_total else -1.0
+        )
+        replace_key: Optional[str] = None
+        if getattr(cfg, "ENABLE_SINGLE_ACTIVE_SHADOW", True):
+            mine = self._shadow_registered_this_run.get(pair)
+            if mine is not None and mine[0] == int(entry_ts):
+                if ratio <= mine[1]:
+                    return "skipped_active"        # a stronger key already represents this candle
+                replace_key = mine[2]              # this key is stronger: it takes over
+            else:
+                active = await self.get_active_shadow_trade(pair)
+                if active is not None:
+                    logger.info(
+                        f"[{pair}] Shadow skipped: {active['alert_key']} @ {active['entry_ts']} "
+                        f"still open — not registering {alert_key} @ {entry_ts}"
+                    )
+                    return "skipped_active"
         try:
             payload = json_dumps({
                 "direction": direction,
@@ -1665,15 +1693,18 @@ class RedisStateStore:
             (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60,
             24 * 3600,
         )
-
         try:
             await asyncio.wait_for(
                 _rc(self._redis).set(key, payload, ex=ttl),
                 timeout=2.0,
             )
+            if replace_key is not None and replace_key != key:
+                await asyncio.wait_for(_rc(self._redis).delete(replace_key), timeout=2.0)
+            self._shadow_registered_this_run[pair] = (int(entry_ts), ratio, key)
             logger.info(
                 f"[{pair}] Shadow pending created: {alert_key} @ {entry_ts} → {key}"
                 + (" (live cooldown active)" if cooldown_active else "")
+                + (f" (replaced weaker {replace_key})" if replace_key else "")
             )
             return "created"
         except Exception as e:
@@ -2297,6 +2328,39 @@ class RedisStateStore:
             return best
         except Exception as e:
             logger.warning(f"get_active_trade failed for {pair}: {e}")
+            return None
+
+    async def get_active_shadow_trade(self, pair: str) -> Optional[Dict[str, Any]]:
+        """The open shadow trade for this pair, or None. Same meaning of 'open' as
+        get_active_trade (pending row exists and is not marked closed), read from
+        the shadow pending keys. Fails open: a Redis problem means 'none open'."""
+        if self.degraded or not self._redis:
+            return None
+        try:
+            keys = await self._fetch_pending_keys(
+                pair, "_shadow_pending_outcome_keys_by_pair", RedisKeyPrefix.SHADOW_PENDING,
+                logger, "shadow",
+            )
+            if not keys:
+                return None
+            raws = await asyncio.wait_for(_rc(self._redis).mget(keys), timeout=2.0)
+            if raws is None or len(raws) != len(keys):
+                return None
+            best: Optional[Dict[str, Any]] = None
+            for k, raw in zip(keys, raws):
+                if not raw:
+                    continue
+                d = json_loads(raw)
+                if d.get("closed_ts") is not None:
+                    continue
+                ets = int(d["entry_ts"])
+                if best is None or ets > best["entry_ts"]:
+                    parts = str(k).split(":")
+                    best = {"pair": pair, "alert_key": parts[-2] if len(parts) >= 2 else "",
+                            "direction": str(d.get("direction", "")), "entry_ts": ets}
+            return best
+        except Exception as e:
+            logger.warning(f"get_active_shadow_trade failed for {pair}: {e}")
             return None
 
     @staticmethod

@@ -33,6 +33,7 @@ from bot_config import cfg, json_dumps
 from alert_registry import alert_family_of, pretty_alert
 from alerts import TelegramQueue, escape_markdown_v2
 from archive_reader import load_archived_outcomes
+from autopsy import build_intelligence, format_intelligence
 from bot_config import _get_session_from_ts
 
 from feedback import (
@@ -51,6 +52,7 @@ from state import RedisStateStore
 
 _TTL = 90 * 86400
 KEY_RECON = "path_recon"
+KEY_AUTOPSY = "brain_autopsy"
 _RECON_CAP = 5000
 _LEDGER_CAP = 600
 _CANDLE_SEC = 900
@@ -290,6 +292,11 @@ async def run(args: argparse.Namespace) -> int:
             _say(format_scoreboard(sbj) if sbj else "[learner] no scoreboard stored yet")
             return 0
 
+        if args.autopsy:
+            apj = _jl(await sdb.get_metadata(KEY_AUTOPSY, timeout=5.0), {})
+            _say(format_intelligence(apj, name_fn=pretty_alert) if apj else "[learner] no autopsy stored yet")
+            return 0
+
         if args.rollback:
             prev = await _strict_get(sdb, KEY_PREV)
             prev_state_raw = await _strict_get(sdb, KEY_STATE_PREV)
@@ -362,7 +369,35 @@ async def run(args: argparse.Namespace) -> int:
 
             text += (f"\n\n🧩 Recovered candle paths for {rstats.get('rebuilt', 0) + rstats.get('from_cache', 0)} "
                      f"older real alert(s) from exchange history (tagged RECON).")
+
         _say(text)
+
+        ap_blob: Optional[Dict[str, Any]] = None
+        ap_text = ""
+        ap_due = False
+        if cfg.ENABLE_TRADE_AUTOPSY:
+            try:
+                ap_blob = build_intelligence(
+                    rows, cost_pct=cost_pct, sl_pct=fixed["sl"], tp_pct=fixed["tp"],
+                    group_fn=alert_family_of,
+                    params={
+                        "min_n": cfg.AUTOPSY_MIN_N, "edge_min_n": cfg.AUTOPSY_EDGE_MIN_N,
+                        "reject_min_n": cfg.AUTOPSY_REJECT_MIN_N, "shrink_k": cfg.AUTOPSY_SHRINK_K,
+                        "target": cfg.TRUST_TARGET_PRECISION, "min_take_n": cfg.TRUST_MIN_TAKE_N,
+                        "windows": cfg.TRUST_WINDOWS,
+                    },
+                )
+                ap_blob["ts"] = int(now_ts)
+                ap_text = format_intelligence(ap_blob, name_fn=pretty_alert)
+                prev_ap = _jl(await sdb.get_metadata(KEY_AUTOPSY, timeout=5.0), {})
+                last_sent = float(prev_ap.get("sent_ts") or 0)
+                hours = float(cfg.AUTOPSY_NOTIFY_HOURS)
+                ap_due = hours > 0 and (now_ts - last_sent) >= hours * 3600
+                ap_blob["sent_ts"] = int(now_ts) if ap_due else int(last_sent)
+                _say(ap_text)
+            except Exception as e:
+                _say(f"[learner] autopsy skipped: {e!r}")
+                ap_blob = None
 
         if args.dry_run:
             _say("[learner] --dry-run: nothing written")
@@ -383,12 +418,16 @@ async def run(args: argparse.Namespace) -> int:
             (KEY_SCORE, json_dumps(sb)),
             (KEY_LEDGER, json_dumps(led)),
         ]
+        if ap_blob is not None:
+            writes.append((KEY_AUTOPSY, json_dumps(ap_blob)))
         await _strict_set_many(sdb, writes, _TTL)
         _say(f"[learner] playbook {blob['label']} written ({len(blob['entries'])} entries, {len(changes)} change(s))")
 
         mode = str(cfg.PLAYBOOK_NOTIFY)
         if mode == "always" or (mode == "changes" and changes):
             await notify(text)
+        if ap_blob is not None and ap_due and ap_text:
+            await notify(ap_text)
         return 0
     finally:
         try:
@@ -405,6 +444,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--rollback", action="store_true")
     ap.add_argument("--digest", action="store_true")
     ap.add_argument("--scoreboard", action="store_true", help="print the last stored scoreboard")
+    ap.add_argument("--autopsy", action="store_true", help="print the last stored autopsy / Trust Meter")
     ap.add_argument("--data-dir", default="")
     args = ap.parse_args(argv)
     try:
