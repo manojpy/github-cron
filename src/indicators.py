@@ -2064,3 +2064,189 @@ def _fib_reversal_confluence_vote(h: np.ndarray, l: np.ndarray, c: np.ndarray, v
     passed = sum(votes.values())
     vote_ok = bool(passed >= cfg_obj.FIB_REVERSAL_CONFLUENCE_REQUIRED)
     return vote_ok, passed, votes
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Auto Trendline (port of the Pine "Auto Trendline [DojiEmoji]" indicator)
+#   upper line = two most recent confirmed pivot HIGHS  (resistance)
+#   lower line = two most recent confirmed pivot LOWS   (support)
+# Events: break, bounce, retest. All maths uses CLOSED candles only.
+# ═══════════════════════════════════════════════════════════════════════════
+_TL_EVENT_KEYS = (
+    "tl_break_buy", "tl_break_sell",
+    "tl_bounce_buy", "tl_bounce_sell",
+    "tl_retest_buy", "tl_retest_sell",
+)
+
+
+def _tl_pivots(arr: np.ndarray, n: int, k_lo: int, k_hi: int, is_high: bool) -> List[Tuple[int, float]]:
+    """Strict fractal pivots k in [k_lo, k_hi]: arr[k] beats the n bars on each side."""
+    if n < 1 or k_hi < k_lo or k_lo < n:
+        return []
+    seg = arr[k_lo - n:k_hi + n + 1]
+    width = 2 * n + 1
+    if seg.size < width:
+        return []
+    win = np.lib.stride_tricks.sliding_window_view(seg, width)
+    ctr = win[:, n]
+    left, right = win[:, :n], win[:, n + 1:]
+    if is_high:
+        ok = (ctr > left.max(axis=1)) & (ctr > right.max(axis=1))
+    else:
+        ok = (ctr < left.min(axis=1)) & (ctr < right.min(axis=1))
+    ok &= np.isfinite(win).all(axis=1)
+    return [(int(k), float(arr[k])) for k in (np.nonzero(ok)[0] + k_lo)]
+
+
+def _tl_line_at(pivots: List[Tuple[int, float]], n: int, t: int, min_slope_pct: float, ref_price: float):
+    """Line built from the two newest pivots KNOWN at bar t.
+
+    Pine confirms a pivot n bars later and applies a further [1] shift, so a
+    pivot at bar k is usable from bar k+n+1. Returns (k1, p1, k2, p2, slope) or None.
+    """
+    known = [p for p in pivots if p[0] <= t - n - 1]
+    if len(known) < 2:
+        return None
+    (k1, p1), (k2, p2) = known[-2], known[-1]
+    if k2 <= k1:
+        return None
+    slope = (p2 - p1) / (k2 - k1)
+    if not np.isfinite(slope):
+        return None
+    if min_slope_pct > 0.0 and ref_price > 0 and abs(slope) / ref_price < min_slope_pct:
+        return None
+    return k1, p1, k2, p2, slope
+
+
+def _tl_value(line, x):
+    _, _, k2, p2, slope = line
+    return p2 + slope * (x - k2)
+
+
+def _trendline_events(o, h, l, c, ts, atr_arr, i15, cfg_obj):
+    """Evaluate trendline break / bounce / retest on the closed candle i15.
+
+    Returns (events, reasons): both dicts keyed by the six alert keys in
+    _TL_EVENT_KEYS. Pure function of the candle history, so a restart or a
+    re-run on the same candle always gives the same answer.
+    """
+    events = {k: False for k in _TL_EVENT_KEYS}
+    reasons: Dict[str, str] = {}
+    n = int(cfg_obj.TRENDLINE_FRACTAL_PERIOD)
+    total = len(c)
+    if i15 is None or i15 >= total or i15 < 2 * n + 3:
+        return events, reasons
+
+    lookback = max(int(cfg_obj.TRENDLINE_LOOKBACK_CANDLES), 6 * n)
+    start = max(0, i15 - lookback)
+    # Never draw a line across a missing-candle gap: restart the window after the last gap.
+    gaps = np.nonzero(np.diff(ts[start:i15 + 1]) != 900)[0]
+    if gaps.size:
+        start = start + int(gaps[-1]) + 1
+    if i15 - start < 2 * n + 3:
+        return events, reasons
+
+    a_now = atr_arr[i15]
+    if not (np.isfinite(a_now) and a_now > 0 and np.isfinite(c[i15]) and np.isfinite(c[i15 - 1])
+            and np.isfinite(h[i15]) and np.isfinite(l[i15])):
+        return events, reasons
+
+    k_lo, k_hi = start + n, i15 - n - 1
+    highs = _tl_pivots(h, n, k_lo, k_hi, True)
+    lows = _tl_pivots(l, n, k_lo, k_hi, False)
+    min_slope = float(cfg_obj.TRENDLINE_MIN_SLOPE_PCT)
+    ref = float(c[i15])
+    touch = float(cfg_obj.TRENDLINE_BOUNCE_ATR_MULT) * a_now
+    pierce = float(cfg_obj.TRENDLINE_BOUNCE_MAX_PIERCE_ATR) * a_now
+    retest_touch = float(cfg_obj.TRENDLINE_RETEST_ATR_MULT) * a_now
+    min_break = float(cfg_obj.TRENDLINE_BREAK_MIN_ATR) * a_now
+    max_bars = int(cfg_obj.TRENDLINE_RETEST_MAX_BARS)
+    pair = PAIR_ID.get() or "?"
+
+    def _desc(line, kind):
+        slope = line[4]
+        return (f"{'rising' if slope > 0 else 'falling' if slope < 0 else 'flat'} {kind} "
+                f"(anchors {i15 - line[0]} and {i15 - line[2]} bars ago)")
+
+    for is_buy in (True, False):
+        side = "buy" if is_buy else "sell"
+        # BUY events use: break -> resistance (highs); bounce/retest-of-break -> see below.
+        res_pivots, sup_pivots = highs, lows
+        kind_res, kind_sup = "resistance", "support"
+
+        # ── BREAK: close crosses the line, previous close was on the other side ──
+        piv = res_pivots if is_buy else sup_pivots
+        line = _tl_line_at(piv, n, i15 - 1, min_slope, ref)
+        if line is not None:
+            lp, lc = _tl_value(line, i15 - 1), _tl_value(line, i15)
+            if is_buy:
+                crossed = c[i15 - 1] <= lp and c[i15] > lc and (c[i15] - lc) >= min_break
+            else:
+                crossed = c[i15 - 1] >= lp and c[i15] < lc and (lc - c[i15]) >= min_break
+            if crossed:
+                key = f"tl_break_{side}"
+                events[key] = True
+                reasons[key] = (f"Close {c[i15]:.6g} broke {'above' if is_buy else 'below'} "
+                                f"{_desc(line, kind_res if is_buy else kind_sup)} at {lc:.6g}")
+
+        # ── BOUNCE: wick reaches the line and the close rejects back to the trend side ──
+        piv = sup_pivots if is_buy else res_pivots
+        line = _tl_line_at(piv, n, i15 - 1, min_slope, ref)
+        if line is not None:
+            lp, lc = _tl_value(line, i15 - 1), _tl_value(line, i15)
+            if is_buy:
+                held_before = c[i15 - 1] > lp
+                touched = l[i15] <= lc + touch and l[i15] >= lc - pierce
+                closed_ok = c[i15] > lc
+            else:
+                held_before = c[i15 - 1] < lp
+                touched = h[i15] >= lc - touch and h[i15] <= lc + pierce
+                closed_ok = c[i15] < lc
+            if held_before and touched and closed_ok:
+                key = f"tl_bounce_{side}"
+                events[key] = True
+                reasons[key] = (f"Rejected {_desc(line, kind_sup if is_buy else kind_res)} "
+                                f"at {lc:.6g}, close {c[i15]:.6g}")
+
+        # ── RETEST: first return to a line broken within the last max_bars candles ──
+        piv = res_pivots if is_buy else sup_pivots
+        j_lo = max(start + 2 * n + 3, i15 - max_bars)
+        for j in range(i15 - 1, j_lo - 1, -1):
+            bl = _tl_line_at(piv, n, j - 1, min_slope, ref)
+            if bl is None:
+                continue
+            bp, bc = _tl_value(bl, j - 1), _tl_value(bl, j)
+            if is_buy:
+                broke = c[j - 1] <= bp and c[j] > bc
+            else:
+                broke = c[j - 1] >= bp and c[j] < bc
+            if not broke:
+                continue
+            # most recent break found: judge the retest against THIS fixed line, then stop
+            mids = np.arange(j + 1, i15)
+            lm = _tl_value(bl, mids) if mids.size else np.empty(0)
+            atr_mid = atr_arr[j + 1:i15]
+            lc = _tl_value(bl, i15)
+            if mids.size:
+                if is_buy:
+                    held = bool(np.all(c[j + 1:i15] > lm))
+                    untouched = bool(np.all(l[j + 1:i15] > lm + float(cfg_obj.TRENDLINE_RETEST_ATR_MULT) * atr_mid))
+                else:
+                    held = bool(np.all(c[j + 1:i15] < lm))
+                    untouched = bool(np.all(h[j + 1:i15] < lm - float(cfg_obj.TRENDLINE_RETEST_ATR_MULT) * atr_mid))
+                if not (held and untouched and np.all(np.isfinite(atr_mid))):
+                    break
+            if is_buy:
+                ok = (l[i15] <= lc + retest_touch and l[i15] >= lc - pierce and c[i15] > lc)
+            else:
+                ok = (h[i15] >= lc - retest_touch and h[i15] <= lc + pierce and c[i15] < lc)
+            if ok:
+                key = f"tl_retest_{side}"
+                events[key] = True
+                reasons[key] = (f"First retest {i15 - j} bars after the break of "
+                                f"{_desc(bl, kind_res if is_buy else kind_sup)} at {lc:.6g}, "
+                                f"close {c[i15]:.6g}")
+            break
+
+    if any(events.values()):
+        logger.debug(f"[{pair}] Trendline events: " + "; ".join(f"{k}: {v}" for k, v in reasons.items()))
+    return events, reasons

@@ -15,7 +15,7 @@ from indicators import (
     get_volume_percentile, get_adaptive_rvol_threshold, get_adaptive_ppo_threshold,
     get_adaptive_rsi_thresholds, get_adaptive_cpr_threshold, _order_block_gate_reason,
     _oi_funding_gate_reason, get_adaptive_adx_threshold_smoothed, _get_smoothed_pctl,
-    _choch_gate_reason, calculate_ob_equilibrium, 
+    _choch_gate_reason, _trendline_events, calculate_ob_equilibrium,
 )
 
 @dataclass(slots=True)
@@ -172,6 +172,10 @@ class GateResult:
     choch_poi_tap_buy: bool = False
     choch_poi_tap_sell: bool = False
     atr_short_arr: Optional[np.ndarray] = None
+
+    # -- Auto Trendline events (tl_break / tl_bounce / tl_retest, buy & sell) --
+    tl_events: Optional[Dict[str, bool]] = None
+    tl_reasons: Optional[Dict[str, str]] = None
 
     # -- percentile-rank confluence votes (optional, all default-disabled) --
     adx_pctl: Optional[float] = None
@@ -968,7 +972,8 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         )
         reversal_candidate = (
             (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT
-             or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT)
+             or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT
+             or cfg.ENABLE_TRENDLINE_ALERTS)
             and (buy_trend_common_relaxed or sell_trend_common_relaxed)
         )
         if not buy_common and not sell_common and not reversal_candidate:
@@ -1063,6 +1068,19 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             if choch_reason:
                 logger_pair.debug(f"[{pair_name}] CHoCH gate: {choch_reason}")
 
+        tl_events: Optional[Dict[str, bool]] = None
+        tl_reasons: Optional[Dict[str, str]] = None
+        if cfg.ENABLE_TRENDLINE_ALERTS and atr_short_arr is not None:
+            try:
+                tl_events, tl_reasons = await asyncio.to_thread(
+                    _trendline_events,
+                    data_15m.open, data_15m.high, data_15m.low, data_15m.close, data_15m.ts,
+                    atr_short_arr, i15, cfg,
+                )
+            except Exception as _tl_err:
+                logger_pair.warning(f"[{pair_name}] trendline evaluation failed: {_tl_err}", exc_info=cfg.DEBUG_MODE)
+                tl_events, tl_reasons = None, None
+
         return GateResult(
             pair_name=pair_name, i15=i15, i5=i5, ts_curr=ts_curr, reference_time=reference_time,
             candle_info=candle_info, o=o, h=h, l=l, c=c,
@@ -1120,6 +1138,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             choch_fvg_buy=choch_fvg_buy, choch_fvg_sell=choch_fvg_sell,
             choch_poi_tap_buy=choch_poi_tap_buy, choch_poi_tap_sell=choch_poi_tap_sell,
             atr_short_arr=atr_short_arr,
+            tl_events=tl_events, tl_reasons=tl_reasons,
             dynamic_flow_cross_up=dynamic_flow_cross_up, dynamic_flow_cross_down=dynamic_flow_cross_down,
             ppo_gate_momentum_ok_buy=ppo_gate_momentum_ok_buy,
             ppo_gate_momentum_ok_sell=ppo_gate_momentum_ok_sell,

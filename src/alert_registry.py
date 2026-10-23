@@ -44,6 +44,9 @@ FAMILY_PREFIXES: List[Tuple[str, str]] = [
     ("strong_reversal_", "Reversal"),
     ("choch_", "Reversal"),
     ("fib_reversal_", "Reversal"),
+    ("tl_break_", "Trendline"),
+    ("tl_bounce_", "Trendline"),
+    ("tl_retest_", "Trendline"),
     ("ob_reversal_", "Order-block"),
     ("vwap_", "VWAP"),
     ("ppo_signal_", "Trend continuation"),
@@ -61,7 +64,7 @@ FAMILY_PREFIXES: List[Tuple[str, str]] = [
 
 # ── display names ────────────────────────────────────────────────────────
 TOKEN_NAMES: Dict[str, str] = {
-    "choch": "CHoCH", "ppo": "PPO", "vwap": "VWAP", "rsi": "RSI", "tk": "TK",
+    "choch": "CHoCH", "tl": "TL", "ppo": "PPO", "vwap": "VWAP", "rsi": "RSI", "tk": "TK",
     "rma": "RMA", "hist": "Hist", "ppohist": "PPO Hist", "adx": "ADX",
     "macd": "MACD", "fib": "Fib", "up": "UP", "down": "DOWN", "buy": "BUY",
     "sell": "SELL", "s1": "S1", "s2": "S2", "s3": "S3", "r1": "R1", "r2": "R2",
@@ -147,6 +150,15 @@ _STANDARD_ROWS: List[Tuple[str, str, str, str]] = [
 
     ("fib_reversal_buy", BUY, "Reversal", "ENABLE_FIB_REVERSAL_ALERT"),
     ("fib_reversal_sell", SELL, "Reversal", "ENABLE_FIB_REVERSAL_ALERT"),
+
+    ("tl_break_buy", BUY, "Trendline", "ENABLE_TL_BREAK_ALERT"),
+    ("tl_break_sell", SELL, "Trendline", "ENABLE_TL_BREAK_ALERT"),
+
+    ("tl_bounce_buy", BUY, "Trendline", "ENABLE_TL_BOUNCE_ALERT"),
+    ("tl_bounce_sell", SELL, "Trendline", "ENABLE_TL_BOUNCE_ALERT"),
+
+    ("tl_retest_buy", BUY, "Trendline", "ENABLE_TL_RETEST_ALERT"),
+    ("tl_retest_sell", SELL, "Trendline", "ENABLE_TL_RETEST_ALERT"),
 
     ("dynamic_flow_cross_buy", BUY, "Confluence", "ENABLE_DYNAMIC_FLOW_CROSS_ALERT"),
     ("dynamic_flow_cross_sell", SELL, "Confluence", "ENABLE_DYNAMIC_FLOW_CROSS_ALERT"),

@@ -773,6 +773,12 @@ _ALERT_DEFINITIONS_RAW: List[Dict[str, Any]] = [
     {"key":"choch_sell","title":"🔴🔀 CHoCH SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("choch_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('choch_reason') or 'Bearish change of character'}","requires":["choch"]},
     {"key":"fib_reversal_buy","title":"🟢🌀 Fib Pivot Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("fib_reversal_buy",False) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('fib_reversal_reason') or 'Fibonacci zone reversal'}","requires":["fib_reversal"]},
     {"key":"fib_reversal_sell","title":"🔴🌀 Fib Pivot Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("fib_reversal_sell",False) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('fib_reversal_reason') or 'Fibonacci zone reversal'}","requires":["fib_reversal"]},
+    {"key":"tl_break_buy","title":"🟢💥 Trendline Break BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("tl_break_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{(ctx.get('tl_reasons') or {}).get('tl_break_buy') or 'Trendline break'}","requires":["trendline","tl_break"]},
+    {"key":"tl_break_sell","title":"🔴💥 Trendline Break SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("tl_break_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{(ctx.get('tl_reasons') or {}).get('tl_break_sell') or 'Trendline break'}","requires":["trendline","tl_break"]},
+    {"key":"tl_bounce_buy","title":"🟢↩️ Trendline Bounce BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("tl_bounce_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{(ctx.get('tl_reasons') or {}).get('tl_bounce_buy') or 'Trendline bounce'}","requires":["trendline","tl_bounce"]},
+    {"key":"tl_bounce_sell","title":"🔴↩️ Trendline Bounce SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("tl_bounce_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{(ctx.get('tl_reasons') or {}).get('tl_bounce_sell') or 'Trendline bounce'}","requires":["trendline","tl_bounce"]},
+    {"key":"tl_retest_buy","title":"🟢🔁 Trendline Retest BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("tl_retest_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{(ctx.get('tl_reasons') or {}).get('tl_retest_buy') or 'Trendline retest'}","requires":["trendline","tl_retest"]},
+    {"key":"tl_retest_sell","title":"🔴🔁 Trendline Retest SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("tl_retest_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{(ctx.get('tl_reasons') or {}).get('tl_retest_sell') or 'Trendline retest'}","requires":["trendline","tl_retest"]},
     {"key":"dynamic_flow_cross_buy","title":"🌊🟢 Dynamic Flow Cross BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("dynamic_flow_cross_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('dynamic_flow_cross_reason') or 'Dynamic Flow Ribbon flipped bullish'}","requires":["dynamic_flow_cross"]},
     {"key":"dynamic_flow_cross_sell","title":"🌊🔴 Dynamic Flow Cross SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("dynamic_flow_cross_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('dynamic_flow_cross_reason') or 'Dynamic Flow Ribbon flipped bearish'}","requires":["dynamic_flow_cross"]},
     {"key":"equilibrium_cross_up","title":"⚖️🟢 Equilibrium Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_wick",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Equilibrium {ctx.get('equilibrium_curr',0) or 0:.2f} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
@@ -918,6 +924,16 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
 
     # ─ CHoCH liquidity-sweep reversal ──
     for k, ok_key in ((AlertKey.CHOCH_BUY, "choch_buy"), (AlertKey.CHOCH_SELL, "choch_sell")):
+        rk = ALERT_KEYS.get(k)
+        if rk and conditional_states.get(rk, False) and not context.get(ok_key):
+            resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
+
+    # ── Auto Trendline (break / bounce / retest) ──
+    for k, ok_key in (
+        (AlertKey.TL_BREAK_BUY, "tl_break_buy"), (AlertKey.TL_BREAK_SELL, "tl_break_sell"),
+        (AlertKey.TL_BOUNCE_BUY, "tl_bounce_buy"), (AlertKey.TL_BOUNCE_SELL, "tl_bounce_sell"),
+        (AlertKey.TL_RETEST_BUY, "tl_retest_buy"), (AlertKey.TL_RETEST_SELL, "tl_retest_sell"),
+    ):
         rk = ALERT_KEYS.get(k)
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
@@ -1934,6 +1950,22 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     passed_names = ", ".join(k for k, v in fib_reversal_votes_sell.items() if v)
                     fib_reversal_reason = f"Fib pivot reversal | {passed_sell}/4 confluence ({passed_names})"
 
+        tl_flags: Dict[str, bool] = {
+            "tl_break_buy": False, "tl_break_sell": False,
+            "tl_bounce_buy": False, "tl_bounce_sell": False,
+            "tl_retest_buy": False, "tl_retest_sell": False,
+        }
+        if cfg.ENABLE_TRENDLINE_ALERTS and gr.tl_events:
+            _tl_osc_buy = bool(ppo_curr < Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi_curr < Constants.RSI_SIGNAL_CROSS_MAX_BUY)
+            _tl_osc_sell = bool(ppo_curr > Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi_curr > Constants.RSI_SIGNAL_CROSS_MIN_SELL)
+            for _tl_key in tl_flags:
+                if not gr.tl_events.get(_tl_key):
+                    continue
+                if _tl_key.endswith("_buy"):
+                    tl_flags[_tl_key] = bool(buy_common_relaxed_wick and _tl_osc_buy)
+                else:
+                    tl_flags[_tl_key] = bool(sell_common_relaxed_wick and _tl_osc_sell)
+
         values_to_check = {
             'ppo_curr': ppo_curr, 'ppo_prev': ppo_prev,
             'rsi_curr': rsi_curr, 'rsi_prev': rsi_prev,
@@ -2007,6 +2039,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "choch_poi_tap_buy": choch_poi_tap_buy, "choch_poi_tap_sell": choch_poi_tap_sell,
             "fib_reversal_buy": fib_reversal_buy, "fib_reversal_sell": fib_reversal_sell,
             "fib_reversal_reason": fib_reversal_reason,
+            **tl_flags,
+            "tl_reasons": gr.tl_reasons or {},
             "dynamic_flow_cross_buy": dynamic_flow_cross_buy, "dynamic_flow_cross_sell": dynamic_flow_cross_sell,
             "dynamic_flow_cross_reason": dynamic_flow_cross_reason,
         }
@@ -2045,6 +2079,14 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             elif "choch" in requires and not cfg.ENABLE_CHOCH_ALERT:
                 skip = True
             elif "fib_reversal" in requires and not cfg.ENABLE_FIB_REVERSAL_ALERT:
+                skip = True
+            elif "trendline" in requires and not cfg.ENABLE_TRENDLINE_ALERTS:
+                skip = True
+            elif "tl_break" in requires and not cfg.ENABLE_TL_BREAK_ALERT:
+                skip = True
+            elif "tl_bounce" in requires and not cfg.ENABLE_TL_BOUNCE_ALERT:
+                skip = True
+            elif "tl_retest" in requires and not cfg.ENABLE_TL_RETEST_ALERT:
                 skip = True
             elif "vwap" in requires and not vwap_available:
                 skip = True
@@ -2243,6 +2285,15 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                             )
                         continue
 
+                if alert_key.startswith("tl_") and cfg.TRENDLINE_SHADOW_MODE:
+                    # Trendline shadow mode: never sent; shadow-tracked at dispatch
+                    # as "trendline_shadow" so results can be reviewed before going live.
+                    if not _brain_disabled:
+                        context.setdefault("trendline_shadow_hits", []).append(
+                            (def_.title, extra, def_.key)
+                        )
+                    continue
+
                 if _brain_disabled:
                     # Never dispatched: handed to the dispatch stage, which
                     # shadow-tracks it as "brain_disabled".
@@ -2406,6 +2457,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     _, ts_curr, reference_time = gr.i15, gr.ts_curr, gr.reference_time
     _disabled_hits = context.pop("brain_disabled_hits", None) or []
     _pb_hits = context.pop("pullback_unconfirmed_hits", None) or []
+    _tl_hits = context.pop("trendline_shadow_hits", None) or []
 
     if kill_switch_mode() == "live" and sdb and not sdb.degraded and sdb._redis:
         if kill_switch_active_run is _SENTINEL_UNSET:
@@ -2535,7 +2587,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             capped_alerts = raw_alerts
 
         alerts_to_send = capped_alerts[:cfg.MAX_ALERTS_PER_PAIR]
-        if _disabled_hits or _pb_hits:
+        if _disabled_hits or _pb_hits or _tl_hits:
             _dis_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
             if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
                 _pair_floor = (
@@ -2559,6 +2611,15 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     sdb, pair_name, _pb_pass, ts_curr, close_curr,
                     block_reason="pullback_unconfirmed",
                     confluence_scores={ak: _confluence_for(ak) for _, _, ak in _pb_pass},
+                    gr=gr, context=context,
+                    logger_pair=logger_pair,
+                )
+            _tl_pass = _disabled_hits_passing_confluence(_tl_hits, _confluence_for, _dis_floor)
+            if _tl_pass:
+                await _record_counterfactual_block(
+                    sdb, pair_name, _tl_pass, ts_curr, close_curr,
+                    block_reason="trendline_shadow",
+                    confluence_scores={ak: _confluence_for(ak) for _, _, ak in _tl_pass},
                     gr=gr, context=context,
                     logger_pair=logger_pair,
                 )
