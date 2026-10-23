@@ -5,7 +5,7 @@ Independent numerical verification of the AOT/JIT-dispatched indicator
 functions, run once at startup before any pair is evaluated.
 
 """
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 import os
 import numpy as np
 import aot_bridge
@@ -99,7 +99,7 @@ def _ref_pine_ema(data: List[float], length: int) -> List[float]:
     """Pine ta.ema: seeded with the first finite value (not an SMA)."""
     alpha = 2.0 / (length + 1)
     out = [float("nan")] * len(data)
-    prev = None
+    prev: Optional[float] = None
     for i, v in enumerate(data):
         if v != v:                      # NaN keeps the last value, like ema_loop_pine
             if prev is not None:
