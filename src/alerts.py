@@ -492,8 +492,9 @@ async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, a
                 "cloud_lower_curr": (context or {}).get("cloud_lower_curr"),
                 "rsi_guard_ema_curr": gr.rsi_guard_ema_curr,
                 "rvol_ok": gr.rvol_ok,
-                "gaussian_gate_ok_buy": gaussian_gate_ok_buy,
-                "gaussian_gate_ok_sell": gaussian_gate_ok_sell,
+
+                "gaussian_gate_ok_buy": gr.gaussian_gate_ok_buy,
+                "gaussian_gate_ok_sell": gr.gaussian_gate_ok_sell,
             })
         for _, _, alert_key in alerts_to_send:
             direction = "buy" if alert_key in BUY_ALERT_KEYS else "sell"
