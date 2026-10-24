@@ -44,7 +44,7 @@ LOG = logging.getLogger("t")
 DOWN = NS(up_pct=0.20, down_pct=0.47)
 UP = NS(up_pct=0.64, down_pct=0.21)
 GOOD_VOTES = {
-    "base_trend": True, "dynamic_flow_ribbon": True, "ichimoku_cloud": True,
+    "base_trend": True, "dynamic_flow_ribbon": True, "gaussian_trend": True,
     "oi_funding": True, "adx": False,
 }
 
@@ -213,7 +213,7 @@ def test_thin_lead_is_neutral_and_clear_lead_counts():
 
 # ── unproven-but-strong tier ────────────────────────────────────────────────
 
-CLEAN = {"base_trend": True, "dynamic_flow_ribbon": True, "ichimoku_cloud": True,
+CLEAN = {"base_trend": True, "dynamic_flow_ribbon": True, "gaussian_trend": True,
          "oi_funding": True, "adx_strength": False}
 
 
@@ -247,11 +247,11 @@ def test_unproven_take_is_off_by_default_and_with_flag_none():
 
 
 def test_why_line_says_all_high_weight_checks_pass_instead_of_repeating_top3():
-    w = {"base_trend": 3.0, "ichimoku_cloud": 2.0, "adx_strength": 1.0}
-    a = un(votes={"base_trend": True, "ichimoku_cloud": True, "adx_strength": False},
+    w = {"base_trend": 3.0, "gaussian_trend": 2.0, "adx_strength": 1.0}
+    a = un(votes={"base_trend": True, "gaussian_trend": True, "adx_strength": False},
            vote_weights=w)
     assert "All high-weight checks pass" in a.why_line
-    b = un(votes={"base_trend": True, "ichimoku_cloud": False, "adx_strength": True},
+    b = un(votes={"base_trend": True, "gaussian_trend": False, "adx_strength": True},
            vote_weights=w)
     assert "Supported by" in b.why_line and "All high-weight" not in b.why_line
 
