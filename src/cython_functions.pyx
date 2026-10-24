@@ -24,7 +24,7 @@ aot_bridge.py) only need to change the import path.
 import numpy as np
 cimport numpy as np
 cimport cython
-from libc.math cimport isnan, isinf, fabs, fmax, fmin
+from libc.math cimport isnan, isinf, fabs, fmax, fmin, cos, sqrt, pow
 
 np.import_array()
 
@@ -269,7 +269,7 @@ def ema_loop_pine(double[:] data, double length_float):
 
     return out_np
 
-# ═══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════���══
 # 6. ema_loop_alpha
 # ═══════════════════════════════════════════════════════════════════
 def ema_loop_alpha(double[:] data, double alpha):
@@ -819,6 +819,146 @@ def range_filter_loop(double[:] x, double[:] r):
         out[i] = prev_filt
     return out_np
 
+
+# ══════════════════════════════════════════════════════════════════════
+# 18. gaussian_filter_loop — Pine: gaussianFilter(src, length, poleCount)
+# ══════════════════════════════════════════════════════════════════════
+def gaussian_filter_loop(double[:] src, int length, int poles):
+    """4-pole cascade Gaussian filter."""
+    cdef int n = src.shape[0]
+    cdef np.ndarray out_np = np.full(n, np.nan, dtype=np.float64)
+    cdef double[:] out = out_np
+    cdef int i
+    cdef double PI = 3.14159265358979323846
+    cdef double beta, alpha, curr_src
+    cdef double s1, s2, s3, s4
+    cdef double prev_s1, prev_s2, prev_s3, prev_s4
+
+    if n == 0 or length < 1 or poles < 1:
+        return out_np
+
+    beta  = (1.0 - cos(2.0 * PI / <double>length)) / \
+            (pow(1.414, 2.0 / <double>poles) - 1.0)
+    alpha = -beta + sqrt(beta * beta + 2.0 * beta)
+
+    prev_s1 = np.nan
+    prev_s2 = np.nan
+    prev_s3 = np.nan
+    prev_s4 = np.nan
+
+    for i in range(n):
+        curr_src = src[i]
+        if isnan(curr_src):
+            out[i] = np.nan
+            prev_s1 = prev_s2 = prev_s3 = prev_s4 = np.nan
+            continue
+
+        s1 = alpha * curr_src + (1.0 - alpha) * (curr_src if isnan(prev_s1) else prev_s1)
+        s2 = alpha * s1       + (1.0 - alpha) * (curr_src if isnan(prev_s2) else prev_s2)
+        s3 = alpha * s2       + (1.0 - alpha) * (curr_src if isnan(prev_s3) else prev_s3)
+        s4 = alpha * s3       + (1.0 - alpha) * (curr_src if isnan(prev_s4) else prev_s4)
+
+        if poles <= 1:
+            out[i] = s1
+        elif poles == 2:
+            out[i] = s2
+        elif poles == 3:
+            out[i] = s3
+        else:
+            out[i] = s4
+
+        prev_s1, prev_s2, prev_s3, prev_s4 = s1, s2, s3, s4
+
+    return out_np
+
+# ══════════════════════════════════════════════════════════════════════
+# 19. efficiency_ratio_loop — Pine ER for the Gaussian trend
+# ══════════════════════════════════════════════════════════════════════
+def efficiency_ratio_loop(double[:] src, int length):
+    """Pine ER for the Gaussian trend."""
+    cdef int n = src.shape[0]
+    cdef np.ndarray er_np = np.full(n, np.nan, dtype=np.float64)
+    cdef double[:] er = er_np
+    cdef np.ndarray diff_np = np.full(n, np.nan, dtype=np.float64)
+    cdef double[:] diffs = diff_np
+    cdef int i
+    cdef double path_sum, net_move
+    cdef int nan_count = 0
+
+    if n == 0 or length < 1:
+        return er_np
+
+    for i in range(1, n):
+        if not isnan(src[i]) and not isnan(src[i - 1]):
+            diffs[i] = fabs(src[i] - src[i - 1])
+
+    path_sum = 0.0
+    for i in range(1, n):
+        if isnan(diffs[i]):
+            nan_count += 1
+        else:
+            path_sum += diffs[i]
+
+        if i - length >= 1:
+            if isnan(diffs[i - length]):
+                nan_count -= 1
+            else:
+                path_sum -= diffs[i - length]
+
+        if i >= length and nan_count == 0:
+            if not isnan(src[i]) and not isnan(src[i - length]):
+                net_move = fabs(src[i] - src[i - length])
+                er[i] = 0.0 if path_sum == 0.0 else net_move / path_sum
+
+    return er_np
+
+# ══════════════════════════════════════════════════════════════════════
+# 20. gaussian_trend_line_loop — Pine stepped deadband line + direction
+# ══════════════════════════════════════════════════════════════════════
+def gaussian_trend_line_loop(double[:] filtered, double[:] upper, double[:] lower):
+    """Pine stepped deadband line + direction."""
+    cdef int n = filtered.shape[0]
+    cdef np.ndarray tl_np = np.full(n, np.nan, dtype=np.float64)
+    cdef np.ndarray dir_np = np.zeros(n, dtype=np.int32)
+    cdef double[:] tl = tl_np
+    cdef int[:] dir_arr = dir_np
+    cdef int i
+    cdef double prev_tl, curr_tl
+
+    if n == 0:
+        return tl_np, dir_np
+
+    curr_tl = filtered[0]
+    if not isnan(upper[0]) and not isnan(curr_tl) and upper[0] < curr_tl:
+        curr_tl = upper[0]
+    if not isnan(lower[0]) and not isnan(curr_tl) and lower[0] > curr_tl:
+        curr_tl = lower[0]
+    tl[0] = curr_tl
+    dir_arr[0] = 0
+
+    for i in range(1, n):
+        prev_tl = tl[i - 1]
+        curr_tl = filtered[i] if isnan(prev_tl) else prev_tl
+
+        if not isnan(upper[i]) and not isnan(curr_tl) and upper[i] < curr_tl:
+            curr_tl = upper[i]
+        if not isnan(lower[i]) and not isnan(curr_tl) and lower[i] > curr_tl:
+            curr_tl = lower[i]
+
+        tl[i] = curr_tl
+
+        if not isnan(curr_tl) and not isnan(prev_tl):
+            if curr_tl > prev_tl:
+                dir_arr[i] = 1
+            elif curr_tl < prev_tl:
+                dir_arr[i] = -1
+            else:
+                dir_arr[i] = dir_arr[i - 1]
+        else:
+            dir_arr[i] = dir_arr[i - 1]
+
+    return tl_np, dir_np
+
 # ══════════════════════════════════════════════════════════════════════
 # EXPORT REGISTRY (replaces Numba EXPORT_CONFIG)
 # ══════════════════════════════════════════════════════════════════════
@@ -844,6 +984,9 @@ EXPORTED_FUNCTION_NAMES = [
     "dynamic_flow_direction_loop",
     "smoothrng_loop",
     "range_filter_loop",
+    "gaussian_filter_loop",
+    "efficiency_ratio_loop",
+    "gaussian_trend_line_loop",
 ]
 
 from aot_meta import (  # noqa: E402

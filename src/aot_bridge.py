@@ -230,6 +230,20 @@ def smoothrng_loop(x: np.ndarray, t: int, m: float) -> np.ndarray:
 def range_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
     """Cirrus Cloud recursive range filter (Pine rngfiltx1x1)."""
     return _dispatch["range_filter_loop"](x, r)
+
+def gaussian_filter_loop(src: np.ndarray, length: int, poles: int) -> np.ndarray:
+    """Gaussian Filter Trend: cascaded one-pole Gaussian filter (Pine gaussianFilter)."""
+    return _dispatch["gaussian_filter_loop"](src, length, poles)
+
+def efficiency_ratio_loop(src: np.ndarray, length: int) -> np.ndarray:
+    """Gaussian Filter Trend: net move / path length over `length` bars."""
+    return _dispatch["efficiency_ratio_loop"](src, length)
+
+def gaussian_trend_line_loop(filtered: np.ndarray, upper: np.ndarray,
+                             lower: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Gaussian Filter Trend: stepped dead-band line + direction (-1/0/1)."""
+    return _dispatch["gaussian_trend_line_loop"](filtered, upper, lower)
+
 # ─────────────────────────────────────────────────────────────────────
 # COMPLETENESS CHECK — catches a forgotten wrapper at import time
 # ──────────────────────────────────────────────────────────────────────

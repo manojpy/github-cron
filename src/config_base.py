@@ -85,7 +85,7 @@ __version__ = "1.8.0-stable"
 
 CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "base_trend": 3.0,
-    "ichimoku_cloud": 2.0,
+    "gaussian_trend": 2.0,
     "rma_cloud": 2.0,
     "cirrus_cloud": 2.0,
     "dynamic_flow_ribbon": 2.0,

@@ -26,8 +26,9 @@ without reintroducing that cost on every run.
 numba_functions_shared.py and aot_build.py both import SOURCE_VERSION from
 here too, so there is exactly one place to update it.
 """
-SOURCE_VERSION = "2026-10-22.1"
-# 2026-10-22.1: added smoothrng_loop + range_filter_loop (Cirrus Cloud).
+
+SOURCE_VERSION = "2026-10-24.1"
+# 2026-10-24.1: added gaussian_filter_loop + efficiency_ratio_loop + gaussian_trend_line_loop (Gaussian Filter Trend).
 # true_range_numba, percentile_rank_numba, calculate_atr_rma, calculate_adx_core.
 # Cython calculate_adx_core reordered (previous version smoothed zero-arrays
 # and returned TR-smoothed-to-ADX; now computes DX correctly).
@@ -50,5 +51,8 @@ AOT_FUNCTION_NAMES = [
     'dynamic_flow_direction_loop',
     'smoothrng_loop',
     'range_filter_loop',
+    'gaussian_filter_loop',
+    'efficiency_ratio_loop',
+    'gaussian_trend_line_loop',
 ]
 

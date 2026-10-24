@@ -43,6 +43,9 @@ SIG_PERCENTILE_RANK  = f8(f8[:], i4, i4, i4, types.boolean)
 SIG_DFR_DIRECTION    = types.Tuple((f8[:], f8[:]))(f8[:], f8[:], f8[:], f8)
 SIG_SMOOTH_RNG       = f8[:](f8[:], i4, f8)
 SIG_RANGE_FILTER     = f8[:](f8[:], f8[:])
+SIG_GAUSSIAN_FILTER     = f8[:](f8[:], i4, i4)
+SIG_EFFICIENCY_RATIO    = f8[:](f8[:], i4)
+SIG_GAUSSIAN_TREND_LINE = types.Tuple((f8[:], i4[:]))(f8[:], f8[:], f8[:])
 
 
 @njit(SIG_SANITIZE_ARRAY, nogil=True, cache=True)
@@ -692,8 +695,109 @@ def range_filter_loop(x, r):
     return out
 
 #=====================================================
-# AOT EXPORT CONFIGURATION
+# Gaussian Filter Trend kernels (Pine: QuantAlgo Gaussian Filter Trend)
 #=====================================================
+
+@njit(SIG_GAUSSIAN_FILTER, nogil=True, cache=True)
+def gaussian_filter_loop(src, length, poles):
+    n = len(src)
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n == 0 or length < 1 or poles < 1:
+        return out
+    PI = 3.14159265358979323846
+    beta  = (1.0 - np.cos(2.0 * PI / float(length))) / \
+            (1.414 ** (2.0 / float(poles)) - 1.0)
+    alpha = -beta + np.sqrt(beta * beta + 2.0 * beta)
+    prev_s1 = np.nan
+    prev_s2 = np.nan
+    prev_s3 = np.nan
+    prev_s4 = np.nan
+    for i in range(n):
+        curr_src = src[i]
+        if np.isnan(curr_src):
+            out[i] = np.nan
+            prev_s1 = prev_s2 = prev_s3 = prev_s4 = np.nan
+            continue
+        s1 = alpha * curr_src + (1.0 - alpha) * (curr_src if np.isnan(prev_s1) else prev_s1)
+        s2 = alpha * s1       + (1.0 - alpha) * (curr_src if np.isnan(prev_s2) else prev_s2)
+        s3 = alpha * s2       + (1.0 - alpha) * (curr_src if np.isnan(prev_s3) else prev_s3)
+        s4 = alpha * s3       + (1.0 - alpha) * (curr_src if np.isnan(prev_s4) else prev_s4)
+        if poles <= 1:
+            out[i] = s1
+        elif poles == 2:
+            out[i] = s2
+        elif poles == 3:
+            out[i] = s3
+        else:
+            out[i] = s4
+        prev_s1, prev_s2, prev_s3, prev_s4 = s1, s2, s3, s4
+    return out
+
+@njit(SIG_EFFICIENCY_RATIO, nogil=True, cache=True)
+def efficiency_ratio_loop(src, length):
+    n = len(src)
+    er = np.full(n, np.nan, dtype=np.float64)
+    if n == 0 or length < 1:
+        return er
+    diffs = np.full(n, np.nan, dtype=np.float64)
+    for i in range(1, n):
+        if not np.isnan(src[i]) and not np.isnan(src[i - 1]):
+            diffs[i] = abs(src[i] - src[i - 1])
+    path_sum = 0.0
+    nan_count = 0
+    for i in range(1, n):
+        if np.isnan(diffs[i]):
+            nan_count += 1
+        else:
+            path_sum += diffs[i]
+        if i - length >= 1:
+            if np.isnan(diffs[i - length]):
+                nan_count -= 1
+            else:
+                path_sum -= diffs[i - length]
+        if i >= length and nan_count == 0:
+            if not np.isnan(src[i]) and not np.isnan(src[i - length]):
+                net_move = abs(src[i] - src[i - length])
+                er[i] = 0.0 if path_sum == 0.0 else net_move / path_sum
+    return er
+
+@njit(SIG_GAUSSIAN_TREND_LINE, nogil=True, cache=True)
+def gaussian_trend_line_loop(filtered, upper, lower):
+    n = len(filtered)
+    tl = np.full(n, np.nan, dtype=np.float64)
+    dir_arr = np.zeros(n, dtype=np.int32)
+    if n == 0:
+        return tl, dir_arr
+    curr_tl = filtered[0]
+    if not np.isnan(upper[0]) and not np.isnan(curr_tl) and upper[0] < curr_tl:
+        curr_tl = upper[0]
+    if not np.isnan(lower[0]) and not np.isnan(curr_tl) and lower[0] > curr_tl:
+        curr_tl = lower[0]
+    tl[0] = curr_tl
+    dir_arr[0] = 0
+    for i in range(1, n):
+        prev_tl = tl[i - 1]
+        curr_tl = filtered[i] if np.isnan(prev_tl) else prev_tl
+        if not np.isnan(upper[i]) and not np.isnan(curr_tl) and upper[i] < curr_tl:
+            curr_tl = upper[i]
+        if not np.isnan(lower[i]) and not np.isnan(curr_tl) and lower[i] > curr_tl:
+            curr_tl = lower[i]
+        tl[i] = curr_tl
+        if not np.isnan(curr_tl) and not np.isnan(prev_tl):
+            if curr_tl > prev_tl:
+                dir_arr[i] = 1
+            elif curr_tl < prev_tl:
+                dir_arr[i] = -1
+            else:
+                dir_arr[i] = dir_arr[i - 1]
+        else:
+            dir_arr[i] = dir_arr[i - 1]
+    return tl, dir_arr
+
+
+
+
+
 
 
 #=====================================================
@@ -718,6 +822,9 @@ EXPORT_CONFIG = {
     'dynamic_flow_direction_loop': SIG_DFR_DIRECTION,
     'smoothrng_loop':        SIG_SMOOTH_RNG,
     'range_filter_loop':     SIG_RANGE_FILTER,
+    'gaussian_filter_loop':  SIG_GAUSSIAN_FILTER,
+    'efficiency_ratio_loop': SIG_EFFICIENCY_RATIO,
+    'gaussian_trend_line_loop': SIG_GAUSSIAN_TREND_LINE,
 }
 
 from aot_meta import (  # noqa: E402

@@ -40,7 +40,7 @@ VERDICT_LABEL = {TAKE: "✅ TAKE", WATCH: "🟡 WATCH", AVOID: "⛔ AVOID"}
 
 VOTE_LABELS = {
     "base_trend": "trend",
-    "ichimoku_cloud": "Ichimoku cloud",
+    "gaussian_trend": "Gaussian trend",
     "rma_cloud": "RMA cloud",
     "cirrus_cloud": "Cirrus cloud",
     "dynamic_flow_ribbon": "market flow",

@@ -492,8 +492,8 @@ async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, a
                 "cloud_lower_curr": (context or {}).get("cloud_lower_curr"),
                 "rsi_guard_ema_curr": gr.rsi_guard_ema_curr,
                 "rvol_ok": gr.rvol_ok,
-                "ichimoku_gate_ok_buy": gr.ichimoku_gate_ok_buy,
-                "ichimoku_gate_ok_sell": gr.ichimoku_gate_ok_sell,
+                "gaussian_gate_ok_buy": gaussian_gate_ok_buy,
+                "gaussian_gate_ok_sell": gaussian_gate_ok_sell,
             })
         for _, _, alert_key in alerts_to_send:
             direction = "buy" if alert_key in BUY_ALERT_KEYS else "sell"
@@ -757,8 +757,8 @@ _ALERT_DEFINITIONS_RAW: List[Dict[str, Any]] = [
     {"key":"rsi_ema5_down","title":"🔴 RSI▼EMA5","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and (rsi.get("prev",50)>=rsi.get("ema_prev",50)) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("curr",50)>ctx.get("rsi_adaptive_sell",40)) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",50)>Constants.RSI_SIGNAL_CROSS_MIN_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼EMA5 {rsi.get('ema_curr',50):.2f} | cap {ctx.get('rsi_adaptive_sell',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["rsi","rsi_alerts"]},
     {"key":"vwap_up","title":"🔵▲ VWAP Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_wick",False) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
     {"key":"vwap_down","title":"🟣▼ VWAP Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_wick",False) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
-    {"key":"cloud_cross_up","title":"☁️🟢 Cloud Up Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Upper {ctx.get('cloud_upper_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"cloud_cross_down","title":"☁️🔴 Cloud Down Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Lower {ctx.get('cloud_lower_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"cloud_cross_up","title":"☁️🟢 Ichimoku Cloud Up Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Upper {ctx.get('cloud_upper_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"cloud_cross_down","title":"☁️🔴 Ichimoku Cloud Down Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Lower {ctx.get('cloud_lower_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"ob_reversal_buy","title":"🟢🏛️ Order Block Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and ctx.get("ob_gate_ok_buy",False) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Demand OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}","requires":[]},
     {"key":"ob_reversal_sell","title":"🔴🏛 Order Block Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and ctx.get("ob_gate_ok_sell",False) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}","requires":[]},
     {"key":"ppo_zero_up","title":"🟢 PPO cross▲0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_wick",False) and (ppo.get("prev",np.nan)<=0.0) and (ppo.get("curr",np.nan)>0.0) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_alerts"]},
@@ -1738,7 +1738,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
     cloud_up, cloud_down = gr.cloud_up, gr.cloud_down
     cloud_upper_val, cloud_lower_val = gr.cloud_upper_val, gr.cloud_lower_val
     cloud_upper_prev, cloud_lower_prev = gr.cloud_upper_prev, gr.cloud_lower_prev
-    ichimoku_gate_ok_buy, ichimoku_gate_ok_sell = gr.ichimoku_gate_ok_buy, gr.ichimoku_gate_ok_sell
+    gaussian_gate_ok_buy, gaussian_gate_ok_sell = gr.gaussian_gate_ok_buy, gr.gaussian_gate_ok_sell
     cloud_group_ok_buy, cloud_group_ok_sell = gr.cloud_group_ok_buy, gr.cloud_group_ok_sell
     tk_conversion_curr, tk_conversion_prev = gr.tk_conversion_curr, gr.tk_conversion_prev
     tk_base_curr, tk_base_prev = gr.tk_base_curr, gr.tk_base_prev
@@ -2007,7 +2007,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "equilibrium_curr": equilibrium_curr, "equilibrium_prev": equilibrium_prev,
             "rma_cloud_ok_buy": rma_cloud_ok_buy, "rma_cloud_ok_sell": rma_cloud_ok_sell,
             "rma_cloud_fast_curr": rma_cloud_fast_curr, "rma_cloud_slow_curr": rma50_15_val,
-            "ichimoku_gate_ok_buy": ichimoku_gate_ok_buy, "ichimoku_gate_ok_sell": ichimoku_gate_ok_sell, 
+            "gaussian_gate_ok_buy": gaussian_gate_ok_buy, "gaussian_gate_ok_sell": gaussian_gate_ok_sell, 
             "cloud_group_ok_buy": cloud_group_ok_buy, "cloud_group_ok_sell": cloud_group_ok_sell,
             "oscillator_group_ok_buy": oscillator_group_ok_buy, "oscillator_group_ok_sell": oscillator_group_ok_sell,
             "buy_common": buy_common, "sell_common": sell_common,
@@ -2552,7 +2552,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     base_buy_trend, base_sell_trend = gr.base_buy_trend, gr.base_sell_trend
     rma50_15_val = gr.rma50_15_val
     cloud_up, cloud_down = gr.cloud_up, gr.cloud_down
-    ichimoku_gate_ok_buy, ichimoku_gate_ok_sell = gr.ichimoku_gate_ok_buy, gr.ichimoku_gate_ok_sell
+    gaussian_gate_ok_buy, gaussian_gate_ok_sell = gr.gaussian_gate_ok_buy, gr.gaussian_gate_ok_sell
     confirmation_buy, confirmation_sell = gr.confirmation_buy, gr.confirmation_sell
     cloud_group_ok_buy, cloud_group_ok_sell = gr.cloud_group_ok_buy, gr.cloud_group_ok_sell
     tk_conversion_curr, tk_conversion_prev = gr.tk_conversion_curr, gr.tk_conversion_prev
@@ -2942,8 +2942,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 "cloud_lower_curr": context.get("cloud_lower_curr"),
                                 "rsi_guard_ema_curr": gr.rsi_guard_ema_curr,
                                 "rvol_ok": gr.rvol_ok,
-                                "ichimoku_gate_ok_buy": gr.ichimoku_gate_ok_buy,
-                                "ichimoku_gate_ok_sell": gr.ichimoku_gate_ok_sell,
+                                "gaussian_gate_ok_buy": gr.gaussian_gate_ok_buy,
+                                "gaussian_gate_ok_sell": gr.gaussian_gate_ok_sell,
                             }
                             tq = await brain_engine.get_trade_quality(
                                 pair_name, alert_key, direction,
@@ -3158,8 +3158,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     "cloud_lower_curr": context.get("cloud_lower_curr"),
                     "rsi_guard_ema_curr": gr.rsi_guard_ema_curr,
                     "rvol_ok": gr.rvol_ok,
-                    "ichimoku_gate_ok_buy": gr.ichimoku_gate_ok_buy,
-                    "ichimoku_gate_ok_sell": gr.ichimoku_gate_ok_sell,
+                    "gaussian_gate_ok_buy": gr.gaussian_gate_ok_buy,
+                    "gaussian_gate_ok_sell": gr.gaussian_gate_ok_sell,
                 }
                 if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
                     await sdb.record_shadow_pending_outcome(
@@ -3295,8 +3295,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     "cloud_lower_curr": context.get("cloud_lower_curr"),
                     "rsi_guard_ema_curr": gr.rsi_guard_ema_curr,
                     "rvol_ok": gr.rvol_ok,
-                    "ichimoku_gate_ok_buy": gr.ichimoku_gate_ok_buy,
-                    "ichimoku_gate_ok_sell": gr.ichimoku_gate_ok_sell,
+                    "gaussian_gate_ok_buy": gr.gaussian_gate_ok_buy,
+                    "gaussian_gate_ok_sell": gr.gaussian_gate_ok_sell,
                     "ml_ev_shadow": (
                         (context.get("ml_ev_shadow_by_alert") or {}).get(alert_key)
                     ),
@@ -4205,15 +4205,15 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     reasons.append(f"OB buy: {gr.ob_gate_reason or 'zone touched, no reversal confirmed'}")
                 if gr.ob_gate_ok_sell is False:
                     reasons.append(f"OB sell: {gr.ob_gate_reason or 'zone touched, no reversal confirmed'}")
-            if cfg.ICHIMOKU_CLOUD_ENABLED:
-                if not ichimoku_gate_ok_buy:
-                    reasons.append("Ichimoku Cloud buy: price not above cloud / future not green (vote)")
-                if not ichimoku_gate_ok_sell:
-                    reasons.append("Ichimoku Cloud sell: price not below cloud / future not red (vote)")
 
+            if cfg.GAUSSIAN_TREND_ENABLED:
+                if not gaussian_gate_ok_buy:
+                    reasons.append("Gaussian Trend buy: trend not bullish (vote)")
+                if not gaussian_gate_ok_sell:
+                    reasons.append("Gaussian Trend sell: trend not bearish (vote)")
             _cg_need = (
-                "Cirrus Cloud veto AND (Ichimoku cloud OR Dynamic Flow)"
-                if cfg.CIRRUS_CLOUD_ENABLED else "ANY enabled vote true (Ichimoku/RMA cloud)"
+                "Cirrus Cloud veto AND (Gaussian Trend OR Dynamic Flow)" 
+                if cfg.CIRRUS_CLOUD_ENABLED else "ANY enabled vote true (Gaussian/RMA cloud)"
             )
             if not cloud_group_ok_buy:
                 reasons.append(f"Cloud group buy: need {_cg_need} — not met")

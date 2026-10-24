@@ -14,6 +14,7 @@ from aot_bridge import (
     calculate_ppo_core, calculate_rsi_core, calculate_atr_rma,
     calculate_adx_core, percentile_rank_numba, dynamic_flow_direction_loop,
     smoothrng_loop, range_filter_loop,
+    gaussian_filter_loop, efficiency_ratio_loop, gaussian_trend_line_loop,
 )
 
 def validate_indicator_array(arr: Optional[np.ndarray], name: str, min_valid_values: int = 1) -> Tuple[bool, Optional[str]]:
@@ -456,6 +457,101 @@ def calculate_cirrus_cloud_numpy(close: np.ndarray, x1: int = 22, x2: float = 9.
         }
 
 
+def calculate_gaussian_trend_numpy(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    gaussian_source: Optional[np.ndarray] = None,
+    preset: str = 'Default',
+    gaussian_length: int = 14,
+    gaussian_poles: int = 4,
+    atr_length: int = 14,
+    fixed_multiplier: float = 1.5,
+    adaptive_width: bool = True,
+    efficiency_length: int = 10,
+    trend_multiplier: float = 0.8,
+    chop_multiplier: float = 2.5,
+    efficiency_smooth: int = 5,
+) -> Dict[str, np.ndarray]:
+    """Python port of 'Gaussian Filter Trend [QuantAlgo]'."""
+    try:
+        n = len(close)
+        if n == 0:
+            raise ValueError("Empty input array")
+
+        if preset == 'Fast Response':
+            gaussian_length, gaussian_poles, atr_length = 8, 2, 10
+            fixed_multiplier, efficiency_length = 1.2, 7
+            trend_multiplier, chop_multiplier, efficiency_smooth = 0.6, 1.8, 3
+        elif preset == 'Smooth Trend':
+            gaussian_length, gaussian_poles, atr_length = 21, 4, 21
+            fixed_multiplier, efficiency_length = 2.0, 18
+            trend_multiplier, chop_multiplier, efficiency_smooth = 1.0, 3.2, 8
+
+        h = np.ascontiguousarray(high, dtype=np.float64)
+        l = np.ascontiguousarray(low,  dtype=np.float64)
+        c = np.ascontiguousarray(close, dtype=np.float64)
+        src = c if gaussian_source is None else np.ascontiguousarray(gaussian_source, dtype=np.float64)
+
+        filtered_price = gaussian_filter_loop(src, gaussian_length, gaussian_poles)
+        
+        er_raw = efficiency_ratio_loop(src, efficiency_length)
+        smoothed_eff = ema_loop_pine(er_raw, float(efficiency_smooth))
+        
+        atr_arr = calculate_atr_rma(h, l, c, atr_length)
+        if adaptive_width:
+            width_multiplier = chop_multiplier + (trend_multiplier - chop_multiplier) * smoothed_eff
+        else:
+            width_multiplier = np.full(n, fixed_multiplier, dtype=np.float64)
+            
+        trend_width = atr_arr * width_multiplier
+        upper_band  = filtered_price + trend_width
+        lower_band  = filtered_price - trend_width
+        
+        trend_line, trend_dir = gaussian_trend_line_loop(filtered_price, upper_band, lower_band)
+        
+        prev_dir = np.zeros_like(trend_dir)
+        if n > 1:
+            prev_dir[1:] = trend_dir[:-1]
+        turned_bull = (trend_dir == 1) & (prev_dir != 1)
+        turned_bear = (trend_dir == -1) & (prev_dir != -1)
+
+        results: Dict[str, np.ndarray] = {
+            'filtered_price': filtered_price,
+            'efficiency_ratio': er_raw,
+            'smoothed_efficiency': smoothed_eff,
+            'upper_band': upper_band,
+            'lower_band': lower_band,
+            'trend_line': trend_line,
+            'trend_dir': trend_dir,
+            'turned_bull': turned_bull,
+            'turned_bear': turned_bear,
+            'valid': np.isfinite(trend_line) & (trend_dir != 0),
+        }
+        for key in ('filtered_price', 'efficiency_ratio', 'smoothed_efficiency',
+                    'upper_band', 'lower_band', 'trend_line'):
+            arr = results[key]
+            if np.any(np.isinf(arr)):
+                results[key] = np.clip(arr, -Constants.INFINITY_CLAMP, Constants.INFINITY_CLAMP)
+                
+        return results
+
+    except Exception as e:
+        logger.error(f"Gaussian Trend calculation failed: {e}", exc_info=True)
+        default_len = len(close) if close is not None else 1
+        return {
+            'filtered_price': np.full(default_len, np.nan, dtype=np.float64),
+            'efficiency_ratio': np.full(default_len, np.nan, dtype=np.float64),
+            'smoothed_efficiency': np.full(default_len, np.nan, dtype=np.float64),
+            'upper_band': np.full(default_len, np.nan, dtype=np.float64),
+            'lower_band': np.full(default_len, np.nan, dtype=np.float64),
+            'trend_line': np.full(default_len, np.nan, dtype=np.float64),
+            'trend_dir': np.zeros(default_len, dtype=np.int32),
+            'turned_bull': np.zeros(default_len, dtype=bool),
+            'turned_bear': np.zeros(default_len, dtype=bool),
+            'valid': np.zeros(default_len, dtype=bool),
+        }
+
 def calculate_rsi_guard_numpy(close: np.ndarray, rsi_len: int, kalman_len: int, ema_len: int) -> Tuple[np.ndarray, np.ndarray]:
     try:
         if close is None or len(close) < rsi_len + kalman_len + ema_len:
@@ -517,6 +613,9 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.dynamic_flow_direction_loop(test_data, test_data, test_data * 0.01, 1.0) 
         _ = aot_bridge.smoothrng_loop(test_data, 22, 9.0)
         _ = aot_bridge.range_filter_loop(test_data, test_data * 0.01)
+        _ = aot_bridge.gaussian_filter_loop(test_data, 14, 4)
+        _ = aot_bridge.efficiency_ratio_loop(test_data, 10)
+        _ = aot_bridge.gaussian_trend_line_loop(test_data, test_data * 1.01, test_data * 0.99)
 
         warmup_elapsed = time.time() - warmup_start
         logger.info(f"✅ JIT warmup complete ({warmup_elapsed:.2f}s)")
@@ -635,14 +734,37 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
         results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
         results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
 
-        # ── Ichimoku cloud (9/26/52/26 — cloud + future cloud only) ──
+        # ── Gaussian Filter Trend (QuantAlgo) — replaces the old Ichimoku 9/26/52/26 cloud vote ──
+        if cfg.GAUSSIAN_TREND_ENABLED:
+            if cfg.GAUSSIAN_SOURCE == 'hl2':
+                _gauss_src = (data_15m["high"] + data_15m["low"]) / 2.0
+            elif cfg.GAUSSIAN_SOURCE == 'hlc3':
+                _gauss_src = (data_15m["high"] + data_15m["low"] + close_15m) / 3.0
+            else:
+                _gauss_src = close_15m
+            _gauss = calculate_gaussian_trend_numpy(
+                data_15m["high"], data_15m["low"], close_15m, _gauss_src,
+                cfg.GAUSSIAN_PRESET, cfg.GAUSSIAN_LENGTH, cfg.GAUSSIAN_POLES,
+                cfg.GAUSSIAN_ATR_LENGTH, cfg.GAUSSIAN_FIXED_MULTIPLIER,
+                cfg.GAUSSIAN_ADAPTIVE_WIDTH, cfg.GAUSSIAN_EFFICIENCY_LENGTH,
+                cfg.GAUSSIAN_TREND_MULTIPLIER, cfg.GAUSSIAN_CHOP_MULTIPLIER,
+                cfg.GAUSSIAN_EFFICIENCY_SMOOTH,
+            )
+            results['gaussian_trend_dir_15'] = _gauss['trend_dir']
+            results['gaussian_valid_15'] = _gauss['valid']
+        else:
+            results['gaussian_trend_dir_15'] = np.zeros(n_15m, dtype=np.int32)
+            results['gaussian_valid_15'] = np.zeros(n_15m, dtype=bool)
+
+        # ── Ichimoku cloud (23/65/130/65 — cloud-cross alerts + alternate bias header) ──
+        # Same BIAS_ICHIMOKU_* periods as the alternate bias header in macd_unified.py.
         if cfg.ICHIMOKU_CLOUD_ENABLED:
             ichimoku = calculate_ichimoku_numpy(
                 data_15m["high"], data_15m["low"], close_15m,
-                cfg.ICHIMOKU_CONVERSION_PERIODS,
-                cfg.ICHIMOKU_BASE_PERIODS,
-                cfg.ICHIMOKU_SPANB_PERIODS,
-                cfg.ICHIMOKU_DISPLACEMENT,
+                cfg.BIAS_ICHIMOKU_CONVERSION_PERIODS,
+                cfg.BIAS_ICHIMOKU_BASE_PERIODS,
+                cfg.BIAS_ICHIMOKU_SPANB_PERIODS,
+                cfg.BIAS_ICHIMOKU_DISPLACEMENT,
             )
             results['ichimoku_cloud_upper'] = ichimoku['cloud_upper']
             results['ichimoku_cloud_lower'] = ichimoku['cloud_lower']
@@ -657,7 +779,7 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['ichimoku_future_red'] = bool_arr.copy()
 
         # ── Tenkan/Kijun (23/65 — TK guard + Tenkan/Kijun cross alerts only) ──
-        # Independent of the cloud's own conversion/base periods above.
+        # Same 23/65 lengths as the Ichimoku cloud above; kept as separate config keys.
         if cfg.ICHIMOKU_TK_GUARD_ENABLED or cfg.ENABLE_TK_CONVERSION_CROSS or cfg.ENABLE_KIJUN_CROSS:
             _, hh_tk_conv = rolling_min_max_numba(data_15m["high"], cfg.ICHIMOKU_TK_CONVERSION_PERIODS)
             ll_tk_conv, _ = rolling_min_max_numba(data_15m["low"], cfg.ICHIMOKU_TK_CONVERSION_PERIODS)

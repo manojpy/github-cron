@@ -6,6 +6,7 @@ functions, run once at startup before any pair is evaluated.
 
 """
 from typing import List, Optional, Tuple
+import math
 import os
 import numpy as np
 import aot_bridge
@@ -129,6 +130,49 @@ def _ref_cirrus(close: List[float], t: int, m: float) -> Tuple[List[float], List
         filt.append(prev)
     return rng, filt
 
+def _ref_gaussian_filter(src: List[float], length: int, poles: int) -> List[float]:
+    """Independent Pine reference for gaussianFilter (nz(stageN, src) seeding)."""
+    beta = (1.0 - math.cos(2.0 * math.pi / length)) / (math.pow(1.414, 2.0 / poles) - 1.0)
+    alpha = -beta + math.sqrt(beta * beta + 2.0 * beta)
+    st: List[Optional[float]] = [None, None, None, None]
+    out: List[float] = []
+    for x in src:
+        s1 = alpha * x + (1.0 - alpha) * (x if st[0] is None else st[0])
+        s2 = alpha * s1 + (1.0 - alpha) * (x if st[1] is None else st[1])
+        s3 = alpha * s2 + (1.0 - alpha) * (x if st[2] is None else st[2])
+        s4 = alpha * s3 + (1.0 - alpha) * (x if st[3] is None else st[3])
+        st = [s1, s2, s3, s4]
+        out.append(s1 if poles <= 1 else s2 if poles == 2 else s3 if poles == 3 else s4)
+    return out
+
+def _ref_efficiency_ratio(src: List[float], length: int) -> List[float]:
+    """Pine: abs(src - src[len]) / math.sum(abs(ta.change(src)), len); 0 when path == 0."""
+    out: List[float] = []
+    for i in range(len(src)):
+        if i < length:
+            out.append(float("nan"))
+            continue
+        path = sum(abs(src[j] - src[j - 1]) for j in range(i - length + 1, i + 1))
+        out.append(0.0 if path == 0.0 else abs(src[i] - src[i - length]) / path)
+    return out
+
+def _ref_gaussian_trend_line(filt: List[float], up: List[float], lo: List[float]) -> Tuple[List[float], List[int]]:
+    """Pine stepped dead-band line + sticky direction (na comparisons are false)."""
+    tl: List[float] = []
+    dr: List[int] = []
+    for i in range(len(filt)):
+        cur = filt[i] if i == 0 or tl[i - 1] != tl[i - 1] else tl[i - 1]
+        if up[i] == up[i] and cur == cur and up[i] < cur:
+            cur = up[i]
+        if lo[i] == lo[i] and cur == cur and lo[i] > cur:
+            cur = lo[i]
+        d = 0 if i == 0 else dr[i - 1]
+        if i > 0 and cur == cur and tl[i - 1] == tl[i - 1]:
+            d = 1 if cur > tl[i - 1] else -1 if cur < tl[i - 1] else d
+        tl.append(cur)
+        dr.append(d)
+    return tl, dr
+
 # ---------------------------------------------------------------------------
 # Deterministic synthetic fixtures -- no RNG, must be byte-identical every run
 # ---------------------------------------------------------------------------
@@ -219,6 +263,23 @@ def run_self_test() -> Tuple[bool, List[str]]:
         _act_filt = aot_bridge.range_filter_loop(close, _act_rng)
         _check(f"range_filter_loop (trend, t={_t})", _act_filt, _exp_filt, failures)
 
+    # Gaussian Filter Trend kernels vs the Pine reference.
+    for _len, _poles in ((14, 4), (8, 2), (21, 3), (30, 1)):
+        _exp_g = _ref_gaussian_filter(close.tolist(), _len, _poles)
+        _check(f"gaussian_filter_loop (trend, len={_len}, poles={_poles})",
+               aot_bridge.gaussian_filter_loop(close, _len, _poles), _exp_g, failures)
+    for _len in (7, 10, 18):
+        _check(f"efficiency_ratio_loop (trend, len={_len})",
+               aot_bridge.efficiency_ratio_loop(close, _len), _ref_efficiency_ratio(close.tolist(), _len), failures)
+    _g_filt = aot_bridge.gaussian_filter_loop(close, 14, 4)
+    _g_band = np.full(len(close), 0.9, dtype=np.float64)
+    _g_band[:12] = np.nan
+    _exp_tl, _exp_dir = _ref_gaussian_trend_line(_g_filt.tolist(), (_g_filt + _g_band).tolist(), (_g_filt - _g_band).tolist())
+    _act_tl, _act_dir = aot_bridge.gaussian_trend_line_loop(_g_filt, _g_filt + _g_band, _g_filt - _g_band)
+    _check("gaussian_trend_line_loop.line (trend)", _act_tl, _exp_tl, failures)
+    _check("gaussian_trend_line_loop.direction (trend)", _act_dir.astype(np.float64),
+           [float(v) for v in _exp_dir], failures)
+
     # --- Analytic invariants on the degenerate flat fixture ---
     flat_atr = aot_bridge.calculate_atr_rma(flat_h, flat_l, flat_c, period)
     flat_atr_tail = flat_atr[period:]
@@ -262,6 +323,17 @@ def run_self_test() -> Tuple[bool, List[str]]:
             _check(f"AOT vs JIT: range_filter_loop (t={_t})",
                    aot_bridge.range_filter_loop(close, _aot_rng),
                    jit_ref.range_filter_loop(close, _jit_rng), failures)
+
+        for _len, _poles in ((14, 4), (8, 2)):
+            _check(f"AOT vs JIT: gaussian_filter_loop (len={_len}, poles={_poles})",
+                   aot_bridge.gaussian_filter_loop(close, _len, _poles),
+                   jit_ref.gaussian_filter_loop(close, _len, _poles), failures)
+        _check("AOT vs JIT: efficiency_ratio_loop",
+               aot_bridge.efficiency_ratio_loop(close, 10), jit_ref.efficiency_ratio_loop(close, 10), failures)
+        _jit_tl, _jit_dir = jit_ref.gaussian_trend_line_loop(_g_filt, _g_filt + _g_band, _g_filt - _g_band)
+        _check("AOT vs JIT: gaussian_trend_line_loop.line", _act_tl, _jit_tl, failures)
+        _check("AOT vs JIT: gaussian_trend_line_loop.direction",
+               _act_dir.astype(np.float64), _jit_dir.astype(np.float64), failures)
 
         jit_dfr_dir, jit_dfr_line = jit_ref.dynamic_flow_direction_loop(hlc3, dfr_basis, dfr_dist, 3.0)
         _check("AOT vs JIT: dynamic_flow_direction_loop.direction", actual_dir, jit_dfr_dir, failures)

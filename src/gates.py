@@ -93,7 +93,7 @@ class GateResult:
     base_buy_trend: bool; base_sell_trend: bool
     rma50_15_val: float; rma200_5_val: float
 
-    # -- ichimoku cloud --
+    # -- Gaussian trend (cloud_up/cloud_down) + Ichimoku 23/65/130/65 cloud levels (cloud-cross alerts) --
     cloud_up: Optional[bool]; cloud_down: Optional[bool]
     cloud_upper_val: float; cloud_lower_val: float
     cloud_upper_prev: float; cloud_lower_prev: float
@@ -205,12 +205,12 @@ class GateResult:
     dynamic_flow_cross_up: bool = False
     dynamic_flow_cross_down: bool = False 
 
-def _cloud_group_decision(cirrus_ok: Optional[bool], ichimoku_ok: Optional[bool],
+def _cloud_group_decision(cirrus_ok: Optional[bool], gaussian_ok: Optional[bool],
                           flow_ok: Optional[bool], rma_ok: Optional[bool]) -> bool:
     """Cloud-group verdict for one direction.
 
     CIRRUS_CLOUD_ENABLED (default): Cirrus Cloud has VETO power.
-        cloud_group_ok = cirrus_ok  AND  (ichimoku_ok OR dynamic_flow_ok)
+        cloud_group_ok = cirrus_ok  AND  (gaussian_ok OR dynamic_flow_ok)
       * Cirrus must be exactly True (Trend Up for buy / Trend Down for sell);
         None (warmup / NaN) fails closed.
       * Of the two supporting clouds only the ENABLED ones count; one True is
@@ -218,14 +218,14 @@ def _cloud_group_decision(cirrus_ok: Optional[bool], ichimoku_ok: Optional[bool]
       * If neither supporting cloud is enabled, Cirrus alone decides.
       * The RMA cloud takes no part.
     CIRRUS_CLOUD_ENABLED=False: legacy strict majority of the enabled
-    Ichimoku / RMA / Dynamic Flow votes (unchanged behaviour).
+    Gaussian Trend / RMA / Dynamic Flow votes.
     """
     if cfg.CIRRUS_CLOUD_ENABLED:
         if cirrus_ok is not True:
             return False
         support = []
-        if cfg.ICHIMOKU_CLOUD_ENABLED:
-            support.append(ichimoku_ok)
+        if cfg.GAUSSIAN_TREND_ENABLED:
+            support.append(gaussian_ok)
         if cfg.DYNAMIC_FLOW_RIBBON_ENABLED:
             support.append(flow_ok)
         if not support:
@@ -233,8 +233,9 @@ def _cloud_group_decision(cirrus_ok: Optional[bool], ichimoku_ok: Optional[bool]
         return any(v is True for v in support)
 
     votes = []
-    if cfg.ICHIMOKU_CLOUD_ENABLED:
-        votes.append(ichimoku_ok)
+
+    if cfg.GAUSSIAN_TREND_ENABLED:
+        votes.append(gaussian_ok)
     if cfg.RMA_CLOUD_ENABLED:
         votes.append(rma_ok)
     if cfg.DYNAMIC_FLOW_RIBBON_ENABLED:
@@ -242,7 +243,8 @@ def _cloud_group_decision(cirrus_ok: Optional[bool], ichimoku_ok: Optional[bool]
     active = [v for v in votes if v is not None]
     if active:
         return sum(1 for v in active if v) > (len(active) / 2.0)
-    return not (cfg.RMA_CLOUD_ENABLED or cfg.ICHIMOKU_CLOUD_ENABLED or cfg.DYNAMIC_FLOW_RIBBON_ENABLED)
+
+    return not (cfg.RMA_CLOUD_ENABLED or cfg.GAUSSIAN_TREND_ENABLED or cfg.DYNAMIC_FLOW_RIBBON_ENABLED)
 
 def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, float, Dict[str, bool]]:
     weights = CONFLUENCE_WEIGHTS 
@@ -250,7 +252,7 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, flo
     total = 0.0
     votes: Dict[str, bool] = {}
     base_trend    = gr.base_buy_trend if is_buy else gr.base_sell_trend
-    ichimoku_ok   = gr.ichimoku_gate_ok_buy if is_buy else gr.ichimoku_gate_ok_sell
+    gaussian_ok   = gr.gaussian_gate_ok_buy if is_buy else gr.gaussian_gate_ok_sell
     rma_cloud_ok  = gr.rma_cloud_ok_buy if is_buy else gr.rma_cloud_ok_sell
     cirrus_ok     = gr.cirrus_ok_buy if is_buy else gr.cirrus_ok_sell
     dynamic_flow_ok = gr.dynamic_flow_ok_buy if is_buy else gr.dynamic_flow_ok_sell
@@ -265,11 +267,11 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, flo
     votes["base_trend"] = bool(base_trend)
     if base_trend: score += w
 
-    if cfg.ICHIMOKU_CLOUD_ENABLED and ichimoku_ok is not None:
-        w = weights["ichimoku_cloud"]
+    if cfg.GAUSSIAN_TREND_ENABLED and gaussian_ok is not None:
+        w = weights["gaussian_trend"]
         total += w
-        votes["ichimoku_cloud"] = bool(ichimoku_ok)
-        if ichimoku_ok: score += w
+        votes["gaussian_trend"] = bool(gaussian_ok)
+        if gaussian_ok: score += w
 
     if cfg.CIRRUS_CLOUD_ENABLED and cirrus_ok is not None:
         w = weights["cirrus_cloud"]
@@ -564,8 +566,8 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         rma200_5 = gate_indicators["rma200_5"]
         ichimoku_cloud_upper = gate_indicators["ichimoku_cloud_upper"]
         ichimoku_cloud_lower = gate_indicators["ichimoku_cloud_lower"]
-        ichimoku_future_green = gate_indicators["ichimoku_future_green"]
-        ichimoku_future_red = gate_indicators["ichimoku_future_red"]
+        gaussian_dir_arr = gate_indicators["gaussian_trend_dir_15"]
+        gaussian_valid_arr = gate_indicators["gaussian_valid_15"]
         ichimoku_conversion_line = gate_indicators["ichimoku_conversion_line"]
         ichimoku_base_line = gate_indicators["ichimoku_base_line"]
         adx_arr = gate_indicators["adx"]
@@ -583,30 +585,23 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         nr_cpr = float(gate_indicators.get('nr_cpr', float('nan')))
         prev_day_close = gate_indicators.get('prev_day_close', float('nan'))
 
-        future_green = ichimoku_future_green[i15]
-        future_red = ichimoku_future_red[i15]
-
+        # Ichimoku cloud (23/65/130/65) — used by the cloud-cross alerts only.
         cloud_upper_val = ichimoku_cloud_upper[i15]
         cloud_lower_val = ichimoku_cloud_lower[i15]
         cloud_upper_prev = ichimoku_cloud_upper[i15 - 1]
         cloud_lower_prev = ichimoku_cloud_lower[i15 - 1]
 
-        ichimoku_cloud_ready = not (
-            np.isnan(cloud_upper_val) or np.isnan(cloud_lower_val)
-            or np.isnan(cloud_upper_prev) or np.isnan(cloud_lower_prev)
-        )
-        if ichimoku_cloud_ready:
-            above_cloud = close_curr > cloud_upper_val
-            below_cloud = close_curr < cloud_lower_val
-            cloud_up = bool(future_green and above_cloud)
-            cloud_down = bool(future_red and below_cloud)
+        # Gaussian Filter Trend: the trend-cloud verdict (cloud_up / cloud_down) now comes
+        # from the Gaussian trend direction (1 = bullish, -1 = bearish). Warmup / neutral
+        # (direction 0) abstains (None) and is not counted in the cloud-group vote.
+        if cfg.GAUSSIAN_TREND_ENABLED and bool(gaussian_valid_arr[i15]):
+            cloud_up = bool(gaussian_dir_arr[i15] == 1)
+            cloud_down = bool(gaussian_dir_arr[i15] == -1)
         else:
             logger_pair.debug(
-                f"[{pair_name}] Ichimoku cloud NaN at i15={i15} (warmup/gap). "
-                f"Ichimoku cloud gate abstains (None) — not counted in cloud-group vote."
+                f"[{pair_name}] Gaussian trend not ready/disabled at i15={i15} (warmup/neutral). "
+                f"Gaussian gate abstains (None) — not counted in cloud-group vote."
             )
-            above_cloud = None
-            below_cloud = None
             cloud_up = None
             cloud_down = None
 
@@ -664,12 +659,8 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         base_buy_trend = bool((rma50_15_val < close_curr) and (rma200_5_val < close_5m_val))
         base_sell_trend = bool((rma50_15_val > close_curr) and (rma200_5_val > close_5m_val))
 
-        if cfg.ICHIMOKU_CLOUD_ENABLED:
-            ichimoku_gate_ok_buy = cloud_up
-            ichimoku_gate_ok_sell = cloud_down
-        else:
-            ichimoku_gate_ok_buy = None
-            ichimoku_gate_ok_sell = None
+        gaussian_gate_ok_buy = cloud_up
+        gaussian_gate_ok_sell = cloud_down
 
         adx_val = adx_arr[i15] if not np.isnan(adx_arr[i15]) else 0.0
         adx_adaptive_threshold = get_adaptive_adx_threshold_smoothed(adx_arr, i15, cfg)
@@ -910,13 +901,13 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         if cfg.DEBUG_MODE and not cloud_group_ok_buy:
             logger_pair.debug(
                 f"[{pair_name}] Cloud group buy blocked "
-                f"(Cirrus={cirrus_ok_buy}, Ichimoku={ichimoku_gate_ok_buy}, "
+                f"(Cirrus={cirrus_ok_buy}, Gaussian={gaussian_gate_ok_buy},"
                 f"DynamicFlow={dynamic_flow_ok_buy}, RMA={rma_cloud_ok_buy})"
             )
         if cfg.DEBUG_MODE and not cloud_group_ok_sell:
             logger_pair.debug(
                 f"[{pair_name}] Cloud group sell blocked "
-                f"(Cirrus={cirrus_ok_sell}, Ichimoku={ichimoku_gate_ok_sell}, "
+                f"(Cirrus={cirrus_ok_sell}, Gaussian={gaussian_gate_ok_sell},"
                 f"DynamicFlow={dynamic_flow_ok_sell}, RMA={rma_cloud_ok_sell})"
             )
 

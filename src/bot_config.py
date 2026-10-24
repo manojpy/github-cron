@@ -9,7 +9,7 @@ import re
 import logging
 import asyncio
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Literal
 from datetime import datetime, timezone
 from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict, PrivateAttr
 from config_base import (
@@ -199,11 +199,19 @@ class BotConfig(BaseModel):
     SKIP_WARMUP: bool = Field(default=False)
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
     SANITIZE_BAD_CANDLES: bool = Field(default=False, description="If True, drop individual invalid candles instead of rejecting the whole fetch")
-    ICHIMOKU_CLOUD_ENABLED: bool = Field(default=True, description="Enable Ichimoku Cloud as trend gate")
-    ICHIMOKU_CONVERSION_PERIODS: int = Field(default=9, ge=1, le=300, description="Ichimoku conversion line length")
-    ICHIMOKU_BASE_PERIODS: int = Field(default=26, ge=1, le=400, description="Ichimoku base line length")
-    ICHIMOKU_SPANB_PERIODS: int = Field(default=52, ge=1, le=500, description="Ichimoku leading span B length")
-    ICHIMOKU_DISPLACEMENT: int = Field(default=26, ge=1, le=400, description="Ichimoku cloud forward displacement")
+    ICHIMOKU_CLOUD_ENABLED: bool = Field(default=True, description="Compute the Ichimoku cloud (BIAS_ICHIMOKU_* = 23/65/130/65) used by the cloud-cross alerts. It no longer votes in the cloud group (Gaussian Trend does)")
+    GAUSSIAN_TREND_ENABLED: bool = Field(default=True, description="Gaussian Filter Trend (QuantAlgo Pine port) as the trend-cloud vote of the cloud group; replaces the old Ichimoku 9/26/52/26 cloud vote")
+    GAUSSIAN_PRESET: Literal['Default', 'Fast Response', 'Smooth Trend'] = Field(default='Default', description="Pine preset. Anything other than Default overrides the GAUSSIAN_* length/pole/ATR/efficiency inputs below, exactly like the Pine script")
+    GAUSSIAN_SOURCE: Literal['close', 'hl2', 'hlc3'] = Field(default='close', description="Price source passed through the Gaussian filter (Pine: Price Source)")
+    GAUSSIAN_LENGTH: int = Field(default=14, ge=2, le=200, description="Gaussian filter sampling length in bars (Pine: Length)")
+    GAUSSIAN_POLES: int = Field(default=4, ge=1, le=4, description="Number of cascaded filter poles (Pine: Poles)")
+    GAUSSIAN_ATR_LENGTH: int = Field(default=14, ge=1, le=200, description="ATR length for the trend dead-band (Pine: ATR Length)")
+    GAUSSIAN_FIXED_MULTIPLIER: float = Field(default=1.5, ge=0.1, le=20.0, description="Fixed dead-band width in ATR units; only used when GAUSSIAN_ADAPTIVE_WIDTH is False")
+    GAUSSIAN_ADAPTIVE_WIDTH: bool = Field(default=True, description="Scale the dead-band by the smoothed Efficiency Ratio (Pine: Adaptive Width)")
+    GAUSSIAN_EFFICIENCY_LENGTH: int = Field(default=10, ge=2, le=200, description="Efficiency Ratio lookback (Pine: Efficiency Length)")
+    GAUSSIAN_TREND_MULTIPLIER: float = Field(default=0.8, ge=0.1, le=20.0, description="ATR width when efficiency is high (Pine: Adaptive Trend Multiplier)")
+    GAUSSIAN_CHOP_MULTIPLIER: float = Field(default=2.5, ge=0.1, le=20.0, description="ATR width when efficiency is low (Pine: Adaptive Chop Multiplier)")
+    GAUSSIAN_EFFICIENCY_SMOOTH: int = Field(default=5, ge=1, le=200, description="EMA length applied to the Efficiency Ratio (Pine: Efficiency Smoothing)")
     ICHIMOKU_TK_CONVERSION_PERIODS: int = Field(default=23, ge=1, le=300, description="Tenkan (conversion) length used for TK guard + cross alerts, independent of cloud conversion length")
     ICHIMOKU_TK_BASE_PERIODS: int = Field(default=65, ge=1, le=400, description="Kijun (base) length used for TK guard + cross alerts, independent of cloud base length")
     ICHIMOKU_TK_GUARD_ENABLED: bool = Field(default=True, description="Require 15m Tenkan(conversion) vs Kijun(base) alignment: buy needs conversion>=base, sell needs conversion<=base")
@@ -793,9 +801,13 @@ class BotConfig(BaseModel):
         # silently NaN and its gate evaluates False for every pair.
         last_idx = Constants.FETCH_LIMIT_15M - 2
         warmups = {
-            'ICHIMOKU cloud (SPANB+DISPLACEMENT-2)':
-                self.ICHIMOKU_SPANB_PERIODS + self.ICHIMOKU_DISPLACEMENT - 2
+            'ICHIMOKU cloud 23/65/130/65 (SPANB+DISPLACEMENT-2)':
+                self.BIAS_ICHIMOKU_SPANB_PERIODS + self.BIAS_ICHIMOKU_DISPLACEMENT - 2
                 if self.ICHIMOKU_CLOUD_ENABLED else 0,
+            'GAUSSIAN trend (5 x LENGTH + EFF_LEN + 3 x EFF_SMOOTH + ATR_LEN)':
+                5 * self.GAUSSIAN_LENGTH + self.GAUSSIAN_EFFICIENCY_LENGTH
+                + 3 * self.GAUSSIAN_EFFICIENCY_SMOOTH + self.GAUSSIAN_ATR_LENGTH
+                if self.GAUSSIAN_TREND_ENABLED else 0,
             'ICHIMOKU TK guard (TK_BASE-1)':
                 self.ICHIMOKU_TK_BASE_PERIODS - 1 if self.ICHIMOKU_TK_GUARD_ENABLED else 0,
             'BIAS_ICHIMOKU cloud (SPANB+DISPLACEMENT-2)':
