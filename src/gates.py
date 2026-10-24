@@ -97,7 +97,7 @@ class GateResult:
     cloud_up: Optional[bool]; cloud_down: Optional[bool]
     cloud_upper_val: float; cloud_lower_val: float
     cloud_upper_prev: float; cloud_lower_prev: float
-    ichimoku_gate_ok_buy: Optional[bool]; ichimoku_gate_ok_sell: Optional[bool]
+    gaussian_gate_ok_buy: Optional[bool]; gaussian_gate_ok_sell: Optional[bool]
     confirmation_buy: bool; confirmation_sell: bool
     cloud_group_ok_buy: bool; cloud_group_ok_sell: bool
 
@@ -893,10 +893,10 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
 
         # ── Cloud group: Cirrus veto AND (Ichimoku OR Dynamic Flow) ──
         cloud_group_ok_buy = _cloud_group_decision(
-            cirrus_ok_buy, ichimoku_gate_ok_buy, dynamic_flow_ok_buy, rma_cloud_ok_buy
+            cirrus_ok_buy, gaussian_gate_ok_buy, dynamic_flow_ok_buy, rma_cloud_ok_buy
         )
         cloud_group_ok_sell = _cloud_group_decision(
-            cirrus_ok_sell, ichimoku_gate_ok_sell, dynamic_flow_ok_sell, rma_cloud_ok_sell
+            cirrus_ok_sell, gaussian_gate_ok_sell, dynamic_flow_ok_sell, rma_cloud_ok_sell
         )
         if cfg.DEBUG_MODE and not cloud_group_ok_buy:
             logger_pair.debug(
@@ -1087,7 +1087,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             cloud_up=cloud_up, cloud_down=cloud_down,
             cloud_upper_val=cloud_upper_val, cloud_lower_val=cloud_lower_val,
             cloud_upper_prev=cloud_upper_prev, cloud_lower_prev=cloud_lower_prev,
-            ichimoku_gate_ok_buy=ichimoku_gate_ok_buy, ichimoku_gate_ok_sell=ichimoku_gate_ok_sell,
+            gaussian_gate_ok_buy=gaussian_gate_ok_buy, gaussian_gate_ok_sell=gaussian_gate_ok_sell,
             confirmation_buy=confirmation_buy, confirmation_sell=confirmation_sell,
             cloud_group_ok_buy=cloud_group_ok_buy, cloud_group_ok_sell=cloud_group_ok_sell,
             tk_conversion_curr=tk_conversion_curr, tk_conversion_prev=tk_conversion_prev,
