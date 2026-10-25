@@ -657,6 +657,28 @@ TQ = {"verdict": "BLOCKED", "p_ev_positive": 0.41, "net_ev": -0.12,
       "evidence_state": "SHADOW", "n_oos": 38, "drift_warning": True,
       "regime_warning": "ranging regime WR=35%"}
 
+
+def test_survival_checklist_passes_and_warnings():
+    out = A.build_survival_checklist(
+        score=22.0, total=30.0, required=18.0, win_rate=0.61, win_sample=45,
+        cal_wr=0.6, cal_reason="ok",
+        tq={"verdict": "MEDIUM", "p_ev_positive": 0.66, "net_ev": 0.21,
+            "drift_warning": True},
+    )
+    assert "✓ gates 22/30 (need 18)" in out
+    assert "✓ WR 61% n=45" in out and "✓ calib 60%" in out
+    assert "✓ brain MEDIUM P=66% EV=+0.21%" in out and "⚠ drift" in out
+
+
+def test_survival_checklist_marks_unevaluated_not_passed():
+    out = A.build_survival_checklist(
+        score=None, total=None, required=None, win_rate=None, win_sample=0,
+        cal_wr=None, cal_reason="thin_bucket_fail_open", tq=None,
+    )
+    assert "○ WR no history" in out and "○ calib thin" in out
+    assert "✓" not in out        # nothing was actually verified
+
+
 def test_message_has_fields_and_is_markdown_safe():
     msg = A.build_brain_filter_message(
         pair="BTC_USD", alert_key="ppo_cross_buy", gate="calibration gate",
