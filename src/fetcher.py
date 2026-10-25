@@ -640,13 +640,12 @@ class DataFetcher:
             backoff=cfg.CANDLE_FETCH_BACKOFF,
             timeout=self.timeout,
         )
-
         out: Dict[str, Dict[str, Optional[float]]] = {}
         if not data:
             logger.warning("Tickers fetch failed -- OI/funding filter running fail-open this run")
-        self.fetch_stats["tickers"]["failed"] += 1
-        await self.circuit_breaker.record_failure("__tickers__")
-        return out
+            self.fetch_stats["tickers"]["failed"] += 1
+            await self.circuit_breaker.record_failure("__tickers__")
+            return out
 
         for row in (data.get("result") or []):
             if not isinstance(row, dict):
@@ -684,11 +683,12 @@ class DataFetcher:
                 continue
 
         if out:
-        await self.circuit_breaker.record_success("__tickers__")
-        self.fetch_stats["tickers"]["success"] += 1
-
+            await self.circuit_breaker.record_success("__tickers__")
+            self.fetch_stats["tickers"]["success"] += 1
         else:
-            logger.warning("Tickers response parsed but no OI/funding fields found -- check Delta API field names")
+            logger.warning(
+                "Tickers response parsed but no OI/funding fields found -- check Delta API field names"
+            )
             self.fetch_stats["tickers"]["failed"] += 1
 
         return out
