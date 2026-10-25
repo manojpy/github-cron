@@ -1358,9 +1358,29 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                     deferred_pairs.append(r[0])
                 logger_main.warning(f"[{r[0]}] Deferred: dedup claim failed; candle remains eligible for retry")
                 continue
+
             valid_results.append((r[0], r[1]))
             if len(r) >= 3 and r[2] is not None:
                 batched_payloads.append(r[2])
+
+    # Late start: when GitHub queueing delays the run past the staleness limit, every
+    # pair is rejected as a stale candle, the run still exits 0 and nothing tells you
+    # that candle was never scanned. Send one notice per 15m slot.
+    _late_n = sum(
+        1 for _lp, _ls in valid_results
+        if isinstance(_ls, dict) and _ls.get("state") == "HARD_REJECT"
+        and "stale candle" in str((_ls.get("summary") or {}).get("suppression", ""))
+    )
+    if _late_n and _late_n * 2 >= len(pairs_to_process):
+        try:
+            if await state_db.claim_notice(f"late_start:{reference_time // 900}", 900):
+                await telegram_queue.send(escape_markdown_v2(
+                    f"⏰ {cfg.BOT_NAME}: late start - {_late_n}/{len(pairs_to_process)} pairs "
+                    f"skipped as stale. The run began {reference_time % 900}s after the 15m close "
+                    f"(limit {int(cfg.MAX_CANDLE_STALENESS_SEC) - 900}s), so this candle was not scanned."
+                ))
+        except Exception as _late_err:
+            logger_main.warning(f"Late-start notice failed (non-fatal): {_late_err}")
 
     # A kill switch that tripped during THIS run must also stop this run's queued
     # alerts. Give their dedup claims back so nothing stays suppressed afterwards.
@@ -2268,6 +2288,20 @@ if __name__ == "__main__":
         logger.info("Skipping Numba warmup (faster startup)")
 
     async def main_with_cleanup():
+        # SIGTERM/SIGINT (workflow `timeout`, docker stop) and a lost run lock only
+        # SET shutdown_event; nothing used to stop the run itself, so it kept going
+        # until the 15s SIGKILL grace ended and skipped the cleanup in run_once's
+        # finally block (lock release, breaker snapshot, Redis/HTTP close).
+        # Cancel the run as soon as the event is set so that cleanup does run.
+        main_task = asyncio.current_task()
+
+        async def _cancel_on_shutdown() -> None:
+            await shutdown_event.wait()
+            logger.warning("Shutdown requested - cancelling the run so cleanup can finish")
+            if main_task is not None:
+                main_task.cancel()
+
+        watcher = asyncio.ensure_future(_cancel_on_shutdown())
         try:
             async with asyncio.timeout(cfg.RUN_TIMEOUT_SECONDS):
                 return await run_once()
@@ -2277,7 +2311,8 @@ if __name__ == "__main__":
                 cfg.RUN_TIMEOUT_SECONDS
             )
             return False
-
+        finally:
+            watcher.cancel()
     try:
         success = asyncio.run(main_with_cleanup())
         if success is None:

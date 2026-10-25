@@ -118,12 +118,13 @@ def _stamp_schema(record: Dict[str, Any]) -> Dict[str, Any]:
 def append_outcome(record: Dict[str, Any], shadow: bool = False) -> None:
     """Append a single record to today's JSONL file.
 
-    NOTE: this API is used by alerts.py to write a *pre-resolution*
-    signal row that carries no `win` field — it is not an outcome, it
-    only records that an alert fired. Those rows are filtered out at
-    read time by archive_reader (based on presence of `win`, not on
-    schema_version). The schema_version stamped here describes the
-    envelope's shape; it does NOT imply the trade has resolved.
+    NOTE: nothing in src/ calls this any more (resolved outcomes are written
+    with append_outcome_batch); it is kept as the single-row API and is
+    exercised by tests. A row written here without a `win` field is a
+    signal-only row, not an outcome: archive_reader and load_recent_outcomes
+    filter such rows out by the presence of `win`, not by schema_version. The
+    schema_version stamped here describes the envelope's shape; it does NOT
+    imply the trade has resolved.
     """
     subdir = "shadow" if shadow else "outcomes"
     path = _today_file(subdir)
