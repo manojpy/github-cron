@@ -244,6 +244,19 @@ def gaussian_trend_line_loop(filtered: np.ndarray, upper: np.ndarray,
     """Gaussian Filter Trend: stepped dead-band line + direction (-1/0/1)."""
     return _dispatch["gaussian_trend_line_loop"](filtered, upper, lower)
 
+def wma_loop(src: np.ndarray, length: int) -> np.ndarray:
+    """Weighted moving average (Pine ta.wma), strict NaN propagation."""
+    return _dispatch["wma_loop"](src, length)
+
+def hma_loop(src: np.ndarray, length: int) -> np.ndarray:
+    """Hull moving average (Pine ta.hma)."""
+    return _dispatch["hma_loop"](src, length)
+
+def momentum_oscillator_core(high: np.ndarray, low: np.ndarray,
+                             close: np.ndarray, length: int) -> np.ndarray:
+    """AlgoAlpha Momentum Oscillator (vf), exact Pine port."""
+    return _dispatch["momentum_oscillator_core"](high, low, close, length)
+
 # ─────────────────────────────────────────────────────────────────────
 # COMPLETENESS CHECK — catches a forgotten wrapper at import time
 # ──────────────────────────────────────────────────────────────────────

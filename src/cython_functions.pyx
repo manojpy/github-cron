@@ -269,7 +269,7 @@ def ema_loop_pine(double[:] data, double length_float):
 
     return out_np
 
-# ══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════���═
 # 6. ema_loop_alpha
 # ═══════════════════════════════════════════════════════════════════
 def ema_loop_alpha(double[:] data, double alpha):
@@ -960,8 +960,151 @@ def gaussian_trend_line_loop(double[:] filtered, double[:] upper, double[:] lowe
     return tl_np, dir_np
 
 # ══════════════════════════════════════════════════════════════════════
-# EXPORT REGISTRY (replaces Numba EXPORT_CONFIG)
+# 21-23. wma_loop / hma_loop / momentum_oscillator_core — Pine: AlgoAlpha Momentum Oscillator
 # ══════════════════════════════════════════════════════════════════════
+def wma_loop(double[:] src, int length):
+    cdef int n = src.shape[0]
+    cdef np.ndarray out_np = np.full(n, np.nan, dtype=np.float64)
+    cdef double[:] out = out_np
+    cdef int i, j
+    cdef double s, norm, val
+    cdef int has_nan
+    if length <= 0:
+        return out_np
+    norm = length * (length + 1) / 2.0
+    for i in range(length - 1, n):
+        s = 0.0
+        has_nan = 0
+        for j in range(length):
+            val = src[i - j]
+            if isnan(val):
+                has_nan = 1
+                break
+            s += val * (length - j)
+        if not has_nan:
+            out[i] = s / norm
+    return out_np
+
+def hma_loop(double[:] src, int length):
+    cdef int n = src.shape[0]
+    cdef np.ndarray out_np = np.full(n, np.nan, dtype=np.float64)
+    cdef int half_len, sqrt_len
+    cdef np.ndarray wma1_np, wma2_np, diff_np
+    cdef double[:] wma1, wma2, diff
+    cdef int i
+    if length <= 0:
+        return out_np
+        
+    half_len = <int>(length / 2.0 + 0.5)
+    if half_len < 1: half_len = 1
+    sqrt_len = <int>(sqrt(<double>length) + 0.5)
+    if sqrt_len < 1: sqrt_len = 1
+        
+    wma1_np = wma_loop(src, half_len)
+    wma2_np = wma_loop(src, length)
+    wma1 = wma1_np
+    wma2 = wma2_np
+    
+    diff_np = np.full(n, np.nan, dtype=np.float64)
+    diff = diff_np
+    for i in range(n):
+        if not isnan(wma1[i]) and not isnan(wma2[i]):
+            diff[i] = 2.0 * wma1[i] - wma2[i]
+            
+    out_np = wma_loop(diff_np, sqrt_len)
+    return out_np
+
+
+def momentum_oscillator_core(double[:] high, double[:] low, double[:] close, int length):
+    cdef int n = close.shape[0]
+    cdef np.ndarray out_vf_np = np.full(n, np.nan, dtype=np.float64)
+    cdef double[:] out_vf = out_vf_np
+    cdef tuple mm_low, mm_high
+    cdef np.ndarray min_low_np, max_high_np
+    cdef double[:] min_low, max_high
+    cdef np.ndarray l_np, h_np, val1_np, hl_diff_np, val2_np, ema_hl_np
+    cdef double[:] l, h, val1, hl_diff, val2, ema_hl
+    cdef int d_state = 0
+    cdef int i
+    cdef double c, h_val, l_val, val, c_prev, h_prev, l_prev, v2, e_hl
+    cdef bint crossover, crossunder
+    
+    if n == 0 or length <= 0:
+        return out_vf_np
+        
+    mm_low = rolling_min_max_numba(low, length)
+    mm_high = rolling_min_max_numba(high, length)
+    min_low_np = mm_low[0]
+    max_high_np = mm_high[1]
+    
+    min_low = min_low_np
+    max_high = max_high_np
+    
+    l_np = ema_loop_pine(min_low_np, <double>length)
+    h_np = ema_loop_pine(max_high_np, <double>length)
+    l = l_np
+    h = h_np
+    
+    val1_np = np.full(n, np.nan, dtype=np.float64)
+    val1 = val1_np
+    
+    for i in range(n):
+        c = close[i]
+        h_val = h[i]
+        l_val = l[i]
+        
+        # Pine parity: if any input to crossover/crossunder or val1 is NaN, 
+        # the state does not update and val1 remains NaN.
+        if isnan(c) or isnan(h_val) or isnan(l_val):
+            continue
+            
+        if i > 0:
+            c_prev = close[i-1]
+            h_prev = h[i-1]
+            l_prev = l[i-1]
+            
+            crossover = False
+            crossunder = False
+            
+            if not isnan(c_prev) and not isnan(h_prev):
+                if c > h_val and c_prev <= h_prev:
+                    crossover = True
+                    
+            if not isnan(c_prev) and not isnan(l_prev):
+                if c < l_val and c_prev >= l_prev:
+                    crossunder = True
+                    
+            if crossover: d_state = 1
+            if crossunder: d_state = -1
+                
+        val = l_val if d_state == 1 else h_val
+        val1[i] = c - val
+        
+    val2_np = hma_loop(val1_np, length)
+    val2 = val2_np
+    
+    hl_diff_np = np.full(n, np.nan, dtype=np.float64)
+    hl_diff = hl_diff_np
+    for i in range(n):
+        if not isnan(high[i]) and not isnan(low[i]):
+            hl_diff[i] = high[i] - low[i]
+            
+    ema_hl_np = ema_loop_pine(hl_diff_np, <double>(length * 2))
+    ema_hl = ema_hl_np
+    
+    for i in range(n):
+        v2 = val2[i]
+        e_hl = ema_hl[i]
+        if not isnan(v2) and not isnan(e_hl):
+            if e_hl != 0.0:
+                out_vf[i] = (v2 / e_hl * 100.0) / 8.0
+            else:
+                # Pine evaluates division by zero as ±Infinity. 
+                # We deliberately leave it as NaN to prevent downstream Inf-clamping 
+                # cascades in the bot's sanitize logic.
+                pass
+                
+    return out_vf_np
 
 # ══════════════════════════════════════════════════════════════════════
 # EXPORT REGISTRY (replaces Numba EXPORT_CONFIG)
@@ -987,6 +1130,9 @@ EXPORTED_FUNCTION_NAMES = [
     "gaussian_filter_loop",
     "efficiency_ratio_loop",
     "gaussian_trend_line_loop",
+    "wma_loop",
+    "hma_loop",
+    "momentum_oscillator_core",
 ]
 
 from aot_meta import (  # noqa: E402

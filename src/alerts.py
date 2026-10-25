@@ -1711,7 +1711,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
     tk_conversion_curr, tk_conversion_prev = gr.tk_conversion_curr, gr.tk_conversion_prev
     tk_base_curr, tk_base_prev = gr.tk_base_curr, gr.tk_base_prev
     equilibrium_curr, equilibrium_prev = gr.equilibrium_curr, gr.equilibrium_prev
-    tk_guard_ok_buy, tk_guard_ok_sell = gr.tk_guard_ok_buy, gr.tk_guard_ok_sell
+    momentum_osc_ok_buy, momentum_osc_ok_sell = gr.momentum_osc_ok_buy, gr.momentum_osc_ok_sell
+    momentum_osc_curr = gr.momentum_osc_curr
     oscillator_group_ok_buy, oscillator_group_ok_sell = gr.oscillator_group_ok_buy, gr.oscillator_group_ok_sell
     ppo_gate_arr, ppo_gate_signal_arr = gr.ppo_gate_arr, gr.ppo_gate_signal_arr
     ppo_gate_curr, ppo_gate_prev = gr.ppo_gate_curr, gr.ppo_gate_prev
@@ -1970,7 +1971,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "cloud_up": cloud_up, "cloud_down": cloud_down,
             "cloud_upper_curr": cloud_upper_val, "cloud_upper_prev": cloud_upper_prev,
             "cloud_lower_curr": cloud_lower_val, "cloud_lower_prev": cloud_lower_prev,
-            "tk_guard_ok_buy": tk_guard_ok_buy, "tk_guard_ok_sell": tk_guard_ok_sell,
+            "momentum_osc_ok_buy": momentum_osc_ok_buy, "momentum_osc_ok_sell": momentum_osc_ok_sell,
+            "momentum_osc_curr": momentum_osc_curr,
             "tk_conversion_curr": tk_conversion_curr, "tk_conversion_prev": tk_conversion_prev, "tk_base_curr": tk_base_curr, "tk_base_prev": tk_base_prev,
             "equilibrium_curr": equilibrium_curr, "equilibrium_prev": equilibrium_prev,
             "rma_cloud_ok_buy": rma_cloud_ok_buy, "rma_cloud_ok_sell": rma_cloud_ok_sell,
@@ -4188,9 +4190,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             if not cloud_group_ok_sell:
                 reasons.append(f"Cloud group sell: need {_cg_need} — not met")
             if not oscillator_group_ok_buy:
-                reasons.append(f"Oscillator group buy: need {Constants.OSCILLATOR_GROUP_MIN_VOTES}-of-3 (PPO/RSI/TK) — not met")
+                reasons.append(f"Oscillator group buy: need {Constants.OSCILLATOR_GROUP_MIN_VOTES}-of-3 (PPO/RSI/Momentum) — not met")
             if not oscillator_group_ok_sell:
-                reasons.append(f"Oscillator group sell: need {Constants.OSCILLATOR_GROUP_MIN_VOTES}-of-3 (PPO/RSI/TK) — not met")
+                reasons.append(f"Oscillator group sell: need {Constants.OSCILLATOR_GROUP_MIN_VOTES}-of-3 (PPO/RSI/Momentum) — not met")
 
             logger_pair.debug(f"😒 {pair_name} | Suppression: {', '.join(reasons)}") 
 

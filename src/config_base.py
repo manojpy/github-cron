@@ -91,7 +91,7 @@ CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "dynamic_flow_ribbon": 2.0,
     "ppo_cross": 2.0,
     "rsi_guard": 2.0,
-    "tk_guard": 2.0,
+    "momentum_osc": 2.0,
     "adx": 1.0,
     "rvol": 1.5,
     "cpr": 1.0,

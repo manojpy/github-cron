@@ -15,6 +15,7 @@ from aot_bridge import (
     calculate_adx_core, percentile_rank_numba, dynamic_flow_direction_loop,
     smoothrng_loop, range_filter_loop,
     gaussian_filter_loop, efficiency_ratio_loop, gaussian_trend_line_loop,
+    momentum_oscillator_core,
 )
 
 def validate_indicator_array(arr: Optional[np.ndarray], name: str, min_valid_values: int = 1) -> Tuple[bool, Optional[str]]:
@@ -577,6 +578,27 @@ def calculate_rsi_guard_numpy(close: np.ndarray, rsi_len: int, kalman_len: int, 
         return (np.full(default_len, np.nan, dtype=np.float64),
                 np.full(default_len, np.nan, dtype=np.float64))
 
+def calculate_momentum_oscillator_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, length: int) -> np.ndarray:
+    """AlgoAlpha Momentum Oscillator (vf) — exact port of the Pine indicator.
+
+    Zero line = 0: vf > 0 is bullish momentum, vf < 0 bearish. NaN until the
+    window has warmed up (about 2 x length bars); callers must treat NaN as
+    "abstain", never as a pass.
+    """
+    try:
+        if close is None or len(close) == 0:
+            raise ValueError("Empty input arrays")
+        h = np.ascontiguousarray(high, dtype=np.float64)
+        l = np.ascontiguousarray(low, dtype=np.float64)
+        c = np.ascontiguousarray(close, dtype=np.float64)
+
+        vf = momentum_oscillator_core(h, l, c, int(length))
+        return sanitize_array_numba(vf, np.nan)
+    except Exception as e:
+        logger.error(f"Momentum Oscillator calculation failed: {e}", exc_info=True)
+        default_len = len(close) if close is not None else 1
+        return np.full(default_len, np.nan, dtype=np.float64)
+
 def warmup_if_needed() -> None:
     """Hybrid warmup with comprehensive coverage & better logging"""
 
@@ -616,6 +638,8 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.gaussian_filter_loop(test_data, 14, 4)
         _ = aot_bridge.efficiency_ratio_loop(test_data, 10)
         _ = aot_bridge.gaussian_trend_line_loop(test_data, test_data * 1.01, test_data * 0.99)
+        _ = aot_bridge.momentum_oscillator_core(test_data, test_data * 0.8, test_data, 10)
+
 
         warmup_elapsed = time.time() - warmup_start
         logger.info(f"✅ JIT warmup complete ({warmup_elapsed:.2f}s)")
@@ -778,9 +802,9 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['ichimoku_future_green'] = bool_arr.copy()
             results['ichimoku_future_red'] = bool_arr.copy()
 
-        # ── Tenkan/Kijun (23/65 — TK guard + Tenkan/Kijun cross alerts only) ──
+        # ── Tenkan/Kijun (23/65 — Tenkan/Kijun cross alerts only; the TK guard was removed) ──
         # Same 23/65 lengths as the Ichimoku cloud above; kept as separate config keys.
-        if cfg.ICHIMOKU_TK_GUARD_ENABLED or cfg.ENABLE_TK_CONVERSION_CROSS or cfg.ENABLE_KIJUN_CROSS:
+        if cfg.ENABLE_TK_CONVERSION_CROSS or cfg.ENABLE_KIJUN_CROSS:
             _, hh_tk_conv = rolling_min_max_numba(data_15m["high"], cfg.ICHIMOKU_TK_CONVERSION_PERIODS)
             ll_tk_conv, _ = rolling_min_max_numba(data_15m["low"], cfg.ICHIMOKU_TK_CONVERSION_PERIODS)
             results['ichimoku_conversion_line'] = (hh_tk_conv + ll_tk_conv) / 2.0
@@ -836,6 +860,13 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['rsi_guard_smooth'] = np.full(n_15m, np.nan, dtype=np.float64)
             results['rsi_guard_ema'] = np.full(n_15m, np.nan, dtype=np.float64)
 
+        # ── Momentum Oscillator (AlgoAlpha) — third oscillator-group vote, replaces the TK guard ──
+        if cfg.MOMENTUM_OSCILLATOR_ENABLED:
+            results['momentum_osc'] = calculate_momentum_oscillator_numpy(
+                data_15m["high"], data_15m["low"], close_15m, cfg.MOMENTUM_OSCILLATOR_LENGTH
+            )
+        else:
+            results['momentum_osc'] = np.full(n_15m, np.nan, dtype=np.float64)
         # RMA fast leg is still needed by the RMA-cloud momentum vote even when the
         # RMA cloud itself is replaced by Cirrus (RMA_CLOUD_ENABLED=False).
         if cfg.RMA_CLOUD_ENABLED or cfg.ENABLE_RMA_CLOUD_MOMENTUM_VOTE:

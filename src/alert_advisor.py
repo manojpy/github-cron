@@ -46,7 +46,8 @@ VOTE_LABELS = {
     "dynamic_flow_ribbon": "market flow",
     "ppo_cross": "PPO cross",
     "rsi_guard": "RSI",
-    "tk_guard": "Tenkan/Kijun",
+    "momentum_osc": "Momentum",
+    "tk_guard": "Tenkan/Kijun",   # legacy label: old outcome rows still carry this vote
     "adx": "ADX",
     "rvol": "relative volume",
     "cpr": "CPR",

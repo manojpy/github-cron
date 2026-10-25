@@ -173,6 +173,52 @@ def _ref_gaussian_trend_line(filt: List[float], up: List[float], lo: List[float]
         dr.append(d)
     return tl, dr
 
+def _ref_momentum_oscillator(high: List[float], low: List[float], close: List[float], length: int) -> List[float]:
+    """Independent bar-by-bar Pine reference for the AlgoAlpha Momentum Oscillator
+    (ta.lowest/highest -> ta.ema -> crossover state -> ta.hma -> ta.ema(high-low, 2*len))."""
+    n = len(close)
+    nan = float("nan")
+
+    def _ema(src: List[float], ln: int) -> List[float]:
+        a = 2.0 / (ln + 1)
+        out = [nan] * len(src)
+        for i, x in enumerate(src):
+            prev = out[i - 1] if i > 0 else nan
+            out[i] = x if prev != prev else a * x + (1.0 - a) * prev
+        return out
+
+    def _wma(src: List[float], ln: int) -> List[float]:
+        out = [nan] * len(src)
+        for i in range(ln - 1, len(src)):
+            w = [src[i - j] for j in range(ln)]
+            if any(v != v for v in w):
+                continue
+            out[i] = sum(v * (ln - j) for j, v in enumerate(w)) / (ln * (ln + 1) / 2.0)
+        return out
+
+    lo_min, _ = _ref_rolling_min_max(low, length)
+    _, hi_max = _ref_rolling_min_max(high, length)
+    l_ = _ema(lo_min, length)
+    h_ = _ema(hi_max, length)
+
+    d = 0
+    val1 = [nan] * n
+    for i in range(n):
+        if i > 0 and close[i] > h_[i] and close[i - 1] <= h_[i - 1]:
+            d = 1
+        if i > 0 and close[i] < l_[i] and close[i - 1] >= l_[i - 1]:
+            d = -1
+        val1[i] = close[i] - (l_[i] if d == 1 else h_[i])
+
+    half = int(length / 2.0 + 0.5)
+    sq = int(math.sqrt(length) + 0.5)
+    w1, w2 = _wma(val1, half), _wma(val1, length)
+    diff = [nan if (a != a or b != b) else 2.0 * a - b for a, b in zip(w1, w2)]
+    val2 = _wma(diff, sq)
+
+    e_hl = _ema([high[i] - low[i] for i in range(n)], length * 2)
+    return [nan if (v != v or e != e or e == 0.0) else (v / e * 100.0) / 8.0 for v, e in zip(val2, e_hl)]
+
 # ---------------------------------------------------------------------------
 # Deterministic synthetic fixtures -- no RNG, must be byte-identical every run
 # ---------------------------------------------------------------------------
@@ -280,6 +326,12 @@ def run_self_test() -> Tuple[bool, List[str]]:
     _check("gaussian_trend_line_loop.direction (trend)", _act_dir.astype(np.float64),
            [float(v) for v in _exp_dir], failures)
 
+    # Momentum Oscillator (AlgoAlpha) vs the independent Pine reference.
+    for _len in (10, 14):
+        _check(f"momentum_oscillator_core (trend, len={_len})",
+               aot_bridge.momentum_oscillator_core(high, low, close, _len),
+               _ref_momentum_oscillator(high.tolist(), low.tolist(), close.tolist(), _len), failures)
+
     # --- Analytic invariants on the degenerate flat fixture ---
     flat_atr = aot_bridge.calculate_atr_rma(flat_h, flat_l, flat_c, period)
     flat_atr_tail = flat_atr[period:]
@@ -334,6 +386,11 @@ def run_self_test() -> Tuple[bool, List[str]]:
         _check("AOT vs JIT: gaussian_trend_line_loop.line", _act_tl, _jit_tl, failures)
         _check("AOT vs JIT: gaussian_trend_line_loop.direction",
                _act_dir.astype(np.float64), _jit_dir.astype(np.float64), failures)
+
+        for _len in (10, 14):
+            _check(f"AOT vs JIT: momentum_oscillator_core (len={_len})",
+                   aot_bridge.momentum_oscillator_core(high, low, close, _len),
+                   jit_ref.momentum_oscillator_core(high, low, close, _len), failures)
 
         jit_dfr_dir, jit_dfr_line = jit_ref.dynamic_flow_direction_loop(hlc3, dfr_basis, dfr_dist, 3.0)
         _check("AOT vs JIT: dynamic_flow_direction_loop.direction", actual_dir, jit_dfr_dir, failures)

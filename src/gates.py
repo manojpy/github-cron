@@ -101,10 +101,11 @@ class GateResult:
     confirmation_buy: bool; confirmation_sell: bool
     cloud_group_ok_buy: bool; cloud_group_ok_sell: bool
 
-    # -- TK guard --
+    # -- Tenkan/Kijun lines (cross alerts only) + Momentum Oscillator vote --
     tk_conversion_curr: float; tk_conversion_prev: float
     tk_base_curr: float; tk_base_prev: float
-    tk_guard_ok_buy: Optional[bool]; tk_guard_ok_sell: Optional[bool]
+    momentum_osc_curr: float
+    momentum_osc_ok_buy: Optional[bool]; momentum_osc_ok_sell: Optional[bool]
 
     # -- oscillator group votes --
     oscillator_group_ok_buy: bool; oscillator_group_ok_sell: bool
@@ -258,7 +259,7 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, flo
     dynamic_flow_ok = gr.dynamic_flow_ok_buy if is_buy else gr.dynamic_flow_ok_sell
     ppo_cross_ok  = gr.ppo_gate_ok_buy if is_buy else gr.ppo_gate_ok_sell
     rsi_guard_ok  = gr.rsi_guard_ok_buy if is_buy else gr.rsi_guard_ok_sell
-    tk_guard_ok   = gr.tk_guard_ok_buy if is_buy else gr.tk_guard_ok_sell
+    momentum_osc_ok = gr.momentum_osc_ok_buy if is_buy else gr.momentum_osc_ok_sell
     oi_funding_ok = gr.oi_funding_ok_buy if is_buy else gr.oi_funding_ok_sell
     ob_gate_ok    = gr.ob_gate_ok_buy if is_buy else gr.ob_gate_ok_sell
 
@@ -303,11 +304,11 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, flo
         votes["rsi_guard"] = bool(rsi_guard_ok)
         if rsi_guard_ok: score += w
 
-    if cfg.ICHIMOKU_TK_GUARD_ENABLED and tk_guard_ok is not None:
-        w = weights["tk_guard"]
+    if cfg.MOMENTUM_OSCILLATOR_ENABLED and momentum_osc_ok is not None:
+        w = weights["momentum_osc"]
         total += w
-        votes["tk_guard"] = bool(tk_guard_ok)
-        if tk_guard_ok: score += w
+        votes["momentum_osc"] = bool(momentum_osc_ok)
+        if momentum_osc_ok: score += w
 
     ppo_gate_mom_ok = gr.ppo_gate_momentum_ok_buy if is_buy else gr.ppo_gate_momentum_ok_sell
     if cfg.ENABLE_PPO_GATE_MOMENTUM_VOTE and ppo_gate_mom_ok is not None:
@@ -578,6 +579,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         ppo_gate_signal_arr = gate_indicators["ppo_gate_signal"]
         rsi_guard_smooth_arr = gate_indicators["rsi_guard_smooth"]
         rsi_guard_ema_arr = gate_indicators["rsi_guard_ema"]
+        momentum_osc_arr = gate_indicators["momentum_osc"]
         rma_cloud_fast_arr = gate_indicators["rma_cloud_fast_15"]
         dynamic_flow_trend_arr = gate_indicators["dynamic_flow_trend_15"]
         dynamic_flow_line_arr = gate_indicators["dynamic_flow_line_15"]
@@ -609,24 +611,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         tk_conversion_prev = ichimoku_conversion_line[i15 - 1]
         tk_base_curr = ichimoku_base_line[i15]
         tk_base_prev = ichimoku_base_line[i15 - 1]
-        tk_guard_valid = not (np.isnan(tk_conversion_curr) or np.isnan(tk_base_curr))
-
-        if cfg.ICHIMOKU_TK_GUARD_ENABLED:
-            if tk_guard_valid:
-                tk_guard_ok_buy = bool((tk_conversion_curr >= tk_base_curr) and (close_curr > tk_base_curr))
-                tk_guard_ok_sell = bool((tk_conversion_curr <= tk_base_curr) and (close_curr < tk_base_curr))
-
-            else:
-                logger_pair.debug(
-                    f"[{pair_name}] TK lines not ready at i15={i15}. "
-                    f"TK guard abstains (None) this run — not counted in majority vote."
-                )
-                tk_guard_ok_buy = None
-                tk_guard_ok_sell = None
-        else:
-            tk_guard_ok_buy = None
-            tk_guard_ok_sell = None
-
         close_prev = close_15m[i15 - 1]
 
         close_prev_invalid = False
@@ -803,6 +787,16 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             rsi_guard_ok_buy = None
             rsi_guard_ok_sell = None
 
+        # Momentum Oscillator vote: buy needs vf above the zero line, sell needs vf below it.
+        # NaN (warmup / missing candles) abstains (None) and is not counted in the oscillator group.
+        momentum_osc_curr = momentum_osc_arr[i15]
+        if cfg.MOMENTUM_OSCILLATOR_ENABLED and not np.isnan(momentum_osc_curr):
+            momentum_osc_ok_buy = bool(momentum_osc_curr > 0.0)
+            momentum_osc_ok_sell = bool(momentum_osc_curr < 0.0)
+        else:
+            momentum_osc_ok_buy = None
+            momentum_osc_ok_sell = None
+
         if cfg.RMA_CLOUD_ENABLED and not np.isnan(rma_cloud_fast_curr) and not np.isnan(rma50_15_val):
             rma_cloud_ok_buy = bool(rma_cloud_fast_curr > rma50_15_val)
             rma_cloud_ok_sell = bool(rma_cloud_fast_curr < rma50_15_val)
@@ -889,7 +883,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             vwap_momentum_ok_buy = None
             vwap_momentum_ok_sell = None
 
-        oscillator_group_enabled = cfg.ENABLE_PPO_GATE or cfg.RSI_GUARD_ENABLED or cfg.ICHIMOKU_TK_GUARD_ENABLED
+        oscillator_group_enabled = cfg.ENABLE_PPO_GATE or cfg.RSI_GUARD_ENABLED or cfg.MOMENTUM_OSCILLATOR_ENABLED
 
         # ── Cloud group: Cirrus veto AND (Ichimoku OR Dynamic Flow) ──
         cloud_group_ok_buy = _cloud_group_decision(
@@ -914,7 +908,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         confirmation_buy = cloud_group_ok_buy
         confirmation_sell = cloud_group_ok_sell
 
-        active_osc_buy = [g for g in (ppo_gate_ok_buy, rsi_guard_ok_buy, tk_guard_ok_buy) if g is not None]
+        active_osc_buy = [g for g in (ppo_gate_ok_buy, rsi_guard_ok_buy, momentum_osc_ok_buy) if g is not None]
         if active_osc_buy:
             oscillator_group_ok_buy = sum(active_osc_buy) >= min(Constants.OSCILLATOR_GROUP_MIN_VOTES, len(active_osc_buy))
         elif oscillator_group_enabled:
@@ -925,7 +919,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         else:
             oscillator_group_ok_buy = True
 
-        active_osc_sell = [g for g in (ppo_gate_ok_sell, rsi_guard_ok_sell, tk_guard_ok_sell) if g is not None]
+        active_osc_sell = [g for g in (ppo_gate_ok_sell, rsi_guard_ok_sell, momentum_osc_ok_sell) if g is not None]
         if active_osc_sell:
             oscillator_group_ok_sell = sum(active_osc_sell) >= min(Constants.OSCILLATOR_GROUP_MIN_VOTES, len(active_osc_sell))
         elif oscillator_group_enabled:
@@ -1092,7 +1086,8 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             cloud_group_ok_buy=cloud_group_ok_buy, cloud_group_ok_sell=cloud_group_ok_sell,
             tk_conversion_curr=tk_conversion_curr, tk_conversion_prev=tk_conversion_prev,
             tk_base_curr=tk_base_curr, tk_base_prev=tk_base_prev,
-            tk_guard_ok_buy=tk_guard_ok_buy, tk_guard_ok_sell=tk_guard_ok_sell,
+            momentum_osc_curr=momentum_osc_curr,
+            momentum_osc_ok_buy=momentum_osc_ok_buy, momentum_osc_ok_sell=momentum_osc_ok_sell,
             oscillator_group_ok_buy=oscillator_group_ok_buy, oscillator_group_ok_sell=oscillator_group_ok_sell,
             ppo_gate_arr=ppo_gate_arr, ppo_gate_signal_arr=ppo_gate_signal_arr,
             ppo_gate_curr=ppo_gate_curr, ppo_gate_prev=ppo_gate_prev,

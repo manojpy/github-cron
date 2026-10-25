@@ -55,6 +55,8 @@ class BotConfig(BaseModel):
     RSI_GUARD_RSI_LEN: int = Field(default=89, ge=2, le=200, description="RSI Guard RSI length")
     RSI_GUARD_KALMAN_LEN: int = Field(default=9, ge=1, le=50, description="RSI Guard Kalman smoothing length")
     RSI_GUARD_EMA_LEN: int = Field(default=50, ge=1, le=200, description="RSI Guard EMA length applied to Kalman-smoothed RSI")
+    MOMENTUM_OSCILLATOR_ENABLED: bool = Field(default=True, description="Enable the AlgoAlpha Momentum Oscillator as the third oscillator-group vote (buy: vf > 0, sell: vf < 0). Replaces the removed Tenkan/Kijun guard")
+    MOMENTUM_OSCILLATOR_LENGTH: int = Field(default=10, ge=2, le=200, description="Underlying Momentum Oscillator length (Pine: Underlying Momentum Oscillator Length)")
     SRSI_RSI_LEN: int = 14
     SRSI_KALMAN_LEN: int = 9
     SRSI_EMA_LEN: int = 5
@@ -214,7 +216,6 @@ class BotConfig(BaseModel):
     GAUSSIAN_EFFICIENCY_SMOOTH: int = Field(default=5, ge=1, le=200, description="EMA length applied to the Efficiency Ratio (Pine: Efficiency Smoothing)")
     ICHIMOKU_TK_CONVERSION_PERIODS: int = Field(default=23, ge=1, le=300, description="Tenkan (conversion) length used for TK guard + cross alerts, independent of cloud conversion length")
     ICHIMOKU_TK_BASE_PERIODS: int = Field(default=65, ge=1, le=400, description="Kijun (base) length used for TK guard + cross alerts, independent of cloud base length")
-    ICHIMOKU_TK_GUARD_ENABLED: bool = Field(default=True, description="Require 15m Tenkan(conversion) vs Kijun(base) alignment: buy needs conversion>=base, sell needs conversion<=base")
     ENABLE_BIAS_HEADER: bool = Field(default=True, description="Prepend a pair-universe directional-bias header (Cirrus Cloud, or Ichimoku when BIAS_USE_CIRRUS=False; cosmetic only, does not gate alerts) to every outgoing Telegram message")
     ALERT_TAKE_MIN_CONVICTION: float = Field(default=70.0, ge=0.0, le=100.0, description="Telegram alert verdict: conviction % at or above which an alert reads TAKE")
     ALERT_WATCH_MIN_CONVICTION: float = Field(default=50.0, ge=0.0, le=100.0, description="Telegram alert verdict: conviction % at or above which an alert reads WATCH (below = AVOID)")
@@ -808,8 +809,12 @@ class BotConfig(BaseModel):
                 5 * self.GAUSSIAN_LENGTH + self.GAUSSIAN_EFFICIENCY_LENGTH
                 + 3 * self.GAUSSIAN_EFFICIENCY_SMOOTH + self.GAUSSIAN_ATR_LENGTH
                 if self.GAUSSIAN_TREND_ENABLED else 0,
-            'ICHIMOKU TK guard (TK_BASE-1)':
-                self.ICHIMOKU_TK_BASE_PERIODS - 1 if self.ICHIMOKU_TK_GUARD_ENABLED else 0,
+            'ICHIMOKU TK lines (TK_BASE-1)':
+                self.ICHIMOKU_TK_BASE_PERIODS - 1
+                if (self.ENABLE_TK_CONVERSION_CROSS or self.ENABLE_KIJUN_CROSS) else 0,
+            'MOMENTUM_OSCILLATOR (2 x LENGTH + sqrt(LENGTH))':
+                2 * self.MOMENTUM_OSCILLATOR_LENGTH + int(round(self.MOMENTUM_OSCILLATOR_LENGTH ** 0.5))
+                if self.MOMENTUM_OSCILLATOR_ENABLED else 0,
             'BIAS_ICHIMOKU cloud (SPANB+DISPLACEMENT-2)':
                 self.BIAS_ICHIMOKU_SPANB_PERIODS + self.BIAS_ICHIMOKU_DISPLACEMENT - 2
                 if (self.ENABLE_BIAS_HEADER and not self.BIAS_USE_CIRRUS) else 0,
