@@ -940,7 +940,8 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
         # Sanitize
         for key in ('rma50_15', 'rma200_5', 'adx', 'atr_short', 'atr_long',
                     'ppo_gate', 'ppo_gate_signal', 'rsi_guard_smooth',
-                    'rsi_guard_ema', 'volume_ema', 'rma_cloud_fast_15', 'vwap_gate'):
+                    'rsi_guard_ema', 'volume_ema', 'rma_cloud_fast_15', 'vwap_gate',
+                    'momentum_osc'):
             arr = results[key]
             if np.any(np.isinf(arr)):
                 results[key] = np.clip(arr, -Constants.INFINITY_CLAMP, Constants.INFINITY_CLAMP)
