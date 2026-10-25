@@ -345,6 +345,39 @@ def _disabled_hits_passing_confluence(hits: List[Tuple[str, str, str]], confluen
             kept.append(hit)
     return kept
 
+
+def build_survival_checklist(*, score: Optional[float], total: Optional[float], required: Optional[float], win_rate: Optional[float], win_sample: int, cal_wr: Optional[float], cal_reason: Optional[str], tq: Optional[Dict[str, Any]]) -> str:
+    """Compact one-line 'why this alert survived' checklist (roadmap #25).
+
+    ✓ = passed on evidence, ○ = not evaluated / fail-open, ⚠ = passed with a warning.
+    """
+    bits: List[str] = []
+    if score is not None and total:
+        need = f" (need {required:.0f})" if required is not None else ""
+        bits.append(f"✓ gates {score:.0f}/{total:.0f}{need}")
+    if win_rate is not None:
+        bits.append(f"✓ WR {win_rate:.0%} n={win_sample}")
+    else:
+        bits.append("○ WR no history")
+    if cal_reason == "ok" and cal_wr is not None:
+        bits.append(f"✓ calib {cal_wr:.0%}")
+    elif cal_reason in ("thin_bucket_fail_open", "out_of_range_fail_open", "no_curve"):
+        bits.append("○ calib thin")
+    if tq and tq.get("verdict") and tq["verdict"] != "BLOCKED":
+        p = tq.get("p_ev_positive")
+        ev = tq.get("net_ev")
+        detail = ""
+        if p is not None and ev is not None:
+            detail = f" P={p:.0%} EV={ev:+.2f}%"
+        bits.append(f"✓ brain {tq['verdict']}{detail}")
+        if tq.get("drift_warning"):
+            bits.append("⚠ drift")
+        if tq.get("regime_warning"):
+            bits.append(f"⚠ {tq['regime_warning']}")
+        if (tq.get("regime_gate") or {}).get("applied"):
+            bits.append(f"⚠ regime gate: {tq['regime_gate']['note']}")
+    return " · ".join(bits)
+
 def build_brain_filter_message(*, pair: str, alert_key: str, gate: str, lines: List[str], tq: Optional[Dict[str, Any]] = None, score: Optional[float] = None, total: Optional[float] = None) -> str:
     """MarkdownV2 'BRAIN FILTER' rejection message (roadmap #26)."""
     e = escape_markdown_v2
