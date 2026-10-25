@@ -579,16 +579,21 @@ class DataFetcher:
                             )
                 return data
             else:
-            logger.warning(f"Candles response missing fields | Symbol: {symbol}")
-            self.fetch_stats["candles"]["failed"] += 1
-            await self.circuit_breaker.record_failure(symbol.split(":")[-1])
+                # response present but missing required OHLC fields
+                logger.warning(f"Candles response missing fields | Symbol: {symbol}")
+                self.fetch_stats["candles"]["failed"] += 1
+                await self.circuit_breaker.record_failure(symbol.split(":")[-1])
+        else:
+            # data is falsy (None / False)
             self.fetch_stats["candles"]["failed"] += 1
             if data is False:
-                logger.warning(f"Candles fetch got 4xx (not counted against circuit breaker) | Symbol: {symbol}")
+                # 4xx from the transport layer — do not count against the breaker
+                logger.warning(
+                    f"Candles fetch got 4xx (not counted against circuit breaker) | Symbol: {symbol}"
+                )
             else:
-
-            logger.warning(f"Candles fetch failed | Symbol: {symbol}")
-            await self.circuit_breaker.record_failure(symbol.split(":")[-1])
+                logger.warning(f"Candles fetch failed | Symbol: {symbol}")
+                await self.circuit_breaker.record_failure(symbol.split(":")[-1])
 
         return None
 
