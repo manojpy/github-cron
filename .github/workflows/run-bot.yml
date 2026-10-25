@@ -423,7 +423,16 @@ jobs:
             echo "❌ Bot exited with code $EXIT_CODE" | tee -a logs/bot_output.log
             exit 1
           fi
+
           echo "✅ Bot completed successfully in ${DURATION}s"
+
+      # `timeout` can SIGKILL the docker CLI after its grace period, which leaves
+      # the container running and still holding the run lock / mounted data dir
+      # while the persist step below reads it. Make sure it is gone.
+      - name: 🧹 Remove leftover bot container
+        if: always()
+        run: |
+          docker rm -f "macd_bot_${{ github.run_id }}" "macd_bot_apply_${{ github.run_id }}" >/dev/null 2>&1 || true
 
       # PHASE 3: RESULTS ANALYSIS
       - name: 📊 Parse Execution Results
