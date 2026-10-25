@@ -3020,27 +3020,10 @@ class RedisStateStore:
                 f"[{pair}] Shadow outcome resolution | resolved={resolved_count}"
             )
 
-    async def get_alert_win_rate(self, pair: str, alert_key: str) -> Tuple[Optional[float], int]:
-        """Returns (win_rate, sample_size). win_rate is None until MIN_WIN_RATE_SAMPLE is reached."""
-        if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
-            return None, 0
-        stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
-        try:
-            
-            data = await asyncio.wait_for(cast("Awaitable[dict[Any, Any]]", _rc(self._redis).hgetall(stats_key)), timeout=2.0)
-            wins = int(data.get("wins", 0))
-            losses = int(data.get("losses", 0))
-            total = wins + losses
-            if total < cfg.MIN_WIN_RATE_SAMPLE:
-                return None, total
-            return wins / total, total
-        except Exception as e:
-            logger.warning(f"Failed to read win rate for {pair}:{alert_key}: {e}")
-            return None, 0
-
     async def get_alert_win_rate_session(self, pair: str, alert_key: str, session: str) -> Tuple[Optional[float], int]:
-        """Session-scoped twin of get_alert_win_rate. win_rate is None until
-        MIN_WIN_RATE_SESSION_SAMPLE is reached for this pair:alert_key:session combo."""
+    """Session-scoped win rate (see batch_get_alert_win_rates for the all-session
+    read). win_rate is None until MIN_WIN_RATE_SESSION_SAMPLE is reached for this
+    pair:alert_key:session combo."""
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not getattr(cfg, "ENABLE_SESSION_FILTER", False):
             return None, 0
         stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}:{session}"

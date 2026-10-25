@@ -355,12 +355,19 @@ class APICircuitBreaker:
         self.failures = 0
         self.last_failure_time = 0.0
         self.state = "CLOSED"
-        self.success_count = 0
-        self._lock = asyncio.Lock()          # NEW
 
-    async def record_success(self) -> None:  # NEW: async
-        async with self._lock:
-            if self.state == "HALF_OPEN":
+    self.success_count = 0
+    self._lock = asyncio.Lock()          # NEW
+    # Symbols currently failing while the breaker is CLOSED. One broken pair
+    # makes three failed requests (15m, 5m, daily); that must not open the
+    # breaker for every healthy pair.
+    self._failing_keys: set = set()
+
+async def record_success(self, key: Optional[str] = None) -> None:  # NEW: async
+    async with self._lock:
+        if key is not None:
+            self._failing_keys.discard(key)
+        if self.state == "HALF_OPEN":
                 self.success_count += 1
                 if self.success_count >= 2:
                     logger.info("💫 Circuit breaker: Recovered, transitioning to CLOSED")
@@ -371,8 +378,14 @@ class APICircuitBreaker:
                 if self.failures > 0:
                     self.failures = max(0, self.failures - 1)
 
-    async def record_failure(self) -> None:   # NEW: async
+    async def record_failure(self, key: Optional[str] = None) -> None:   # NEW: async
         async with self._lock:
+            if key is not None and self.state == "CLOSED":
+                if key in self._failing_keys:
+                    # Same symbol failing again (another resolution of the same
+                    # pair): not evidence of an API-wide outage.
+                    return
+                self._failing_keys.add(key)
             self.failures += 1
             self.last_failure_time = time.time()
 
@@ -541,9 +554,8 @@ class DataFetcher:
         if data:
             result = data.get("result", {})
             if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
-                await self.circuit_breaker.record_success()
+                await self.circuit_breaker.record_success(symbol.split(":")[-1])
                 self.fetch_stats["candles"]["success"] += 1
-
                 num_candles = len(result.get("t", []))
                 if num_candles > 0:
                     last_open = result["t"][-1]
@@ -568,16 +580,16 @@ class DataFetcher:
                             )
                 return data
             else:
-                logger.warning(f"Candles response missing fields | Symbol: {symbol}")
-                self.fetch_stats["candles"]["failed"] += 1
-                await self.circuit_breaker.record_failure()
-        else:
+            logger.warning(f"Candles response missing fields | Symbol: {symbol}")
+            self.fetch_stats["candles"]["failed"] += 1
+            await self.circuit_breaker.record_failure(symbol.split(":")[-1])
             self.fetch_stats["candles"]["failed"] += 1
             if data is False:
                 logger.warning(f"Candles fetch got 4xx (not counted against circuit breaker) | Symbol: {symbol}")
             else:
-                logger.warning(f"Candles fetch failed | Symbol: {symbol}")
-                await self.circuit_breaker.record_failure()
+
+            logger.warning(f"Candles fetch failed | Symbol: {symbol}")
+            await self.circuit_breaker.record_failure(symbol.split(":")[-1])
 
         return None
 
@@ -628,9 +640,9 @@ class DataFetcher:
         out: Dict[str, Dict[str, Optional[float]]] = {}
         if not data:
             logger.warning("Tickers fetch failed -- OI/funding filter running fail-open this run")
-            self.fetch_stats["tickers"]["failed"] += 1
-            await self.circuit_breaker.record_failure()
-            return out
+        self.fetch_stats["tickers"]["failed"] += 1
+        await self.circuit_breaker.record_failure("__tickers__")
+        return out
 
         for row in (data.get("result") or []):
             if not isinstance(row, dict):
@@ -668,8 +680,9 @@ class DataFetcher:
                 continue
 
         if out:
-            await self.circuit_breaker.record_success()
-            self.fetch_stats["tickers"]["success"] += 1
+        await self.circuit_breaker.record_success("__tickers__")
+        self.fetch_stats["tickers"]["success"] += 1
+
         else:
             logger.warning("Tickers response parsed but no OI/funding fields found -- check Delta API field names")
             self.fetch_stats["tickers"]["failed"] += 1
