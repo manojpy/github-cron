@@ -603,23 +603,13 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             cloud_lower_val = cloud_lower_arr[i5]
             cloud_upper_prev = cloud_upper_arr[i5 - 1]
             cloud_lower_prev = cloud_lower_arr[i5 - 1]
-            # 15m alignment (must be green/red for buy/sell)
-            cloud_upper_15 = ichimoku_cloud_upper[i15]
-            cloud_lower_15 = ichimoku_cloud_lower[i15]
-            # For buy: price should be above cloud on 15m or cloud itself green-ish; we use close vs cloud
-            _cloud_15m_ok_buy = (not np.isnan(cloud_upper_15) and close_curr > cloud_upper_15)
-            _cloud_15m_ok_sell = (not np.isnan(cloud_lower_15) and close_curr < cloud_lower_15)
         else:
             cloud_upper_val = ichimoku_cloud_upper[i15]
             cloud_lower_val = ichimoku_cloud_lower[i15]
             cloud_upper_prev = ichimoku_cloud_upper[i15 - 1]
             cloud_lower_prev = ichimoku_cloud_lower[i15 - 1]
-            _cloud_15m_ok_buy = True
-            _cloud_15m_ok_sell = True
 
-        # Gaussian Filter Trend: the trend-cloud verdict (cloud_up / cloud_down) now comes
-        # from the Gaussian trend direction (1 = bullish, -1 = bearish). Warmup / neutral
-        # (direction 0) abstains (None) and is not counted in the cloud-group vote.
+        # Gaussian Filter Trend (unchanged)
         if cfg.GAUSSIAN_TREND_ENABLED and bool(gaussian_valid_arr[i15]):
             cloud_up = bool(gaussian_dir_arr[i15] == 1)
             cloud_down = bool(gaussian_dir_arr[i15] == -1)
@@ -638,11 +628,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             tk_conversion_prev = tk_conv_arr[i5 - 1]
             tk_base_curr = tk_base_arr[i5]
             tk_base_prev = tk_base_arr[i5 - 1]
-            # 15m alignment for TK / Kijun
-            _tk_15m_ok_buy = (not np.isnan(ichimoku_conversion_line[i15]) and close_curr > ichimoku_conversion_line[i15])
-            _tk_15m_ok_sell = (not np.isnan(ichimoku_conversion_line[i15]) and close_curr < ichimoku_conversion_line[i15])
-            _kijun_15m_ok_buy = (not np.isnan(ichimoku_base_line[i15]) and close_curr > ichimoku_base_line[i15])
-            _kijun_15m_ok_sell = (not np.isnan(ichimoku_base_line[i15]) and close_curr < ichimoku_base_line[i15])
             close_prev_for_cross = data_5m.close[i5 - 1]
             close_curr_for_cross = data_5m.close[i5]
         else:
@@ -650,10 +635,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             tk_conversion_prev = ichimoku_conversion_line[i15 - 1]
             tk_base_curr = ichimoku_base_line[i15]
             tk_base_prev = ichimoku_base_line[i15 - 1]
-            _tk_15m_ok_buy = True
-            _tk_15m_ok_sell = True
-            _kijun_15m_ok_buy = True
-            _kijun_15m_ok_sell = True
             close_prev_for_cross = close_15m[i15 - 1]
             close_curr_for_cross = close_curr
 
