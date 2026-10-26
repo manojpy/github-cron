@@ -80,8 +80,8 @@ class GateResult:
     open_curr: float; high_curr: float; low_curr: float; close_curr: float
     close_prev: float
     close_5m_val: float
-    close_prev_cross: float = 0.0  # close used for cross alerts (5m or 15m per CROSS_ALERT_TF)
-    close_curr_cross: float = 0.0
+    close_prev_cross: float          # close used for cross alerts (5m or 15m per CROSS_ALERT_TF)
+    close_curr_cross: float
     is_green: bool; is_red: bool
     is_valid_for_buy: bool; is_valid_for_sell: bool
     candle_index: int
