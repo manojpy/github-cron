@@ -3894,7 +3894,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         # as processed so this exact candle is not re-evaluated.
                         await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
                         logger_pair.info(
-                            f"����🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
+                            f"🔔🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
                             f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                         )
                     elif confirmation_blocked:

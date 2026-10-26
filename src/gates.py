@@ -894,7 +894,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
                         and close_curr < dynamic_flow_line_curr
                     )
 
-        # ─�� Momentum Oscillator zero-line cross (same structure as the Dynamic Flow cross) ──
+        #Momentum Oscillator zero-line cross (same structure as the Dynamic Flow cross) ──
         momentum_cross_up = False
         momentum_cross_down = False
 
