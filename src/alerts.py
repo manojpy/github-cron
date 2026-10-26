@@ -757,6 +757,8 @@ _ALERT_DEFINITIONS_RAW: List[Dict[str, Any]] = [
     {"key":"tl_retest_sell","title":"🔴🔁 Trendline Retest SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("tl_retest_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{(ctx.get('tl_reasons') or {}).get('tl_retest_sell') or 'Trendline retest'}","requires":["trendline","tl_retest"]},
     {"key":"dynamic_flow_cross_buy","title":"🌊🟢 Dynamic Flow Cross BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("dynamic_flow_cross_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('dynamic_flow_cross_reason') or 'Dynamic Flow Ribbon flipped bullish'}","requires":["dynamic_flow_cross"]},
     {"key":"dynamic_flow_cross_sell","title":"🌊🔴 Dynamic Flow Cross SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("dynamic_flow_cross_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('dynamic_flow_cross_reason') or 'Dynamic Flow Ribbon flipped bearish'}","requires":["dynamic_flow_cross"]},
+    {"key":"momentum_cross_buy","title":"🚀🟢 Momentum Cross BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("momentum_cross_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('momentum_cross_reason') or 'Momentum Oscillator crossed above 0'}","requires":["momentum_cross"]},
+    {"key":"momentum_cross_sell","title":"🚀🔴 Momentum Cross SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("momentum_cross_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('momentum_cross_reason') or 'Momentum Oscillator crossed below 0'}","requires":["momentum_cross"]},
     {"key":"equilibrium_cross_up","title":"⚖️🟢 Equilibrium Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_wick",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Equilibrium {ctx.get('equilibrium_curr',0) or 0:.2f} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"equilibrium_cross_down","title":"⚖️🔴 Equilibrium Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_wick",False) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Equilibrium {ctx.get('equilibrium_curr',0) or 0:.2f} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
 ]
@@ -916,6 +918,12 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
 
     # ── Dynamic Flow Ribbon crossover ──
     for k, ok_key in ((AlertKey.DYNAMIC_FLOW_CROSS_BUY, "dynamic_flow_cross_buy"), (AlertKey.DYNAMIC_FLOW_CROSS_SELL, "dynamic_flow_cross_sell")):
+        rk = ALERT_KEYS.get(k)
+        if rk and conditional_states.get(rk, False) and not context.get(ok_key):
+            resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
+
+    # ── Momentum Oscillator zero-line crossover ──
+    for k, ok_key in ((AlertKey.MOMENTUM_CROSS_BUY, "momentum_cross_buy"), (AlertKey.MOMENTUM_CROSS_SELL, "momentum_cross_sell")):
         rk = ALERT_KEYS.get(k)
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
@@ -1739,6 +1747,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
     choch_fvg_buy, choch_fvg_sell = gr.choch_fvg_buy, gr.choch_fvg_sell
     choch_poi_tap_buy, choch_poi_tap_sell = gr.choch_poi_tap_buy, gr.choch_poi_tap_sell
     dynamic_flow_cross_up, dynamic_flow_cross_down = gr.dynamic_flow_cross_up, gr.dynamic_flow_cross_down
+    momentum_cross_up, momentum_cross_down = gr.momentum_cross_up, gr.momentum_cross_down
 
     try:
         alert_indicators = await asyncio.to_thread(
@@ -1902,6 +1911,17 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             elif dynamic_flow_cross_sell:
                 dynamic_flow_cross_reason = "Price lost Dynamic Flow line (bearish)"
 
+        momentum_cross_buy, momentum_cross_sell = False, False
+        momentum_cross_reason = None
+        if cfg.ENABLE_MOMENTUM_CROSS_ALERT:
+            momentum_cross_buy = bool(buy_common_relaxed_wick and momentum_cross_up)
+            momentum_cross_sell = bool(sell_common_relaxed_wick and momentum_cross_down)
+
+            if momentum_cross_buy:
+                momentum_cross_reason = f"Momentum Oscillator crossed above 0 ({cfg.MOMENTUM_CROSS_TF})"
+            elif momentum_cross_sell:
+                momentum_cross_reason = f"Momentum Oscillator crossed below 0 ({cfg.MOMENTUM_CROSS_TF})"
+
         fib_reversal_buy, fib_reversal_sell = False, False
         fib_reversal_reason = None
         fib_reversal_votes_buy = fib_reversal_votes_sell = None
@@ -2023,6 +2043,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "tl_reasons": gr.tl_reasons or {},
             "dynamic_flow_cross_buy": dynamic_flow_cross_buy, "dynamic_flow_cross_sell": dynamic_flow_cross_sell,
             "dynamic_flow_cross_reason": dynamic_flow_cross_reason,
+            "momentum_cross_buy": momentum_cross_buy, "momentum_cross_sell": momentum_cross_sell,
+            "momentum_cross_reason": momentum_cross_reason,
         }
         context["pullback_state_buy"] = context["pullback_state_sell"] = "none"
         context["pullback_info_buy"] = context["pullback_info_sell"] = {}
@@ -2159,8 +2181,10 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
 
                 choch_exception = (alert_key == "choch_buy" and choch_reversal_bullish)
                 dynamic_flow_cross_exception = (alert_key == "dynamic_flow_cross_buy" and dynamic_flow_cross_buy)
+                momentum_cross_exception = (alert_key == "momentum_cross_buy" and momentum_cross_buy)
                 fib_reversal_exception = (alert_key == "fib_reversal_buy" and fib_reversal_buy)
-                if not (is_valid_for_buy or reversal_bullish or choch_exception or dynamic_flow_cross_exception or fib_reversal_exception):
+                if not (is_valid_for_buy or reversal_bullish or choch_exception or dynamic_flow_cross_exception or momentum_cross_exception or fib_reversal_exception):
+
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: not valid for buy (wick/body fail, no reversal pattern)")
                     continue
@@ -2175,8 +2199,9 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
 
                 choch_exception = (alert_key == "choch_sell" and choch_reversal_bearish)
                 dynamic_flow_cross_exception = (alert_key == "dynamic_flow_cross_sell" and dynamic_flow_cross_sell)
+                momentum_cross_exception = (alert_key == "momentum_cross_sell" and momentum_cross_sell)
                 fib_reversal_exception = (alert_key == "fib_reversal_sell" and fib_reversal_sell)
-                if not (is_valid_for_sell or reversal_bearish or choch_exception or dynamic_flow_cross_exception or fib_reversal_exception):
+                if not (is_valid_for_sell or reversal_bearish or choch_exception or dynamic_flow_cross_exception or momentum_cross_exception or fib_reversal_exception):
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: not valid for sell (wick/body fail, no reversal pattern)")
                     continue
@@ -3869,7 +3894,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         # as processed so this exact candle is not re-evaluated.
                         await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
                         logger_pair.info(
-                            f"🔔🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
+                            f"����🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
                             f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                         )
                     elif confirmation_blocked:

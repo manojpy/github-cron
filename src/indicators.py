@@ -955,6 +955,15 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['dynamic_flow_trend_5m'] = np.full(n_5m, np.nan, dtype=np.float64)
             results['dynamic_flow_line_5m'] = np.full(n_5m, np.nan, dtype=np.float64)
 
+        # ── 5m Momentum Oscillator (only for the Momentum cross alert on 5m) ──
+        if (cfg.ENABLE_MOMENTUM_CROSS_ALERT and cfg.MOMENTUM_OSCILLATOR_ENABLED
+                and cfg.MOMENTUM_CROSS_TF == "5m"):
+            results['momentum_osc_5m'] = calculate_momentum_oscillator_numpy(
+                data_5m["high"], data_5m["low"], close_5m, cfg.MOMENTUM_OSCILLATOR_LENGTH
+            )
+        else:
+            results['momentum_osc_5m'] = np.full(n_5m, np.nan, dtype=np.float64)
+
         if cfg.ENABLE_VWAP:
             results['vwap_gate'] = calculate_vwap_numpy(
                 data_15m["high"], data_15m["low"], close_15m,

@@ -189,7 +189,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     reversal_eligible = (
         (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT
          or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT
-         or cfg.ENABLE_TRENDLINE_ALERTS)
+         or cfg.ENABLE_MOMENTUM_CROSS_ALERT or cfg.ENABLE_TRENDLINE_ALERTS)
         and (gr.buy_trend_common_relaxed or gr.sell_trend_common_relaxed)
     )
     gate_passed = gr.buy_common or gr.sell_common or reversal_eligible

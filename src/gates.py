@@ -207,6 +207,8 @@ class GateResult:
     dynamic_flow_ok_sell: Optional[bool] = None
     dynamic_flow_cross_up: bool = False
     dynamic_flow_cross_down: bool = False 
+    momentum_cross_up: bool = False
+    momentum_cross_down: bool = False
 
 def _cloud_group_decision(cirrus_ok: Optional[bool], gaussian_ok: Optional[bool],
                           flow_ok: Optional[bool], rma_ok: Optional[bool]) -> bool:
@@ -892,7 +894,33 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
                         and close_curr < dynamic_flow_line_curr
                     )
 
+        # ─�� Momentum Oscillator zero-line cross (same structure as the Dynamic Flow cross) ──
+        momentum_cross_up = False
+        momentum_cross_down = False
+
+        if cfg.ENABLE_MOMENTUM_CROSS_ALERT and cfg.MOMENTUM_OSCILLATOR_ENABLED:
+            if cfg.MOMENTUM_CROSS_TF == "5m" and i5 >= 1:
+                mom_5m = gate_indicators["momentum_osc_5m"]
+                mom_c5 = mom_5m[i5]
+                mom_p5 = mom_5m[i5 - 1]
+                if (not np.isnan(mom_c5) and not np.isnan(mom_p5)
+                        and not np.isnan(momentum_osc_curr)):
+                    # 15m oscillator must be on the same side of 0 as the 5m cross
+                    momentum_cross_up = bool(
+                        mom_p5 < 0.0 and mom_c5 > 0.0 and momentum_osc_curr > 0.0
+                    )
+                    momentum_cross_down = bool(
+                        mom_p5 > 0.0 and mom_c5 < 0.0 and momentum_osc_curr < 0.0
+                    )
+            elif i15 >= 1:
+                mom_c15 = momentum_osc_curr
+                mom_p15 = momentum_osc_arr[i15 - 1]
+                if not np.isnan(mom_c15) and not np.isnan(mom_p15):
+                    momentum_cross_up = bool(mom_p15 < 0.0 and mom_c15 > 0.0)
+                    momentum_cross_down = bool(mom_p15 > 0.0 and mom_c15 < 0.0)
+
         ppo_gate_prev_val = ppo_gate_arr[i15 - 1] if i15 >= 1 else ppo_gate_curr
+
         if (cfg.ENABLE_PPO_GATE_MOMENTUM_VOTE
                 and not np.isnan(ppo_gate_curr) and not np.isnan(ppo_gate_prev_val)):
             ppo_gate_momentum_ok_buy = bool(ppo_gate_curr > ppo_gate_prev_val)
@@ -1010,7 +1038,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         reversal_candidate = (
             (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT
              or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT
-             or cfg.ENABLE_TRENDLINE_ALERTS)
+             or cfg.ENABLE_MOMENTUM_CROSS_ALERT or cfg.ENABLE_TRENDLINE_ALERTS)
             and (buy_trend_common_relaxed or sell_trend_common_relaxed)
         )
         if not buy_common and not sell_common and not reversal_candidate:
@@ -1179,6 +1207,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             atr_short_arr=atr_short_arr,
             tl_events=tl_events, tl_reasons=tl_reasons,
             dynamic_flow_cross_up=dynamic_flow_cross_up, dynamic_flow_cross_down=dynamic_flow_cross_down,
+            momentum_cross_up=momentum_cross_up, momentum_cross_down=momentum_cross_down,
             ppo_gate_momentum_ok_buy=ppo_gate_momentum_ok_buy,
             ppo_gate_momentum_ok_sell=ppo_gate_momentum_ok_sell,
             rsi_guard_momentum_ok_buy=rsi_guard_momentum_ok_buy,
