@@ -698,7 +698,7 @@ class BotConfig(BaseModel):
             if self.CONFLUENCE_MIN_ABS_SCORE > max_achievable:
                 raise ValueError(
                     f'CONFLUENCE_MIN_ABS_SCORE ({self.CONFLUENCE_MIN_ABS_SCORE}) exceeds the max '
-                    f'achievable weighted total ({max_achievable}) �� every alert would be blocked forever'
+                    f'achievable weighted total ({max_achievable}) — every alert would be blocked forever'
                 )
         return self
 
