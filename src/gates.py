@@ -209,47 +209,35 @@ class GateResult:
     dynamic_flow_cross_down: bool = False 
     momentum_cross_up: bool = False
     momentum_cross_down: bool = False
+    gaussian_cross_up: bool = False
+    gaussian_cross_down: bool = False
+    rma_cloud_slow_curr: float = float("nan")
+
 
 def _cloud_group_decision(cirrus_ok: Optional[bool], gaussian_ok: Optional[bool],
                           flow_ok: Optional[bool], rma_ok: Optional[bool]) -> bool:
-    """Cloud-group verdict for one direction.
+    """Cloud-group verdict for one direction: N-of-M vote.
 
-    CIRRUS_CLOUD_ENABLED (default): Cirrus Cloud has VETO power.
-        cloud_group_ok = cirrus_ok  AND  (gaussian_ok OR dynamic_flow_ok)
-      * Cirrus must be exactly True (Trend Up for buy / Trend Down for sell);
-        None (warmup / NaN) fails closed.
-      * Of the two supporting clouds only the ENABLED ones count; one True is
-        enough. If both are enabled but both abstain (None) or both disagree -> False.
-      * If neither supporting cloud is enabled, Cirrus alone decides.
-      * The RMA cloud takes no part.
-    CIRRUS_CLOUD_ENABLED=False: legacy strict majority of the enabled
-    Gaussian Trend / RMA / Dynamic Flow votes.
+    The four clouds are
+        RMA cloud (5m), Cirrus Cloud (5m), Dynamic Flow (15m), Gaussian Trend (15m).
+    Only the ENABLED ones take part. The group passes when at least
+    min(Constants.CLOUD_GROUP_MIN_VOTES, number of enabled clouds) of them are
+    exactly True. None (warmup / NaN / abstain) counts as NOT agreeing, so a cloud
+    that is not ready can never help a trade through. No cloud enabled -> pass.
     """
-    if cfg.CIRRUS_CLOUD_ENABLED:
-        if cirrus_ok is not True:
-            return False
-        support = []
-        if cfg.GAUSSIAN_TREND_ENABLED:
-            support.append(gaussian_ok)
-        if cfg.DYNAMIC_FLOW_RIBBON_ENABLED:
-            support.append(flow_ok)
-        if not support:
-            return True
-        return any(v is True for v in support)
-
-    votes = []
-
-    if cfg.GAUSSIAN_TREND_ENABLED:
-        votes.append(gaussian_ok)
+    enabled = []
     if cfg.RMA_CLOUD_ENABLED:
-        votes.append(rma_ok)
+        enabled.append(rma_ok)
+    if cfg.CIRRUS_CLOUD_ENABLED:
+        enabled.append(cirrus_ok)
     if cfg.DYNAMIC_FLOW_RIBBON_ENABLED:
-        votes.append(flow_ok)
-    active = [v for v in votes if v is not None]
-    if active:
-        return sum(1 for v in active if v) > (len(active) / 2.0)
-
-    return not (cfg.RMA_CLOUD_ENABLED or cfg.GAUSSIAN_TREND_ENABLED or cfg.DYNAMIC_FLOW_RIBBON_ENABLED)
+        enabled.append(flow_ok)
+    if cfg.GAUSSIAN_TREND_ENABLED:
+        enabled.append(gaussian_ok)
+    if not enabled:
+        return True
+    need = min(Constants.CLOUD_GROUP_MIN_VOTES, len(enabled))
+    return sum(1 for v in enabled if v is True) >= need
 
 def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, float, Dict[str, bool]]:
     weights = CONFLUENCE_WEIGHTS 
@@ -825,13 +813,19 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             momentum_osc_ok_buy = None
             momentum_osc_ok_sell = None
 
-        if cfg.RMA_CLOUD_ENABLED and not np.isnan(rma_cloud_fast_curr) and not np.isnan(rma50_15_val):
-            rma_cloud_ok_buy = bool(rma_cloud_fast_curr > rma50_15_val)
-            rma_cloud_ok_sell = bool(rma_cloud_fast_curr < rma50_15_val)
+        # RMA Cloud (5m): RMA fast vs RMA slow on 5m closes, read at the matched 5m bar.
+        rma_cloud_fast_5m_val = float("nan")
+        rma_cloud_slow_5m_val = float("nan")
+        if cfg.RMA_CLOUD_ENABLED:
+            rma_cloud_fast_5m_val = float(gate_indicators["rma_cloud_fast_5m"][i5])
+            rma_cloud_slow_5m_val = float(gate_indicators["rma_cloud_slow_5m"][i5])
+        if cfg.RMA_CLOUD_ENABLED and not np.isnan(rma_cloud_fast_5m_val) and not np.isnan(rma_cloud_slow_5m_val):
+            rma_cloud_ok_buy = bool(rma_cloud_fast_5m_val > rma_cloud_slow_5m_val)
+            rma_cloud_ok_sell = bool(rma_cloud_fast_5m_val < rma_cloud_slow_5m_val)
         else:
             rma_cloud_ok_buy = None
             rma_cloud_ok_sell = None
-      
+
         dynamic_flow_curr = dynamic_flow_trend_arr[i15]
         if cfg.DYNAMIC_FLOW_RIBBON_ENABLED and not np.isnan(dynamic_flow_curr):
             dynamic_flow_ok_buy = bool(np.isclose(dynamic_flow_curr, -1.0, atol=1e-9))
@@ -840,11 +834,11 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             dynamic_flow_ok_buy = None
             dynamic_flow_ok_sell = None
 
-        # Cirrus Cloud veto vote. None = disabled or not yet valid (warmup/NaN);
-        # _cloud_group_decision treats None as a FAIL for the veto.
-        if cfg.CIRRUS_CLOUD_ENABLED and bool(gate_indicators["cirrus_valid_15"][i15]):
-            cirrus_ok_buy = bool(gate_indicators["cirrus_trend_up_15"][i15])
-            cirrus_ok_sell = bool(gate_indicators["cirrus_trend_dn_15"][i15])
+        # Cirrus Cloud (5m) vote. None = disabled or not yet valid (warmup/NaN);
+        # _cloud_group_decision treats None as "does not agree".
+        if cfg.CIRRUS_CLOUD_ENABLED and bool(gate_indicators["cirrus_valid_5m"][i5]):
+            cirrus_ok_buy = bool(gate_indicators["cirrus_trend_up_5m"][i5])
+            cirrus_ok_sell = bool(gate_indicators["cirrus_trend_dn_5m"][i5])
         else:
             cirrus_ok_buy = None
             cirrus_ok_sell = None
@@ -894,6 +888,50 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
                         and close_curr < dynamic_flow_line_curr
                     )
 
+        # ── Gaussian Filter Trend line cross (same structure as the Dynamic Flow cross) ──
+        gaussian_cross_up = False
+        gaussian_cross_down = False
+
+        if cfg.ENABLE_GAUSSIAN_CROSS_ALERT and cfg.GAUSSIAN_TREND_ENABLED:
+            if cfg.GAUSSIAN_CROSS_TF == "5m" and i5 >= 1:
+                g_dir_5m = gate_indicators["gaussian_trend_dir_5m"]
+                g_valid_5m = gate_indicators["gaussian_valid_5m"]
+                g_line_5m = gate_indicators["gaussian_line_5m"]
+                g_line_c = g_line_5m[i5]
+                g_line_p = g_line_5m[i5 - 1]
+                g_c_prev_5 = data_5m.close[i5 - 1]
+                g_c_curr_5 = data_5m.close[i5]
+                if (bool(g_valid_5m[i5]) and not np.isnan(g_line_c)
+                        and not np.isnan(g_line_p) and not np.isnan(g_c_prev_5)):
+                    # 15m Gaussian trend must be aligned (cloud_up / cloud_down) for the cross
+                    gaussian_cross_up = bool(
+                        g_dir_5m[i5] == 1
+                        and g_c_prev_5 < g_line_p
+                        and g_c_curr_5 > g_line_c
+                        and cloud_up is True
+                    )
+                    gaussian_cross_down = bool(
+                        g_dir_5m[i5] == -1
+                        and g_c_prev_5 > g_line_p
+                        and g_c_curr_5 < g_line_c
+                        and cloud_down is True
+                    )
+            elif i15 >= 1:
+                g_line_15 = gate_indicators["gaussian_line_15"]
+                g_line_curr = g_line_15[i15]
+                g_line_prev = g_line_15[i15 - 1]
+                if (bool(gaussian_valid_arr[i15]) and not np.isnan(g_line_curr)
+                        and not np.isnan(g_line_prev) and not np.isnan(close_prev)):
+                    gaussian_cross_up = bool(
+                        gaussian_dir_arr[i15] == 1
+                        and close_prev < g_line_prev
+                        and close_curr > g_line_curr
+                    )
+                    gaussian_cross_down = bool(
+                        gaussian_dir_arr[i15] == -1
+                        and close_prev > g_line_prev
+                        and close_curr < g_line_curr
+                    )
         #Momentum Oscillator zero-line cross (same structure as the Dynamic Flow cross) ──
         momentum_cross_up = False
         momentum_cross_down = False
@@ -965,7 +1003,8 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
 
         oscillator_group_enabled = cfg.ENABLE_PPO_GATE or cfg.RSI_GUARD_ENABLED or cfg.MOMENTUM_OSCILLATOR_ENABLED
 
-        # ── Cloud group: Cirrus veto AND (Ichimoku OR Dynamic Flow) ──
+
+        # ── Cloud group: any CLOUD_GROUP_MIN_VOTES of (RMA 5m, Cirrus 5m, Dynamic Flow 15m, Gaussian 15m) ──
         cloud_group_ok_buy = _cloud_group_decision(
             cirrus_ok_buy, gaussian_gate_ok_buy, dynamic_flow_ok_buy, rma_cloud_ok_buy
         )
@@ -1038,7 +1077,8 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         reversal_candidate = (
             (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT
              or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT
-             or cfg.ENABLE_MOMENTUM_CROSS_ALERT or cfg.ENABLE_TRENDLINE_ALERTS)
+             or cfg.ENABLE_MOMENTUM_CROSS_ALERT or cfg.ENABLE_GAUSSIAN_CROSS_ALERT
+             or cfg.ENABLE_TRENDLINE_ALERTS)
             and (buy_trend_common_relaxed or sell_trend_common_relaxed)
         )
         if not buy_common and not sell_common and not reversal_candidate:
@@ -1176,7 +1216,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             ppo_gate_ok_buy=ppo_gate_ok_buy, ppo_gate_ok_sell=ppo_gate_ok_sell,
             rsi_guard_smooth_curr=rsi_guard_smooth_curr, rsi_guard_ema_curr=rsi_guard_ema_curr,
             rsi_guard_ok_buy=rsi_guard_ok_buy, rsi_guard_ok_sell=rsi_guard_ok_sell,
-            rma_cloud_fast_curr=rma_cloud_fast_curr,
+            rma_cloud_fast_curr=rma_cloud_fast_5m_val, rma_cloud_slow_curr=rma_cloud_slow_5m_val,
             rma_cloud_ok_buy=rma_cloud_ok_buy, rma_cloud_ok_sell=rma_cloud_ok_sell,
             dynamic_flow_ok_buy=dynamic_flow_ok_buy, dynamic_flow_ok_sell=dynamic_flow_ok_sell,
             cirrus_ok_buy=cirrus_ok_buy, cirrus_ok_sell=cirrus_ok_sell,
@@ -1208,6 +1248,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             tl_events=tl_events, tl_reasons=tl_reasons,
             dynamic_flow_cross_up=dynamic_flow_cross_up, dynamic_flow_cross_down=dynamic_flow_cross_down,
             momentum_cross_up=momentum_cross_up, momentum_cross_down=momentum_cross_down,
+            gaussian_cross_up=gaussian_cross_up, gaussian_cross_down=gaussian_cross_down,
             ppo_gate_momentum_ok_buy=ppo_gate_momentum_ok_buy,
             ppo_gate_momentum_ok_sell=ppo_gate_momentum_ok_sell,
             rsi_guard_momentum_ok_buy=rsi_guard_momentum_ok_buy,

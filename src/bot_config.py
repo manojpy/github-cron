@@ -264,9 +264,9 @@ class BotConfig(BaseModel):
     BIAS_ICHIMOKU_BASE_PERIODS: int = Field(default=65, ge=1, le=400, description="Base (Kijun) length for the bias-header cloud")
     BIAS_ICHIMOKU_SPANB_PERIODS: int = Field(default=130, ge=1, le=500, description="Leading Span B length for the bias-header cloud")
     BIAS_ICHIMOKU_DISPLACEMENT: int = Field(default=65, ge=1, le=400, description="Forward displacement for the bias-header cloud")
-    RMA_CLOUD_ENABLED: bool = Field(default=True, description="Enable RMA(fast)/RMA(50) 15m cloud as trend gate; green (buy) when RMA_fast>RMA50, red (sell) when RMA_fast<RMA50. Reuses the existing RMA50(15m)/RMA_50_PERIOD used for base trend.")
-    RMA_CLOUD_FAST_PERIOD: int = Field(default=20, ge=2, le=200, description="RMA Cloud fast period (15m). Slow leg reuses RMA_50_PERIOD.")
-    CIRRUS_CLOUD_ENABLED: bool = Field(default=True, description="Cirrus Cloud (Pine port) as the VETO of the cloud group: buy needs Trend Up, sell needs Trend Down, AND at least one of Ichimoku cloud / Dynamic Flow Ribbon agreeing. When True the RMA-cloud vote is no longer part of the cloud group")
+    RMA_CLOUD_ENABLED: bool = Field(default=True, description="Enable the 5m RMA(fast)/RMA(slow) cloud as one of the cloud-group votes; green (buy) when RMA_fast>RMA_slow, red (sell) when RMA_fast<RMA_slow, both computed on 5m closes (fast = RMA_CLOUD_FAST_PERIOD, slow = RMA_50_PERIOD). Independent of the 15m RMA50 used for base trend.")
+    RMA_CLOUD_FAST_PERIOD: int = Field(default=20, ge=2, le=200, description="RMA Cloud fast period (5m). Slow leg reuses RMA_50_PERIOD (also on 5m).")
+    CIRRUS_CLOUD_ENABLED: bool = Field(default=True, description="Cirrus Cloud (Pine port), calculated on 5m closes, as one of the cloud-group votes: buy needs Trend Up, sell needs Trend Down. The cloud group passes when at least CLOUD_GROUP_MIN_VOTES of the enabled clouds (RMA 5m, Cirrus 5m, Dynamic Flow 15m, Gaussian 15m) agree")
     CIRRUS_X1: int = Field(default=22, ge=1, le=200, description="Cirrus Cloud slow range EMA length (Pine x1)")
     CIRRUS_X2: float = Field(default=9.0, gt=0.0, le=100.0, description="Cirrus Cloud slow range multiplier (Pine x2)")
     CIRRUS_X3: int = Field(default=15, ge=1, le=200, description="Cirrus Cloud fast range EMA length (Pine x3)")
@@ -282,6 +282,8 @@ class BotConfig(BaseModel):
     ENABLE_KIJUN_CROSS: bool = Field(default=True, description="Enable alert when close crosses above/below the Ichimoku base (Kijun) line, subject to all other buy/sell common conditions. Timeframe controlled by CROSS_ALERT_TF.")
     ENABLE_MOMENTUM_CROSS_ALERT: bool = Field(default=False, description="Add Momentum Oscillator zero-line crossover/cross-under alert: fires on the candle where the Momentum Oscillator (vf) crosses above/below 0, gated exactly like the Dynamic Flow cross (buy_trend_common_relaxed/sell_trend_common_relaxed plus a wick-ratio-or-reversal-pattern condition). When MOMENTUM_CROSS_TF is '5m' the 15m oscillator must also be on the same side of 0. Requires MOMENTUM_OSCILLATOR_ENABLED.")
     MOMENTUM_CROSS_TF: str = Field(default="5m", pattern="^(5m|15m)$", description="Timeframe for the Momentum cross alert: '5m' (cross detected on 5m data and additionally requires the 15m oscillator to be on the favourable side of 0) or '15m' (cross detected on 15m data).")
+    ENABLE_GAUSSIAN_CROSS_ALERT: bool = Field(default=False, description="Add Gaussian Filter Trend line crossover/cross-under alert: fires on the candle where price crosses the Gaussian trend line while the Gaussian direction is aligned, gated exactly like the Dynamic Flow cross (buy_trend_common_relaxed/sell_trend_common_relaxed plus a wick-ratio-or-reversal-pattern condition). Requires GAUSSIAN_TREND_ENABLED. Timeframe controlled by GAUSSIAN_CROSS_TF.")
+    GAUSSIAN_CROSS_TF: str = Field(default="5m", pattern="^(5m|15m)$", description="Timeframe for the Gaussian cross alert: '5m' (cross detected on a 5m Gaussian line and additionally requires the 15m Gaussian trend to be in the favourable direction) or '15m' (cross detected on the 15m Gaussian line).")
     CROSS_ALERT_TF: str = Field(default="5m", description="Timeframe for cloud_cross / tk_conversion / kijun_cross / dynamic_flow_cross detection: '5m' (default) or '15m'. When '5m', the cross is detected on 5m data and additionally requires the corresponding 15m indicator to be in the favorable direction (e.g. 15m Dynamic Flow green for a buy cross). All other common conditions remain on their existing timeframes (mostly 15m + RMA200 on 5m).")
     ENABLE_STRONG_REVERSAL_ALERT: bool = Field(default=True, description="Enable candlestick reversal-pattern alert (Engulfing/Piercing/Star/Soldiers-Crows/Tweezer/Harami/Marubozu/Pinbar) on top of full buy_common/sell_common confluence")
     ENABLE_EQUILIBRIUM_CROSS: bool = Field(default=False, description="Add 15m SMC Equilibrium cross alert: fires when close crosses the 50% midpoint (equilibrium) of the OB_LOOKBACK_CANDLES dealing range — same premium/discount equilibrium used by ENABLE_OB_PREMIUM_DISCOUNT_FILTER — gated by buy_trend_common_relaxed/sell_trend_common_relaxed plus a wick-ratio-or-reversal-pattern condition and the PPO/RSI signal-cross guard, same relaxed gating style as CHoCH")
@@ -696,7 +698,7 @@ class BotConfig(BaseModel):
             if self.CONFLUENCE_MIN_ABS_SCORE > max_achievable:
                 raise ValueError(
                     f'CONFLUENCE_MIN_ABS_SCORE ({self.CONFLUENCE_MIN_ABS_SCORE}) exceeds the max '
-                    f'achievable weighted total ({max_achievable}) — every alert would be blocked forever'
+                    f'achievable weighted total ({max_achievable}) �� every alert would be blocked forever'
                 )
         return self
 

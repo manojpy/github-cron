@@ -61,6 +61,7 @@ FAMILY_PREFIXES: List[Tuple[str, str]] = [
     ("equilibrium_cross_", "Pattern"),
     ("dynamic_flow_", "Confluence"),
     ("momentum_cross_", "Confluence"),
+    ("gaussian_cross_", "Confluence"),
 ]
 
 # ── display names ────────────────────────────────────────────────────────
@@ -166,6 +167,9 @@ _STANDARD_ROWS: List[Tuple[str, str, str, str]] = [
 
     ("momentum_cross_buy", BUY, "Confluence", "ENABLE_MOMENTUM_CROSS_ALERT"),
     ("momentum_cross_sell", SELL, "Confluence", "ENABLE_MOMENTUM_CROSS_ALERT"),
+
+    ("gaussian_cross_buy", BUY, "Confluence", "ENABLE_GAUSSIAN_CROSS_ALERT"),
+    ("gaussian_cross_sell", SELL, "Confluence", "ENABLE_GAUSSIAN_CROSS_ALERT"),
 
     ("equilibrium_cross_up", BUY, "Pattern", "ENABLE_EQUILIBRIUM_CROSS"),
     ("equilibrium_cross_down", SELL, "Pattern", "ENABLE_EQUILIBRIUM_CROSS"),

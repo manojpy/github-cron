@@ -776,9 +776,11 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             )
             results['gaussian_trend_dir_15'] = _gauss['trend_dir']
             results['gaussian_valid_15'] = _gauss['valid']
+            results['gaussian_line_15'] = _gauss['trend_line']
         else:
             results['gaussian_trend_dir_15'] = np.zeros(n_15m, dtype=np.int32)
             results['gaussian_valid_15'] = np.zeros(n_15m, dtype=bool)
+            results['gaussian_line_15'] = np.full(n_15m, np.nan, dtype=np.float64)
 
         # ── Ichimoku cloud (23/65/130/65 — cloud-cross alerts + alternate bias header) ──
         # Same BIAS_ICHIMOKU_* periods as the alternate bias header in macd_unified.py.
@@ -867,25 +869,33 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             )
         else:
             results['momentum_osc'] = np.full(n_15m, np.nan, dtype=np.float64)
-        # RMA fast leg is still needed by the RMA-cloud momentum vote even when the
-        # RMA cloud itself is replaced by Cirrus (RMA_CLOUD_ENABLED=False).
+
+        # RMA fast leg (15m) is still needed by the RMA-cloud momentum vote.
         if cfg.RMA_CLOUD_ENABLED or cfg.ENABLE_RMA_CLOUD_MOMENTUM_VOTE:
             results['rma_cloud_fast_15'] = calculate_rma_numpy(close_15m, cfg.RMA_CLOUD_FAST_PERIOD)
         else:
             results['rma_cloud_fast_15'] = np.full(n_15m, np.nan, dtype=np.float64)
 
-        # ── Cirrus Cloud — veto gate of the cloud group ──
+        # ── RMA Cloud (5m): RMA fast vs RMA slow, both on 5m closes ──
+        if cfg.RMA_CLOUD_ENABLED:
+            results['rma_cloud_fast_5m'] = calculate_rma_numpy(close_5m, cfg.RMA_CLOUD_FAST_PERIOD)
+            results['rma_cloud_slow_5m'] = calculate_rma_numpy(close_5m, cfg.RMA_50_PERIOD)
+        else:
+            results['rma_cloud_fast_5m'] = np.full(len(close_5m), np.nan, dtype=np.float64)
+            results['rma_cloud_slow_5m'] = np.full(len(close_5m), np.nan, dtype=np.float64)
+
+        # ── Cirrus Cloud (5m) — one of the cloud-group votes ──
         if cfg.CIRRUS_CLOUD_ENABLED:
             _cirrus = calculate_cirrus_cloud_numpy(
-                close_15m, cfg.CIRRUS_X1, cfg.CIRRUS_X2, cfg.CIRRUS_X3, cfg.CIRRUS_X4
+                close_5m, cfg.CIRRUS_X1, cfg.CIRRUS_X2, cfg.CIRRUS_X3, cfg.CIRRUS_X4
             )
-            results['cirrus_trend_up_15'] = _cirrus['trend_up']
-            results['cirrus_trend_dn_15'] = _cirrus['trend_dn']
-            results['cirrus_valid_15'] = _cirrus['valid']
+            results['cirrus_trend_up_5m'] = _cirrus['trend_up']
+            results['cirrus_trend_dn_5m'] = _cirrus['trend_dn']
+            results['cirrus_valid_5m'] = _cirrus['valid']
         else:
-            results['cirrus_trend_up_15'] = np.zeros(n_15m, dtype=bool)
-            results['cirrus_trend_dn_15'] = np.zeros(n_15m, dtype=bool)
-            results['cirrus_valid_15'] = np.zeros(n_15m, dtype=bool)
+            results['cirrus_trend_up_5m'] = np.zeros(len(close_5m), dtype=bool)
+            results['cirrus_trend_dn_5m'] = np.zeros(len(close_5m), dtype=bool)
+            results['cirrus_valid_5m'] = np.zeros(len(close_5m), dtype=bool)
 
         # ── Dynamic Flow Ribbon (BigBeluga) — third cloud-group trend gate ──
         if cfg.DYNAMIC_FLOW_RIBBON_ENABLED:
@@ -963,6 +973,31 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             )
         else:
             results['momentum_osc_5m'] = np.full(n_5m, np.nan, dtype=np.float64)
+
+        # ── 5m Gaussian Filter Trend (only for the Gaussian cross alert on 5m) ──
+        if (cfg.ENABLE_GAUSSIAN_CROSS_ALERT and cfg.GAUSSIAN_TREND_ENABLED
+                and cfg.GAUSSIAN_CROSS_TF == "5m"):
+            if cfg.GAUSSIAN_SOURCE == 'hl2':
+                _gauss_src_5m = (data_5m["high"] + data_5m["low"]) / 2.0
+            elif cfg.GAUSSIAN_SOURCE == 'hlc3':
+                _gauss_src_5m = (data_5m["high"] + data_5m["low"] + close_5m) / 3.0
+            else:
+                _gauss_src_5m = close_5m
+            _gauss_5m = calculate_gaussian_trend_numpy(
+                data_5m["high"], data_5m["low"], close_5m, _gauss_src_5m,
+                cfg.GAUSSIAN_PRESET, cfg.GAUSSIAN_LENGTH, cfg.GAUSSIAN_POLES,
+                cfg.GAUSSIAN_ATR_LENGTH, cfg.GAUSSIAN_FIXED_MULTIPLIER,
+                cfg.GAUSSIAN_ADAPTIVE_WIDTH, cfg.GAUSSIAN_EFFICIENCY_LENGTH,
+                cfg.GAUSSIAN_TREND_MULTIPLIER, cfg.GAUSSIAN_CHOP_MULTIPLIER,
+                cfg.GAUSSIAN_EFFICIENCY_SMOOTH,
+            )
+            results['gaussian_trend_dir_5m'] = _gauss_5m['trend_dir']
+            results['gaussian_valid_5m'] = _gauss_5m['valid']
+            results['gaussian_line_5m'] = _gauss_5m['trend_line']
+        else:
+            results['gaussian_trend_dir_5m'] = np.zeros(n_5m, dtype=np.int32)
+            results['gaussian_valid_5m'] = np.zeros(n_5m, dtype=bool)
+            results['gaussian_line_5m'] = np.full(n_5m, np.nan, dtype=np.float64)
 
         if cfg.ENABLE_VWAP:
             results['vwap_gate'] = calculate_vwap_numpy(
