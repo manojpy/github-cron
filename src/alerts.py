@@ -1956,6 +1956,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
 
         context = {
             "close_curr": close_curr, "close_prev": close_prev,
+            "close_curr_cross": getattr(gr, "close_curr_cross", close_curr),
+            "close_prev_cross": getattr(gr, "close_prev_cross", close_prev),
             "ppo_curr": ppo_curr, "ppo_prev": ppo_prev,
             "ppo_sig_curr": ppo_sig_curr, "ppo_sig_prev": ppo_sig_prev,
             "rsi_curr": rsi_curr, "rsi_prev": rsi_prev,
@@ -2114,22 +2116,21 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 "keys": {"cloud_cross_up", "cloud_cross_down"},
                 "enabled": cfg.ENABLE_CLOUD_CROSS_ALERT,
                 "validator": validate_cloud_cross,
-                "ctx_args": ("close_prev", "close_curr", "cloud_upper_prev", "cloud_upper_curr",
+                "ctx_args": ("close_prev_cross", "close_curr_cross", "cloud_upper_prev", "cloud_upper_curr",
                              "cloud_lower_prev", "cloud_lower_curr"),
             },
             "tk_conversion": {
                 "keys": {"tk_conversion_up", "tk_conversion_down"},
                 "enabled": cfg.ENABLE_TK_CONVERSION_CROSS,
                 "validator": validate_conversion_cross,
-                "ctx_args": ("close_prev", "close_curr", "tk_conversion_prev", "tk_conversion_curr"),
+                "ctx_args": ("close_prev_cross", "close_curr_cross", "tk_conversion_prev", "tk_conversion_curr"),
             },
             "kijun_cross": {
                 "keys": {"kijun_cross_up", "kijun_cross_down"},
                 "enabled": cfg.ENABLE_KIJUN_CROSS,
                 "validator": validate_conversion_cross,
-                "ctx_args": ("close_prev", "close_curr", "tk_base_prev", "tk_base_curr"),
+                "ctx_args": ("close_prev_cross", "close_curr_cross", "tk_base_prev", "tk_base_curr"),
             },
-   
             "equilibrium_cross": {
                 "keys": {"equilibrium_cross_up", "equilibrium_cross_down"},
                 "enabled": cfg.ENABLE_EQUILIBRIUM_CROSS,

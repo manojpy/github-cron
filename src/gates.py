@@ -80,6 +80,8 @@ class GateResult:
     open_curr: float; high_curr: float; low_curr: float; close_curr: float
     close_prev: float
     close_5m_val: float
+    close_prev_cross: float = 0.0  # close used for cross alerts (5m or 15m per CROSS_ALERT_TF)
+    close_curr_cross: float = 0.0
     is_green: bool; is_red: bool
     is_valid_for_buy: bool; is_valid_for_sell: bool
     candle_index: int
@@ -587,11 +589,33 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         nr_cpr = float(gate_indicators.get('nr_cpr', float('nan')))
         prev_day_close = gate_indicators.get('prev_day_close', float('nan'))
 
+        # CROSS_ALERT_TF controls whether cloud / TK / kijun / dynamic_flow crosses
+        # are evaluated on 5m or 15m data. Default is "5m". When "5m" we still
+        # require the corresponding 15m indicator to be directionally aligned.
+        _cross_tf = getattr(cfg, "CROSS_ALERT_TF", "5m")
+        _use_5m_cross = (_cross_tf == "5m")
+
         # Ichimoku cloud (23/65/130/65) — used by the cloud-cross alerts only.
-        cloud_upper_val = ichimoku_cloud_upper[i15]
-        cloud_lower_val = ichimoku_cloud_lower[i15]
-        cloud_upper_prev = ichimoku_cloud_upper[i15 - 1]
-        cloud_lower_prev = ichimoku_cloud_lower[i15 - 1]
+        if _use_5m_cross and i5 >= 1:
+            cloud_upper_arr = gate_indicators["ichimoku_cloud_upper_5m"]
+            cloud_lower_arr = gate_indicators["ichimoku_cloud_lower_5m"]
+            cloud_upper_val = cloud_upper_arr[i5]
+            cloud_lower_val = cloud_lower_arr[i5]
+            cloud_upper_prev = cloud_upper_arr[i5 - 1]
+            cloud_lower_prev = cloud_lower_arr[i5 - 1]
+            # 15m alignment (must be green/red for buy/sell)
+            cloud_upper_15 = ichimoku_cloud_upper[i15]
+            cloud_lower_15 = ichimoku_cloud_lower[i15]
+            # For buy: price should be above cloud on 15m or cloud itself green-ish; we use close vs cloud
+            _cloud_15m_ok_buy = (not np.isnan(cloud_upper_15) and close_curr > cloud_upper_15)
+            _cloud_15m_ok_sell = (not np.isnan(cloud_lower_15) and close_curr < cloud_lower_15)
+        else:
+            cloud_upper_val = ichimoku_cloud_upper[i15]
+            cloud_lower_val = ichimoku_cloud_lower[i15]
+            cloud_upper_prev = ichimoku_cloud_upper[i15 - 1]
+            cloud_lower_prev = ichimoku_cloud_lower[i15 - 1]
+            _cloud_15m_ok_buy = True
+            _cloud_15m_ok_sell = True
 
         # Gaussian Filter Trend: the trend-cloud verdict (cloud_up / cloud_down) now comes
         # from the Gaussian trend direction (1 = bullish, -1 = bearish). Warmup / neutral
@@ -607,12 +631,33 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             cloud_up = None
             cloud_down = None
 
-        tk_conversion_curr = ichimoku_conversion_line[i15]
-        tk_conversion_prev = ichimoku_conversion_line[i15 - 1]
-        tk_base_curr = ichimoku_base_line[i15]
-        tk_base_prev = ichimoku_base_line[i15 - 1]
-        close_prev = close_15m[i15 - 1]
+        if _use_5m_cross and i5 >= 1:
+            tk_conv_arr = gate_indicators["ichimoku_conversion_line_5m"]
+            tk_base_arr = gate_indicators["ichimoku_base_line_5m"]
+            tk_conversion_curr = tk_conv_arr[i5]
+            tk_conversion_prev = tk_conv_arr[i5 - 1]
+            tk_base_curr = tk_base_arr[i5]
+            tk_base_prev = tk_base_arr[i5 - 1]
+            # 15m alignment for TK / Kijun
+            _tk_15m_ok_buy = (not np.isnan(ichimoku_conversion_line[i15]) and close_curr > ichimoku_conversion_line[i15])
+            _tk_15m_ok_sell = (not np.isnan(ichimoku_conversion_line[i15]) and close_curr < ichimoku_conversion_line[i15])
+            _kijun_15m_ok_buy = (not np.isnan(ichimoku_base_line[i15]) and close_curr > ichimoku_base_line[i15])
+            _kijun_15m_ok_sell = (not np.isnan(ichimoku_base_line[i15]) and close_curr < ichimoku_base_line[i15])
+            close_prev_for_cross = data_5m.close[i5 - 1]
+            close_curr_for_cross = data_5m.close[i5]
+        else:
+            tk_conversion_curr = ichimoku_conversion_line[i15]
+            tk_conversion_prev = ichimoku_conversion_line[i15 - 1]
+            tk_base_curr = ichimoku_base_line[i15]
+            tk_base_prev = ichimoku_base_line[i15 - 1]
+            _tk_15m_ok_buy = True
+            _tk_15m_ok_sell = True
+            _kijun_15m_ok_buy = True
+            _kijun_15m_ok_sell = True
+            close_prev_for_cross = close_15m[i15 - 1]
+            close_curr_for_cross = close_curr
 
+        close_prev = close_15m[i15 - 1]  # still used for other 15m logic
         close_prev_invalid = False
         if np.isnan(close_prev) or np.isinf(close_prev) or close_prev <= 0:
             logger_pair.warning(
@@ -824,21 +869,47 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         dynamic_flow_cross_up = False
         dynamic_flow_cross_down = False
 
-        if cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT and cfg.DYNAMIC_FLOW_RIBBON_ENABLED and i15 >= 1:
-            dynamic_flow_line_curr = dynamic_flow_line_arr[i15]
-            dynamic_flow_line_prev = dynamic_flow_line_arr[i15 - 1]
-            if (not np.isnan(dynamic_flow_curr) and not np.isnan(dynamic_flow_line_curr)
-                    and not np.isnan(dynamic_flow_line_prev) and not np.isnan(close_prev)):
-                dynamic_flow_cross_up = bool(
-                    np.isclose(dynamic_flow_curr, -1.0, atol=1e-9)
-                    and close_prev < dynamic_flow_line_prev
-                    and close_curr > dynamic_flow_line_curr
-                )
-                dynamic_flow_cross_down = bool(
-                    np.isclose(dynamic_flow_curr, 1.0, atol=1e-9)
-                    and close_prev > dynamic_flow_line_prev
-                    and close_curr < dynamic_flow_line_curr
-                )
+        if cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT and cfg.DYNAMIC_FLOW_RIBBON_ENABLED:
+            if _use_5m_cross and i5 >= 1:
+                df_trend_5m = gate_indicators["dynamic_flow_trend_5m"]
+                df_line_5m = gate_indicators["dynamic_flow_line_5m"]
+                df_curr_5 = df_trend_5m[i5]
+                df_line_c = df_line_5m[i5]
+                df_line_p = df_line_5m[i5 - 1]
+                c_prev_5 = data_5m.close[i5 - 1]
+                c_curr_5 = data_5m.close[i5]
+                # 15m must be green (bullish = -1.0) for a buy cross
+                df_15m_green = bool(np.isclose(dynamic_flow_curr, -1.0, atol=1e-9))
+                df_15m_red = bool(np.isclose(dynamic_flow_curr, 1.0, atol=1e-9))
+                if (not np.isnan(df_curr_5) and not np.isnan(df_line_c)
+                        and not np.isnan(df_line_p) and not np.isnan(c_prev_5)):
+                    dynamic_flow_cross_up = bool(
+                        np.isclose(df_curr_5, -1.0, atol=1e-9)
+                        and c_prev_5 < df_line_p
+                        and c_curr_5 > df_line_c
+                        and df_15m_green
+                    )
+                    dynamic_flow_cross_down = bool(
+                        np.isclose(df_curr_5, 1.0, atol=1e-9)
+                        and c_prev_5 > df_line_p
+                        and c_curr_5 < df_line_c
+                        and df_15m_red
+                    )
+            elif i15 >= 1:
+                dynamic_flow_line_curr = dynamic_flow_line_arr[i15]
+                dynamic_flow_line_prev = dynamic_flow_line_arr[i15 - 1]
+                if (not np.isnan(dynamic_flow_curr) and not np.isnan(dynamic_flow_line_curr)
+                        and not np.isnan(dynamic_flow_line_prev) and not np.isnan(close_prev)):
+                    dynamic_flow_cross_up = bool(
+                        np.isclose(dynamic_flow_curr, -1.0, atol=1e-9)
+                        and close_prev < dynamic_flow_line_prev
+                        and close_curr > dynamic_flow_line_curr
+                    )
+                    dynamic_flow_cross_down = bool(
+                        np.isclose(dynamic_flow_curr, 1.0, atol=1e-9)
+                        and close_prev > dynamic_flow_line_prev
+                        and close_curr < dynamic_flow_line_curr
+                    )
 
         ppo_gate_prev_val = ppo_gate_arr[i15 - 1] if i15 >= 1 else ppo_gate_curr
         if (cfg.ENABLE_PPO_GATE_MOMENTUM_VOTE
@@ -1071,6 +1142,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             candle_info=candle_info, o=o, h=h, l=l, c=c,
             open_curr=open_curr, high_curr=high_curr, low_curr=low_curr, close_curr=close_curr,
             close_prev=close_prev, close_5m_val=close_5m_val,
+            close_prev_cross=close_prev_for_cross, close_curr_cross=close_curr_for_cross,
             is_green=is_green, is_red=is_red,
             is_valid_for_buy=is_valid_for_buy, is_valid_for_sell=is_valid_for_sell,
             candle_index=i15, min_wick_ratio=Constants.MIN_WICK_RATIO,
