@@ -25,7 +25,8 @@
   "MAX_ALERTS_PER_PAIR": 9,
   "MAX_ALERTS_PER_RUN": 50,
   "CROSS_ALERT_TF": "5m", 
-
+  "MOMENTUM_CROSS_TF": "5m",
+  
   "PPO_FAST": 7,
   "PPO_SLOW": 16,
   "PPO_SIGNAL": 5,
