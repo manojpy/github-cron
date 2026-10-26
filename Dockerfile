@@ -5,7 +5,7 @@
 # ---------- STAGE 1: UV INSTALLER ----------
 FROM python:3.11-slim-bookworm AS uv-installer
 
-RUN pip install --no-cache-dir uv==0.13.1
+RUN pip install --no-cache-dir uv==0.13.5
 
 # ---------- STAGE 2: DEPENDENCIES BUILDER ----------
 FROM python:3.11-slim-bookworm AS deps-builder

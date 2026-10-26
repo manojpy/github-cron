@@ -17,7 +17,7 @@ cython==3.3.0
 redis[hiredis]==8.1.0
 hiredis==3.5.0
 pydantic==2.14.1
-pydantic-settings==2.16.0
+pydantic-settings==2.16.1
 orjson==3.13.0
 
 # System & Utilities
@@ -25,6 +25,6 @@ psutil==7.2.2
 tbb==2023.2.0
 tzdata==2026.5
 typing-extensions==4.16.0
-setuptools==84.0.0
+setuptools==84.2.1
 wheel==0.48.0
 py-cpuinfo==9.0.0
