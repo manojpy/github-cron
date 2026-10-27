@@ -555,8 +555,10 @@ def _record_status_line(status: str, active: Optional[Dict[str, Any]]) -> str:
         return f"⏭ Ignored — {active.get('pair', '')} {side} trade open since {since}, not recorded"
     if status == "COOLDOWN":
         resume = format_ist_time(int((active or {}).get("until_ts", 0)) + 900, "%H:%M IST")
-        return f"⏸Cooldown — same-direction trade recently closed, not recorded until the {resume} candle, 
+
+        return f"⏸ Cooldown — target recently hit, not recorded until the {resume} candle"
     return "📝 Recorded as trade"
+
 
 def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], items: List[Tuple[str, str]], keys: List[str], tq_by_key: Dict[str, Optional[Dict[str, Any]]], votes: Optional[Dict[str, bool]], required: Optional[float], bias_context: Optional[BiasContext], logger_pair: logging.Logger, pb_by_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None, adx_val: Optional[float] = None, record_line: Optional[str] = None, pullback_line: Optional[str] = None, decision_sink: Optional[Dict[str, Any]] = None) -> Tuple[str, Optional[str]]:
     """Build the rich body for one pair/direction and return (body, verdict).
@@ -3204,7 +3206,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             to_record = list(alerts_to_send)
             if record_status == "COOLDOWN":
                 logger_pair.info(
-                    f"[{pair_name}] NOT RECORDED ts={ts_curr}:  cooldown after trade close"
+                    f"[{pair_name}] NOT RECORDED ts={ts_curr}: cooldown after target hit "
                     f"(hit candle {(record_active or {}).get('hit_ts')})"
                 )
                 return
@@ -3540,7 +3542,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         advisor_seen: Dict[str, Any] = {}
         if alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER and cfg.ENABLE_TRADE_CLOSE_NOTICE:
             _cd_fn = getattr(sdb, "in_trade_cooldown", None)
-            _cd_hit = await _cd_fn(pair_name, ts_curr, direction="buy" if is_buy_batch else "sell") if _cd_fn else None
+            _cd_hit = await _cd_fn(pair_name, ts_curr) if _cd_fn else None
             if _cd_hit is not None:
                 record_status = "COOLDOWN"
                 record_active = {
