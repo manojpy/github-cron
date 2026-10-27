@@ -276,14 +276,14 @@ def load_archived_outcomes(data_dir: str, window_days: int = 30, shadow: bool = 
     all_files = list(root.glob("*.jsonl")) + list(root.glob("*.jsonl.gz"))
     files = sorted(all_files, key=lambda p: p.name.split(".jsonl")[0], reverse=True)
 
+    # A file is named for the UTC day it was WRITTEN and a row is never written before
+    # its entry day, so a file dated before the cutoff's day cannot hold an in-window row.
+    # (mtime is useless here: a git checkout stamps every file with the checkout time.)
+    cutoff_day = time.strftime("%Y-%m-%d", time.gmtime(cutoff))
     for path in files:
-        # Quick mtime check: if the whole file predates the window and
-        # we already have plenty of rows, stop reading further files.
-        try:
-            if path.stat().st_mtime < cutoff and len(rows) > 5000:
-                break
-        except OSError:
-            pass
+        _day = path.name.split(".jsonl")[0]
+        if len(_day) == 10 and _day < cutoff_day:
+            break      # newest-first: every remaining file is older still
         stats["files_read"] += 1
         try:
             if path.suffix == ".gz":

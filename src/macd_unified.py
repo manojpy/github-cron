@@ -189,7 +189,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     reversal_eligible = (
         (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT
          or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT
-         or cfg.ENABLE_MOMENTUM_CROSS_ALERT or cfg.ENABLE_GAUSSIAN_CROSS_ALERT
          or cfg.ENABLE_TRENDLINE_ALERTS)
         and (gr.buy_trend_common_relaxed or gr.sell_trend_common_relaxed)
     )
@@ -2046,12 +2045,26 @@ async def run_once() -> Optional[bool]:
         if cfg.ENABLE_BRAIN and not _ALERT_ONLY_MODE:
             try:
                 brain = BrainEngine(sdb)
-
-                if getattr(cfg, "BRAIN_REPORT_ON_DEMAND", False):
+                # Alerts are already sent. Give the report only the time left before the
+                # hard deadline, so a slow report cannot turn a good run into a failed one.
+                _budget = float(cfg.RUN_TIMEOUT_SECONDS) - (time.time() - start_time) - 20.0
+                if _budget < 30.0:
+                    logger_run.warning(
+                        f"🧠 Brain report skipped: only {max(_budget, 0):.0f}s left before the run deadline"
+                    )
+                elif getattr(cfg, "BRAIN_REPORT_ON_DEMAND", False):
                     logger_run.info("🧠 Brain report on demand requested — forcing report generation...")
-                    await brain.send_report_now(pairs_to_process, telegram_queue, logger_run)
+                    await asyncio.wait_for(
+                        brain.send_report_now(pairs_to_process, telegram_queue, logger_run),
+                        timeout=_budget,
+                    )
                 else:
-                    await brain.maybe_generate_report(pairs_to_process, telegram_queue, logger_run)
+                    await asyncio.wait_for(
+                        brain.maybe_generate_report(pairs_to_process, telegram_queue, logger_run),
+                        timeout=_budget,
+                    )
+            except asyncio.TimeoutError:
+                logger_run.warning("🧠 Brain report timed out — alerts were already delivered; report skipped this run")
             except Exception as e:
                 logger_run.warning(f"Brain report generation failed: {e}")
         elif _ALERT_ONLY_MODE:

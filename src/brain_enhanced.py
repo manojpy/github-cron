@@ -290,8 +290,10 @@ class BrainEngineV2(BrainCore):
             recent_rows = cached_recent if cached_recent is not None else load_archived_outcomes(
                 data_dir, window_days=recent_days, shadow=False
             )
-            medium_rows = load_archived_outcomes(data_dir, window_days=medium_days, shadow=False)
+            # One archive read: the medium window is a time-filtered subset of the long one.
             long_rows = load_archived_outcomes(data_dir, window_days=long_days, shadow=False)
+            _med_cutoff = time.time() - medium_days * 86400
+            medium_rows = [r for r in long_rows if r.get("entry_ts", 0) >= _med_cutoff]
 
             result = (recent_rows, medium_rows, long_rows)
             self._layered_rows_cache = result
@@ -1472,8 +1474,12 @@ class BrainEngineV2(BrainCore):
                 if not await telegram_queue.send(msg):
                     sent_ok = False
 
-            # Store the plan for later application (feature kept intact)
-            await self._store_pending_plan(recs)
+            # Store the plan for later application. A storage failure must not fall
+            # through to the fallback report below: the report was already sent.
+            try:
+                await self._store_pending_plan(recs)
+            except Exception as store_err:
+                logger_run.error(f"Brain plan could not be stored (report was sent): {store_err}")
 
             if sent_ok:
                 logger_run.info(f"Brain report sent ({len(plan_messages)} messages) and stored for application")
