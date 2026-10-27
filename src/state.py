@@ -1565,8 +1565,8 @@ class RedisStateStore:
             return True
         if self.degraded:
             return False
+        _cd_hit = await self.in_trade_cooldown(pair, entry_ts, direction=direction)
 
-        _cd_hit = await self.in_trade_cooldown(pair, entry_ts)
         if _cd_hit is not None:
             logger.info(
                 f"[{pair}] Cooldown after target (hit candle {_cd_hit}) — "
@@ -2372,9 +2372,12 @@ class RedisStateStore:
             return f"{RedisKeyPrefix.TRADE_COOLDOWN}shadow:{pair}"
         return f"{RedisKeyPrefix.TRADE_COOLDOWN}{pair}"
 
-    async def in_trade_cooldown(self, pair: str, entry_ts: int, source: str = "Recorded") -> Optional[int]:
-        """Return the target-hit candle ts when `entry_ts` is inside the pair's
+    async def in_trade_cooldown(self, pair: str, entry_ts: int, source: str = "Recorded", direction: Optional[str] = None) -> Optional[int]:
+        """Return the closing candle ts when `entry_ts` is inside the pair's
         re-entry cooldown for `source` ('Recorded' or 'Shadowed'), else None.
+        The cooldown only applies to a new signal in the SAME direction as the
+        trade that closed; an opposite-direction signal is never held back.
+        `direction=None` (unknown) keeps the old behaviour: any direction is held.
         Fails open (Redis problem = no cooldown)."""
         n = int(getattr(cfg, "TRADE_CLOSE_COOLDOWN_CANDLES", 0))
         if (
@@ -2387,28 +2390,37 @@ class RedisStateStore:
         try:
             raw = await asyncio.wait_for(
                 _rc(self._redis).get(self._cooldown_key(pair, source)),
-
                 timeout=2.0,
             )
             if raw is None:
                 return None
-            hit_ts = int(raw)
+            if isinstance(raw, bytes):
+                raw = raw.decode()
+            ts_part, _, dir_part = str(raw).partition(":")
+            hit_ts = int(ts_part)
         except Exception:
             return None
+        if direction is not None and dir_part:
+            want = "buy" if str(direction).lower() in ("buy", "long") else "sell"
+            if want != dir_part:
+                return None  # opposite direction: cooldown does not apply
         return hit_ts if int(entry_ts) <= hit_ts + n * 900 else None
 
-    async def _start_trade_cooldown(self, pair: str, hit_ts: int, logger_pair: logging.Logger, source: str = "Recorded") -> None:
+    async def _start_trade_cooldown(self, pair: str, hit_ts: int, logger_pair: logging.Logger, source: str = "Recorded", direction: str = "") -> None:
         if self.degraded or not self._redis:
             return
         key = self._cooldown_key(pair, source)
         ttl = int((int(cfg.TRADE_CLOSE_COOLDOWN_CANDLES) + 4) * 900)
         try:
             raw = await asyncio.wait_for(_rc(self._redis).get(key), timeout=2.0)
-            if raw is not None and int(raw) >= int(hit_ts):
-                return  # never move the cooldown backwards
+            if raw is not None:
+                if isinstance(raw, bytes):
+                    raw = raw.decode()
+                if int(str(raw).partition(":")[0]) >= int(hit_ts):
+                    return  # never move the cooldown backwards
+            value = f"{int(hit_ts)}:{direction}" if direction else str(int(hit_ts))
             await asyncio.wait_for(
-                _rc(self._redis).set(key, str(int(hit_ts)), ex=ttl), timeout=2.0
-
+                _rc(self._redis).set(key, value, ex=ttl), timeout=2.0
             )
         except Exception as e:
             logger_pair.warning(f"[{pair}] Could not start trade cooldown: {e}")
@@ -2420,6 +2432,7 @@ class RedisStateStore:
         if not getattr(cfg, "ENABLE_TRADE_CLOSE_NOTICE", True):
             return
         cooldown_hit_ts: Optional[int] = None
+        cooldown_dir = ""
         for d in rows:
             raw_entry = d.get("entry_ts")
             if raw_entry is None:
@@ -2451,8 +2464,9 @@ class RedisStateStore:
                 reason in ("stop", "both")
                 and getattr(cfg, "TRADE_CLOSE_COOLDOWN_ON_STOP", False)
             )
-            if starts_cooldown and hit_ts is not None:
-                cooldown_hit_ts = max(int(hit_ts), cooldown_hit_ts or 0)
+            if starts_cooldown and hit_ts is not None and int(hit_ts) >= (cooldown_hit_ts or 0):
+                cooldown_hit_ts = int(hit_ts)
+                cooldown_dir = direction
 
         # Only real (Recorded) trades start the live cooldown; a shadow target hit
         # never does, and shadow entries are no longer skipped during a cooldown.
@@ -2461,7 +2475,7 @@ class RedisStateStore:
             and cooldown_hit_ts is not None
             and int(getattr(cfg, "TRADE_CLOSE_COOLDOWN_CANDLES", 0)) > 0
         ):
-            await self._start_trade_cooldown(pair, cooldown_hit_ts, logger_pair, source)
+            await self._start_trade_cooldown(pair, cooldown_hit_ts, logger_pair, source, cooldown_dir)
 
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int, logger_pair: logging.Logger) -> None:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not self._redis:
