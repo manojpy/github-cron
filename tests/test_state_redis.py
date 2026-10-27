@@ -499,7 +499,7 @@ def _row(pair="ETHUSD", key="ppo_cross_up", ts=None, **over):
 def _write(tmp_path, rows):
     d = tmp_path / "outcomes"
     d.mkdir()
-    (d / "2026-09-21.jsonl").write_text(
+    (d / (time.strftime("%Y-%m-%d", time.gmtime()) + ".jsonl")).write_text(
         "\n".join(json.dumps(r) for r in rows) + "\n",
         encoding="utf-8",
     )
