@@ -430,11 +430,17 @@ async def run(args: argparse.Namespace) -> int:
             await notify(ap_text)
         return 0
     finally:
+        # Always close the shared HTTP session (Telegram notify / any late get_session
+        # can reopen it after the intermediate closes in recover_paths / fetch_control_candles).
+        try:
+            from fetcher import SessionManager
+            await SessionManager.close_session()
+        except Exception:
+            pass
         try:
             await sdb.close()
         except Exception:
             pass
-
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Slow learner: validated trade-plan playbook")
