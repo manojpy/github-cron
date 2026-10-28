@@ -555,10 +555,8 @@ def _record_status_line(status: str, active: Optional[Dict[str, Any]]) -> str:
         return f"⏭ Ignored — {active.get('pair', '')} {side} trade open since {since}, not recorded"
     if status == "COOLDOWN":
         resume = format_ist_time(int((active or {}).get("until_ts", 0)) + 900, "%H:%M IST")
-
-        return f"⏸ Cooldown — target recently hit, not recorded until the {resume} candle"
+        return f"⏸ Cooldown — same-direction trade recently closed, not recorded until the {resume} candle"
     return "📝 Recorded as trade"
-
 
 def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], items: List[Tuple[str, str]], keys: List[str], tq_by_key: Dict[str, Optional[Dict[str, Any]]], votes: Optional[Dict[str, bool]], required: Optional[float], bias_context: Optional[BiasContext], logger_pair: logging.Logger, pb_by_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None, adx_val: Optional[float] = None, record_line: Optional[str] = None, pullback_line: Optional[str] = None, decision_sink: Optional[Dict[str, Any]] = None) -> Tuple[str, Optional[str]]:
     """Build the rich body for one pair/direction and return (body, verdict).
@@ -1228,9 +1226,11 @@ async def send_trade_close_notices(sdb: RedisStateStore, telegram_queue: Telegra
         "target": "Target Done",
         "stop": "Stop Loss Hit",
         "both": "Target and Stop both touched in one candle",
+        "horizon": f"{cfg.OUTCOME_LOOKAHEAD_CANDLES * 15 / 60:g}h window ended, no target or stop",
     }
-    icon = {"target": "✅", "stop": "🛑", "both": "⚠️"}
-    events.sort(key=lambda e: (e["source"] != "Recorded", e["pair"], e["entry_ts"]))
+    icon = {"target": "✅", "stop": "🛑", "both": "⚠️", "horizon": "⏱"}
+    events.sort(key=lambda e: (e["reason"] == "horizon", e["source"] != "Recorded", e["pair"], e["entry_ts"]))
+
     # A pair/candle can hold a Recorded row (alert A passed) and a Shadowed row
     # (alert B on the same candle was filtered). Same entry candle, same bracket,
     # so they close together: announce the trade once, as Recorded.
@@ -1244,6 +1244,14 @@ async def send_trade_close_notices(sdb: RedisStateStore, telegram_queue: Telegra
     lines = ["🎯 Trade updates"]
     for e in events[:30]:
         side = "BUY" if e["direction"] == "buy" else "SELL"
+        if e["reason"] == "horizon":
+            _pct = e.get("pct")
+            _pct_txt = f", {_pct:+.2f}% at close" if isinstance(_pct, (int, float)) else ""
+            lines.append(
+                f"{icon['horizon']} {e['pair']} ({e['source']}) {label['horizon']} — {side} from "
+                f"{format_ist_time(int(e['entry_ts']), '%H:%M')} candle{_pct_txt}"
+            )
+            continue
         hit = e.get("hit_ts")
         when = (
             f"{format_ist_time(int(hit), '%H:%M')}–{format_ist_time(int(hit) + 900, '%H:%M')} candle"
@@ -3206,7 +3214,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             to_record = list(alerts_to_send)
             if record_status == "COOLDOWN":
                 logger_pair.info(
-                    f"[{pair_name}] NOT RECORDED ts={ts_curr}: cooldown after target hit "
+                    f"[{pair_name}] NOT RECORDED ts={ts_curr}:  cooldown after trade close"
                     f"(hit candle {(record_active or {}).get('hit_ts')})"
                 )
                 return
@@ -3542,7 +3550,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         advisor_seen: Dict[str, Any] = {}
         if alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER and cfg.ENABLE_TRADE_CLOSE_NOTICE:
             _cd_fn = getattr(sdb, "in_trade_cooldown", None)
-            _cd_hit = await _cd_fn(pair_name, ts_curr) if _cd_fn else None
+            _cd_hit = await _cd_fn(pair_name, ts_curr, direction="buy" if is_buy_batch else "sell") if _cd_fn else None
             if _cd_hit is not None:
                 record_status = "COOLDOWN"
                 record_active = {

@@ -2089,8 +2089,11 @@ class RedisStateStore:
             else:
                 anchor = float(data.get("fill_price") or entry_price)
                 path_start = entry_idx + 1
-            lows = data_15m.low[path_start:i15 + 1]
-            highs = data_15m.high[path_start:i15 + 1]
+            # Never look past the outcome window: a late run (cron outage) must not
+            # turn a trade that expired flat into a stop/target from later candles.
+            last_idx = min(i15, fill_idx + int(cfg.OUTCOME_LOOKAHEAD_CANDLES))
+            lows = data_15m.low[path_start:last_idx + 1]
+            highs = data_15m.high[path_start:last_idx + 1]
             if not len(lows):
                 return None
 
@@ -2425,6 +2428,32 @@ class RedisStateStore:
         except Exception as e:
             logger_pair.warning(f"[{pair}] Could not start trade cooldown: {e}")
 
+    @staticmethod
+    def _horizon_close_event(raw: Optional[str], result: Dict[str, Any], fin_json: Optional[str],
+                             fin_new: bool, early_final: bool) -> Optional[Dict[str, Any]]:
+        """Close event for a trade that reaches its horizon resolution without a
+        stop/target notice of its own. None when nothing new must be announced:
+        already finished early (announced then), or its target was announced on an
+        earlier run (closed_ts already stored in the pending row)."""
+        if early_final or not raw or not getattr(cfg, "ENABLE_HORIZON_CLOSE_NOTICE", True):
+            return None
+        try:
+            if fin_new and fin_json:
+                # Target first seen on the very run that also reached the horizon.
+                return json_loads(fin_json)
+            data = json_loads(raw)
+            if data.get("closed_ts") is not None:
+                return None
+            is_buy = str(data.get("direction", "")).lower() in ("buy", "long")
+            move = float(result["pct_move"])
+            fill_delay = max(0, int(getattr(cfg, "OUTCOME_FILL_DELAY_CANDLES", 1)))
+            data["closed_reason"] = "horizon"
+            data["closed_candle_ts"] = int(data["entry_ts"]) + (fill_delay + int(cfg.OUTCOME_LOOKAHEAD_CANDLES)) * 900
+            data["horizon_pct"] = move if is_buy else -move
+            return data
+        except Exception:
+            return None
+
     async def _publish_close_events(self, pair: str, rows: List[Dict[str, Any]], source: str, logger_pair: logging.Logger) -> None:
         """Queue 'Target Done / Stop Hit' notices for this run's Telegram update and
         start the re-entry cooldown. Call only AFTER the closed_ts write succeeded,
@@ -2459,6 +2488,7 @@ class RedisStateStore:
                 "entry_ts": entry_ts,
                 "reason": reason,
                 "hit_ts": int(hit_ts) if hit_ts is not None else None,
+                "pct": d.get("horizon_pct"),
             })
             starts_cooldown = reason == "target" or (
                 reason in ("stop", "both")
@@ -2574,6 +2604,9 @@ class RedisStateStore:
                                 close_events.append(json_loads(_fin_json))
                             except Exception:
                                 pass
+                        _hev = self._horizon_close_event(raw, result, _fin_json, _fin_new, _early_final)
+                        if _hev is not None:
+                            close_events.append(_hev)
                         alert_key = result["alert_key"]
                         direction = result["direction"]
                         entry_ts = result["entry_ts"]
@@ -2850,6 +2883,9 @@ class RedisStateStore:
                                 close_events.append(json_loads(_fin_json))
                             except Exception:
                                 pass
+                        _hev = self._horizon_close_event(raw, result, _fin_json, _fin_new, _early_final)
+                        if _hev is not None:
+                            close_events.append(_hev)
                         alert_key = result["alert_key"]
                         direction = result["direction"]
                         entry_ts = result["entry_ts"]
