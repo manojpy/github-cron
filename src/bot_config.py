@@ -272,6 +272,8 @@ class BotConfig(BaseModel):
     CIRRUS_X2: float = Field(default=9.0, gt=0.0, le=100.0, description="Cirrus Cloud slow range multiplier (Pine x2)")
     CIRRUS_X3: int = Field(default=15, ge=1, le=200, description="Cirrus Cloud fast range EMA length (Pine x3)")
     CIRRUS_X4: float = Field(default=5.0, gt=0.0, le=100.0, description="Cirrus Cloud fast range multiplier (Pine x4)")
+    CIRRUS_MIN_GAP_PCT: float = Field(default=0.0, ge=0.0, le=5.0, description="Neutral band for Cirrus Cloud: when the two filter lines are closer than this percent of price, the trend is neither Up nor Down (the Cirrus vote abstains). 0 = exact Pine replica. Near-parallel lines flip on tiny price differences between the bot's data and TradingView's, so a small band (e.g. 0.10) removes those edge-case votes")
+    ENABLE_CLOUD_VOTE_LINE: bool = Field(default=True, description="Add one line to every alert showing how each of the four clouds (Cirrus 5m, Dynamic Flow 15m, Gaussian 15m, RMA 5m) voted at decision time")
     BIAS_USE_CIRRUS: bool = Field(default=True, description="Base the pair-universe bias header on Cirrus Cloud (Trend Up / Trend Down / neutral) instead of the standalone Ichimoku cloud (BIAS_ICHIMOKU_*). False restores the Ichimoku bias")
     DYNAMIC_FLOW_RIBBON_ENABLED: bool = Field(default=True, description="Enable the 15m Dynamic Flow Ribbon (BigBeluga) as a third cloud-group trend gate alongside Ichimoku Cloud and RMA Cloud; green (buy) when the band-flip direction is bullish, red (sell) when bearish")
     DYNAMIC_FLOW_FACTOR: float = Field(default=3.0, ge=0.1, le=20.0, description="Dynamic Flow Ribbon band-width multiplier (Pine 'Length' input) — bands sit at basis \u00b1 factor*dist")

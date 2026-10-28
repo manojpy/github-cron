@@ -412,7 +412,8 @@ def calculate_dynamic_flow_ribbon_numpy(high: np.ndarray, low: np.ndarray, close
         return nan_arr, nan_arr.copy()
 
 def calculate_cirrus_cloud_numpy(close: np.ndarray, x1: int = 22, x2: float = 9.0,
-                                 x3: int = 15, x4: float = 5.0) -> Dict[str, np.ndarray]:
+                                 x3: int = 15, x4: float = 5.0,
+                                 min_gap_pct: float = 0.0) -> Dict[str, np.ndarray]:
     """Cirrus Cloud — exact port of the Pine indicator (uses close only).
 
         smoothrngX1(x, t, m) => ta.ema(ta.ema(|x - x[1]|, t), 2t-1) * m
@@ -435,11 +436,15 @@ def calculate_cirrus_cloud_numpy(close: np.ndarray, x1: int = 22, x2: float = 9.
         filtx12 = range_filter_loop(c, smrngx1x2)
 
         valid = np.isfinite(filtx1) & np.isfinite(filtx12)
+        gap_ok = np.ones(n, dtype=bool)
+        if min_gap_pct > 0.0:
+            with np.errstate(invalid='ignore'):
+                gap_ok = np.abs(filtx1 - filtx12) >= (min_gap_pct / 100.0) * np.abs(c)
         return {
             'filtx1': filtx1,
             'filtx12': filtx12,
-            'trend_up': valid & (filtx1 < filtx12),
-            'trend_dn': valid & (filtx1 > filtx12),
+            'trend_up': valid & gap_ok & (filtx1 < filtx12),
+            'trend_dn': valid & gap_ok & (filtx1 > filtx12),
             'valid': valid,
             'smrngx1x': smrngx1x,
             'smrngx1x2': smrngx1x2,
@@ -887,7 +892,8 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
         # ── Cirrus Cloud (5m) — one of the cloud-group votes ──
         if cfg.CIRRUS_CLOUD_ENABLED:
             _cirrus = calculate_cirrus_cloud_numpy(
-                close_5m, cfg.CIRRUS_X1, cfg.CIRRUS_X2, cfg.CIRRUS_X3, cfg.CIRRUS_X4
+                close_5m, cfg.CIRRUS_X1, cfg.CIRRUS_X2, cfg.CIRRUS_X3, cfg.CIRRUS_X4,
+                cfg.CIRRUS_MIN_GAP_PCT
             )
             results['cirrus_trend_up_5m'] = _cirrus['trend_up']
             results['cirrus_trend_dn_5m'] = _cirrus['trend_dn']

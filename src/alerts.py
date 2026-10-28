@@ -547,6 +547,17 @@ def _bias_alignment(direction: str, bias_context: Optional[BiasContext], min_edg
     market_up = up > down
     return "with" if (direction == "buy") == market_up else "against"
 
+def _cloud_vote_line(gr: "GateResult", is_buy: bool) -> str:
+    """One line with each cloud's vote for this direction: ✓ agrees, ✗ disagrees, – off/not ready."""
+    def _v(x: Optional[bool]) -> str:
+        return "✓" if x is True else "✗" if x is False else "–"
+    cirrus = gr.cirrus_ok_buy if is_buy else gr.cirrus_ok_sell
+    flow = gr.dynamic_flow_ok_buy if is_buy else gr.dynamic_flow_ok_sell
+    gauss = gr.gaussian_gate_ok_buy if is_buy else gr.gaussian_gate_ok_sell
+    rma = gr.rma_cloud_ok_buy if is_buy else gr.rma_cloud_ok_sell
+    agree = sum(1 for x in (cirrus, flow, gauss, rma) if x is True)
+    return f"☁️ Clouds {agree}/4 — Cirrus {_v(cirrus)} · Flow {_v(flow)} · Gaussian {_v(gauss)} · RMA {_v(rma)}"
+
 def _record_status_line(status: str, active: Optional[Dict[str, Any]]) -> str:
     """One-line Telegram label for the one-active-trade rule."""
     if status == "IGNORED" and active:
@@ -3567,6 +3578,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             if record_active:
                 record_status = "IGNORED"
             record_line = _record_status_line(record_status, record_active)
+        if alerts_to_send and cfg.ENABLE_CLOUD_VOTE_LINE:
+            _cloud_line = _cloud_vote_line(gr, bool(is_buy_batch))
+            logger_pair.info(f"[{pair_name}] {_cloud_line}")
+            record_line = f"{record_line}\n{_cloud_line}" if record_line else _cloud_line
 
         if batch_mode and alerts_to_send:
             direction = "buy" if is_buy_batch else "sell"
