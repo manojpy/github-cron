@@ -2450,6 +2450,7 @@ class RedisStateStore:
             data["closed_reason"] = "horizon"
             data["closed_candle_ts"] = int(data["entry_ts"]) + (fill_delay + int(cfg.OUTCOME_LOOKAHEAD_CANDLES)) * 900
             data["horizon_pct"] = move if is_buy else -move
+            data["horizon_win"] = bool(result.get("win"))
             return data
         except Exception:
             return None
@@ -2489,6 +2490,7 @@ class RedisStateStore:
                 "reason": reason,
                 "hit_ts": int(hit_ts) if hit_ts is not None else None,
                 "pct": d.get("horizon_pct"),
+                "win": d.get("horizon_win"),
             })
             starts_cooldown = reason == "target" or (
                 reason in ("stop", "both")

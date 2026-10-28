@@ -1247,8 +1247,9 @@ async def send_trade_close_notices(sdb: RedisStateStore, telegram_queue: Telegra
         if e["reason"] == "horizon":
             _pct = e.get("pct")
             _pct_txt = f", {_pct:+.2f}% at close" if isinstance(_pct, (int, float)) else ""
+            _hicon = "✅" if e.get("win") is True else "⛔" if e.get("win") is False else icon["horizon"]
             lines.append(
-                f"{icon['horizon']} {e['pair']} ({e['source']}) {label['horizon']} — {side} from "
+                f"{_hicon} {e['pair']} ({e['source']}) {label['horizon']} — {side} from "
                 f"{format_ist_time(int(e['entry_ts']), '%H:%M')} candle{_pct_txt}"
             )
             continue
