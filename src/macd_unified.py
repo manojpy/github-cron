@@ -527,7 +527,8 @@ async def compute_bias_context(prepared_tasks: List[Tuple[str, str, Dict[str, An
                 continue
             if cfg.BIAS_USE_CIRRUS:
                 cirrus = calculate_cirrus_cloud_numpy(
-                    pd_15m.close, cfg.CIRRUS_X1, cfg.CIRRUS_X2, cfg.CIRRUS_X3, cfg.CIRRUS_X4
+                    pd_15m.close, cfg.CIRRUS_X1, cfg.CIRRUS_X2, cfg.CIRRUS_X3, cfg.CIRRUS_X4,
+                    cfg.CIRRUS_MIN_GAP_PCT,
                 )
                 if not bool(cirrus['valid'][i15]):
                     continue
