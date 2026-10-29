@@ -343,8 +343,7 @@ def test_opposite_directions_of_a_group_are_not_flagged():
 
 def test_footer_has_candle_open_time_and_bias():
     text = _send([_p("AAAUSD", "buy", 24, 27)], BIAS_DOWN)
-    assert "⏰" in text and "📆" in text and "Bias" in text
-
+    assert "⏰" in text and "📆" in text and "▼57% 🟥" in text
 
 def test_basket_note_when_three_same_direction_takes():
     ps = [_p(n, "buy", 26, 27, "TAKE") for n in ("AAAUSD", "BBBUSD", "CCCUSD")] \
