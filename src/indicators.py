@@ -2161,6 +2161,128 @@ def _pullback_continuation_state(o: np.ndarray, h: np.ndarray, l: np.ndarray, c:
         return "exhaustion", info
     return "pullback", info
 
+def _exhaustion_risk(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
+    atr: np.ndarray, ppohist: np.ndarray, rsi: np.ndarray, i15: int,
+    is_buy: bool, cfg_obj: BotConfig) -> Tuple[int, Dict[str, Any]]:
+    """Stateless late-trend exhaustion score for an entry on closed candle i15.
+
+    Answers: is this signal firing at the END of a mature, stretched move?
+    Three independent categories, two votes each (score 0-6):
+      EXT   extension : run extreme far from the baseline EMA (ATR units); many
+                        consecutive higher swing highs (lower lows for SELL)
+      MOM   momentum  : price swing high >= previous one while PPO histogram /
+                        RSI is lower (divergence at confirmed swings only)
+      FAIL  failure   : little room (in stop distances) between entry and the run
+                        extreme; run-extreme candle rejected (big wick) or broke the
+                        previous swing and closed back inside it
+    Uses closed candles <= i15 and swings confirmed by SWING_BARS candles, so it
+    never repaints and never looks ahead. SELL mirrors the arrays. Missing or
+    non-finite data returns status "unknown" with score 0 (no vote, never a veto).
+    """
+    unknown: Tuple[int, Dict[str, Any]] = (
+        0, {"status": "unknown", "score": 0, "cats": 0, "veto": False, "reasons": []})
+    lb = int(cfg_obj.EXHAUSTION_LOOKBACK_CANDLES)
+    swing = int(cfg_obj.EXHAUSTION_SWING_BARS)
+    if i15 < 30 or i15 >= len(c):
+        return unknown
+    start = max(0, i15 - lb)
+    if i15 - start < 30:
+        return unknown
+    a = float(atr[i15])
+    if not np.isfinite(a) or a <= 0:
+        return unknown
+    if is_buy:
+        oo, hh, ll, cc, ph, rr = o, h, l, c, ppohist, rsi
+    else:
+        oo, hh, ll, cc, ph, rr = -o, -l, -h, -c, -ppohist, -rsi
+    if not (np.all(np.isfinite(hh[start:i15 + 1])) and np.all(np.isfinite(cc[start:i15 + 1]))
+            and np.all(np.isfinite(ll[start:i15 + 1])) and np.all(np.isfinite(oo[start:i15 + 1]))):
+        return unknown
+
+    # ── baseline EMA (trend anchor), seeded 3 periods back ──
+    p = int(cfg_obj.EXHAUSTION_BASELINE_EMA)
+    alpha = 2.0 / (p + 1.0)
+    seg = cc[max(0, i15 - 3 * p):i15 + 1]
+    ema = float(seg[0])
+    for v in seg[1:]:
+        ema += alpha * (float(v) - ema)
+
+    # ── latest run extreme ──
+    run_lo = max(start, i15 - int(cfg_obj.EXHAUSTION_RUN_BARS) + 1)
+    seg_h = hh[run_lo:i15 + 1]
+    ih = run_lo + int(len(seg_h) - 1 - np.argmax(seg_h[::-1]))
+    run_hi = float(hh[ih])
+    ext_atr = (run_hi - ema) / a
+
+    # ── confirmed swing highs (strictly above the left bars, not below the right bars) ──
+    sh: List[int] = []
+    for j in range(start + swing, i15 - swing + 1):
+        hj = hh[j]
+        if hj > np.max(hh[j - swing:j]) and hj >= np.max(hh[j + 1:j + swing + 1]):
+            sh.append(j)
+    legs = 1 if sh else 0
+    for k in range(len(sh) - 1, 0, -1):
+        if hh[sh[k]] > hh[sh[k - 1]]:
+            legs += 1
+        else:
+            break
+
+    # ── divergence between the last two confirmed swing highs ──
+    ppo_div = rsi_div = False
+    if len(sh) >= 2:
+        j1, j2 = sh[-2], sh[-1]
+        if i15 - j2 <= int(cfg_obj.EXHAUSTION_DIV_MAX_AGE_BARS) and hh[j2] >= hh[j1]:
+            if np.isfinite(ph[j1]) and np.isfinite(ph[j2]) and ph[j2] < ph[j1]:
+                ppo_div = True
+            if np.isfinite(rr[j1]) and np.isfinite(rr[j2]) and rr[j2] < rr[j1] - float(cfg_obj.EXHAUSTION_RSI_DIV_MIN):
+                rsi_div = True
+
+    # ── room to the run extreme, in stop distances (only for a pullback entry) ──
+    risk_abs = float(cfg_obj.OUTCOME_MAE_LOSS_PCT) / 100.0 * abs(float(c[i15]))
+    room_r: Optional[float] = None
+    if ih < i15 and risk_abs > 0:
+        room = run_hi - float(cc[i15])
+        if room > 0:
+            room_r = room / risk_abs
+
+    # ── rejection at the run extreme ──
+    rng = float(hh[ih] - ll[ih])
+    top_wick = float(hh[ih] - max(oo[ih], cc[ih])) / rng if rng > 0 else 0.0
+    prior = [j for j in sh if j < ih]
+    failed_break = bool(prior and hh[ih] > hh[prior[-1]] and cc[ih] <= hh[prior[-1]])
+    rejected = top_wick >= float(cfg_obj.EXHAUSTION_TOP_WICK_RATIO) or failed_break
+
+    ext_vote = ext_atr >= float(cfg_obj.EXHAUSTION_EXT_ATR)
+    legs_vote = legs >= int(cfg_obj.EXHAUSTION_MIN_LEGS)
+    room_vote = room_r is not None and room_r < float(cfg_obj.EXHAUSTION_MIN_ROOM_R)
+    ext_pts = int(ext_vote) + int(legs_vote)
+    mom_pts = int(ppo_div) + int(rsi_div)
+    fail_pts = int(room_vote) + int(rejected)
+    score = ext_pts + mom_pts + fail_pts
+    cats = int(ext_pts > 0) + int(mom_pts > 0) + int(fail_pts > 0)
+    reasons: List[str] = []
+    if ext_vote:
+        reasons.append("EXT_ATR")
+    if legs_vote:
+        reasons.append("LEGS")
+    if ppo_div:
+        reasons.append("PPO_DIV")
+    if rsi_div:
+        reasons.append("RSI_DIV")
+    if room_vote:
+        reasons.append("NO_ROOM")
+    if rejected:
+        reasons.append("TOP_REJECT")
+    veto = bool(score >= int(cfg_obj.EXHAUSTION_VETO_SCORE) and cats >= int(cfg_obj.EXHAUSTION_MIN_CATEGORIES))
+    return score, {
+        "status": "ok", "score": int(score), "cats": int(cats), "veto": veto, "reasons": reasons,
+        "ext_pts": ext_pts, "mom_pts": mom_pts, "fail_pts": fail_pts,
+        "ext_atr": round(float(ext_atr), 2), "legs": int(legs),
+        "ppo_div": int(ppo_div), "rsi_div": int(rsi_div),
+        "room_r": None if room_r is None else round(float(room_r), 2),
+        "top_wick": round(float(top_wick), 2),
+    }
+
 def _prior_leg_direction(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray, end_idx: int, lookback: int) -> int:
     first = end_idx - lookback
     if end_idx < 0 or first < 0 or end_idx >= len(closes):

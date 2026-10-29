@@ -348,6 +348,27 @@ class BotConfig(BaseModel):
     PULLBACK_TRIGGER_BUFFER_ATR: float = Field(default=0.0, ge=0.0, le=2.0, description="Extra distance (ATR_SHORT multiples) the trigger candle must close beyond the pullback trigger level")
     PULLBACK_MIN_BARS_AFTER_LOW: int = Field(default=1, ge=0, le=6, description="Exhaustion (WATCH) needs at least this many closed candles after the pullback extreme, so a one-candle bounce top/bottom cannot qualify and the trigger level always exists. 0 = old behaviour (exhaustion allowed on the extreme candle itself)")
     PULLBACK_CONFIRM_WINDOW_BARS: int = Field(default=1, ge=1, le=4, description="A trigger close on any of the last N candles confirms the setup. 1 = the current candle only (strict). 2 lets a host alert that fires one candle after the trigger still be tagged")
+    EXHAUSTION_MODE: str = Field(default="shadow", pattern="^(off|shadow|live)$", description="Late-trend exhaustion filter for the host alerts (same list as the pullback layer). off = not computed; shadow = score computed, stored with every Recorded/Shadowed trade and shown on the alert, nothing blocked; live = a host alert whose exhaustion score reaches EXHAUSTION_VETO_SCORE (in at least EXHAUSTION_MIN_CATEGORIES categories) is not sent and is shadow-tracked as 'exhaustion_veto'. Existing alert conditions are never changed. Keep shadow until the Brain's exhaustion study shows the veto catches early stops without losing winners")
+    EXHAUSTION_SCOPE: str = Field(default="all", pattern="^(all|hosts)$", description="Which alerts the exhaustion filter covers. all = every alert (pivot, cross, reversal, trendline...), measured in the alert's own direction; hosts = only the pullback-layer host alerts")
+    EXHAUSTION_EXCLUDE_KEYS: List[str] = Field(default_factory=list, description="Alert keys the exhaustion filter never touches, e.g. [\"tl_break_buy\"]. Empty = none excluded")
+    EXHAUSTION_VETO_SCORE: int = Field(default=4, ge=1, le=6, description="Exhaustion score (0-6) at which a host alert is vetoed in live mode")
+    EXHAUSTION_MIN_CATEGORIES: int = Field(default=2, ge=1, le=3, description="Independent categories (extension, momentum, failed continuation) that must each score at least 1 before a veto, so one noisy indicator can never block a trade alone")
+    EXHAUSTION_SHOW_MIN_SCORE: int = Field(default=3, ge=0, le=6, description="Show a warning line on the Telegram alert when the exhaustion score is at least this. 0 = never show")
+    EXHAUSTION_LOOKBACK_CANDLES: int = Field(default=96, ge=40, le=300, description="Closed 15m candles scanned for swing highs/lows, leg count and divergence")
+    EXHAUSTION_RUN_BARS: int = Field(default=24, ge=8, le=96, description="Candles scanned back for the latest run extreme used by the extension and rejection tests")
+    EXHAUSTION_BASELINE_EMA: int = Field(default=50, ge=10, le=200, description="EMA period of the trend baseline that extension is measured from")
+    EXHAUSTION_EXT_ATR: float = Field(default=3.5, ge=1.0, le=15.0, description="Extension vote: run extreme is at least this many ATR_SHORT from the baseline EMA")
+    EXHAUSTION_SWING_BARS: int = Field(default=2, ge=1, le=5, description="Bars on each side that confirm a swing high/low (a swing is only used after it is confirmed, so nothing repaints)")
+    EXHAUSTION_MIN_LEGS: int = Field(default=4, ge=2, le=12, description="Maturity vote: this many consecutive higher swing highs (lower swing lows for SELL) ending at the latest confirmed swing")
+    EXHAUSTION_DIV_MAX_AGE_BARS: int = Field(default=30, ge=6, le=96, description="Divergence only counts when the latest swing is at most this many candles old")
+    EXHAUSTION_RSI_DIV_MIN: float = Field(default=1.0, ge=0.0, le=20.0, description="RSI must be lower at the latest swing than at the previous one by at least this many points to count as divergence")
+    EXHAUSTION_MIN_ROOM_R: float = Field(default=0.75, ge=0.1, le=5.0, description="No-room vote: distance from entry close to the run extreme is less than this many stop distances (OUTCOME_MAE_LOSS_PCT)")
+    EXHAUSTION_TOP_WICK_RATIO: float = Field(default=0.5, ge=0.2, le=0.95, description="Rejection vote: the run-extreme candle has an upper (BUY) / lower (SELL) wick of at least this share of its range, or broke the previous swing and closed back inside it")
+    EXHAUSTION_VERDICT_MODE: str = Field(default="shadow", pattern="^(off|shadow|live)$", description="Feed the exhaustion score into the TAKE/WATCH/AVOID verdict. off = ignored; shadow = what it WOULD change is stored with the trade (advisor_seen.exhaustion_adj) but the verdict is untouched; live = restrict-only: lowers conviction and can turn TAKE into WATCH or AVOID, never raises. Needs EXHAUSTION_MODE shadow or live (the score must be computed)")
+    EXHAUSTION_VERDICT_WATCH_SCORE: int = Field(default=3, ge=1, le=6, description="With at least EXHAUSTION_MIN_CATEGORIES categories scoring, this score turns a TAKE into WATCH (live verdict mode)")
+    EXHAUSTION_VERDICT_AVOID_SCORE: int = Field(default=5, ge=1, le=6, description="With at least EXHAUSTION_MIN_CATEGORIES categories scoring, this score turns TAKE/WATCH into AVOID (live verdict mode). Must be >= the WATCH score")
+    EXHAUSTION_VERDICT_PENALTY_PER_POINT: float = Field(default=5.0, ge=0.0, le=20.0, description="Conviction points removed for every exhaustion score point above 2 (live verdict mode). 0 = no conviction penalty")
+    EXHAUSTION_EARLY_STOP_BARS: int = Field(default=2, ge=1, le=6, description="A trade stopped within this many candles after fill counts as an early stop in the Brain's exhaustion study")
     EVAL_CONCURRENCY_LIMIT: int = Field(default=2, ge=1, le=30, description="Max pairs evaluated concurrently")
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
@@ -686,7 +707,11 @@ class BotConfig(BaseModel):
                 f'PULLBACK_MIN_RETRACE ({self.PULLBACK_MIN_RETRACE}) must be strictly less than '
                 f'PULLBACK_MAX_RETRACE ({self.PULLBACK_MAX_RETRACE})'
             )
-
+        if self.EXHAUSTION_VERDICT_WATCH_SCORE > self.EXHAUSTION_VERDICT_AVOID_SCORE:
+            raise ValueError(
+                f'EXHAUSTION_VERDICT_WATCH_SCORE ({self.EXHAUSTION_VERDICT_WATCH_SCORE}) must not exceed '
+                f'EXHAUSTION_VERDICT_AVOID_SCORE ({self.EXHAUSTION_VERDICT_AVOID_SCORE})'
+            )
         if self.RMA_CLOUD_ENABLED and self.RMA_CLOUD_FAST_PERIOD >= self.RMA_50_PERIOD:
             raise ValueError(
                 f'RMA_CLOUD_FAST_PERIOD ({self.RMA_CLOUD_FAST_PERIOD}) must be strictly less than '

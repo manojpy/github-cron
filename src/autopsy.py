@@ -513,16 +513,65 @@ def build_intelligence(
                                        keep_last=int(p.get("keep_last", 40))),
             "edges": edge_map(pop, cost_pct=cost_pct, min_n=int(p.get("edge_min_n", 20)), shrink_k=float(p.get("shrink_k", 10.0))),
         }
+    blob["exhaustion"] = exhaustion_study(
+        list(live) + list(shadow), cost_pct=cost_pct,
+        early_bars=int(p.get("exh_early_bars", 2)), min_n=int(p.get("exh_min_n", 30)))
     blob["rejections"] = rejection_audit(shadow, live, cost_pct=cost_pct, min_n=int(p.get("reject_min_n", 20)))
     blob["trust"] = trust_meter(live, cost_pct=cost_pct, sl_pct=sl_pct, tp_pct=tp_pct,
                                 target=float(p.get("target", 0.80)), min_take_n=int(p.get("min_take_n", 100)),
                                 windows=int(p.get("windows", 4)))
     return blob
 
+# ── 5. late-trend exhaustion study ────────────────────────────────────────
+def exhaustion_study(rows: Sequence[Row], *, cost_pct: float, early_bars: int = 2, min_n: int = 30,
+                     veto_scores: Sequence[int] = (3, 4, 5), min_cats: int = 2) -> Dict[str, Any]:
+    """Does the exhaustion score predict stops within `early_bars` candles?
+    For each possible veto threshold: how many early stops it would have caught,
+    how many winners it would have blocked, and the net P&L per trade before and after.
+    Report only; nothing here changes an alert."""
+    pts: List[Tuple[int, int, bool, float, bool]] = []
+    for r in rows:
+        ctx = r.get("context") if isinstance(r.get("context"), dict) else {}
+        sc, ct = ctx.get("exh_score"), ctx.get("exh_cats")
+        if isinstance(sc, bool) or not isinstance(sc, (int, float)):
+            continue
+        o = _outcome(r, cost_pct)
+        if o is None:
+            continue
+        sl_c = r.get("sl_candle")
+        early = (r.get("outcome_class") == "sl" and isinstance(sl_c, (int, float))
+                 and not isinstance(sl_c, bool) and int(sl_c) < early_bars)
+        pts.append((int(sc), int(ct) if isinstance(ct, (int, float)) else 0, bool(early), o[0], o[1]))
+    n = len(pts)
+    out: Dict[str, Any] = {"n": n, "early_bars": early_bars, "status": "COLLECTING" if n < min_n else "OK",
+                           "bands": [], "cuts": []}
+    if n == 0:
+        return out
+    n_early = sum(1 for p in pts if p[2])
+    n_win = sum(1 for p in pts if p[4])
+    out["early_rate"] = round(n_early / n, 3)
+    mean_all = sum(p[3] for p in pts) / n
+    for label, lo, hi in (("0-1", 0, 1), ("2", 2, 2), ("3", 3, 3), ("4+", 4, 6)):
+        g = [p for p in pts if lo <= p[0] <= hi]
+        if g:
+            out["bands"].append({"band": label, "n": len(g),
+                                 "early": round(sum(1 for p in g if p[2]) / len(g), 3),
+                                 "success": round(sum(1 for p in g if p[4]) / len(g), 3),
+                                 "mean_net": round(sum(p[3] for p in g) / len(g), 3)})
+    for t in veto_scores:
+        blocked = [p for p in pts if p[0] >= t and p[1] >= min_cats]
+        kept = [p for p in pts if not (p[0] >= t and p[1] >= min_cats)]
+        out["cuts"].append({
+            "score": t, "blocked": len(blocked), "kept_share": round(len(kept) / n, 3),
+            "early_caught": None if not n_early else round(sum(1 for p in blocked if p[2]) / n_early, 3),
+            "winners_lost": None if not n_win else round(sum(1 for p in blocked if p[4]) / n_win, 3),
+            "net_before": round(mean_all, 3),
+            "net_after": None if not kept else round(sum(p[3] for p in kept) / len(kept), 3),
+        })
+    return out
 
 def _pct(x: Optional[float]) -> str:
     return "n/a" if x is None else f"{x:.0%}"
-
 
 def format_intelligence(blob: Mapping[str, Any], name_fn: Callable[[str], str] = str, max_chars: int = 3400) -> str:
     q = blob.get("quality") or {}
@@ -575,6 +624,23 @@ def format_intelligence(blob: Mapping[str, Any], name_fn: Callable[[str], str] =
         lines.append("  collecting evidence")
     for x in shown:
         lines.append(f"  {x['reason']}: n={x['n']} success {x['success']:.0%} net {x['mean_net']:+.2f}% -> {x['status']}")
+
+    ex = blob.get("exhaustion") or {}
+    if ex.get("n"):
+        lines.append("")
+        lines.append(f"⏳ LATE-TREND EXHAUSTION (n={ex['n']}, stopped within {ex['early_bars']} candles: "
+                     f"{_pct(ex.get('early_rate'))}) {ex.get('status', '')}")
+        for b in ex.get("bands", []):
+            lines.append(f"  score {b['band']}: n={b['n']} early-stop {b['early']:.0%} success {b['success']:.0%} "
+                         f"net {b['mean_net']:+.2f}%")
+        if ex.get("status") == "OK":
+            for c in ex.get("cuts", []):
+                if c["blocked"]:
+                    ec = "n/a" if c["early_caught"] is None else f"{c['early_caught']:.0%}"
+                    wl = "n/a" if c["winners_lost"] is None else f"{c['winners_lost']:.0%}"
+                    na = "n/a" if c["net_after"] is None else f"{c['net_after']:+.2f}"
+                    lines.append(f"  veto at >={c['score']}: blocks {c['blocked']} | catches {ec} of early stops | "
+                                 f"loses {wl} of winners | keeps {c['kept_share']:.0%} | net {c['net_before']:+.2f} -> {na}%")
     last = ((((blob.get("pops") or {}).get("LIVE") or {}).get("autopsy") or {}).get("autopsies") or [])[-3:]
     if last:
         lines.append("")

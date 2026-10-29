@@ -80,6 +80,7 @@ class PairAdvice:
     size_line: str = ""
     notes: List[str] = field(default_factory=list)
     qualifier: str = ""                # e.g. "small size" for an unproven TAKE
+    exh_adj: Optional[Dict[str, Any]] = None   # late-trend exhaustion adjustment (stored with the trade)
 
     @property
     def label(self) -> str:
@@ -427,7 +428,7 @@ def _pb_rule_hit(playbook: Dict[str, Any], ctx: Optional[Dict[str, Any]]) -> Opt
             return r
     return None
 
-def advise_pair(*, playbook: Optional[Dict[str, Any]] = None, playbook_mode: str = "off", playbook_allow_upgrade: bool = False, playbook_ctx: Optional[Dict[str, Any]] = None, **kwargs: Any) -> PairAdvice:
+def _advise_pair_playbook(*, playbook: Optional[Dict[str, Any]] = None, playbook_mode: str = "off", playbook_allow_upgrade: bool = False, playbook_ctx: Optional[Dict[str, Any]] = None, **kwargs: Any) -> PairAdvice:
     """Core advice, optionally overlaid with the learner's validated playbook entry.
     off / shadow : the advice is byte-for-byte the core advice (shadow only records).
     live         : RESTRICT-ONLY.
@@ -495,5 +496,71 @@ def advise_pair(*, playbook: Optional[Dict[str, Any]] = None, playbook_mode: str
     except Exception:
         return _advise_pair_core(**kwargs)
     return advice
+
+# ── Late-trend exhaustion overlay (restrict-only, togglable) ──────────────
+def _apply_exhaustion(advice: PairAdvice, info: Optional[Dict[str, Any]], mode: str,
+                      params: Dict[str, Any], kwargs: Dict[str, Any]) -> PairAdvice:
+    """Lower (never raise) the verdict when the entry looks like the end of a mature move.
+    shadow : records what it WOULD do in advice.exh_adj; the advice is unchanged.
+    live   : conviction loses `penalty_per_point` for every score point above 2; with at least
+             `min_cats` independent categories scoring, score >= watch_score turns TAKE into
+             WATCH and score >= avoid_score turns TAKE/WATCH into AVOID. The conviction
+             penalty can also lower the verdict through the normal TAKE/WATCH cut-offs.
+    off, unknown or missing data: advice unchanged."""
+    if mode not in ("shadow", "live") or not isinstance(info, dict) or info.get("status") != "ok":
+        return advice
+    try:
+        score, cats = int(info.get("score", 0)), int(info.get("cats", 0))
+        if score <= 0:
+            return advice
+        w, a = int(params.get("watch_score", 3)), int(params.get("avoid_score", 5))
+        minc, per = int(params.get("min_cats", 2)), float(params.get("penalty_per_point", 5.0))
+        take_min, watch_min = float(kwargs.get("take_min", 70.0)), float(kwargs.get("watch_min", 50.0))
+        enough = cats >= minc
+        penalty = per * max(0, score - 2) if enough else 0.0
+        old_v, old_c = advice.verdict, advice.conviction
+        new_v, new_c = old_v, old_c
+        if new_c is not None and penalty > 0:
+            new_c = int(round(max(0.0, new_c - penalty)))
+            if new_v == TAKE and new_c < take_min:
+                new_v = WATCH
+            if new_v == WATCH and new_c < watch_min:
+                new_v = AVOID
+        if enough:
+            if score >= a and new_v in (TAKE, WATCH):
+                new_v = AVOID
+            elif score >= w and new_v == TAKE:
+                new_v = WATCH
+        if new_c is not None and new_v != old_v:
+            # keep the shown conviction inside the band of the verdict it now reads
+            new_c = int(min(new_c, (take_min if new_v == WATCH else watch_min) - 1))
+        changed = new_v != old_v or new_c != old_c
+        advice.exh_adj = {"score": score, "cats": cats, "penalty": penalty, "verdict_from": old_v,
+                          "verdict_to": new_v, "conviction_from": old_c, "conviction_to": new_c,
+                          "applied": bool(mode == "live" and changed)}
+        if mode != "live" or not changed:
+            return advice
+        reasons = ", ".join(info.get("reasons") or [])
+        advice.conviction = new_c
+        if new_v != old_v:
+            advice.verdict = new_v
+            advice.qualifier = ""
+            if new_v == AVOID:
+                advice.size_line = ""
+            advice.why_line += " Held back by late-trend exhaustion."
+        advice.risk_label = "Risk"
+        advice.risk_line = f"late-trend exhaustion {score}/6 ({reasons}); " + advice.risk_line
+    except Exception:
+        return advice
+    return advice
+
+
+def advise_pair(*, exhaustion: Optional[Dict[str, Any]] = None, exhaustion_mode: str = "off",
+                exhaustion_params: Optional[Dict[str, Any]] = None, **kwargs: Any) -> PairAdvice:
+    """Core advice -> playbook overlay -> late-trend exhaustion overlay."""
+    advice = _advise_pair_playbook(**kwargs)
+    return _apply_exhaustion(advice, exhaustion, exhaustion_mode, dict(exhaustion_params or {}), kwargs)
+
+
 
 

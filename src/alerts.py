@@ -67,7 +67,7 @@ import threshold_engine as engine
 from indicators import (
     calculate_alert_indicators_numpy, validate_indicators_dict, validate_vwap_cross,
     validate_cloud_cross, validate_conversion_cross, validate_equilibrium_cross,
-    _fib_reversal_confluence_vote, _pullback_continuation_state,
+    _fib_reversal_confluence_vote, _pullback_continuation_state, _exhaustion_risk,
 )
 from threshold_engine import hash_config_state
 from feature_store import FEATURE_SET_VERSION
@@ -482,6 +482,7 @@ async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, a
                     "effective_score": effective_score,
                     "effective_required": effective_required,
                     **rich_fields,
+                    **exhaustion_trade_fields(context or {}, direction),
                 },
             )
     except Exception as e:
@@ -569,7 +570,7 @@ def _record_status_line(status: str, active: Optional[Dict[str, Any]]) -> str:
         return f"⏸ Cooldown — same-direction trade recently closed, not recorded until the {resume} candle"
     return "📝 Recorded as trade"
 
-def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], items: List[Tuple[str, str]], keys: List[str], tq_by_key: Dict[str, Optional[Dict[str, Any]]], votes: Optional[Dict[str, bool]], required: Optional[float], bias_context: Optional[BiasContext], logger_pair: logging.Logger, pb_by_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None, adx_val: Optional[float] = None, record_line: Optional[str] = None, pullback_line: Optional[str] = None, decision_sink: Optional[Dict[str, Any]] = None) -> Tuple[str, Optional[str]]:
+def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], items: List[Tuple[str, str]], keys: List[str], tq_by_key: Dict[str, Optional[Dict[str, Any]]], votes: Optional[Dict[str, bool]], required: Optional[float], bias_context: Optional[BiasContext], logger_pair: logging.Logger, pb_by_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None, adx_val: Optional[float] = None, record_line: Optional[str] = None, pullback_line: Optional[str] = None, decision_sink: Optional[Dict[str, Any]] = None, exhaustion: Optional[Dict[str, Any]] = None) -> Tuple[str, Optional[str]]:
     """Build the rich body for one pair/direction and return (body, verdict).
     Never raises: any failure degrades to a plain header + setup line (verdict
     None) so an alert is never lost to a formatting bug."""
@@ -602,6 +603,14 @@ def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int
             price=float(price) if isinstance(price, (int, float)) else None,
 
             playbook=next((pb_by_key[k] for k in s_keys if pb_by_key and pb_by_key.get(k)), None),
+            exhaustion=exhaustion,
+            exhaustion_mode=str(cfg.EXHAUSTION_VERDICT_MODE),
+            exhaustion_params={
+                "watch_score": cfg.EXHAUSTION_VERDICT_WATCH_SCORE,
+                "avoid_score": cfg.EXHAUSTION_VERDICT_AVOID_SCORE,
+                "min_cats": cfg.EXHAUSTION_MIN_CATEGORIES,
+                "penalty_per_point": cfg.EXHAUSTION_VERDICT_PENALTY_PER_POINT,
+            },
             playbook_mode=str(getattr(cfg, "PLAYBOOK_MODE", "off")),
             playbook_allow_upgrade=bool(getattr(cfg, "PLAYBOOK_ALLOW_UPGRADE", False)),
             playbook_ctx={
@@ -616,6 +625,7 @@ def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int
                 "conviction": advice.conviction,
                 "confidence": advice.confidence,
                 "qualifier": advice.qualifier or None,
+                "exhaustion_adj": advice.exh_adj,
                 "keys": list(s_keys),
             })
         body = build_rich_pair_msg(
@@ -1633,11 +1643,62 @@ def pullback_message_line(context: Dict[str, Any], direction: str, keys: List[st
     info = context.get(f"pullback_info_{side}") or {}
     return f"↩ Pullback continuation ✓ ({', '.join(info.get('votes', []))}) | {_pullback_levels_text(info)}"
 
+def _exhaustion_applies(alert_key: str) -> bool:
+    """Does the late-trend exhaustion filter cover this alert? EXHAUSTION_SCOPE 'all' = every
+    alert (pivots, crosses, reversals...) except EXHAUSTION_EXCLUDE_KEYS; 'hosts' = only the
+    pullback-layer host alerts. The score is always measured in the alert's own direction."""
+    if alert_key in cfg.EXHAUSTION_EXCLUDE_KEYS:
+        return False
+    if cfg.EXHAUSTION_SCOPE == "all":
+        return True
+    return alert_key in _PULLBACK_HOST_KEYS
+
+def exhaustion_trade_fields(context: Dict[str, Any], direction: str) -> Dict[str, Any]:
+    """Flat numeric snapshot of the exhaustion score, stored with every Recorded and
+    Shadowed trade so the Brain can study it. Empty when the filter is off/unknown."""
+    side = "buy" if str(direction).lower() == "buy" else "sell"
+    info = context.get(f"exhaustion_info_{side}") or {}
+    if info.get("status") != "ok":
+        return {}
+    out: Dict[str, Any] = {
+        "exh_score": info["score"], "exh_cats": info["cats"],
+        "exh_ext_atr": info["ext_atr"], "exh_legs": info["legs"],
+        "exh_ppo_div": info["ppo_div"], "exh_rsi_div": info["rsi_div"],
+        "exh_top_wick": info["top_wick"],
+    }
+    if info.get("room_r") is not None:
+        out["exh_room_r"] = info["room_r"]
+    return out
+
+def exhaustion_message_line(context: Dict[str, Any], direction: str, keys: List[str]) -> Optional[str]:
+    """Warning line for an alert whose exhaustion score is elevated but not vetoed."""
+    if cfg.EXHAUSTION_MODE == "off" or not cfg.EXHAUSTION_SHOW_MIN_SCORE:
+        return None
+    if not any(_exhaustion_applies(k) for k in keys):
+        return None
+    side = "buy" if direction == "buy" else "sell"
+    info = context.get(f"exhaustion_info_{side}") or {}
+    if info.get("status") != "ok" or info.get("score", 0) < cfg.EXHAUSTION_SHOW_MIN_SCORE:
+        return None
+    return (f"⏳ Late-trend risk {info['score']}/6 ({', '.join(info.get('reasons', []))}) | "
+            f"{info['ext_atr']:.1f} ATR from EMA{cfg.EXHAUSTION_BASELINE_EMA}, {info['legs']} swing legs")
+
+def exhaustion_info_for_verdict(context: Dict[str, Any], direction: str, keys: List[str]) -> Optional[Dict[str, Any]]:
+    """Exhaustion info handed to the TAKE/WATCH/AVOID advisor (None = leave the verdict alone)."""
+    if cfg.EXHAUSTION_MODE == "off" or cfg.EXHAUSTION_VERDICT_MODE == "off":
+        return None
+    if not any(_exhaustion_applies(k) for k in keys):
+        return None
+    return context.get(f"exhaustion_info_{'buy' if direction == 'buy' else 'sell'}") or None
+
+def _join_lines(*parts: Optional[str]) -> Optional[str]:
+    kept = [p for p in parts if p]
+    return "\n".join(kept) if kept else None
+
 # Pullback WATCH entries gathered during evaluation and sent as ONE message after the
 # real alerts: (pair, dedup_key, escaped_block). One process = one run, so a module
 # list is safe; it is emptied by flush_pullback_watch().
 _PULLBACK_WATCH_QUEUE: List[Tuple[str, str, str]] = []
-
 
 async def send_pullback_watch(context: Dict[str, Any], gr: GateResult, sdb: RedisStateStore, telegram_queue: "TelegramQueue", logger_pair: logging.Logger) -> int:
     """Informational WATCH: pullback shows exhaustion, trigger candle not closed yet.
@@ -2108,6 +2169,20 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     context[f"pullback_info_{_side}"] = _inf
             except Exception as _pb_err:
                 logger_pair.warning(f"[{pair_name}] pullback state failed: {_pb_err}", exc_info=cfg.DEBUG_MODE)
+        context["exhaustion_info_buy"] = context["exhaustion_info_sell"] = {}
+        context["exhaustion_veto_buy"] = context["exhaustion_veto_sell"] = False
+        if cfg.EXHAUSTION_MODE != "off" and gr.atr_short_arr is not None:
+            try:
+                _ex_ppohist = np.asarray(ppo_gate_arr, dtype=float) - np.asarray(ppo_gate_signal_arr, dtype=float)
+                for _side, _is_buy in (("buy", True), ("sell", False)):
+                    _ex_score, _ex_info = _exhaustion_risk(
+                        data_15m.open, data_15m.high, data_15m.low, data_15m.close,
+                        gr.atr_short_arr, _ex_ppohist, smooth_rsi, i15, _is_buy, cfg,
+                    )
+                    context[f"exhaustion_info_{_side}"] = _ex_info
+                    context[f"exhaustion_veto_{_side}"] = bool(_ex_info.get("veto"))
+            except Exception as _ex_err:
+                logger_pair.warning(f"[{pair_name}] exhaustion score failed: {_ex_err}", exc_info=cfg.DEBUG_MODE)
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev, "ema_curr": rsi_ema_curr, "ema_prev": rsi_ema_prev}
@@ -2334,6 +2409,20 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                             )
                         continue
 
+                if cfg.EXHAUSTION_MODE == "live" and _exhaustion_applies(alert_key)::
+                    _ex_side = "buy" if alert_key in BUY_ALERT_KEYS else "sell"
+                    if context.get(f"exhaustion_veto_{_ex_side}"):
+                        if cfg.DEBUG_MODE:
+                            logger_pair.debug(f"Skipping {alert_key}: late-trend exhaustion "
+                                              f"{(context.get(f'exhaustion_info_{_ex_side}') or {}).get('reasons')}")
+                        if not _brain_disabled:
+                            # Shadow-tracked at dispatch as "exhaustion_veto" so the
+                            # veto's effect is measured, not invisible.
+                            context.setdefault("exhaustion_veto_hits", []).append(
+                                (def_.title, extra, def_.key)
+                            )
+                        continue
+
                 if alert_key.startswith("tl_") and cfg.TRENDLINE_SHADOW_MODE:
                     # Trendline shadow mode: never sent; shadow-tracked at dispatch
                     # as "trendline_shadow" so results can be reviewed before going live.
@@ -2507,6 +2596,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     _disabled_hits = context.pop("brain_disabled_hits", None) or []
     _pb_hits = context.pop("pullback_unconfirmed_hits", None) or []
     _tl_hits = context.pop("trendline_shadow_hits", None) or []
+    _ex_hits = context.pop("exhaustion_veto_hits", None) or []
 
     if kill_switch_mode() == "live" and sdb and not sdb.degraded and sdb._redis:
         if kill_switch_active_run is _SENTINEL_UNSET:
@@ -2636,7 +2726,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             capped_alerts = raw_alerts
 
         alerts_to_send = capped_alerts[:cfg.MAX_ALERTS_PER_PAIR]
-        if _disabled_hits or _pb_hits or _tl_hits:
+        if _disabled_hits or _pb_hits or _tl_hits or _ex_hits:
             _dis_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
             if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
                 _pair_floor = (
@@ -2660,6 +2750,15 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     sdb, pair_name, _pb_pass, ts_curr, close_curr,
                     block_reason="pullback_unconfirmed",
                     confluence_scores={ak: _confluence_for(ak) for _, _, ak in _pb_pass},
+                    gr=gr, context=context,
+                    logger_pair=logger_pair,
+                )
+            _ex_pass = _disabled_hits_passing_confluence(_ex_hits, _confluence_for, _dis_floor)
+            if _ex_pass:
+                await _record_counterfactual_block(
+                    sdb, pair_name, _ex_pass, ts_curr, close_curr,
+                    block_reason="exhaustion_veto",
+                    confluence_scores={ak: _confluence_for(ak) for _, _, ak in _ex_pass},
                     gr=gr, context=context,
                     logger_pair=logger_pair,
                 )
@@ -3349,6 +3448,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         [ak for _, _, ak in alerts_to_send if ak != alert_key]
                         if cfg.ENABLE_SINGLE_ACTIVE_TRADE else None
                     ),
+                    **exhaustion_trade_fields(
+                        context, "buy" if alert_key in BUY_ALERT_KEYS else "sell"),
                 }
                 # ── NEW: compute effective score after macro/cluster ──
                 eff_score = s
@@ -3613,8 +3714,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 bias_context=bias_context,
                 logger_pair=logger_pair,
                 record_line=record_line,
-                pullback_line=pullback_message_line(context, direction, keys),
+                pullback_line=_join_lines(
+                    pullback_message_line(context, direction, keys),
+                    exhaustion_message_line(context, direction, keys),
+                ),
                 decision_sink=advisor_seen,
+                exhaustion=exhaustion_info_for_verdict(context, direction, keys),
             )
             msg_body = msg
 
@@ -3842,8 +3947,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 bias_context=bias_context,
                 logger_pair=logger_pair,
                 record_line=record_line,
-                pullback_line=pullback_message_line(context, direction, keys),
+                pullback_line=_join_lines(
+                    pullback_message_line(context, direction, keys),
+                    exhaustion_message_line(context, direction, keys),
+                ),
                 decision_sink=advisor_seen,
+                exhaustion=exhaustion_info_for_verdict(context, direction, keys),
             )
             # Footer: candle OPEN time (e.g. 16:00 for the 16:00-16:15 candle,
             # delivered ~16:16). The timestamp is always present; the bias
