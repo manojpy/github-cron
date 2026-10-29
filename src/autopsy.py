@@ -537,7 +537,8 @@ def exhaustion_study(rows: Sequence[Row], *, cost_pct: float, early_bars: int = 
     Report only; nothing here changes an alert."""
     pts: List[Tuple[int, int, bool, float, bool]] = []
     for r in rows:
-        ctx = r.get("context") if isinstance(r.get("context"), dict) else {}
+        ctx_raw = r.get("context")
+        ctx: Dict[str, Any] = ctx_raw if isinstance(ctx_raw, dict) else {}
         sc, ct = ctx.get("exh_score"), ctx.get("exh_cats")
         if isinstance(sc, bool) or not isinstance(sc, (int, float)):
             continue
