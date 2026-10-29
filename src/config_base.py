@@ -204,17 +204,15 @@ class BiasContext:
     compute_bias_context in macd_unified.py). Purely a cosmetic header
     prepended to every outgoing Telegram message this run — see
     cfg.ENABLE_BIAS_HEADER. Never gates or filters an alert.
-    With cfg.BIAS_USE_CIRRUS (default) a pair counts as:
-      up      - Cirrus Cloud Trend Up on the last closed 15m candle
-      down    - Cirrus Cloud Trend Down on the last closed 15m candle
-      neutral - filters equal (no trend either way)
-      (pairs whose Cirrus filters are not yet valid are skipped)
-    With BIAS_USE_CIRRUS=False the legacy Ichimoku rule applies
-    (23/65/130/65 — see BIAS_ICHIMOKU_* config):
-      up      - last closed 15m close above the cloud AND future cloud green
-      down    - last closed 15m close below the cloud AND future cloud red
-      neutral - everything else"""
-
+    A pair counts as (all three conditions must hold):
+      up      - 5m RMA(200) below the 5m close AND 5m Cirrus Cloud green
+                (Trend Up) with the 5m close above the cloud AND 15m Gaussian
+                trend line green
+      down    - 5m RMA(200) above the 5m close AND 5m Cirrus Cloud red
+                (Trend Down) with the 5m close below the cloud AND 15m Gaussian
+                trend line red
+      neutral - anything else
+      (pairs with missing/not-yet-valid inputs are skipped)"""
     up_count: int
     down_count: int
     neutral_count: int

@@ -21,9 +21,8 @@ from bot_config import (
     Constants, TRACE_ID, PAIR_ID, cfg, logger, logger_main,
     format_ist_time, MEMORY_CHECK_INTERVAL_PAIRS, validate_runtime_config,
     json_dumps, json_loads, JSON_BACKEND, shutdown_event, __version__, BtcMacroContext,
-    ClusterContext, BiasContext,
+    ClusterContext, BiasContext, normalize_timestamp, normalize_timestamp_array,
 )
-# ── fetcher : only orchestrator-level I/O ──
 from fetcher import (
     SessionManager, DataFetcher, PriceData, parse_candles_to_numpy,
     get_last_closed_index_from_array,
@@ -32,7 +31,7 @@ from fetcher import (
 from indicators import (
     get_utc_date_key, should_reset_daily_state, warmup_if_needed,
     _normalize_samples, _prune_stale_samples, _oi_funding_gate_reason,
-    calculate_ichimoku_numpy, calculate_cirrus_cloud_numpy,
+    calculate_rma_numpy, calculate_cirrus_cloud_numpy, calculate_gaussian_trend_numpy,
 )
 from state import (
     _blanket_reset_pair, _clear_all_redis_states, _redis_key_inventory, build_products_map_from_cfg,
@@ -506,61 +505,77 @@ async def _compute_directional_cluster(prepared_tasks: List[Tuple[str, str, Dict
     ), gate_cache
 
 async def compute_bias_context(prepared_tasks: List[Tuple[str, str, Dict[str, Any]]], reference_time: int, parsed_cache: Optional[Dict[str, Any]] = None) -> Optional[BiasContext]:
-    """Pair-universe directional-bias pre-pass on 15m: Cirrus Cloud by default
-    (cfg.BIAS_USE_CIRRUS), or the standalone Ichimoku 23/65/130/65 cloud
-    (cfg.BIAS_ICHIMOKU*) when BIAS_USE_CIRRUS=False. Cosmetic only: feeds the header
-    line prepended to every outgoing alert this run (cfg.ENABLE_BIAS_HEADER);
-    never gates or filters an alert. See BiasContext docstring for the
-    per-pair up/down/neutral classification rule."""
+    """Pair-universe directional-bias pre-pass. Cosmetic only: feeds the bias line
+    appended to every outgoing alert this run (cfg.ENABLE_BIAS_HEADER); never gates
+    or filters an alert. See BiasContext docstring for the per-pair rule
+    (RMA 200 5m + Cirrus Cloud 5m + Gaussian 15m, all three must agree)."""
     parsed_cache = parsed_cache or {}
     up = down = neutral = 0
     counted = 0
 
     for p_name, symbol, candles in prepared_tasks:
         try:
-            pd_15m, _, _ = parsed_cache.get(p_name, (None, None, None))
-            if pd_15m is None:
+            pd_15m, pd_5m, _ = parsed_cache.get(p_name, (None, None, None))
+            if pd_15m is None or pd_5m is None:
                 continue
 
             i15 = get_last_closed_index_from_array(pd_15m.ts, 15, reference_time, p_name)
             if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
                 continue
-            if cfg.BIAS_USE_CIRRUS:
-                cirrus = calculate_cirrus_cloud_numpy(
-                    pd_15m.close, cfg.CIRRUS_X1, cfg.CIRRUS_X2, cfg.CIRRUS_X3, cfg.CIRRUS_X4,
-                    cfg.CIRRUS_MIN_GAP_PCT,
-                )
-                if not bool(cirrus['valid'][i15]):
+
+            # Same closed 5m candle the gate evaluation uses (gates.py): the 5m candle
+            # that opened one interval before the current 5m boundary, falling back to
+            # the last 5m candle inside the closed 15m candle's window.
+            ts_5m = normalize_timestamp_array(pd_5m.ts)
+            expected_5m_open = (reference_time // 300) * 300 - 300
+            matches_5m = np.flatnonzero(np.abs(ts_5m - expected_5m_open) <= 30)
+            if matches_5m.size > 0:
+                i5 = int(matches_5m[-1])
+            else:
+                ts_15m_open = int(normalize_timestamp(int(pd_15m.ts[i15])))
+                window = np.flatnonzero((ts_5m >= ts_15m_open) & (ts_5m < ts_15m_open + 900))
+                if window.size == 0:
                     continue
-                counted += 1
-                if bool(cirrus['trend_up'][i15]):
-                    up += 1
-                elif bool(cirrus['trend_dn'][i15]):
-                    down += 1
-                else:
-                    neutral += 1
-                continue
+                i5 = int(window[-1])
 
-            ichimoku = calculate_ichimoku_numpy(
-                pd_15m.high, pd_15m.low, pd_15m.close,
-                cfg.BIAS_ICHIMOKU_CONVERSION_PERIODS,
-                cfg.BIAS_ICHIMOKU_BASE_PERIODS,
-                cfg.BIAS_ICHIMOKU_SPANB_PERIODS,
-                cfg.BIAS_ICHIMOKU_DISPLACEMENT,
+            close_5m = pd_5m.close
+            price = float(close_5m[i5])
+            rma200 = float(calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)[i5])
+            cirrus = calculate_cirrus_cloud_numpy(
+                close_5m, cfg.CIRRUS_X1, cfg.CIRRUS_X2, cfg.CIRRUS_X3, cfg.CIRRUS_X4,
+                cfg.CIRRUS_MIN_GAP_PCT,
             )
-            price = pd_15m.close[i15]
-            cloud_upper = ichimoku['cloud_upper'][i15]
-            cloud_lower = ichimoku['cloud_lower'][i15]
-            future_green = bool(ichimoku['future_green'][i15])
-            future_red = bool(ichimoku['future_red'][i15])
 
-            if np.isnan(price) or np.isnan(cloud_upper) or np.isnan(cloud_lower):
+            if cfg.GAUSSIAN_SOURCE == 'hl2':
+                g_src = (pd_15m.high + pd_15m.low) / 2.0
+            elif cfg.GAUSSIAN_SOURCE == 'hlc3':
+                g_src = (pd_15m.high + pd_15m.low + pd_15m.close) / 3.0
+            else:
+                g_src = pd_15m.close
+            gauss = calculate_gaussian_trend_numpy(
+                pd_15m.high, pd_15m.low, pd_15m.close, g_src,
+                cfg.GAUSSIAN_PRESET, cfg.GAUSSIAN_LENGTH, cfg.GAUSSIAN_POLES,
+                cfg.GAUSSIAN_ATR_LENGTH, cfg.GAUSSIAN_FIXED_MULTIPLIER,
+                cfg.GAUSSIAN_ADAPTIVE_WIDTH, cfg.GAUSSIAN_EFFICIENCY_LENGTH,
+                cfg.GAUSSIAN_TREND_MULTIPLIER, cfg.GAUSSIAN_CHOP_MULTIPLIER,
+                cfg.GAUSSIAN_EFFICIENCY_SMOOTH,
+            )
+
+            # Any missing input -> the pair is skipped (not counted), never guessed.
+            if (not np.isfinite(price) or not np.isfinite(rma200)
+                    or not bool(cirrus['valid'][i5]) or not bool(gauss['valid'][i15])):
                 continue
+
+            cloud_top = max(float(cirrus['filtx1'][i5]), float(cirrus['filtx12'][i5]))
+            cloud_bottom = min(float(cirrus['filtx1'][i5]), float(cirrus['filtx12'][i5]))
+            g_dir = int(gauss['trend_dir'][i15])
 
             counted += 1
-            if price > cloud_upper and future_green:
+            if (rma200 < price and bool(cirrus['trend_up'][i5])
+                    and price > cloud_top and g_dir == 1):
                 up += 1
-            elif price < cloud_lower and future_red:
+            elif (rma200 > price and bool(cirrus['trend_dn'][i5])
+                    and price < cloud_bottom and g_dir == -1):
                 down += 1
             else:
                 neutral += 1
@@ -1222,7 +1237,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 logger_main.warning(f"Macro context ({ref_pair}) eval failed, disabling macro gate this run: {e}")
                 btc_context = None
 
-    # ── Pair-Universe Ichimoku Bias Header (cosmetic only — see BiasContext docstring) ──
+    # ── Pair-Universe Bias Line (cosmetic only — see BiasContext docstring) ──
     bias_context: Optional[BiasContext] = None
     if cfg.ENABLE_BIAS_HEADER:
         try:

@@ -649,32 +649,20 @@ def build_pair_msg_safe(**kwargs: Any) -> str:
     return build_pair_msg_and_verdict(**kwargs)[0]
 
 def _format_bias_header(bias_context: BiasContext) -> str:
-    up_pct = round(bias_context.up_pct * 100)
-    down_pct = round(bias_context.down_pct * 100)
-    neutral_pct = round(bias_context.neutral_pct * 100)
-
-    # (count, emoji, arrow, label, pct)  — ties break Up > Down > Neutral
-    candidates = [
-        (bias_context.up_count,    "🟢", "▲", "Uptrend",   up_pct),
-        (bias_context.down_count,  "🔴", "▼", "Downtrend", down_pct),
-        (bias_context.neutral_count, "⚪", "◽", "Neutral", neutral_pct),
+    """Bias bar: dominant bucket first, then the others by size. One square per 10%
+    (rounded half-up per bucket), e.g. '▼70% 🟥🟥🟥🟥🟥🟥🟥  ▲20% 🟩🟩  ◽10% ⬜'.
+    Ties break Up > Down > Neutral. Contains no MarkdownV2-reserved characters."""
+    buckets = [
+        (bias_context.up_count,      "▲", "🟩", round(bias_context.up_pct * 100)),
+        (bias_context.down_count,    "▼", "🟥", round(bias_context.down_pct * 100)),
+        (bias_context.neutral_count, "◽", "⬜", round(bias_context.neutral_pct * 100)),
     ]
-    _, emoji, arrow, label, pct = max(candidates, key=lambda t: t[0])
-
-    # Non-dominant fragments in fixed order: up → down → neutral
-    fragments = []
-    for lbl, arr, p in (
-        ("Uptrend",   "▲", up_pct),
-        ("Downtrend", "▼", down_pct),
-        ("Neutral",   "◽", neutral_pct),
-    ):
-        if lbl != label:
-            fragments.append(f"{arr}{p}%")
-
-    return (
-        f"{emoji} Bias \\- {arrow}{label}\\({pct}%\\), "
-        f"{' '.join(fragments)}"
-    )
+    buckets.sort(key=lambda t: -t[0])   # stable: ties keep up > down > neutral order
+    parts = []
+    for _, arrow, square, pct in buckets:
+        blocks = square * ((pct + 5) // 10)
+        parts.append(f"{arrow}{pct}%" + (f" {blocks}" if blocks else ""))
+    return "  ".join(parts)
 
 def create_pivot_alert(level: str, is_buy: bool) -> Dict[str, Any]:
     """Factory function to create pivot alert definitions (check_fn/extra_fn are lambdas closing over `level` / `is_buy`).
