@@ -1091,6 +1091,241 @@ def test_pullback_confirm_window_and_invalidation():
     c2[24:27] = [99.0, 98.0, 98.5]   # pullback breaks the impulse start
     o2 = np.r_[c2[0], c2[:-1]]
     h2, l2 = np.maximum(o2, c2) + 0.1, np.minimum(o2, c2) - 0.1
+
     assert A._pullback_continuation_state(o2, h2, l2, c2, ts, atr, ph, rsi, 26, True, True, strict)[0] == "invalid"
+
+# ======================================================================
+# late-trend exhaustion: scorer, helpers, verdict overlay, study
+# ======================================================================
+import autopsy
+from indicators import _exhaustion_risk
+
+# Every threshold the scorer reads is pinned here, so tests never depend on config defaults.
+_EX_PIN = dict(
+    EXHAUSTION_LOOKBACK_CANDLES=96, EXHAUSTION_RUN_BARS=24, EXHAUSTION_BASELINE_EMA=50,
+    EXHAUSTION_SWING_BARS=2, EXHAUSTION_EXT_ATR=3.5, EXHAUSTION_MIN_LEGS=4,
+    EXHAUSTION_DIV_MAX_AGE_BARS=30, EXHAUSTION_RSI_DIV_MIN=1.0, EXHAUSTION_MIN_ROOM_R=0.75,
+    EXHAUSTION_TOP_WICK_RATIO=0.5, EXHAUSTION_TOP_MAX_AGE_BARS=12, EXHAUSTION_MOM_FADE_BARS=12,
+    EXHAUSTION_PROVISIONAL_MOMENTUM=False, EXHAUSTION_VETO_SCORE=4, EXHAUSTION_MIN_CATEGORIES=2,
+    OUTCOME_MAE_LOSS_PCT=1.0,
+)
+
+def _ex_cfg(**over):
+    return cfg.model_copy(update={**_EX_PIN, **over})
+
+def _ex_series(n=140):
+    """Staircase up-trend (6 up bars, 6 down bars) with fading momentum."""
+    c = [100.0]
+    for k in range(1, n):
+        c.append(c[-1] + (0.35 if (k // 6) % 2 == 0 else -0.25))
+    c = np.array(c)
+    o = np.r_[c[0], c[:-1]]
+    h, low = np.maximum(o, c) + 0.1, np.minimum(o, c) - 0.1
+    atr = np.full(n, 0.3)
+    ph = np.array([max(0.5 - 0.02 * k, -1) if (k // 6) % 2 == 0 else -0.2 for k in range(n)])
+    rsi = np.array([70 - 0.1 * k for k in range(n)], dtype=float)
+    return o, h, low, c, atr, ph, rsi
+
+
+def _ex_buy(i=119, cfg_o=None, series=None):
+    o, h, low, c, atr, ph, rsi = series or _ex_series()
+    return _exhaustion_risk(o, h, low, c, atr, ph, rsi, i, True, cfg_o or _ex_cfg())
+
+def test_exhaustion_scorer_votes_and_boundaries():
+    score, info = _ex_buy()
+    assert info["status"] == "ok" and score == info["score"] > 0
+    assert info["ext_atr"] >= 3.5 and info["legs"] >= 4          # fixture property, thresholds pinned above
+    assert "EXT_ATR" in info["reasons"] and "LEGS" in info["reasons"]
+    # extension vote flips exactly around its threshold
+    assert "EXT_ATR" in _ex_buy(cfg_o=_ex_cfg(EXHAUSTION_EXT_ATR=max(1.0, info["ext_atr"] - 0.05)))[1]["reasons"]
+    assert "EXT_ATR" not in _ex_buy(cfg_o=_ex_cfg(EXHAUSTION_EXT_ATR=info["ext_atr"] + 0.05))[1]["reasons"]
+    # leg-count vote flips at its threshold
+    assert "LEGS" in _ex_buy(cfg_o=_ex_cfg(EXHAUSTION_MIN_LEGS=info["legs"]))[1]["reasons"]
+    assert "LEGS" not in _ex_buy(cfg_o=_ex_cfg(EXHAUSTION_MIN_LEGS=info["legs"] + 1))[1]["reasons"]
+    # veto needs BOTH the score and enough independent categories
+    at = _ex_cfg(EXHAUSTION_VETO_SCORE=info["score"], EXHAUSTION_MIN_CATEGORIES=info["cats"])
+    assert _ex_buy(cfg_o=at)[1]["veto"] is True
+    assert _ex_buy(cfg_o=_ex_cfg(EXHAUSTION_VETO_SCORE=info["score"] + 1,
+                                  EXHAUSTION_MIN_CATEGORIES=1))[1]["veto"] is False       # score one short
+    assert _ex_buy(cfg_o=_ex_cfg(EXHAUSTION_VETO_SCORE=1,
+                                  EXHAUSTION_MIN_CATEGORIES=info["cats"] + 1))[1]["veto"] is False  # one category short
+    assert info["score"] <= 6 and info["mom_pts"] <= 2
+
+
+def test_exhaustion_scorer_buy_sell_symmetry():
+    o, h, low, c, atr, ph, rsi = _ex_series()
+    for i in (60, 100, 119, 125):
+        b = _exhaustion_risk(o, h, low, c, atr, ph, rsi, i, True, _ex_cfg())
+        s = _exhaustion_risk(-o, -low, -h, -c, atr, -ph, -rsi, i, False, _ex_cfg())
+        assert b == s
+
+def test_exhaustion_scorer_missing_data_fails_open():
+    o, h, low, c, atr, ph, rsi = _ex_series()
+    assert _exhaustion_risk(o, h, low, c, atr, ph, rsi, 10, True, _ex_cfg())[1]["status"] == "unknown"      # short history
+    c_nan = c.copy()
+    c_nan[100] = np.nan
+    s, info = _exhaustion_risk(o, h, low, c_nan, atr, ph, rsi, 119, True, _ex_cfg())
+    assert (s, info["status"], info["veto"]) == (0, "unknown", False)
+    atr0 = atr.copy()
+    atr0[119] = 0.0
+    assert _exhaustion_risk(o, h, low, c, atr0, ph, rsi, 119, True, _ex_cfg())[1]["status"] == "unknown"
+    ph_nan = ph.copy()
+    ph_nan[:] = np.nan               
+    s, info = _exhaustion_risk(o, h, low, c, atr, ph_nan, rsi, 119, True, _ex_cfg())
+    assert info["status"] == "ok" and info["ppo_div"] == 0
+
+def test_exhaustion_scorer_never_looks_ahead():
+    o, h, low, c, atr, ph, rsi = _ex_series()
+    full = _exhaustion_risk(o, h, low, c, atr, ph, rsi, 119, True, _ex_cfg())
+    cut = _exhaustion_risk(o[:120], h[:120], low[:120], c[:120], atr[:120], ph[:120], rsi[:120], 119, True, _ex_cfg())
+    assert full == cut
+
+def test_exhaustion_rejection_freshness_and_provisional_fade():
+    o, h, low, c, atr, ph, rsi = _ex_series()
+    _, base = _ex_buy()
+    age = base["top_age"]
+    assert age >= 1, "series must end after its run extreme (the signal bar cannot be the extreme)"
+    h2 = h.copy()
+    h2[119 - age] += 1.5                                      # huge upper wick on the run-extreme candle
+    fresh = _exhaustion_risk(o, h2, low, c, atr, ph, rsi, 119, True, _ex_cfg())[1]
+    assert fresh["rej_wick"] == 1 and "TOP_REJECT" in fresh["reasons"]
+    stale = _exhaustion_risk(o, h2, low, c, atr, ph, rsi, 119, True, _ex_cfg(EXHAUSTION_TOP_MAX_AGE_BARS=age - 1))[1]
+    assert stale["rej_wick"] == 0
+    # fresh run high whose histogram / RSI are already below their own recent peak
+    n = 140
+    c2 = c.copy()
+    c2[130:] = c2[129] + np.arange(1, n - 129) * 0.4
+    o2 = np.r_[c2[0], c2[:-1]]
+    h3, l3 = np.maximum(o2, c2) + 0.1, np.minimum(o2, c2) - 0.1
+    ph3, rsi3 = ph.copy(), rsi.copy()
+    ph3[120:128], ph3[130:] = 2.0, 0.3
+    rsi3[120:128], rsi3[130:] = 80.0, 70.0
+    off = _exhaustion_risk(o2, h3, l3, c2, atr, ph3, rsi3, 139, True, _ex_cfg(EXHAUSTION_PROVISIONAL_MOMENTUM=False))
+    on = _exhaustion_risk(o2, h3, l3, c2, atr, ph3, rsi3, 139, True, _ex_cfg(EXHAUSTION_PROVISIONAL_MOMENTUM=True))
+    assert off[1]["mom_fade"] == 1 and "MOM_FADE" not in off[1]["reasons"]      # measured, not scored
+    assert on[1]["mom_fade"] == 1 and "MOM_FADE" in on[1]["reasons"] and on[0] == off[0] + 1
+
+
+def _ex_ctx(score=4, cats=2, status="ok"):
+    info = {"status": status, "score": score, "cats": cats, "veto": score >= 4 and cats >= 2,
+            "reasons": ["EXT_ATR", "LEGS"], "ext_atr": 5.1, "legs": 5, "ppo_div": 0, "rsi_div": 1,
+            "room_r": None, "top_wick": 0.2, "top_age": 3, "ext_pts": 2, "mom_pts": 1, "fail_pts": 1,
+            "v_ext": 1, "v_legs": 1, "v_room": 0, "rej_wick": 1, "rej_break": 0, "mom_fade": 0}
+    return {"exhaustion_info_buy": info, "exhaustion_info_sell": {}}
+
+
+def test_exhaustion_scope_helpers_and_toggles(monkeypatch):
+    monkeypatch.setattr(cfg, "EXHAUSTION_SCOPE", "all", raising=False)
+    monkeypatch.setattr(cfg, "EXHAUSTION_EXCLUDE_KEYS", ["ppo_zero_up"], raising=False)
+    assert A._exhaustion_applies("pivot_up_r1") and A._exhaustion_applies("strong_reversal_buy")
+    assert not A._exhaustion_applies("ppo_zero_up")
+    monkeypatch.setattr(cfg, "EXHAUSTION_SCOPE", "hosts", raising=False)
+    monkeypatch.setattr(cfg, "EXHAUSTION_EXCLUDE_KEYS", [], raising=False)
+    assert A._exhaustion_applies("strong_reversal_buy") and not A._exhaustion_applies("pivot_up_r1")
+    monkeypatch.setattr(cfg, "EXHAUSTION_SCOPE", "all", raising=False)
+    ctx = _ex_ctx()
+    # snapshot stored with trades: flat, numeric, empty when unknown
+    f = A.exhaustion_trade_fields(ctx, "buy")
+    assert f["exh_score"] == 4 and f["exh_cats"] == 2 and "exh_room_r" not in f and f["exh_rej_wick"] == 1
+    assert A.exhaustion_trade_fields(_ex_ctx(status="unknown"), "buy") == {}
+    assert A.exhaustion_trade_fields(ctx, "sell") == {}
+    # warning line: only at/above the show threshold, never when the filter is off
+    monkeypatch.setattr(cfg, "EXHAUSTION_MODE", "shadow", raising=False)
+    monkeypatch.setattr(cfg, "EXHAUSTION_SHOW_MIN_SCORE", 3, raising=False)
+    assert "Late-trend risk 4/6" in A.exhaustion_message_line(ctx, "buy", ["vwap_up"])
+    assert A.exhaustion_message_line(_ex_ctx(score=2), "buy", ["vwap_up"]) is None
+    monkeypatch.setattr(cfg, "EXHAUSTION_MODE", "off", raising=False)
+    assert A.exhaustion_message_line(ctx, "buy", ["vwap_up"]) is None
+    # info handed to the verdict advisor follows both toggles
+    monkeypatch.setattr(cfg, "EXHAUSTION_MODE", "shadow", raising=False)
+    monkeypatch.setattr(cfg, "EXHAUSTION_VERDICT_MODE", "live", raising=False)
+    assert A.exhaustion_info_for_verdict(ctx, "buy", ["vwap_up"]) is ctx["exhaustion_info_buy"]
+    monkeypatch.setattr(cfg, "EXHAUSTION_VERDICT_MODE", "off", raising=False)
+    assert A.exhaustion_info_for_verdict(ctx, "buy", ["vwap_up"]) is None
+    monkeypatch.setattr(cfg, "EXHAUSTION_VERDICT_MODE", "live", raising=False)
+    monkeypatch.setattr(cfg, "EXHAUSTION_MODE", "off", raising=False)
+    assert A.exhaustion_info_for_verdict(ctx, "buy", ["vwap_up"]) is None
+
+
+def test_exhaustion_verdict_overlay_live_shadow_off():
+    strong = {"net_ev": 0.30, "verdict": "ACTIONABLE", "evidence_state": "ACTIONABLE",
+              "regime_wr": 0.7, "p_ev_positive": 0.8}
+    base = dict(direction="buy", score=26, total=27, required=21, votes={}, tqs=[strong],
+                bias="with", take_min=70, watch_min=50)
+    prm = dict(watch_score=3, avoid_score=5, min_cats=2, penalty_per_point=5.0)
+
+    def run(score, cats, mode, status="ok", **over):
+        info = {"status": status, "score": score, "cats": cats, "reasons": ["EXT_ATR"]}
+        return advise_pair(exhaustion=info, exhaustion_mode=mode, exhaustion_params=prm, **{**base, **over})
+
+    plain = advise_pair(**base)
+    assert plain.verdict == TAKE and plain.exh_adj is None
+    assert run(2, 2, "live").verdict == TAKE                       # below the watch score
+    assert run(3, 1, "live").verdict == TAKE                       # one category is never enough
+    w = run(3, 2, "live")
+    assert w.verdict == WATCH and w.conviction < 70 and "late-trend exhaustion 3/6" in w.risk_line
+    a = run(5, 2, "live")
+    assert a.verdict == AVOID and a.conviction < 50 and a.size_line == ""
+    s = run(5, 2, "shadow")                                        # shadow: recorded, not applied
+    assert (s.verdict, s.conviction) == (plain.verdict, plain.conviction)
+    assert s.exh_adj["verdict_to"] == AVOID and s.exh_adj["applied"] is False
+    assert run(5, 3, "off").exh_adj is None
+    assert run(5, 3, "live", status="unknown").verdict == TAKE     # missing data fails open
+    # restrict-only: a verdict that is already AVOID is never raised
+    weak = dict(strong, net_ev=-0.2)
+    assert run(5, 2, "live", tqs=[weak]).verdict == AVOID
+    # no brain history: hard rule still applies, no conviction is invented
+    nodata = run(5, 2, "live", tqs=[None])
+    assert nodata.verdict == AVOID and nodata.conviction is None
+
+def test_exhaustion_study_population_early_stop_and_configured_cut():
+    def row(score, cats, early, net, ts):
+        return {"context": {"exh_score": score, "exh_cats": cats}, "entry_ts": ts, "pair": "X",
+                "outcome_class": "sl" if net < 0 else "tp",
+                "outcome_reason": "stop_hit" if net < 0 else "target_hit",
+                "sl_candle": (0 if early else 5) if net < 0 else None, "win": net > 0,
+                "realized_cost_pct": 0.1}
+    rows = ([row(5, 3, True, -1, k) for k in range(10)] + [row(5, 3, False, 1, k) for k in range(10, 12)]
+            + [row(1, 0, False, 1, k) for k in range(12, 40)]
+            + [{"context": {}, "entry_ts": 99, "pair": "X", "outcome_reason": "stop_hit"}])   # no snapshot: ignored
+    st = autopsy.exhaustion_study(rows, cost_pct=0.1, early_bars=2, min_n=30, veto_score=5)
+    assert st["n"] == 40 and st["status"] == "OK" and st["early_rate"] == round(10 / 40, 3)
+    cut = next(c for c in st["cuts"] if c["configured"])
+    assert cut["score"] == 5 and cut["blocked"] == 12 and cut["early_caught"] == 1.0
+    assert cut["winners_lost"] == round(2 / 30, 3) and cut["net_after"] > cut["net_before"]
+    # stop after the early window is not an early stop
+    late = autopsy.exhaustion_study([row(5, 3, False, -1, 1)] * 3, cost_pct=0.1, early_bars=2, min_n=1)
+    assert late["early_rate"] == 0.0
+
+def test_exhaustion_veto_decision_and_shadow_recording(monkeypatch):
+    ctx = {"exhaustion_veto_buy": True, "exhaustion_veto_sell": False, **_ex_ctx(score=5, cats=3)}
+    monkeypatch.setattr(cfg, "EXHAUSTION_SCOPE", "all", raising=False)
+    monkeypatch.setattr(cfg, "EXHAUSTION_EXCLUDE_KEYS", ["tl_break_buy"], raising=False)
+    monkeypatch.setattr(cfg, "EXHAUSTION_MODE", "shadow", raising=False)
+    assert A.exhaustion_vetoes(ctx, "vwap_up") is False                 # shadow never vetoes
+    monkeypatch.setattr(cfg, "EXHAUSTION_MODE", "live", raising=False)
+    assert A.exhaustion_vetoes(ctx, "vwap_up") is True                  # live, covered, BUY side vetoed
+    assert A.exhaustion_vetoes(ctx, "vwap_down") is False               # SELL side has no veto
+    assert A.exhaustion_vetoes(ctx, "tl_break_buy") is False            # excluded key
+    monkeypatch.setattr(cfg, "EXHAUSTION_SCOPE", "hosts", raising=False)
+    assert A.exhaustion_vetoes(ctx, "vwap_up") is False                 # not a host alert
+    assert A.exhaustion_vetoes(ctx, "strong_reversal_buy") is True
+    # the vetoed alert is shadow-tracked with its reason and the exhaustion snapshot
+    seen = []
+
+    class _Sdb:
+        degraded = False
+
+        async def record_shadow_pending_outcome(self, pair, key, direction, ts, price, **kw):
+            seen.append((pair, key, direction, kw["context"]))
+            return "created"
+
+    monkeypatch.setattr(cfg, "ENABLE_BRAIN", True, raising=False)
+    monkeypatch.setattr(cfg, "BRAIN_SHADOW_MODE", True, raising=False)
+    asyncio.run(A._record_counterfactual_block(
+        _Sdb(), "ETHUSD", [("Strong Reversal", "", "strong_reversal_buy")], 1000, 100.0,
+        block_reason="exhaustion_veto", context=ctx, logger_pair=LOG))
+    assert len(seen) == 1 and seen[0][1] == "strong_reversal_buy" and seen[0][2] == "buy"
+    assert seen[0][3]["rejection_reason"] == "exhaustion_veto" and seen[0][3]["exh_score"] == 5
 
 
