@@ -2409,7 +2409,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                             )
                         continue
 
-                if cfg.EXHAUSTION_MODE == "live" and _exhaustion_applies(alert_key)::
+                if cfg.EXHAUSTION_MODE == "live" and _exhaustion_applies(alert_key):
                     _ex_side = "buy" if alert_key in BUY_ALERT_KEYS else "sell"
                     if context.get(f"exhaustion_veto_{_ex_side}"):
                         if cfg.DEBUG_MODE:
