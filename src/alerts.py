@@ -1653,6 +1653,14 @@ def _exhaustion_applies(alert_key: str) -> bool:
         return True
     return alert_key in _PULLBACK_HOST_KEYS
 
+def exhaustion_vetoes(context: Dict[str, Any], alert_key: str) -> bool:
+    """True when the live exhaustion veto must stop this alert (live mode, alert covered by the
+    scope, and its side's score reached the veto rule). Shadow mode never vetoes."""
+    if cfg.EXHAUSTION_MODE != "live" or not _exhaustion_applies(alert_key):
+        return False
+    side = "buy" if alert_key in BUY_ALERT_KEYS else "sell"
+    return bool(context.get(f"exhaustion_veto_{side}"))
+
 def exhaustion_trade_fields(context: Dict[str, Any], direction: str) -> Dict[str, Any]:
     """Flat numeric snapshot of the exhaustion score, stored with every Recorded and
     Shadowed trade so the Brain can study it. Empty when the filter is off/unknown."""
@@ -2413,19 +2421,18 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                             )
                         continue
 
-                if cfg.EXHAUSTION_MODE == "live" and _exhaustion_applies(alert_key):
+                if exhaustion_vetoes(context, alert_key):
                     _ex_side = "buy" if alert_key in BUY_ALERT_KEYS else "sell"
-                    if context.get(f"exhaustion_veto_{_ex_side}"):
-                        if cfg.DEBUG_MODE:
-                            logger_pair.debug(f"Skipping {alert_key}: late-trend exhaustion "
-                                              f"{(context.get(f'exhaustion_info_{_ex_side}') or {}).get('reasons')}")
-                        if not _brain_disabled:
-                            # Shadow-tracked at dispatch as "exhaustion_veto" so the
-                            # veto's effect is measured, not invisible.
-                            context.setdefault("exhaustion_veto_hits", []).append(
-                                (def_.title, extra, def_.key)
-                            )
-                        continue
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(f"Skipping {alert_key}: late-trend exhaustion "
+                                          f"{(context.get(f'exhaustion_info_{_ex_side}') or {}).get('reasons')}")
+                    if not _brain_disabled:
+                        # Shadow-tracked at dispatch as "exhaustion_veto" so the
+                        # veto's effect is measured, not invisible.
+                        context.setdefault("exhaustion_veto_hits", []).append(
+                            (def_.title, extra, def_.key)
+                        )
+                    continue
 
                 if alert_key.startswith("tl_") and cfg.TRENDLINE_SHADOW_MODE:
                     # Trendline shadow mode: never sent; shadow-tracked at dispatch
