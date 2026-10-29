@@ -205,10 +205,12 @@ class BiasContext:
     prepended to every outgoing Telegram message this run — see
     cfg.ENABLE_BIAS_HEADER. Never gates or filters an alert.
     A pair counts as (all three conditions must hold):
-      up      - 5m RMA(200) below the 5m close AND 5m Cirrus Cloud green
+      up      - 5m RMA cloud green (RMA 20 > RMA 50) with the 5m close above
+                it AND 5m Cirrus Cloud green
                 (Trend Up) with the 5m close above the cloud AND 15m Gaussian
                 trend line green
-      down    - 5m RMA(200) above the 5m close AND 5m Cirrus Cloud red
+      down    - 5m RMA cloud red (RMA 20 < RMA 50) with the 5m close below
+                it AND 5m Cirrus Cloud red
                 (Trend Down) with the 5m close below the cloud AND 15m Gaussian
                 trend line red
       neutral - anything else

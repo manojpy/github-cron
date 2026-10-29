@@ -508,7 +508,7 @@ async def compute_bias_context(prepared_tasks: List[Tuple[str, str, Dict[str, An
     """Pair-universe directional-bias pre-pass. Cosmetic only: feeds the bias line
     appended to every outgoing alert this run (cfg.ENABLE_BIAS_HEADER); never gates
     or filters an alert. See BiasContext docstring for the per-pair rule
-    (RMA 200 5m + Cirrus Cloud 5m + Gaussian 15m, all three must agree)."""
+    (RMA cloud 20/50 5m + Cirrus Cloud 5m + Gaussian 15m, all three must agree)."""
     parsed_cache = parsed_cache or {}
     up = down = neutral = 0
     counted = 0
@@ -540,7 +540,8 @@ async def compute_bias_context(prepared_tasks: List[Tuple[str, str, Dict[str, An
 
             close_5m = pd_5m.close
             price = float(close_5m[i5])
-            rma200 = float(calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)[i5])
+            rma_fast = float(calculate_rma_numpy(close_5m, cfg.RMA_CLOUD_FAST_PERIOD)[i5])
+            rma_slow = float(calculate_rma_numpy(close_5m, cfg.RMA_50_PERIOD)[i5])
             cirrus = calculate_cirrus_cloud_numpy(
                 close_5m, cfg.CIRRUS_X1, cfg.CIRRUS_X2, cfg.CIRRUS_X3, cfg.CIRRUS_X4,
                 cfg.CIRRUS_MIN_GAP_PCT,
@@ -562,19 +563,19 @@ async def compute_bias_context(prepared_tasks: List[Tuple[str, str, Dict[str, An
             )
 
             # Any missing input -> the pair is skipped (not counted), never guessed.
-            if (not np.isfinite(price) or not np.isfinite(rma200)
+            if (not np.isfinite(price) or not np.isfinite(rma_fast) or not np.isfinite(rma_slow)
                     or not bool(cirrus['valid'][i5]) or not bool(gauss['valid'][i15])):
                 continue
-
+            rma_top, rma_bottom = max(rma_fast, rma_slow), min(rma_fast, rma_slow)
             cloud_top = max(float(cirrus['filtx1'][i5]), float(cirrus['filtx12'][i5]))
             cloud_bottom = min(float(cirrus['filtx1'][i5]), float(cirrus['filtx12'][i5]))
             g_dir = int(gauss['trend_dir'][i15])
 
             counted += 1
-            if (rma200 < price and bool(cirrus['trend_up'][i5])
+            if (rma_fast > rma_slow and price > rma_top and bool(cirrus['trend_up'][i5])
                     and price > cloud_top and g_dir == 1):
                 up += 1
-            elif (rma200 > price and bool(cirrus['trend_dn'][i5])
+            elif (rma_fast < rma_slow and price < rma_bottom and bool(cirrus['trend_dn'][i5])
                     and price < cloud_bottom and g_dir == -1):
                 down += 1
             else:
