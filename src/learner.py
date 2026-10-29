@@ -385,6 +385,9 @@ async def run(args: argparse.Namespace) -> int:
                         "reject_min_n": cfg.AUTOPSY_REJECT_MIN_N, "shrink_k": cfg.AUTOPSY_SHRINK_K,
                         "target": cfg.TRUST_TARGET_PRECISION, "min_take_n": cfg.TRUST_MIN_TAKE_N,
                         "windows": cfg.TRUST_WINDOWS,
+                        "exh_early_bars": cfg.EXHAUSTION_EARLY_STOP_BARS,
+                        "exh_min_cats": cfg.EXHAUSTION_MIN_CATEGORIES,
+                        "exh_veto_score": cfg.EXHAUSTION_VETO_SCORE,
                     },
                 )
                 ap_blob["ts"] = int(now_ts)

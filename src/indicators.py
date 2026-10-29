@@ -2245,18 +2245,33 @@ def _exhaustion_risk(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
         if room > 0:
             room_r = room / risk_abs
 
-    # ── rejection at the run extreme ──
+    # ── rejection at the run extreme (only while the extreme is fresh) ──
     rng = float(hh[ih] - ll[ih])
     top_wick = float(hh[ih] - max(oo[ih], cc[ih])) / rng if rng > 0 else 0.0
     prior = [j for j in sh if j < ih]
-    failed_break = bool(prior and hh[ih] > hh[prior[-1]] and cc[ih] <= hh[prior[-1]])
-    rejected = top_wick >= float(cfg_obj.EXHAUSTION_TOP_WICK_RATIO) or failed_break
+    top_age = int(i15 - ih)
+    fresh_top = top_age <= int(cfg_obj.EXHAUSTION_TOP_MAX_AGE_BARS)
+    rej_wick = bool(fresh_top and top_wick >= float(cfg_obj.EXHAUSTION_TOP_WICK_RATIO))
+    rej_break = bool(fresh_top and prior and hh[ih] > hh[prior[-1]] and cc[ih] <= hh[prior[-1]])
+    rejected = rej_wick or rej_break
+
+    # ── provisional momentum fade: a fresh high cannot be a confirmed swing yet, so compare
+    #    the histogram / RSI at that high with their own recent peak (closed candles only) ──
+    mom_fade = False
+    fb = int(cfg_obj.EXHAUSTION_MOM_FADE_BARS)
+    if (i15 - ih) <= swing and ih - fb >= start:
+        pk_ph, pk_rr = ph[ih - fb:ih], rr[ih - fb:ih]
+        if (np.all(np.isfinite(pk_ph)) and np.all(np.isfinite(pk_rr))
+                and np.isfinite(ph[ih]) and np.isfinite(rr[ih])):
+            mom_fade = bool(ph[ih] < float(np.max(pk_ph))
+                            and rr[ih] < float(np.max(pk_rr)) - float(cfg_obj.EXHAUSTION_RSI_DIV_MIN))
 
     ext_vote = ext_atr >= float(cfg_obj.EXHAUSTION_EXT_ATR)
     legs_vote = legs >= int(cfg_obj.EXHAUSTION_MIN_LEGS)
     room_vote = room_r is not None and room_r < float(cfg_obj.EXHAUSTION_MIN_ROOM_R)
     ext_pts = int(ext_vote) + int(legs_vote)
-    mom_pts = int(ppo_div) + int(rsi_div)
+    fade_vote = bool(mom_fade and cfg_obj.EXHAUSTION_PROVISIONAL_MOMENTUM)
+    mom_pts = min(2, int(ppo_div) + int(rsi_div) + int(fade_vote))
     fail_pts = int(room_vote) + int(rejected)
     score = ext_pts + mom_pts + fail_pts
     cats = int(ext_pts > 0) + int(mom_pts > 0) + int(fail_pts > 0)
@@ -2269,6 +2284,8 @@ def _exhaustion_risk(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
         reasons.append("PPO_DIV")
     if rsi_div:
         reasons.append("RSI_DIV")
+    if fade_vote:
+        reasons.append("MOM_FADE")
     if room_vote:
         reasons.append("NO_ROOM")
     if rejected:
@@ -2280,7 +2297,9 @@ def _exhaustion_risk(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
         "ext_atr": round(float(ext_atr), 2), "legs": int(legs),
         "ppo_div": int(ppo_div), "rsi_div": int(rsi_div),
         "room_r": None if room_r is None else round(float(room_r), 2),
-        "top_wick": round(float(top_wick), 2),
+        "top_wick": round(float(top_wick), 2), "top_age": top_age,
+        "mom_fade": int(mom_fade), "rej_wick": int(rej_wick), "rej_break": int(rej_break),
+        "v_ext": int(ext_vote), "v_legs": int(legs_vote), "v_room": int(room_vote),
     }
 
 def _prior_leg_direction(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray, end_idx: int, lookback: int) -> int:

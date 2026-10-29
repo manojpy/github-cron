@@ -1664,7 +1664,11 @@ def exhaustion_trade_fields(context: Dict[str, Any], direction: str) -> Dict[str
         "exh_score": info["score"], "exh_cats": info["cats"],
         "exh_ext_atr": info["ext_atr"], "exh_legs": info["legs"],
         "exh_ppo_div": info["ppo_div"], "exh_rsi_div": info["rsi_div"],
-        "exh_top_wick": info["top_wick"],
+        "exh_top_wick": info["top_wick"], "exh_top_age": info["top_age"],
+        "exh_ext_pts": info["ext_pts"], "exh_mom_pts": info["mom_pts"], "exh_fail_pts": info["fail_pts"],
+        "exh_v_ext": info["v_ext"], "exh_v_legs": info["v_legs"], "exh_v_room": info["v_room"],
+        "exh_rej_wick": info["rej_wick"], "exh_rej_break": info["rej_break"],
+        "exh_mom_fade": info["mom_fade"],
     }
     if info.get("room_r") is not None:
         out["exh_room_r"] = info["room_r"]
@@ -3300,6 +3304,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     "rvol_ok": gr.rvol_ok,
                     "gaussian_gate_ok_buy": gr.gaussian_gate_ok_buy,
                     "gaussian_gate_ok_sell": gr.gaussian_gate_ok_sell,
+                    **exhaustion_trade_fields(context, direction),
                 }
                 if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
                     await sdb.record_shadow_pending_outcome(

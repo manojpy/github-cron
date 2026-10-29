@@ -513,9 +513,15 @@ def build_intelligence(
                                        keep_last=int(p.get("keep_last", 40))),
             "edges": edge_map(pop, cost_pct=cost_pct, min_n=int(p.get("edge_min_n", 20)), shrink_k=float(p.get("shrink_k", 10.0))),
         }
+    # Population: the trades the existing strategy sends (Recorded) plus the guard's OWN vetoed
+    # alerts (shadow rows with reason exhaustion_veto, which only exist once the veto is live).
+    # Signals rejected by other gates are a different population and are never mixed in.
+    veto_rows = independent_rows([r for r in shadow_all if _reason_of(r) == "exhaustion_veto"])
     blob["exhaustion"] = exhaustion_study(
-        list(live) + list(shadow), cost_pct=cost_pct,
-        early_bars=int(p.get("exh_early_bars", 2)), min_n=int(p.get("exh_min_n", 30)))
+        list(live) + veto_rows, cost_pct=cost_pct,
+        early_bars=int(p.get("exh_early_bars", 2)), min_n=int(p.get("exh_min_n", 30)),
+        min_cats=int(p.get("exh_min_cats", 2)), veto_score=int(p.get("exh_veto_score", 4)))
+    blob["exhaustion"]["population"] = {"recorded": len(live), "exhaustion_veto_shadow": len(veto_rows)}
     blob["rejections"] = rejection_audit(shadow, live, cost_pct=cost_pct, min_n=int(p.get("reject_min_n", 20)))
     blob["trust"] = trust_meter(live, cost_pct=cost_pct, sl_pct=sl_pct, tp_pct=tp_pct,
                                 target=float(p.get("target", 0.80)), min_take_n=int(p.get("min_take_n", 100)),
@@ -524,7 +530,7 @@ def build_intelligence(
 
 # ── 5. late-trend exhaustion study ────────────────────────────────────────
 def exhaustion_study(rows: Sequence[Row], *, cost_pct: float, early_bars: int = 2, min_n: int = 30,
-                     veto_scores: Sequence[int] = (3, 4, 5), min_cats: int = 2) -> Dict[str, Any]:
+                     veto_scores: Sequence[int] = (3, 4, 5), min_cats: int = 2, veto_score: int = 4) -> Dict[str, Any]:
     """Does the exhaustion score predict stops within `early_bars` candles?
     For each possible veto threshold: how many early stops it would have caught,
     how many winners it would have blocked, and the net P&L per trade before and after.
@@ -558,11 +564,12 @@ def exhaustion_study(rows: Sequence[Row], *, cost_pct: float, early_bars: int = 
                                  "early": round(sum(1 for p in g if p[2]) / len(g), 3),
                                  "success": round(sum(1 for p in g if p[4]) / len(g), 3),
                                  "mean_net": round(sum(p[3] for p in g) / len(g), 3)})
-    for t in veto_scores:
+
+    for t in sorted(set(int(x) for x in veto_scores) | {int(veto_score)}):
         blocked = [p for p in pts if p[0] >= t and p[1] >= min_cats]
         kept = [p for p in pts if not (p[0] >= t and p[1] >= min_cats)]
         out["cuts"].append({
-            "score": t, "blocked": len(blocked), "kept_share": round(len(kept) / n, 3),
+            "score": t, "configured": t == int(veto_score), "blocked": len(blocked), "kept_share": round(len(kept) / n, 3),
             "early_caught": None if not n_early else round(sum(1 for p in blocked if p[2]) / n_early, 3),
             "winners_lost": None if not n_win else round(sum(1 for p in blocked if p[4]) / n_win, 3),
             "net_before": round(mean_all, 3),
@@ -628,7 +635,9 @@ def format_intelligence(blob: Mapping[str, Any], name_fn: Callable[[str], str] =
     ex = blob.get("exhaustion") or {}
     if ex.get("n"):
         lines.append("")
-        lines.append(f"⏳ LATE-TREND EXHAUSTION (n={ex['n']}, stopped within {ex['early_bars']} candles: "
+        pop = ex.get("population") or {}
+        lines.append(f"⏳ LATE-TREND EXHAUSTION (n={ex['n']}: Recorded {pop.get('recorded', 0)} + vetoed "
+                     f"{pop.get('exhaustion_veto_shadow', 0)}; stopped within {ex['early_bars']} candles: "
                      f"{_pct(ex.get('early_rate'))}) {ex.get('status', '')}")
         for b in ex.get("bands", []):
             lines.append(f"  score {b['band']}: n={b['n']} early-stop {b['early']:.0%} success {b['success']:.0%} "
@@ -639,7 +648,7 @@ def format_intelligence(blob: Mapping[str, Any], name_fn: Callable[[str], str] =
                     ec = "n/a" if c["early_caught"] is None else f"{c['early_caught']:.0%}"
                     wl = "n/a" if c["winners_lost"] is None else f"{c['winners_lost']:.0%}"
                     na = "n/a" if c["net_after"] is None else f"{c['net_after']:+.2f}"
-                    lines.append(f"  veto at >={c['score']}: blocks {c['blocked']} | catches {ec} of early stops | "
+                    lines.append(f"  veto at >={c['score']}{' (configured)' if c.get('configured') else ''}: blocks{c['blocked']} | catches {ec} of early stops | "
                                  f"loses {wl} of winners | keeps {c['kept_share']:.0%} | net {c['net_before']:+.2f} -> {na}%")
     last = ((((blob.get("pops") or {}).get("LIVE") or {}).get("autopsy") or {}).get("autopsies") or [])[-3:]
     if last:
