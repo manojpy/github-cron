@@ -80,7 +80,7 @@ class GateResult:
     open_curr: float; high_curr: float; low_curr: float; close_curr: float
     close_prev: float
     close_5m_val: float
-    close_prev_cross: float          # close used for cross alerts (5m or 15m per CROSS_ALERT_TF)
+    close_prev_cross: float          # close used for Ichimoku cross alerts (5m or 15m per ICHIMOKU_CROSS_ALERT_TF)
     close_curr_cross: float
     is_green: bool; is_red: bool
     is_valid_for_buy: bool; is_valid_for_sell: bool
@@ -579,14 +579,16 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         nr_cpr = float(gate_indicators.get('nr_cpr', float('nan')))
         prev_day_close = gate_indicators.get('prev_day_close', float('nan'))
 
-        # CROSS_ALERT_TF controls whether cloud / TK / kijun / dynamic_flow crosses
-        # are evaluated on 5m or 15m data. Default is "5m". When "5m" we still
-        # require the corresponding 15m indicator to be directionally aligned.
-        _cross_tf = getattr(cfg, "CROSS_ALERT_TF", "5m")
-        _use_5m_cross = (_cross_tf == "5m")
+        # Ichimoku crosses (cloud / TK / kijun) use their own TF, independent of Dynamic Flow.
+        _ichimoku_cross_tf = getattr(cfg, "ICHIMOKU_CROSS_ALERT_TF", "5m")
+        _use_5m_ichimoku_cross = (_ichimoku_cross_tf == "5m")
+
+        # Dynamic Flow cross keeps the original CROSS_ALERT_TF.
+        _df_cross_tf = getattr(cfg, "CROSS_ALERT_TF", "5m")
+        _use_5m_df_cross = (_df_cross_tf == "5m")
 
         # Ichimoku cloud (23/65/130/65) — used by the cloud-cross alerts only.
-        if _use_5m_cross and i5 >= 1:
+        if _use_5m_ichimoku_cross and i5 >= 1:
             cloud_upper_arr = gate_indicators["ichimoku_cloud_upper_5m"]
             cloud_lower_arr = gate_indicators["ichimoku_cloud_lower_5m"]
             cloud_upper_val = cloud_upper_arr[i5]
@@ -611,7 +613,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             cloud_up = None
             cloud_down = None
 
-        if _use_5m_cross and i5 >= 1:
+        if _use_5m_ichimoku_cross and i5 >= 1:
             tk_conv_arr = gate_indicators["ichimoku_conversion_line_5m"]
             tk_base_arr = gate_indicators["ichimoku_base_line_5m"]
             tk_conversion_curr = tk_conv_arr[i5]
@@ -844,7 +846,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         dynamic_flow_cross_down = False
 
         if cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT and cfg.DYNAMIC_FLOW_RIBBON_ENABLED:
-            if _use_5m_cross and i5 >= 1:
+            if _use_5m_df_cross and i5 >= 1:
                 df_trend_5m = gate_indicators["dynamic_flow_trend_5m"]
                 df_line_5m = gate_indicators["dynamic_flow_line_5m"]
                 df_curr_5 = df_trend_5m[i5]

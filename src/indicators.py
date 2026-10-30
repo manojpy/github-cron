@@ -982,21 +982,26 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['dynamic_flow_trend_15'] = np.full(n_15m, np.nan, dtype=np.float64)
             results['dynamic_flow_line_15'] = np.full(n_15m, np.nan, dtype=np.float64)
 
-        # ── 5m versions of Ichimoku + Dynamic Flow (for CROSS_ALERT_TF == "5m") ──
-        # Computed only when any of the cross alerts are enabled and TF is 5m,
-        # so the 15m path pays zero extra cost when the option is left at "15m".
-        _need_5m_cross = (
-            getattr(cfg, "CROSS_ALERT_TF", "5m") == "5m"
+        # ── 5m versions of Ichimoku + Dynamic Flow ────────────────────────────
+        # Ichimoku (cloud / TK / kijun) is controlled by ICHIMOKU_CROSS_ALERT_TF.
+        # Dynamic Flow is controlled by CROSS_ALERT_TF.
+        # They are independent so you can run Ichimoku on 15m while Dynamic Flow stays on 5m (or vice-versa).
+        close_5m = data_5m["close"]
+        n_5m = len(close_5m)
+
+        _need_5m_ichimoku = (
+            getattr(cfg, "ICHIMOKU_CROSS_ALERT_TF", "5m") == "5m"
             and (
                 cfg.ENABLE_CLOUD_CROSS_ALERT
                 or cfg.ENABLE_TK_CONVERSION_CROSS
                 or cfg.ENABLE_KIJUN_CROSS
-                or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT
             )
         )
-        close_5m = data_5m["close"]
-        n_5m = len(close_5m)
-        if _need_5m_cross:
+        _need_5m_df = (
+            getattr(cfg, "CROSS_ALERT_TF", "5m") == "5m"
+            and cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT
+        )
+        if _need_5m_ichimoku:
             if cfg.ICHIMOKU_CLOUD_ENABLED or cfg.ENABLE_CLOUD_CROSS_ALERT:
                 ichimoku_5m = calculate_ichimoku_numpy(
                     data_5m["high"], data_5m["low"], close_5m,
@@ -1022,21 +1027,18 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             else:
                 results['ichimoku_conversion_line_5m'] = np.full(n_5m, np.nan, dtype=np.float64)
                 results['ichimoku_base_line_5m'] = np.full(n_5m, np.nan, dtype=np.float64)
-
-            if cfg.DYNAMIC_FLOW_RIBBON_ENABLED or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT:
-                results['dynamic_flow_trend_5m'], results['dynamic_flow_line_5m'] = calculate_dynamic_flow_ribbon_numpy(
-                    data_5m["high"], data_5m["low"], close_5m,
-                    cfg.DYNAMIC_FLOW_FACTOR, cfg.DYNAMIC_FLOW_BASIS_LENGTH, cfg.DYNAMIC_FLOW_DIST_LENGTH
-                )
-            else:
-                results['dynamic_flow_trend_5m'] = np.full(n_5m, np.nan, dtype=np.float64)
-                results['dynamic_flow_line_5m'] = np.full(n_5m, np.nan, dtype=np.float64)
         else:
-            # Placeholders so downstream code can always key-lookup without KeyError
             results['ichimoku_cloud_upper_5m'] = np.full(n_5m, np.nan, dtype=np.float64)
             results['ichimoku_cloud_lower_5m'] = np.full(n_5m, np.nan, dtype=np.float64)
             results['ichimoku_conversion_line_5m'] = np.full(n_5m, np.nan, dtype=np.float64)
             results['ichimoku_base_line_5m'] = np.full(n_5m, np.nan, dtype=np.float64)
+
+        if _need_5m_df and (cfg.DYNAMIC_FLOW_RIBBON_ENABLED or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT):
+            results['dynamic_flow_trend_5m'], results['dynamic_flow_line_5m'] = calculate_dynamic_flow_ribbon_numpy(
+                data_5m["high"], data_5m["low"], close_5m,
+                cfg.DYNAMIC_FLOW_FACTOR, cfg.DYNAMIC_FLOW_BASIS_LENGTH, cfg.DYNAMIC_FLOW_DIST_LENGTH
+            )
+        else:
             results['dynamic_flow_trend_5m'] = np.full(n_5m, np.nan, dtype=np.float64)
             results['dynamic_flow_line_5m'] = np.full(n_5m, np.nan, dtype=np.float64)
 
