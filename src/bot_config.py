@@ -217,7 +217,7 @@ class BotConfig(BaseModel):
     GAUSSIAN_EFFICIENCY_SMOOTH: int = Field(default=5, ge=1, le=200, description="EMA length applied to the Efficiency Ratio (Pine: Efficiency Smoothing)")
     ICHIMOKU_TK_CONVERSION_PERIODS: int = Field(default=23, ge=1, le=300, description="Tenkan (conversion) length used for TK guard + cross alerts, independent of cloud conversion length")
     ICHIMOKU_TK_BASE_PERIODS: int = Field(default=65, ge=1, le=400, description="Kijun (base) length used for TK guard + cross alerts, independent of cloud base length")
-    ENABLE_BIAS_HEADER: bool = Field(default=True, description="Add the pair-universe bias bar (share of pairs in Uptrend / Downtrend / Neutral: 5m RMA 200 + 5m Cirrus Cloud + 15m Gaussian must all agree; cosmetic only, does not gate alerts) to every outgoing Telegram message")
+    ENABLE_BIAS_HEADER: bool = Field(default=True, description="Add the pair-universe bias bar (share of pairs in Uptrend / Downtrend / Neutral: any 2 of 3 of 1h SuperTrend pair 5/2.15 + 7/1.85, 15m Ichimoku 23/65/130/65 cloud + future cloud colour, 15m Gaussian line colour; cosmetic only, does not gate alerts) to every outgoing Telegram message")
     ALERT_TAKE_MIN_CONVICTION: float = Field(default=70.0, ge=0.0, le=100.0, description="Telegram alert verdict: conviction % at or above which an alert reads TAKE")
     ALERT_WATCH_MIN_CONVICTION: float = Field(default=50.0, ge=0.0, le=100.0, description="Telegram alert verdict: conviction % at or above which an alert reads WATCH (below = AVOID)")
     ALERT_SHADOW_CONVICTION_CAP: float = Field(default=55.0, ge=0.0, le=100.0, description="Conviction ceiling while the only evidence is SHADOW/INSUFFICIENT, so nothing reads TAKE before it has real results")
@@ -261,10 +261,15 @@ class BotConfig(BaseModel):
     ALERT_UNPROVEN_SIZE_MULT: float = Field(default=0.25, ge=0.0, le=1.0, description="Advisory size multiple shown for unproven TAKE alerts")
     ALERT_BASKET_NOTE_MIN: int = Field(default=3, ge=2, le=50, description="Add a 'size as one basket' note when this many same-direction TAKE alerts land in one batch")
     ALERT_CORRELATED_PAIRS: List[List[str]] = Field(default_factory=lambda: [["PAXGUSD", "XAUTUSD"]], description="Groups of pairs on the same underlying; later same-direction members of a group get a 'count as one trade' note")
-    BIAS_ICHIMOKU_CONVERSION_PERIODS: int = Field(default=23, ge=1, le=300, description="Conversion (Tenkan) length for the standalone cloud-cross alert")
-    BIAS_ICHIMOKU_BASE_PERIODS: int = Field(default=65, ge=1, le=400, description="Base (Kijun) length for the cloud-cross alert")
-    BIAS_ICHIMOKU_SPANB_PERIODS: int = Field(default=130, ge=1, le=500, description="Leading Span B length for the cloud-cross alert")
-    BIAS_ICHIMOKU_DISPLACEMENT: int = Field(default=65, ge=1, le=400, description="Forward displacement for the cloud-cross alert")
+    BIAS_ICHIMOKU_CONVERSION_PERIODS: int = Field(default=23, ge=1, le=300, description="Conversion (Tenkan) length for the standalone bias-header Ichimoku cloud, independent of the alert-gate cloud")
+    BIAS_ICHIMOKU_BASE_PERIODS: int = Field(default=65, ge=1, le=400, description="Base (Kijun) length for the bias-header cloud")
+    BIAS_ICHIMOKU_SPANB_PERIODS: int = Field(default=130, ge=1, le=500, description="Leading Span B length for the bias-header cloud")
+    BIAS_ICHIMOKU_DISPLACEMENT: int = Field(default=65, ge=1, le=400, description="Forward displacement for the bias-header cloud")
+    BIAS_SUPERTREND_1_PERIOD: int = Field(default=5, ge=1, le=100, description="Bias header: ATR length of the first 1h SuperTrend")
+    BIAS_SUPERTREND_1_FACTOR: float = Field(default=2.15, gt=0.0, le=20.0, description="Bias header: ATR factor of the first 1h SuperTrend")
+    BIAS_SUPERTREND_2_PERIOD: int = Field(default=7, ge=1, le=100, description="Bias header: ATR length of the second 1h SuperTrend")
+    BIAS_SUPERTREND_2_FACTOR: float = Field(default=1.85, gt=0.0, le=20.0, description="Bias header: ATR factor of the second 1h SuperTrend")
+    BIAS_SUPERTREND_INCLUDE_FORMING_HOUR: bool = Field(default=True, description="Bias header: True = the 1h SuperTrend includes the still-forming current hour (what a live TradingView 1h chart shows); False = last fully closed hour only")
     RMA_CLOUD_ENABLED: bool = Field(default=True, description="Enable the 5m RMA(fast)/RMA(slow) cloud as one of the cloud-group votes; green (buy) when RMA_fast>RMA_slow, red (sell) when RMA_fast<RMA_slow, both computed on 5m closes (fast = RMA_CLOUD_FAST_PERIOD, slow = RMA_50_PERIOD). Independent of the 15m RMA50 used for base trend.")
     RMA_CLOUD_FAST_PERIOD: int = Field(default=20, ge=2, le=200, description="RMA Cloud fast period (5m). Slow leg reuses RMA_50_PERIOD (also on 5m).")
     CIRRUS_CLOUD_ENABLED: bool = Field(default=True, description="Cirrus Cloud (Pine port), calculated on 5m closes, as one of the cloud-group votes: buy needs Trend Up, sell needs Trend Down. The cloud group passes when at least CLOUD_GROUP_MIN_VOTES of the enabled clouds (RMA 5m, Cirrus 5m, Dynamic Flow 15m, Gaussian 15m) agree")
@@ -839,7 +844,7 @@ class BotConfig(BaseModel):
         warmups = {
             'ICHIMOKU cloud 23/65/130/65 (SPANB+DISPLACEMENT-2)':
                 self.BIAS_ICHIMOKU_SPANB_PERIODS + self.BIAS_ICHIMOKU_DISPLACEMENT - 2
-                if self.ICHIMOKU_CLOUD_ENABLED else 0,
+                if (self.ICHIMOKU_CLOUD_ENABLED or self.ENABLE_BIAS_HEADER) else 0,
             'GAUSSIAN trend (5 x LENGTH + EFF_LEN + 3 x EFF_SMOOTH + ATR_LEN)':
                 5 * self.GAUSSIAN_LENGTH + self.GAUSSIAN_EFFICIENCY_LENGTH
                 + 3 * self.GAUSSIAN_EFFICIENCY_SMOOTH + self.GAUSSIAN_ATR_LENGTH
@@ -852,7 +857,7 @@ class BotConfig(BaseModel):
                 if self.MOMENTUM_OSCILLATOR_ENABLED else 0,
             'CIRRUS cloud (3 x slowest EMA span to settle)':
                 3 * (2 * max(self.CIRRUS_X1, self.CIRRUS_X3) - 1)
-                if (self.CIRRUS_CLOUD_ENABLED or self.ENABLE_BIAS_HEADER) else 0,
+                if self.CIRRUS_CLOUD_ENABLED else 0,
             'RSI_GUARD (RSI+KALMAN+EMA lengths)':
                 self.RSI_GUARD_RSI_LEN + self.RSI_GUARD_KALMAN_LEN + self.RSI_GUARD_EMA_LEN
                 if self.RSI_GUARD_ENABLED else 0,

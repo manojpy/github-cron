@@ -16,22 +16,21 @@ from typing import Dict, Any, Optional, Tuple, Set, List, Sequence, Callable, Aw
 
 from datetime import datetime, timezone
 import numpy as np
-
 from bot_config import (
     Constants, TRACE_ID, PAIR_ID, cfg, logger, logger_main,
     format_ist_time, MEMORY_CHECK_INTERVAL_PAIRS, validate_runtime_config,
     json_dumps, json_loads, JSON_BACKEND, shutdown_event, __version__, BtcMacroContext,
-    ClusterContext, BiasContext, normalize_timestamp, normalize_timestamp_array,
+    ClusterContext, BiasContext, normalize_timestamp_array,
 )
 from fetcher import (
     SessionManager, DataFetcher, PriceData, parse_candles_to_numpy,
     get_last_closed_index_from_array,
 )
-# ── indicators : only helpers macd_unified.py calls directly ──
 from indicators import (
     get_utc_date_key, should_reset_daily_state, warmup_if_needed,
     _normalize_samples, _prune_stale_samples, _oi_funding_gate_reason,
-    calculate_rma_numpy, calculate_cirrus_cloud_numpy, calculate_gaussian_trend_numpy,
+    calculate_gaussian_trend_numpy, calculate_ichimoku_numpy,
+    aggregate_ohlc_hourly_numpy, calculate_supertrend_numpy,
 )
 from state import (
     _blanket_reset_pair, _clear_all_redis_states, _redis_key_inventory, build_products_map_from_cfg,
@@ -504,49 +503,56 @@ async def _compute_directional_cluster(prepared_tasks: List[Tuple[str, str, Dict
         buy_pct=buy_count / total, sell_pct=sell_count / total,
     ), gate_cache
 
+# Minimum 1h bars before the bias SuperTrend is trusted (ATR 5/7 is settled long before this).
+_BIAS_ST_MIN_HOURS = 30
+
 async def compute_bias_context(prepared_tasks: List[Tuple[str, str, Dict[str, Any]]], reference_time: int, parsed_cache: Optional[Dict[str, Any]] = None) -> Optional[BiasContext]:
     """Pair-universe directional-bias pre-pass. Cosmetic only: feeds the bias line
     appended to every outgoing alert this run (cfg.ENABLE_BIAS_HEADER); never gates
     or filters an alert. See BiasContext docstring for the per-pair rule
-    (RMA cloud 20/50 5m + Cirrus Cloud 5m + Gaussian 15m, all three must agree)."""
+    (any 2 of 3: 1h SuperTrend pair, 15m Ichimoku 23/65/130/65 cloud + future
+    cloud colour, 15m Gaussian line colour)."""
     parsed_cache = parsed_cache or {}
     up = down = neutral = 0
     counted = 0
 
     for p_name, symbol, candles in prepared_tasks:
         try:
-            pd_15m, pd_5m, _ = parsed_cache.get(p_name, (None, None, None))
-            if pd_15m is None or pd_5m is None:
+            pd_15m, _, _ = parsed_cache.get(p_name, (None, None, None))
+            if pd_15m is None:
                 continue
 
             i15 = get_last_closed_index_from_array(pd_15m.ts, 15, reference_time, p_name)
             if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
                 continue
+            price = float(pd_15m.close[i15])
 
-            # Same closed 5m candle the gate evaluation uses (gates.py): the 5m candle
-            # that opened one interval before the current 5m boundary, falling back to
-            # the last 5m candle inside the closed 15m candle's window.
-            ts_5m = normalize_timestamp_array(pd_5m.ts)
-            expected_5m_open = (reference_time // 300) * 300 - 300
-            matches_5m = np.flatnonzero(np.abs(ts_5m - expected_5m_open) <= 30)
-            if matches_5m.size > 0:
-                i5 = int(matches_5m[-1])
-            else:
-                ts_15m_open = int(normalize_timestamp(int(pd_15m.ts[i15])))
-                window = np.flatnonzero((ts_5m >= ts_15m_open) & (ts_5m < ts_15m_open + 900))
-                if window.size == 0:
-                    continue
-                i5 = int(window[-1])
-
-            close_5m = pd_5m.close
-            price = float(close_5m[i5])
-            rma_fast = float(calculate_rma_numpy(close_5m, cfg.RMA_CLOUD_FAST_PERIOD)[i5])
-            rma_slow = float(calculate_rma_numpy(close_5m, cfg.RMA_50_PERIOD)[i5])
-            cirrus = calculate_cirrus_cloud_numpy(
-                close_5m, cfg.CIRRUS_X1, cfg.CIRRUS_X2, cfg.CIRRUS_X3, cfg.CIRRUS_X4,
-                cfg.CIRRUS_MIN_GAP_PCT,
+            # ── 1) 1h SuperTrend pair (built from the 15m candles up to the last closed one) ──
+            ts_15m = normalize_timestamp_array(pd_15m.ts)[: i15 + 1]
+            h1_high, h1_low, h1_close, h1_complete = aggregate_ohlc_hourly_numpy(
+                ts_15m, pd_15m.high[: i15 + 1], pd_15m.low[: i15 + 1], pd_15m.close[: i15 + 1],
             )
+            if not h1_complete and not cfg.BIAS_SUPERTREND_INCLUDE_FORMING_HOUR:
+                h1_high, h1_low, h1_close = h1_high[:-1], h1_low[:-1], h1_close[:-1]
+            if h1_close.size < _BIAS_ST_MIN_HOURS:
+                continue
+            st_a = float(calculate_supertrend_numpy(
+                h1_high, h1_low, h1_close,
+                cfg.BIAS_SUPERTREND_1_PERIOD, cfg.BIAS_SUPERTREND_1_FACTOR)[-1])
+            st_b = float(calculate_supertrend_numpy(
+                h1_high, h1_low, h1_close,
+                cfg.BIAS_SUPERTREND_2_PERIOD, cfg.BIAS_SUPERTREND_2_FACTOR)[-1])
 
+            # ── 2) 15m Ichimoku cloud 23/65/130/65 + future cloud colour ──
+            ichi = calculate_ichimoku_numpy(
+                pd_15m.high, pd_15m.low, pd_15m.close,
+                cfg.BIAS_ICHIMOKU_CONVERSION_PERIODS, cfg.BIAS_ICHIMOKU_BASE_PERIODS,
+                cfg.BIAS_ICHIMOKU_SPANB_PERIODS, cfg.BIAS_ICHIMOKU_DISPLACEMENT,
+            )
+            cloud_top = float(ichi['cloud_upper'][i15])
+            cloud_bottom = float(ichi['cloud_lower'][i15])
+
+            # ── 3) 15m Gaussian trend line colour ──
             if cfg.GAUSSIAN_SOURCE == 'hl2':
                 g_src = (pd_15m.high + pd_15m.low) / 2.0
             elif cfg.GAUSSIAN_SOURCE == 'hlc3':
@@ -562,21 +568,30 @@ async def compute_bias_context(prepared_tasks: List[Tuple[str, str, Dict[str, An
                 cfg.GAUSSIAN_EFFICIENCY_SMOOTH,
             )
 
-            # Any missing input -> the pair is skipped (not counted), never guessed.
-            if (not np.isfinite(price) or not np.isfinite(rma_fast) or not np.isfinite(rma_slow)
-                    or not bool(cirrus['valid'][i5]) or not bool(gauss['valid'][i15])):
+            # Missing price / SuperTrend / cloud -> the pair is skipped (not counted), never guessed.
+            if (not np.isfinite(price) or not np.isfinite(st_a) or not np.isfinite(st_b)
+                    or not np.isfinite(cloud_top) or not np.isfinite(cloud_bottom)):
                 continue
-            rma_top, rma_bottom = max(rma_fast, rma_slow), min(rma_fast, rma_slow)
-            cloud_top = max(float(cirrus['filtx1'][i5]), float(cirrus['filtx12'][i5]))
-            cloud_bottom = min(float(cirrus['filtx1'][i5]), float(cirrus['filtx12'][i5]))
-            g_dir = int(gauss['trend_dir'][i15])
+            # A Gaussian line with no direction yet is neither green nor red (no vote).
+            g_dir = int(gauss['trend_dir'][i15]) if bool(gauss['valid'][i15]) else 0
+
+            # Each vote is up, down, or neither (close between the two SuperTrends,
+            # close inside the cloud / future cloud against the close, Gaussian flat).
+            up_votes = (
+                int(price > st_a and price > st_b)
+                + int(price > cloud_top and bool(ichi['future_green'][i15]))
+                + int(g_dir == 1)
+            )
+            down_votes = (
+                int(price < st_a and price < st_b)
+                + int(price < cloud_bottom and bool(ichi['future_red'][i15]))
+                + int(g_dir == -1)
+            )
 
             counted += 1
-            if (rma_fast > rma_slow and price > rma_top and bool(cirrus['trend_up'][i5])
-                    and price > cloud_top and g_dir == 1):
+            if up_votes >= 2:
                 up += 1
-            elif (rma_fast < rma_slow and price < rma_bottom and bool(cirrus['trend_dn'][i5])
-                    and price < cloud_bottom and g_dir == -1):
+            elif down_votes >= 2:
                 down += 1
             else:
                 neutral += 1

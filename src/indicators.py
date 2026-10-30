@@ -392,6 +392,75 @@ def calculate_ichimoku_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarra
             'lead_line2': np.full(n, np.nan, dtype=np.float64),
         }
 
+def aggregate_ohlc_hourly_numpy(ts: np.ndarray, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+    """Build 1h high/low/close bars from 15m candles (UTC-hour aligned, same as
+    the exchange's 1h candles). `ts` is the 15m OPEN time in seconds. The last
+    bar may still be forming; the returned flag says whether it holds the
+    :45 candle (i.e. the hour is complete)."""
+    n = len(ts)
+    if n == 0:
+        empty = np.empty(0, dtype=np.float64)
+        return empty, empty.copy(), empty.copy(), False
+    hour_key = np.asarray(ts, dtype=np.int64) // 3600
+    starts = np.flatnonzero(np.concatenate(([True], hour_key[1:] != hour_key[:-1])))
+    ends = np.concatenate((starts[1:] - 1, [n - 1]))
+    h1_high = np.maximum.reduceat(np.asarray(high, dtype=np.float64), starts)
+    h1_low = np.minimum.reduceat(np.asarray(low, dtype=np.float64), starts)
+    h1_close = np.asarray(close, dtype=np.float64)[ends]
+    last_complete = bool(int(ts[ends[-1]]) % 3600 >= 2700)
+    return h1_high, h1_low, h1_close, last_complete
+
+def calculate_supertrend_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, atr_period: int, factor: float) -> np.ndarray:
+    """Exact replica of Pine v5/v6 ta.supertrend(factor, atr_period): hl2 source,
+    ATR = RMA(true range) seeded with the SMA of the first `atr_period` bars,
+    final-band ratcheting, direction flip on a close beyond the band.
+    Returns the SuperTrend LINE (lower band in an uptrend, upper band in a
+    downtrend); NaN until the ATR is valid."""
+    n = len(close)
+    line = np.full(n, np.nan, dtype=np.float64)
+    if n <= atr_period or atr_period < 1:
+        return line
+
+    tr = np.empty(n, dtype=np.float64)
+    tr[0] = high[0] - low[0]
+    prev_close_arr = close[:-1]
+    tr[1:] = np.maximum(
+        high[1:] - low[1:],
+        np.maximum(np.abs(high[1:] - prev_close_arr), np.abs(low[1:] - prev_close_arr)),
+    )
+    atr = np.full(n, np.nan, dtype=np.float64)
+    atr[atr_period - 1] = float(np.mean(tr[:atr_period]))
+    for i in range(atr_period, n):
+        atr[i] = (atr[i - 1] * (atr_period - 1) + tr[i]) / atr_period
+
+    prev_upper = 0.0            # Pine nz(upperBand[1]) / nz(lowerBand[1])
+    prev_lower = 0.0
+    prev_line = np.nan
+    for i in range(n):
+        if not np.isfinite(atr[i]):
+            continue
+        src = (high[i] + low[i]) / 2.0
+        upper = src + factor * atr[i]
+        lower = src - factor * atr[i]
+        prev_close = close[i - 1] if i > 0 else np.nan
+        if not (lower > prev_lower or prev_close < prev_lower):
+            lower = prev_lower
+        if not (upper < prev_upper or prev_close > prev_upper):
+            upper = prev_upper
+
+        if i == 0 or not np.isfinite(atr[i - 1]):
+            direction = 1
+        elif prev_line == prev_upper:
+            direction = -1 if close[i] > upper else 1
+        else:
+            direction = 1 if close[i] < lower else -1
+
+        prev_line = lower if direction == -1 else upper
+        line[i] = prev_line
+        prev_upper = upper
+        prev_lower = lower
+    return line
+
 def calculate_dynamic_flow_ribbon_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, factor: float, basis_length: int, dist_length: int) -> Tuple[np.ndarray, np.ndarray]:
     try:
         n = len(close)

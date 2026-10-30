@@ -204,16 +204,17 @@ class BiasContext:
     compute_bias_context in macd_unified.py). Purely a cosmetic header
     prepended to every outgoing Telegram message this run — see
     cfg.ENABLE_BIAS_HEADER. Never gates or filters an alert.
-    A pair counts as (all three conditions must hold):
-      up      - 5m RMA cloud green (RMA 20 > RMA 50) with the 5m close above
-                it AND 5m Cirrus Cloud green
-                (Trend Up) with the 5m close above the cloud AND 15m Gaussian
-                trend line green
-      down    - 5m RMA cloud red (RMA 20 < RMA 50) with the 5m close below
-                it AND 5m Cirrus Cloud red
-                (Trend Down) with the 5m close below the cloud AND 15m Gaussian
-                trend line red
-      neutral - anything else
+    A pair counts as (any 2 of the 3 conditions below):
+      up      - 1) 15m close above BOTH 1h SuperTrends (5/2.15 and 7/1.85)
+                2) 15m close above the 15m Ichimoku cloud (23/65/130/65) AND the
+                   future cloud green (Span A >= Span B)
+                3) 15m Gaussian trend line green
+      down    - 1) 15m close below BOTH 1h SuperTrends
+                2) 15m close below the Ichimoku cloud AND the future cloud red
+                   (Span A <= Span B)
+                3) 15m Gaussian trend line red
+      neutral - anything else (e.g. close between the two SuperTrends, close
+                inside the cloud, or fewer than 2 conditions on one side)
       (pairs with missing/not-yet-valid inputs are skipped)"""
     up_count: int
     down_count: int
