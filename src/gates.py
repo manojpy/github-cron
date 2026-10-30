@@ -638,9 +638,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             close_prev_invalid = True
 
         if close_prev_invalid:
-            logger_pair.warning(
-                f"[{pair_name}] close_prev invalid — skipping all cross alerts"
-            )
             await _blanket_reset_pair(sdb, pair_name, logger_pair)
             return pair_name, {
                 "state": "INVALID_PREV_CLOSE",

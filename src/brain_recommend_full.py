@@ -1261,7 +1261,11 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
     # Challenger weights accumulate via weight_optimizer / apply_pending_plan
     # when ENABLE_CHAMPION_CHALLENGER is on. Promotion is intentionally not
     # automatic while CHALLENGER_SHADOW_ONLY is True (safe-by-default).
-    if getattr(cfg, "ENABLE_CHAMPION_CHALLENGER", False):
+    if getattr(cfg, "ENABLE_CHAMPION_CHALLENGER", False) and not (
+        (ai_metrics.get("challenger_promotion") or {}).get("promoted")
+    ):
+        # (skipped when the early check above already promoted: the challenger is
+        # consumed, so a second call would overwrite that result with "no_challenger")
         try:
             promo = await self.maybe_promote_challenger(force=False)
             ai_metrics["challenger_promotion"] = promo

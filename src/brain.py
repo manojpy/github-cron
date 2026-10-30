@@ -314,7 +314,15 @@ class BrainCore:
             # of one in one bucket), whereas reading tips afterwards could
             # silently skip rows. Counting a row twice is the safer error.
             stream_tips = await self._stream_tips()
-            real_rows, shadow_rows = await self._get_rows()
+            if getattr(cfg, "BRAIN_ARCHIVE_SHALLOW", False):
+                # Alert-only runs check out just a few days of the file archive, so
+                # self._get_rows() (archive first) would build the live calibration
+                # curve from a truncated sample (e.g. 166 of 461 real rows) and
+                # persist it for every later run. The Redis streams hold the full
+                # history, so read those instead.
+                real_rows, shadow_rows = await BrainCore._get_rows(self)
+            else:
+                real_rows, shadow_rows = await self._get_rows()
             n_real, n_shadow = len(real_rows), len(shadow_rows)
             logger_run.info(
                 f"🎯 Calibration refresh input: {n_real} real, {n_shadow} shadow rows"
@@ -1603,7 +1611,7 @@ class BrainCore:
 
         total_recs = recs["recommendation_count"]
         if total_recs == 0:
-            lines.append("No actionable signal yet — accumulating samples.")
+            lines.append(escape_markdown_v2("No actionable signal yet — accumulating samples."))
 
         msg = self._truncate_telegram(lines)
 

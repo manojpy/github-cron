@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 from brain_audit import DataCoverage, HealthStatus, get_audit, reset_audit, ACTION_GATE_MIN_ROWS
 from archive_reader import load_archived_outcomes
-from bot_config import cfg, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS, json_dumps, json_loads
+from bot_config import cfg, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS, format_ist_time, json_dumps, json_loads
 from state import RedisKeyPrefix, RedisStateStore
 from brain import BrainCore, _extract_p_value_for_fdr
 import threshold_engine as engine
@@ -1230,8 +1230,8 @@ class BrainEngineV2(BrainCore):
             raw = await self.sdb.get_metadata("brain_pending_plan")
             if not raw:
                 await telegram_queue.send(escape_markdown_v2(
-                    "⚠️ No pending brain plan found\\.\n"
-                    "Run a report first with `BRAIN_REPORT_ON_DEMAND=true`\\."
+                    "⚠️ No pending brain plan found.\n"
+                    "Run a report first with `BRAIN_REPORT_ON_DEMAND=true`."
                 ))
                 return False   
             plan = json_loads(raw)
@@ -1403,13 +1403,13 @@ class BrainEngineV2(BrainCore):
                         logger_run.debug(f"Repair ledger toggle record failed (non-fatal): {e}")
                 trailer = ""
                 if applied_config:
-                    trailer += "\nConfig overrides require a restart\\."
+                    trailer += "\nConfig overrides require a restart."
                 if applied_live:
-                    trailer += "\nWeight/alert changes take effect on the next dispatch\\."
+                    trailer += "\nWeight/alert changes take effect on the next dispatch."
 
                 msg = (
                     f"✅ APPLIED BRAIN PLAN\n"
-                    f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"Time: {format_ist_time()}\n"
                     + "\n".join(applied)
                     + trailer
                 )
@@ -1429,8 +1429,8 @@ class BrainEngineV2(BrainCore):
                 return True
             else:
                 await telegram_queue.send(escape_markdown_v2(
-                    "⚠️ No applicable changes in the plan\\.\n"
-                    "All recommended changes may already be applied\\."
+                    "⚠️ No applicable changes in the plan.\n"
+                    "All recommended changes may already be applied."
                 ))
                 return False
                 

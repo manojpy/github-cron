@@ -258,7 +258,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
         )
         brier_status = (
             "Healthy" if (brier < 0.20 and ev_positive)
-            else "MISALIBRATED" if brier >= 0.20
+            else "MISCALIBRATED" if brier >= 0.20
             else "CALIBRATED-BUT-EV-NEGATIVE"
         )
         recommendations.append({
@@ -353,7 +353,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                 threshold_rec["severity"] = "medium"
                 threshold_rec["stability_blocked"] = True
                 threshold_rec["message"] += (
-                    f"⚠️ STABILITY GATE BLOCKED: {gate_reason}. "
+                    f"\n⚠️ STABILITY GATE BLOCKED: {gate_reason}. "
                     f"Patch suppressed to prevent oscillation."
                 )
                 emit_patch = False

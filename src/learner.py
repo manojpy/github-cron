@@ -433,15 +433,24 @@ async def run(args: argparse.Namespace) -> int:
             await notify(ap_text)
         return 0
     finally:
-        # Always close the shared HTTP session (Telegram notify / any late get_session
-        # can reopen it after the intermediate closes in recover_paths / fetch_control_candles).
         try:
-            from fetcher import SessionManager
-            await SessionManager.close_session()
+            await asyncio.wait_for(sdb.close(), timeout=3.0)
         except Exception:
             pass
+
+        # sdb.close() only drops the reference; close the shared Redis pool too
+        # (macd_unified does the same at shutdown).
         try:
-            await sdb.close()
+            await asyncio.wait_for(RedisStateStore.shutdown_global_pool(), timeout=5.0)
+        except Exception:
+            pass
+
+        # notify() opens the shared Telegram HTTP session AFTER the candle/path
+        # fetches already closed theirs; without this the process exits with an
+        # "Unclosed client session / Unclosed connector" warning.
+        try:
+            from fetcher import SessionManager
+            await asyncio.wait_for(SessionManager.close_session(), timeout=5.0)
         except Exception:
             pass
 

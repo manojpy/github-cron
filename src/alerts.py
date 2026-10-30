@@ -2597,6 +2597,18 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     _tl_hits = context.pop("trendline_shadow_hits", None) or []
     _ex_hits = context.pop("exhaustion_veto_hits", None) or []
 
+    async def _persist_resets_when_blocked() -> None:
+        """ACTIVE->INACTIVE resets are edge-triggered (they fire only on the
+        cross-flip candle). The kill-switch / heat-gate returns below happen
+        before the normal reset step, so a flip during a block would leave the
+        key ACTIVE and silently swallow the next same-direction cross."""
+        try:
+            _resets = _build_resets(pair_name, context, conditional_states)
+            if _resets:
+                await sdb.atomic_batch_update(_resets)
+        except Exception as e:
+            logger_pair.warning(f"[{pair_name}] Reset persist on blocked path failed: {e}")
+
     if kill_switch_mode() == "live" and sdb and not sdb.degraded and sdb._redis:
         if kill_switch_active_run is _SENTINEL_UNSET:
             try:
@@ -2610,6 +2622,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             is_active = bool(kill_switch_active_run)
         if is_active:
             logger_pair.warning(f"[{pair_name}] Kill switch active — dispatch blocked")
+            await _persist_resets_when_blocked()
             return pair_name, {
                 "state": "KILL_SWITCH",
                 "ts": int(time.time()),
@@ -2646,8 +2659,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     block_reason="portfolio_heat",
                     confluence_scores={ak: _confluence_for(ak) for _, _, ak in raw_alerts},
                     gr=gr, context=context,
+
                     logger_pair=logger_pair,
                 )
+                await _persist_resets_when_blocked()
                 return pair_name, {
                     "state": "PORTFOLIO_HEAT",
                     "ts": int(time.time()),
