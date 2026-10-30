@@ -177,7 +177,10 @@ async def poll_feedback(sdb: Any, token: str, chat_id: str, pairs: Sequence[str]
             if len(log) > _LOG_CAP:
                 keep = sorted(log, key=lambda k: int(k.rsplit("|", 1)[-1]))[-_LOG_CAP:]
                 log = {k: log[k] for k in keep}
-            await sdb.set_metadata(KEY_FEEDBACK, json.dumps(log, separators=(",", ":")), ttl=_TTL, timeout=3.0)
+            if not await sdb.set_metadata(KEY_FEEDBACK, json.dumps(log, separators=(",", ":")), ttl=_TTL, timeout=3.0):
+                # Not saved: leave the Telegram offset alone so these taps are
+                # delivered again next run instead of being lost for good.
+                return 0
         await sdb.set_metadata(KEY_OFFSET, str(int(updates[-1]["update_id"]) + 1), ttl=30 * 86400, timeout=3.0)
         for a in actions:                     # best-effort UX: stale taps may fail, the record is already saved
             if a.get("id"):

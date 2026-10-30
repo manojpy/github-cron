@@ -597,8 +597,9 @@ def format_intelligence(blob: Mapping[str, Any], name_fn: Callable[[str], str] =
         d = (tm.get("verdicts") or {}).get(v)
         if d:
             nl = "n/a" if d.get("net_lb") is None else f"{d['net_lb']:+.2f}"
+            nm = "n/a" if d.get("mean_net") is None else f"{d['mean_net']:+.2f}%"
             lines.append(f"{v}: n={d['n']} ({d['coverage']:.0%} of verdicts) | precision {d['precision']:.0%} "
-                         f"[{d['wilson'][0]:.0%}-{d['wilson'][1]:.0%}] | net {d['mean_net']:+.2f}%/trade (lower bound {nl})")
+                         f"[{d['wilson'][0]:.0%}-{d['wilson'][1]:.0%}] | net {nm}/trade (lower bound {nl})")
     if tm.get("verdicts"):
         lines.append(f"Break-even precision {tm['breakeven_precision']:.0%} | target {tm['target']:.0%}"
                      + (f" | meets target: {'yes' if tm.get('meets_target') else 'not proven'}" if "meets_target" in tm else "")

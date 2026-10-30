@@ -267,6 +267,27 @@ async def _strict_set_many(sdb: RedisStateStore, items: List[Tuple[str, str]], t
             pipe.set(f"{sdb.meta_prefix}{key}", value, ex=ttl)
         await asyncio.wait_for(cast(Awaitable[Any], pipe.execute()), timeout=10.0)
 
+def _tg_chunks(text: str, limit: int = 3800) -> List[str]:
+    """MarkdownV2-escaped chunks of at most `limit` chars (Telegram rejects > 4096).
+    Splits on blank lines, then on single lines for an oversized paragraph."""
+    chunks: List[str] = []
+    cur = ""
+    for para in text.split("\n\n"):
+        pieces = [escape_markdown_v2(para)]
+        if len(pieces[0]) > limit:
+            pieces = [escape_markdown_v2(ln) for ln in para.split("\n")]
+        for i, piece in enumerate(pieces):
+            piece = piece[:limit]
+            sep = "\n\n" if i == 0 else "\n"
+            if cur and len(cur) + len(sep) + len(piece) > limit:
+                chunks.append(cur)
+                cur = piece
+            else:
+                cur = cur + sep + piece if cur else piece
+    if cur:
+        chunks.append(cur)
+    return chunks
+
 async def run(args: argparse.Namespace) -> int:
     data_dir = args.data_dir or os.environ.get("OUTCOME_DATA_DIR") or ""
     sdb = RedisStateStore(cfg.REDIS_URL)
@@ -278,8 +299,8 @@ async def run(args: argparse.Namespace) -> int:
 
     async def notify(text: str) -> None:
         if tq is not None:
-            await tq.send(escape_markdown_v2(text))
-
+            for chunk in _tg_chunks(text):
+                await tq.send(chunk)
     try:
         if args.digest:
             led = _jl(await sdb.get_metadata(KEY_LEDGER, timeout=5.0), [])

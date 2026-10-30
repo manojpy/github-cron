@@ -467,6 +467,11 @@ def build_playbook(
         cand_plan: Optional[Dict[str, Any]] = None
         if sel["status"] == "VALIDATED" and sel.get("best"):
             cand_plan = _plan(sel["best"])
+            if champ and _plan(champ["plan"]) == cand_plan:
+                # The best plan IS the served champion. Freezing it as a "challenger"
+                # would run 3 cycles of re-validation and then be REJECTED for not
+                # beating itself by min_ev_lift, a spurious change notice each time.
+                cand_plan = None
         if chall:
             cp = chall["plan"]
             he = _ev(hold_rows, cp, cost_pct)

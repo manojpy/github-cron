@@ -6,6 +6,7 @@ from __future__ import annotations
 import re
 import logging
 import json
+import numbers
 from typing import Dict, Any, List, Union, Set
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
@@ -270,7 +271,7 @@ class SafeFormatter(logging.Formatter):
         """Mask sensitive values while preserving numeric types for %d/%f format specifiers."""
         if value is None:
             return value
-        if isinstance(value, (int, float, bool)):
+        if isinstance(value, numbers.Number):   # int/float/bool AND numpy scalars (np.int64 is not an int)
             return value
         return SafeFormatter._apply_all_redactions(str(value))
 
