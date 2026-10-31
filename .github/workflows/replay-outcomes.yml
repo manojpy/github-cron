@@ -93,6 +93,10 @@ jobs:
           git clone --depth=1 \
             "https://github.com/manojpy/outcome-data.git" \
             /tmp/data-repo
+          # Same union-merge rule as run-bot.yml and cleanup-outcomes.yml: if the
+          # bot appends to today's .jsonl between our clone and our push, the
+          # rebase below merges both sets of rows instead of aborting on a conflict.
+          echo '*.jsonl merge=union' >> /tmp/data-repo/.git/info/attributes
 
       - name: ♻️ Merge artifacts into data repo
         if: steps.list.outputs.has_candidates == 'true'
