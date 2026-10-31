@@ -375,10 +375,12 @@ def rejection_audit(shadow_rows: Sequence[Row], live_rows: Sequence[Row], *, cos
         se, _nb = cluster_se(vals, [x[0] for x in g]) if n >= 2 else (float("inf"), 0)
         if n < min_n or se == float("inf"):
             status = "COLLECTING"
-        elif mean + z * se < 0:
-            status = "JUSTIFIED"
-        elif mean - z * se > 0:
-            status = "COSTLY"
+        elif live_net is None:
+            status = "UNCLEAR"
+        elif mean + z * se < live_net:
+            status = "JUSTIFIED"   # rejected trades did significantly worse than the kept ones
+        elif mean - z * se > live_net:
+            status = "COSTLY"      # rejected trades did significantly better than the kept ones
         else:
             status = "UNCLEAR"
         out_rows.append({"reason": reason, "n": n, "success": round(p, 3), "wilson": [round(lo, 3), round(hi, 3)],

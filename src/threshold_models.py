@@ -1164,7 +1164,7 @@ def build_calibration_curves(rows: List[Row], bucket_pct: float = 5.0, min_sampl
     # ── FIX (Priority 6): Merge shadow rows into the calibration
     if shadow_rows:
         for r in shadow_rows:
-            rejection = (r.get("context") or {}).get("rejection_reason", "")
+            rejection = r.get("rejection_reason") or (r.get("context") or {}).get("rejection_reason", "")
             if rejection == "calibration_gate":
                 continue  # Avoid selection leakage
             by_ak[r["alert_key"]].append(r)
