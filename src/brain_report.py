@@ -311,9 +311,9 @@ def _outcome_anatomy(rows: List[Dict[str, Any]], cfg) -> Tuple[Optional[str], Di
         f"A TARGET WIN is price moving +{target:.1f}% your way "
         f"before it moves -{risk:.1f}% against you, within {hours:g} hours.",
         f"Break-even needs roughly {1.0 / (1.0 + rr):.0%} TARGET wins (before fees).",
-        f"Trades that do neither are also labelled a win when they close on the "
-        f"right side of the entry, so the headline Win Rate runs higher than the "
-        f"target rate below. Net EV is the figure to trust.",
+        "Trades that do neither are also labelled a win when they close on the "
+        "right side of the entry, so the headline Win Rate runs higher than the "
+        "target rate below. Net EV is the figure to trust.",
     ]
     if known:
         lines.append(f"How {known} trades actually ended:")
