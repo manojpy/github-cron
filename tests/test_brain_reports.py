@@ -177,7 +177,10 @@ def test_win_rule_explained_with_break_even():
     text = _plain(_report(_rows__brain_report_v2(_SPEC)))
     assert "WHY THE WIN RATE LOOKS LOW" in text
     assert "before it moves -1.0% against you, within 3 hours" in text
-    assert "Break-even needs roughly 33% wins" in text
+    # Wording from _outcome_anatomy: "TARGET wins" distinguishes the
+    # target-before-stop rate from the headline win rate (which also
+    # counts positive-PnL timeouts).
+    assert "Break-even needs roughly 33% TARGET wins" in text
 
 def test_scorecard_uses_friendly_names_and_summarises_thin():
     text = _plain(_report(_rows__brain_report_v2(_SPEC)))
