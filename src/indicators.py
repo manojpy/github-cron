@@ -967,10 +967,35 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['cirrus_trend_up_5m'] = _cirrus['trend_up']
             results['cirrus_trend_dn_5m'] = _cirrus['trend_dn']
             results['cirrus_valid_5m'] = _cirrus['valid']
+            # Top / bottom of the two Cirrus lines (used by the Cirrus cross alert).
+            results['cirrus_top_5m'] = np.where(
+                _cirrus['valid'], np.maximum(_cirrus['filtx1'], _cirrus['filtx12']), np.nan)
+            results['cirrus_bot_5m'] = np.where(
+                _cirrus['valid'], np.minimum(_cirrus['filtx1'], _cirrus['filtx12']), np.nan)
         else:
             results['cirrus_trend_up_5m'] = np.zeros(len(close_5m), dtype=bool)
             results['cirrus_trend_dn_5m'] = np.zeros(len(close_5m), dtype=bool)
             results['cirrus_valid_5m'] = np.zeros(len(close_5m), dtype=bool)
+            results['cirrus_top_5m'] = np.full(len(close_5m), np.nan, dtype=np.float64)
+            results['cirrus_bot_5m'] = np.full(len(close_5m), np.nan, dtype=np.float64)
+
+        # ── Cirrus Cloud on 15m closes (only for the Cirrus cross alert when CROSS_ALERT_TF is 15m) ──
+        if cfg.CIRRUS_CLOUD_ENABLED and cfg.ENABLE_CIRRUS_CROSS_ALERT and cfg.CROSS_ALERT_TF == "15m":
+            _cirrus_15 = calculate_cirrus_cloud_numpy(
+                close_15m, cfg.CIRRUS_X1, cfg.CIRRUS_X2, cfg.CIRRUS_X3, cfg.CIRRUS_X4,
+                cfg.CIRRUS_MIN_GAP_PCT
+            )
+            results['cirrus_up_15'] = _cirrus_15['trend_up']
+            results['cirrus_dn_15'] = _cirrus_15['trend_dn']
+            results['cirrus_top_15'] = np.where(
+                _cirrus_15['valid'], np.maximum(_cirrus_15['filtx1'], _cirrus_15['filtx12']), np.nan)
+            results['cirrus_bot_15'] = np.where(
+                _cirrus_15['valid'], np.minimum(_cirrus_15['filtx1'], _cirrus_15['filtx12']), np.nan)
+        else:
+            results['cirrus_up_15'] = np.zeros(n_15m, dtype=bool)
+            results['cirrus_dn_15'] = np.zeros(n_15m, dtype=bool)
+            results['cirrus_top_15'] = np.full(n_15m, np.nan, dtype=np.float64)
+            results['cirrus_bot_15'] = np.full(n_15m, np.nan, dtype=np.float64)
 
         # ── Dynamic Flow Ribbon (BigBeluga) — third cloud-group trend gate ──
         if cfg.DYNAMIC_FLOW_RIBBON_ENABLED:

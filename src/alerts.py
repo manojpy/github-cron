@@ -510,11 +510,21 @@ async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, a
         except Exception as e:
             logger_pair.debug(f"Why-rejected log failed ({block_reason}): {e}")
 
-def build_rich_pair_msg(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], setup_line: str, advice: PairAdvice, primary_emoji: Optional[str] = None, record_line: Optional[str] = None, pullback_line: Optional[str] = None) -> str:
-    """Structured Telegram body (MarkdownV2-escaped) WITHOUT bias/datetime footer."""
+def build_rich_pair_msg(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], setup_line: str, advice: PairAdvice, primary_emoji: Optional[str] = None, record_line: Optional[str] = None, pullback_line: Optional[str] = None, short: bool = False) -> str:
+    """Structured Telegram body (MarkdownV2-escaped) WITHOUT bias/datetime footer.
+    short=True (alert ignored because a trade is already open) keeps only the header,
+    the setup line and the status line."""
     side_word = "BUY" if direction.lower() == "buy" else "SELL"
     header_emoji = (primary_emoji or "").strip() or ("🟢" if side_word == "BUY" else "🔴")
     conv = f"{advice.conviction}%" if advice.conviction is not None else "n/a"
+    if short:
+        short_lines = [
+            f"{header_emoji} {pair} — {side_word} | {_format_price(price)}{_fmt_score(score, total)}",
+            setup_line,
+        ]
+        if record_line:
+            short_lines.append(record_line)
+        return "\n".join(escape_markdown_v2(x) for x in short_lines)
     lines = [
         f"{header_emoji} {pair} — {side_word} | {_format_price(price)}{_fmt_score(score, total)}",
         f"🎯 Conviction {conv} | {advice.label}",
@@ -570,7 +580,7 @@ def _record_status_line(status: str, active: Optional[Dict[str, Any]]) -> str:
         return f"⏸ Cooldown — same-direction trade recently closed, not recorded until the {resume} candle"
     return "📝 Recorded as trade"
 
-def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], items: List[Tuple[str, str]], keys: List[str], tq_by_key: Dict[str, Optional[Dict[str, Any]]], votes: Optional[Dict[str, bool]], required: Optional[float], bias_context: Optional[BiasContext], logger_pair: logging.Logger, pb_by_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None, adx_val: Optional[float] = None, record_line: Optional[str] = None, pullback_line: Optional[str] = None, decision_sink: Optional[Dict[str, Any]] = None, exhaustion: Optional[Dict[str, Any]] = None) -> Tuple[str, Optional[str]]:
+def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], items: List[Tuple[str, str]], keys: List[str], tq_by_key: Dict[str, Optional[Dict[str, Any]]], votes: Optional[Dict[str, bool]], required: Optional[float], bias_context: Optional[BiasContext], logger_pair: logging.Logger, pb_by_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None, adx_val: Optional[float] = None, record_line: Optional[str] = None, pullback_line: Optional[str] = None, decision_sink: Optional[Dict[str, Any]] = None, exhaustion: Optional[Dict[str, Any]] = None, short: bool = False) -> Tuple[str, Optional[str]]:
     """Build the rich body for one pair/direction and return (body, verdict).
     Never raises: any failure degrades to a plain header + setup line (verdict
     None) so an alert is never lost to a formatting bug."""
@@ -634,6 +644,7 @@ def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int
             primary_emoji=_leading_emoji(s_items[0][0]),
             record_line=record_line,
             pullback_line=pullback_line,
+            short=short,
         )
         return body, advice.verdict
     except Exception as e:
@@ -768,6 +779,8 @@ _ALERT_DEFINITIONS_RAW: List[Dict[str, Any]] = [
     {"key":"momentum_cross_sell","title":"🚀🔴 Momentum Cross SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("momentum_cross_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('momentum_cross_reason') or 'Momentum Oscillator crossed below 0'}","requires":["momentum_cross"]},
     {"key":"gaussian_cross_buy","title":"〰️🟢 Gaussian Cross BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("gaussian_cross_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('gaussian_cross_reason') or 'Price reclaimed Gaussian line'}","requires":["gaussian_cross"]},
     {"key":"gaussian_cross_sell","title":"〰️🔴 Gaussian Cross SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("gaussian_cross_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('gaussian_cross_reason') or 'Price lost Gaussian line'}","requires":["gaussian_cross"]},
+    {"key":"cirrus_cross_buy","title":"☁️🟢 Cirrus Cross BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("cirrus_cross_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('cirrus_cross_reason') or 'Close crossed above the top Cirrus line'}","requires":["cirrus_cross"]},
+    {"key":"cirrus_cross_sell","title":"☁️🔴 Cirrus Cross SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("cirrus_cross_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('cirrus_cross_reason') or 'Close crossed below the bottom Cirrus line'}","requires":["cirrus_cross"]},
     {"key":"equilibrium_cross_up","title":"⚖️🟢 Equilibrium Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_wick",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Equilibrium {ctx.get('equilibrium_curr',0) or 0:.2f} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"equilibrium_cross_down","title":"⚖️🔴 Equilibrium Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_wick",False) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Equilibrium {ctx.get('equilibrium_curr',0) or 0:.2f} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
 ]
@@ -939,6 +952,12 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
 
     # ── Gaussian Filter Trend line crossover ──
     for k, ok_key in ((AlertKey.GAUSSIAN_CROSS_BUY, "gaussian_cross_buy"), (AlertKey.GAUSSIAN_CROSS_SELL, "gaussian_cross_sell")):
+        rk = ALERT_KEYS.get(k)
+        if rk and conditional_states.get(rk, False) and not context.get(ok_key):
+            resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
+
+    # ── Cirrus Cloud line crossover ──
+    for k, ok_key in ((AlertKey.CIRRUS_CROSS_BUY, "cirrus_cross_buy"), (AlertKey.CIRRUS_CROSS_SELL, "cirrus_cross_sell")):
         rk = ALERT_KEYS.get(k)
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
@@ -1606,6 +1625,7 @@ _PULLBACK_HOST_KEYS = frozenset({
     "dynamic_flow_cross_buy", "dynamic_flow_cross_sell",
     "momentum_cross_buy", "momentum_cross_sell",
     "gaussian_cross_buy", "gaussian_cross_sell",
+    "cirrus_cross_buy", "cirrus_cross_sell",
     "hist_rma_buy", "hist_rma_sell",
     "ppohist_buy", "ppohist_sell",
 })
@@ -1709,6 +1729,13 @@ async def send_pullback_watch(context: Dict[str, Any], gr: GateResult, sdb: Redi
         return 0
     if not sdb or sdb.degraded:
         return 0
+    if not any(context.get(f"pullback_state_{s}") == "exhaustion" for s in ("buy", "sell")):
+        return 0
+    # One recorded trade per pair: a WATCH for a pair that already has an open trade
+    # adds nothing, so it is only sent for pairs with no active trade.
+    if cfg.ENABLE_SINGLE_ACTIVE_TRADE and cfg.ENABLE_WIN_RATE_FILTER:
+        if await sdb.get_active_trade(gr.pair_name):
+            return 0
     queued = 0
     for side in ("buy", "sell"):
         if context.get(f"pullback_state_{side}") != "exhaustion":
@@ -1841,6 +1868,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
     dynamic_flow_cross_up, dynamic_flow_cross_down = gr.dynamic_flow_cross_up, gr.dynamic_flow_cross_down
     momentum_cross_up, momentum_cross_down = gr.momentum_cross_up, gr.momentum_cross_down
     gaussian_cross_up, gaussian_cross_down = gr.gaussian_cross_up, gr.gaussian_cross_down
+    cirrus_cross_up, cirrus_cross_down = gr.cirrus_cross_up, gr.cirrus_cross_down
     try:
         alert_indicators = await asyncio.to_thread(
             calculate_alert_indicators_numpy, data_15m.as_dict(), data_5m.as_dict(), data_daily, reference_time
@@ -2025,6 +2053,17 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             elif gaussian_cross_sell:
                 gaussian_cross_reason = f"Price lost Gaussian line (bearish, {cfg.GAUSSIAN_CROSS_TF})"
 
+        cirrus_cross_buy, cirrus_cross_sell = False, False
+        cirrus_cross_reason = None
+        if cfg.ENABLE_CIRRUS_CROSS_ALERT:
+            cirrus_cross_buy = bool(buy_common_relaxed_wick and cirrus_cross_up)
+            cirrus_cross_sell = bool(sell_common_relaxed_wick and cirrus_cross_down)
+
+            if cirrus_cross_buy:
+                cirrus_cross_reason = f"Close crossed above the top Cirrus line (cloud green, {cfg.CROSS_ALERT_TF})"
+            elif cirrus_cross_sell:
+                cirrus_cross_reason = f"Close crossed below the bottom Cirrus line (cloud red, {cfg.CROSS_ALERT_TF})"
+
         fib_reversal_buy, fib_reversal_sell = False, False
         fib_reversal_reason = None
         fib_reversal_votes_buy = fib_reversal_votes_sell = None
@@ -2150,6 +2189,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "momentum_cross_reason": momentum_cross_reason,
             "gaussian_cross_buy": gaussian_cross_buy, "gaussian_cross_sell": gaussian_cross_sell,
             "gaussian_cross_reason": gaussian_cross_reason,
+            "cirrus_cross_buy": cirrus_cross_buy, "cirrus_cross_sell": cirrus_cross_sell,
+            "cirrus_cross_reason": cirrus_cross_reason,
         }
         context["pullback_state_buy"] = context["pullback_state_sell"] = "none"
         context["pullback_info_buy"] = context["pullback_info_sell"] = {}
@@ -2302,8 +2343,9 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 dynamic_flow_cross_exception = (alert_key == "dynamic_flow_cross_buy" and dynamic_flow_cross_buy)
                 momentum_cross_exception = (alert_key == "momentum_cross_buy" and momentum_cross_buy)
                 gaussian_cross_exception = (alert_key == "gaussian_cross_buy" and gaussian_cross_buy)
+                cirrus_cross_exception = (alert_key == "cirrus_cross_buy" and cirrus_cross_buy)
                 fib_reversal_exception = (alert_key == "fib_reversal_buy" and fib_reversal_buy)
-                if not (is_valid_for_buy or reversal_bullish or choch_exception or dynamic_flow_cross_exception or momentum_cross_exception or gaussian_cross_exception or fib_reversal_exception):
+                if not (is_valid_for_buy or reversal_bullish or choch_exception or dynamic_flow_cross_exception or momentum_cross_exception or gaussian_cross_exception or cirrus_cross_exception or fib_reversal_exception):
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: not valid for buy (wick/body fail, no reversal pattern)")
                     continue
@@ -2320,8 +2362,9 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 dynamic_flow_cross_exception = (alert_key == "dynamic_flow_cross_sell" and dynamic_flow_cross_sell)
                 momentum_cross_exception = (alert_key == "momentum_cross_sell" and momentum_cross_sell)
                 gaussian_cross_exception = (alert_key == "gaussian_cross_sell" and gaussian_cross_sell)
+                cirrus_cross_exception = (alert_key == "cirrus_cross_sell" and cirrus_cross_sell)
                 fib_reversal_exception = (alert_key == "fib_reversal_sell" and fib_reversal_sell)
-                if not (is_valid_for_sell or reversal_bearish or choch_exception or dynamic_flow_cross_exception or momentum_cross_exception or gaussian_cross_exception or fib_reversal_exception):
+                if not (is_valid_for_sell or reversal_bullish or choch_exception or dynamic_flow_cross_exception or momentum_cross_exception or gaussian_cross_exception or cirrus_cross_exception or fib_reversal_exception):
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: not valid for sell (wick/body fail, no reversal pattern)")
                     continue
@@ -3694,7 +3737,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             if record_active:
                 record_status = "IGNORED"
             record_line = _record_status_line(record_status, record_active)
-        if alerts_to_send and cfg.ENABLE_CLOUD_VOTE_LINE:
+        
+        if alerts_to_send and cfg.ENABLE_CLOUD_VOTE_LINE and record_status != "IGNORED":
             _cloud_line = _cloud_vote_line(gr, bool(is_buy_batch))
             logger_pair.info(f"[{pair_name}] {_cloud_line}")
             record_line = f"{record_line}\n{_cloud_line}" if record_line else _cloud_line
@@ -3735,6 +3779,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 ),
                 decision_sink=advisor_seen,
                 exhaustion=exhaustion_info_for_verdict(context, direction, keys),
+                short=(record_status == "IGNORED"),
             )
             msg_body = msg
 
@@ -4381,6 +4426,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 if not gaussian_gate_ok_sell:
                     reasons.append("Gaussian Trend sell: trend not bearish (vote)")
             _cg_need = (
+                f"Gaussian 15m (veto) plus any {Constants.CLOUD_GROUP_MIN_VOTES - 1} of the other enabled clouds "
+                "(RMA 5m / Cirrus 5m / Dynamic Flow 15m)"
+                if Constants.CLOUD_GROUP_GAUSSIAN_VETO and cfg.GAUSSIAN_TREND_ENABLED else
                 f"{Constants.CLOUD_GROUP_MIN_VOTES} of the enabled clouds "
                 "(RMA 5m / Cirrus 5m / Dynamic Flow 15m / Gaussian 15m)"
             )

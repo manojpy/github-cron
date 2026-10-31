@@ -211,8 +211,9 @@ class GateResult:
     momentum_cross_down: bool = False
     gaussian_cross_up: bool = False
     gaussian_cross_down: bool = False
+    cirrus_cross_up: bool = False
+    cirrus_cross_down: bool = False
     rma_cloud_slow_curr: float = float("nan")
-
 
 def _cloud_group_decision(cirrus_ok: Optional[bool], gaussian_ok: Optional[bool],
                           flow_ok: Optional[bool], rma_ok: Optional[bool]) -> bool:
@@ -237,6 +238,10 @@ def _cloud_group_decision(cirrus_ok: Optional[bool], gaussian_ok: Optional[bool]
     if not enabled:
         return True
     need = min(Constants.CLOUD_GROUP_MIN_VOTES, len(enabled))
+    # Gaussian has veto power: it must agree, and then any (need - 1) of the other
+    # enabled clouds complete the group (default: Gaussian + any 2 of the other 3).
+    if Constants.CLOUD_GROUP_GAUSSIAN_VETO and cfg.GAUSSIAN_TREND_ENABLED and gaussian_ok is not True:
+        return False
     return sum(1 for v in enabled if v is True) >= need
 
 def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, float, Dict[str, bool]]:
@@ -931,6 +936,52 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
                         and close_prev > g_line_prev
                         and close_curr < g_line_curr
                     )
+
+        # ── Cirrus Cloud cross: the 15m close crosses the TOP Cirrus line while the cloud is
+        # green (buy), or the BOTTOM line while it is red (sell). CROSS_ALERT_TF picks the Cirrus:
+        # '5m' = the 5m Cirrus read at the 5m bar that closes with this 15m candle (and the one
+        # before it for the previous close); '15m' = a Cirrus calculated on 15m closes. ──
+        cirrus_cross_up = False
+        cirrus_cross_down = False
+
+        if cfg.ENABLE_CIRRUS_CROSS_ALERT and cfg.CIRRUS_CLOUD_ENABLED and i15 >= 1:
+            _cx_up = _cx_dn = False
+            _cx_top_c = _cx_top_p = _cx_bot_c = _cx_bot_p = float("nan")
+            if cfg.CROSS_ALERT_TF == "5m":
+                _t15 = int(normalize_timestamp(int(data_15m.ts[i15])))
+                _want = np.array([_t15 + 600, _t15 - 300], dtype=np.int64)   # last 5m bar of this / the previous 15m candle
+                _pos = np.searchsorted(ts_5m_arr, _want)
+                if (np.all(_pos < len(ts_5m_arr))
+                        and int(ts_5m_arr[_pos[0]]) == int(_want[0])
+                        and int(ts_5m_arr[_pos[1]]) == int(_want[1])):
+                    _jc, _jp = int(_pos[0]), int(_pos[1])
+                    _cx_up = bool(gate_indicators["cirrus_trend_up_5m"][_jc])
+                    _cx_dn = bool(gate_indicators["cirrus_trend_dn_5m"][_jc])
+                    _cx_top_c = float(gate_indicators["cirrus_top_5m"][_jc])
+                    _cx_top_p = float(gate_indicators["cirrus_top_5m"][_jp])
+                    _cx_bot_c = float(gate_indicators["cirrus_bot_5m"][_jc])
+                    _cx_bot_p = float(gate_indicators["cirrus_bot_5m"][_jp])
+            else:
+                _cx_up = bool(gate_indicators["cirrus_up_15"][i15])
+                _cx_dn = bool(gate_indicators["cirrus_dn_15"][i15])
+                _cx_top_c = float(gate_indicators["cirrus_top_15"][i15])
+                _cx_top_p = float(gate_indicators["cirrus_top_15"][i15 - 1])
+                _cx_bot_c = float(gate_indicators["cirrus_bot_15"][i15])
+                _cx_bot_p = float(gate_indicators["cirrus_bot_15"][i15 - 1])
+            if not np.isnan(close_prev):
+                cirrus_cross_up = bool(
+                    _cx_up
+                    and not np.isnan(_cx_top_c) and not np.isnan(_cx_top_p)
+                    and close_prev < _cx_top_p
+                    and close_curr > _cx_top_c
+                )
+                cirrus_cross_down = bool(
+                    _cx_dn
+                    and not np.isnan(_cx_bot_c) and not np.isnan(_cx_bot_p)
+                    and close_prev > _cx_bot_p
+                    and close_curr < _cx_bot_c
+                )
+
         #Momentum Oscillator zero-line cross (same structure as the Dynamic Flow cross) ──
         momentum_cross_up = False
         momentum_cross_down = False
@@ -1077,6 +1128,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT
              or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT
              or cfg.ENABLE_MOMENTUM_CROSS_ALERT or cfg.ENABLE_GAUSSIAN_CROSS_ALERT
+             or cfg.ENABLE_CIRRUS_CROSS_ALERT
              or cfg.ENABLE_TRENDLINE_ALERTS)
             and (buy_trend_common_relaxed or sell_trend_common_relaxed)
         )
@@ -1248,6 +1300,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             dynamic_flow_cross_up=dynamic_flow_cross_up, dynamic_flow_cross_down=dynamic_flow_cross_down,
             momentum_cross_up=momentum_cross_up, momentum_cross_down=momentum_cross_down,
             gaussian_cross_up=gaussian_cross_up, gaussian_cross_down=gaussian_cross_down,
+            cirrus_cross_up=cirrus_cross_up, cirrus_cross_down=cirrus_cross_down,
             ppo_gate_momentum_ok_buy=ppo_gate_momentum_ok_buy,
             ppo_gate_momentum_ok_sell=ppo_gate_momentum_ok_sell,
             rsi_guard_momentum_ok_buy=rsi_guard_momentum_ok_buy,
