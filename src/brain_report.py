@@ -308,13 +308,19 @@ def _outcome_anatomy(rows: List[Dict[str, Any]], cfg) -> Tuple[Optional[str], Di
     med_mfe = _med([r["mfe"] * 100.0 for r in rows if r.get("mfe") is not None])
     med_mae = _med([r["mae"] * 100.0 for r in rows if r.get("mae") is not None])
     lines = [
-        f"A trade counts as a WIN only if price moves +{target:.1f}% your way "
+        f"A TARGET WIN is price moving +{target:.1f}% your way "
         f"before it moves -{risk:.1f}% against you, within {hours:g} hours.",
-        f"Break-even needs roughly {1.0 / (1.0 + rr):.0%} wins (before fees).",
+        f"Break-even needs roughly {1.0 / (1.0 + rr):.0%} TARGET wins (before fees).",
+        f"Trades that do neither are also labelled a win when they close on the "
+        f"right side of the entry, so the headline Win Rate runs higher than the "
+        f"target rate below. Net EV is the figure to trust.",
     ]
     if known:
         lines.append(f"How {known} trades actually ended:")
-        lines.append(f"  • {counts['target'] / known:.0%} reached the +{target:.1f}% target")
+        lines.append(
+            f"  • {counts['target'] / known:.0%} reached the +{target:.1f}% target "
+            f"(target win rate vs {1.0 / (1.0 + rr):.0%} break-even)"
+        )
         lines.append(f"  • {counts['stop'] / known:.0%} hit the -{risk:.1f}% stop first")
         lines.append(f"  • {counts['neither'] / known:.0%} did neither in {hours:g}h")
         if counts["both"]:
@@ -559,7 +565,7 @@ def _sec_summary(F: Dict[str, Any], cfg) -> List[_Piece]:
     ]))))
     out.append(_c("\n".join(
         [f"📊 {n} resolved trades"] + _table([
-            ("📈 Win Rate:", f"{wr:.0%}"),
+            ("📈 Win Rate (incl. timeouts):", f"{wr:.0%}"),
             ("💰 Net EV/trade:", _ev_text(F)),
             ("📅 History available:", _fmt_days(days)),
             ("📅 History requested:", f"{F['req_days']} days"),
@@ -785,7 +791,7 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
     entries = [
         ("Trades", str(n),
          "🟢 Good sample" if n >= 100 else "🟡 Small sample" if n >= 30 else "🔴 Tiny sample"),
-        ("Win Rate", f"{wr:.0%}", wr_verdict),
+        ("Win Rate (incl. timeouts)", f"{wr:.0%}", wr_verdict),
         ("Net EV", _ev_text(F),
          "⚪ Not computed yet" if not F["net_ev_known"]
          else "🟢 Positive" if net_ev > 0.05 else "🟡 Flat" if net_ev > -0.05 else "🔴 Negative"),

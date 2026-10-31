@@ -1423,8 +1423,9 @@ class BrainCore:
 
         # ── 📊 HEALTH (compact) ──
         wr_icon = "✅" if (overall_wr or 0) >= target_wr else "⚠️"
+        wr_txt = f"{overall_wr:.0%}" if overall_wr is not None else "n/a"
         lines.append(escape_markdown_v2(
-            f"📊 WR: {overall_wr:.0%} vs {target_wr:.0%} target {wr_icon} | "
+            f"📊 WR: {wr_txt} vs {target_wr:.0%} target {wr_icon} | "
             f"Gate: ≥{cc.get('CONFLUENCE_MIN_ABS_SCORE')} / ≥{cc.get('CONFLUENCE_MIN_PCT')}%"
         ))
 

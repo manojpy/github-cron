@@ -303,13 +303,14 @@ def format_outcome_totals(source: str, stats: Optional[Dict[str, int]], icon: st
     timeouts = max(0, min(int(s.get("timeouts", 0)), losses))
     timeout_wins = max(0, min(int(s.get("timeout_wins", 0)), wins))
     win_rate = (wins / total * 100.0) if total else 0.0
+    target_rate = ((wins - timeout_wins) / total * 100.0) if total else 0.0
     prefix = f"{icon} " if icon else ""
     return (
         f"{prefix}{source} - {total}, {OUTCOME_WIN_LABEL} - {wins - timeout_wins}, "
         f"{OUTCOME_LOSS_LABEL} - {losses - timeouts}, "
         f"{OUTCOME_TIMEOUT_LABEL} - {timeouts + timeout_wins}"
         f"{f' ({timeout_wins} won)' if timeout_wins else ''}, "
-        f"Win Rate - {win_rate:.0f}%"
+        f"Win Rate - {win_rate:.0f}% (target-only {target_rate:.0f}%)"
     )
 
 class RedisKeyPrefix:
