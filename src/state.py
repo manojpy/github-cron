@@ -3544,6 +3544,7 @@ class RedisLock:
         self.token: Optional[str] = None
         self.lost = False
         self.acquired_by_me = False
+        self._attempt_token: Optional[str] = None   # token of an attempt whose SET may have landed
         self.last_extend_time = time.monotonic() 
 
     def _client(self) -> Optional[redis.Redis]:
@@ -3560,12 +3561,23 @@ class RedisLock:
             return False
 
         try:
-            token = str(uuid.uuid4())
+            # Reuse the token of an earlier attempt that errored out: its SET may have
+            # landed with only the reply lost. A fresh token would then find our OWN lock
+            # and report "another instance is running", silently skipping the whole 15m run.
+            token = self._attempt_token or str(uuid.uuid4())
+            retrying = self._attempt_token is not None
+            self._attempt_token = token
             ok = await asyncio.wait_for(
                 client.set(self.lock_key, token, nx=True, ex=self.expire),
                 timeout=timeout,
-            )      
+            )
+            if not ok and retrying:
+                current = await asyncio.wait_for(client.get(self.lock_key), timeout=timeout)
+                if isinstance(current, (bytes, bytearray)):
+                    current = current.decode()
+                ok = (current == token)
             if ok:
+                self._attempt_token = None
                 self.token = token
                 self.acquired_by_me = True
                 self.lost = False
@@ -3576,8 +3588,9 @@ class RedisLock:
                 )
                 return True
 
+            self._attempt_token = None      # genuinely held by another instance
             logger.warning(f"Could not acquire Redis lock (held): {self.lock_key}")
-            return False      
+            return False 
         except asyncio.TimeoutError:
             logger.error(f"Timeout acquiring lock {self.lock_key} after {timeout}s")
             self.error = True

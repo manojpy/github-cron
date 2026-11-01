@@ -243,21 +243,27 @@ def collect(client: Any, max_keys: int = 200_000, scan_count: int = 500, sample_
             ttl = int(res[2 * j + 1])
             records.append({"key": k, "type": ktype, "ttl": ttl, "bytes": None})
 
-    # Byte sizes are sampled per family (MEMORY USAGE can be slow, and some
-    # managed Redis offerings do not support it at all).
+    # The sampled keys are queried in pipelined batches (one round trip per batch),
+    # not one MEMORY USAGE call at a time: ~25 keys x ~19 families used to cost ~60s.
     seen: Dict[str, int] = {}
+    sampled: List[Dict[str, Any]] = []
     for rec in records:
         name, _ = classify_key(rec["key"])
         if seen.get(name, 0) >= sample_bytes:
             continue
-        try:
-            rec["bytes"] = client.memory_usage(rec["key"])
-        except Exception:
-            rec["bytes"] = None
-            seen[name] = sample_bytes  # unsupported: stop trying for this family
-            continue
         seen[name] = seen.get(name, 0) + 1
-
+        sampled.append(rec)
+    for i in range(0, len(sampled), scan_count):
+        chunk = sampled[i:i + scan_count]
+        try:
+            pipe = client.pipeline(transaction=False)
+            for rec in chunk:
+                pipe.memory_usage(rec["key"])
+            res = pipe.execute(raise_on_error=False)
+        except Exception:
+            break  # MEMORY USAGE unsupported on this server: sizes stay None
+        for rec, val in zip(chunk, res):
+            rec["bytes"] = None if isinstance(val, BaseException) else val
     streams: Dict[str, int] = {}
     for s in KNOWN_STREAMS:
         try:

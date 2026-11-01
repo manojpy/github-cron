@@ -703,12 +703,16 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 2.0, "ml_calibration_runload",
             ),
         )
-
     async def _kill_switch_flag() -> bool:
-        return bool(await state_db._safe_redis_op(
+        _ks_raw = await state_db._safe_redis_op(
             lambda: _rc(state_db._redis).exists(KILL_SWITCH_KEY),
             2.0, "kill_switch_poll_runload",
-        ))
+        )
+        if _ks_raw is None:
+            # _safe_redis_op swallows timeouts/errors and returns None; treat that as
+            # "unknown" so the caller's fail-closed handler runs instead of reading it as "off".
+            raise RuntimeError("kill-switch read failed (Redis timeout/error)")
+        return bool(_ks_raw)
 
     async def _heat_positions() -> List[Dict[str, Any]]:
         return await load_open_positions(
@@ -789,12 +793,22 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
         if daily_cache_settled:
             cache_keys = [f"daily_cache:{sym}:{day_key}" for sym in daily_symbols]
-            cached_map = await state_db.batch_get_metadata(cache_keys)
+            try:
+                cached_map = await state_db.batch_get_metadata(cache_keys)
+            except Exception as e:
+                logger_main.warning(f"Daily cache read failed ({e}) — fetching all daily bars live")
+                cached_map = {}
 
             for sym, ck in zip(daily_symbols, cache_keys):
                 raw = cached_map.get(ck)
+                cached_daily = None
                 if raw:
-                    all_candles.setdefault(sym, {})["D"] = json_loads(raw)
+                    try:
+                        cached_daily = json_loads(raw)
+                    except Exception as e:
+                        logger_main.warning(f"Daily cache for {sym} unreadable ({e}) — refetching")
+                if cached_daily:
+                    all_candles.setdefault(sym, {})["D"] = cached_daily
                     daily_cache_hits += 1
                 else:
                     miss_symbols.append(sym)
@@ -1770,8 +1784,11 @@ async def run_once() -> Optional[bool]:
                             await sdb.atomic_batch_update([], deletes=all_delete_keys)
                         )
                     except Exception as e:
-                        logger_run.error(f"❌ Failed to delete daily reset keys: {e}")
-                        raise
+                        logger_run.error(
+                            f"❌ Failed to delete daily reset keys: {e} — NOT marking the day as reset; "
+                            "it will be retried on the next run"
+                        )
+                        reset_deleted_ok = False
                     if reset_deleted_ok:
                         logger_run.info(
                             f"✅ Cleared {len(all_delete_keys)} daily alert keys "
@@ -1793,7 +1810,8 @@ async def run_once() -> Optional[bool]:
                 logger_run.debug(f"No daily reset needed (last reset: {last_reset_date_str})")
 
         if sdb.degraded and not sdb.degraded_alerted:
-            telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+            if telegram_queue is None:
+                telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
             await telegram_queue.send(escape_markdown_v2(
                 f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
                 f"Dedup claims cannot be taken, so ALL alerts are blocked (fail-closed) "
