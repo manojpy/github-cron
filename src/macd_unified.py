@@ -748,8 +748,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     fetch_start = time.time()
     limit_15m = Constants.FETCH_LIMIT_15M
     limit_5m = max(
+        Constants.FETCH_LIMIT_5M,
         Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER,
-        cfg.RMA_200_PERIOD * 3 
+        cfg.RMA_200_PERIOD * 3,
     )
     daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else 0
     fetch_daily = cfg.ENABLE_PIVOT or cfg.ENABLE_CPR
