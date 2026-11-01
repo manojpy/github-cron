@@ -448,11 +448,14 @@ jobs:
 
           if grep -q "RUN COMPLETE" "$LOG_FILE"; then
             STATUS="Success"
-            DURATION=$(grep -oP "Duration:\s*\K[\d.]+(?=s)" "$LOG_FILE" | head -1 || echo "N/A")
-            ALERTS=$(grep -oP "(?:Alerts|Sent):\s*\K\d+" "$LOG_FILE" | head -1 || echo "0")
-            PAIRS=$(grep -oP "Pairs:\s*\K[\d/]+" "$LOG_FILE" | head -1 || echo "N/A")
-            MEMORY=$(grep -oP "Memory:\s*\K\d+MB" "$LOG_FILE" | head -1 || echo "N/A")
-            REDIS_STATUS=$(grep -oP "Redis:\s*\K\w+" "$LOG_FILE" | head -1 || echo "UNKNOWN")
+            # Read the figures from the RUN COMPLETE line only: the startup banner
+            # also prints "Pairs: 30 | ...", which used to be picked up as "pairs scanned".
+            SUMMARY_LINE=$(grep "RUN COMPLETE" "$LOG_FILE" | tail -1)
+            DURATION=$(grep -oP "Duration:\s*\K[\d.]+(?=s)" <<< "$SUMMARY_LINE" | head -1 || echo "N/A")
+            ALERTS=$(grep -oP "Alerts:\s*\K\d+" <<< "$SUMMARY_LINE" | head -1 || echo "0")
+            PAIRS=$(grep -oP "Pairs:\s*\K[\d/]+" <<< "$SUMMARY_LINE" | head -1 || echo "N/A")
+            MEMORY=$(grep -oP "Memory:\s*\K\d+MB" <<< "$SUMMARY_LINE" | head -1 || echo "N/A")
+            REDIS_STATUS=$(grep -oP "Redis:\s*\K\w+" <<< "$SUMMARY_LINE" | head -1 || echo "UNKNOWN")
           else
             STATUS="Failed"
             ERROR_MSG=$(grep -E "FATAL ERROR|Bot run failed|Error|ERROR" "$LOG_FILE" | head -1 | cut -c1-120 || echo "Unknown error")
@@ -488,6 +491,28 @@ jobs:
             echo "- 💾 Memory Used: ${{ steps.results.outputs.memory }}" >> $GITHUB_STEP_SUMMARY
             echo "- 🗄️ Redis Status: ${{ steps.results.outputs.redis_status }}" >> $GITHUB_STEP_SUMMARY
           fi
+
+      - name: 🩺 Add run health to summary
+        if: always() && inputs.apply_brain_plan != true
+        run: |
+          F=/tmp/data-repo/run_summary.json
+          if [ ! -f "$F" ]; then
+            echo "ℹ️ No run_summary.json was written this run" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 - "$F" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          s = json.load(open(sys.argv[1]))
+          tg = s.get("telegram") or {}
+          dlq = s.get("telegram_dlq") or {}
+          print("### 🩺 Run health")
+          print(f"- Telegram: {tg.get('sent_ok', 0)} sent, {tg.get('sent_failed', 0)} failed, DLQ pending {dlq.get('pending')}")
+          print(f"- Redis: {s.get('redis_status')} (memory {s.get('redis_mem_pct')}%)")
+          print(f"- Pairs: {s.get('pairs_completed')}/{s.get('pairs_configured')} completed, {s.get('pairs_deferred')} deferred")
+          stale = s.get("stale_candle_pairs") or []
+          print(f"- Stale candles: {', '.join(stale) if stale else 'none'}")
+          print(f"- Dedup: {s.get('dedup_text')}")
+          PY
 
       # PHASE 4: ARTIFACT UPLOAD & VISIBILITY
       - name: 📂 Ensure Logs Directory Exists
