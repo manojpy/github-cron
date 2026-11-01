@@ -30,9 +30,19 @@ class _Pipe:
     def ttl(self, k):
         self.ops.append(("ttl", k))
 
-    def execute(self):
-        return [self.c.type(k) if op == "type" else self.c.ttl(k) for op, k in self.ops]
+    def memory_usage(self, k):
+        self.ops.append(("memory", k))
 
+    def execute(self, raise_on_error=True):
+        out = []
+        for op, k in self.ops:
+            try:
+                out.append(getattr(self.c, "memory_usage" if op == "memory" else op)(k))
+            except Exception as e:
+                if raise_on_error:
+                    raise
+                out.append(e)
+        return out
 
 class _Redis:
     """Minimal read-only fake; records every command so tests can prove no writes."""
