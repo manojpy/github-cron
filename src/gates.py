@@ -838,6 +838,15 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             dynamic_flow_ok_buy = None
             dynamic_flow_ok_sell = None
 
+        if pair_name == "ETHUSD":  # TEMP diagnostic: remove after comparing with TradingView
+            _lo = max(0, i15 - 47)
+            for _k in range(_lo, i15 + 1):
+                logger_pair.info(
+                    f"[FLOWTRACE] {format_ist_time(int(data_15m.ts[_k]))} "
+                    f"dir={dynamic_flow_trend_arr[_k]:+.0f} line={dynamic_flow_line_arr[_k]:.2f} "
+                    f"close={close_15m[_k]:.2f}"
+                )
+
         # Cirrus Cloud (5m) vote. None = disabled or not yet valid (warmup/NaN);
         # _cloud_group_decision treats None as "does not agree".
         if cfg.CIRRUS_CLOUD_ENABLED and bool(gate_indicators["cirrus_valid_5m"][i5]):
