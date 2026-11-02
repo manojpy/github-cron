@@ -618,6 +618,18 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             cloud_up = None
             cloud_down = None
 
+        if pair_name == "BEATUSD":  # TEMP diagnostic: remove after comparing with TradingView
+            _g_line = gate_indicators["gaussian_line_15"]
+            logger_pair.info(
+                f"[GAUSSTRACE] bars={len(close_15m)} first={format_ist_time(int(data_15m.ts[0]))}"
+            )
+            for _k in range(max(0, i15 - 71), i15 + 1):
+                logger_pair.info(
+                    f"[GAUSSTRACE] {format_ist_time(int(data_15m.ts[_k]))} "
+                    f"dir={int(gaussian_dir_arr[_k]):+d} line={_g_line[_k]:.5f} "
+                    f"close={close_15m[_k]:.5f}"
+                )
+
         if _use_5m_ichimoku_cross and i5 >= 1:
             tk_conv_arr = gate_indicators["ichimoku_conversion_line_5m"]
             tk_base_arr = gate_indicators["ichimoku_base_line_5m"]
