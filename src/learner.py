@@ -41,7 +41,7 @@ from feedback import (
     heat_gate_report, margin_report,
 )
 from pathrecon import (
-    apply_recon, cache_key, cache_pack, cache_unpack, needs_recon, recon_path, windows_for,
+    KEY_RECON, apply_recon, cache_key, cache_pack, cache_unpack, needs_recon, recon_path, windows_for,
 )
 from playbook import (
     ControlModel, KEY_CURRENT, KEY_LEDGER, KEY_PREV, KEY_SCORE, KEY_STATE, KEY_STATE_PREV,
@@ -49,18 +49,14 @@ from playbook import (
 )
 from scoreboard import build_scoreboard, format_scoreboard
 from state import RedisStateStore
-
 _TTL = 90 * 86400
-KEY_RECON = "path_recon"
 KEY_AUTOPSY = "brain_autopsy"
 _RECON_CAP = 5000
 _LEDGER_CAP = 600
 _CANDLE_SEC = 900
 
-
 def _say(msg: str) -> None:
     print(msg, flush=True)
-
 
 def params_from_cfg() -> Dict[str, Any]:
     p = default_params()

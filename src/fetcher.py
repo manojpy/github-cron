@@ -1509,7 +1509,7 @@ async def verify_mark_price_agrees(fetcher: DataFetcher, pair_name: str, ts_curr
         # Only suppress on ACTIVE disagreement. Mark doji is treated as
         # "not disagreeing" to avoid noise suppressions.
         if (is_green and mark_is_red) or (is_red and mark_is_green):
-            logger_pair.error(
+            logger_pair.warning(
                 f"[{pair_name}] MARK PRICE DISAGREES: trade-price candle is "
                 f"{'green' if is_green else 'red'}, Mark Price shows O={mo:.4f} C={mc:.4f} "
                 f"({'green' if mark_is_green else 'red' if mark_is_red else 'doji'}) — suppressing"

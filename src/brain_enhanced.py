@@ -18,6 +18,7 @@ from archive_reader import load_archived_outcomes
 from bot_config import cfg, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS, format_ist_time, json_dumps, json_loads
 from state import RedisKeyPrefix, RedisStateStore
 from brain import BrainCore, _extract_p_value_for_fdr
+from pathrecon import KEY_RECON, apply_cached, needs_recon
 import threshold_engine as engine
 from threshold_engine import (
     optimize_vote_weights,
@@ -287,11 +288,13 @@ class BrainEngineV2(BrainCore):
 
         if data_dir and Path(data_dir).exists():
             cached_recent = getattr(self, "_recent_rows_cache", None)
-            recent_rows = cached_recent if cached_recent is not None else load_archived_outcomes(
-                data_dir, window_days=recent_days, shadow=False
+            recent_rows = cached_recent if cached_recent is not None else await asyncio.to_thread(
+                load_archived_outcomes, data_dir, window_days=recent_days, shadow=False
             )
             # One archive read: the medium window is a time-filtered subset of the long one.
-            long_rows = load_archived_outcomes(data_dir, window_days=long_days, shadow=False)
+            long_rows = await asyncio.to_thread(
+                load_archived_outcomes, data_dir, window_days=long_days, shadow=False
+            )
             _med_cutoff = time.time() - medium_days * 86400
             medium_rows = [r for r in long_rows if r.get("entry_ts", 0) >= _med_cutoff]
 
@@ -302,6 +305,27 @@ class BrainEngineV2(BrainCore):
         result = await BrainCore._get_layered_window_rows(self)
         self._layered_rows_cache = result
         return result
+
+    async def _with_cached_paths(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Old real alerts archived without a candle path are invisible to the plan lab.
+        The learner rebuilds those paths and caches them in Redis; reuse that cache here
+        (one GET, no network fetch). Any problem returns the rows unchanged."""
+        try:
+            if not any(needs_recon(r) for r in rows):
+                return rows
+            raw = await self.sdb.get_metadata(KEY_RECON, timeout=5.0)
+            cache = json_loads(raw) if raw else None
+            if not isinstance(cache, dict) or not cache:
+                return rows
+            out, applied = apply_cached(rows, cache)
+            if applied:
+                logging.getLogger("macd_bot").info(
+                    f"🧩 Brain: {applied}/{len(rows)} archived alerts got their candle path from the learner cache"
+                )
+            return out
+        except Exception as e:
+            logging.getLogger("macd_bot").debug(f"Brain: cached path lookup skipped: {e!r}")
+            return rows
 
     async def _load_rows(self) -> tuple:
         """Shared row loader — reads from archived files if available,
@@ -318,15 +342,18 @@ class BrainEngineV2(BrainCore):
         data_dir = getattr(cfg, "OUTCOME_DATA_DIR", None) or os.environ.get("OUTCOME_DATA_DIR")
         
         if data_dir and Path(data_dir).exists():
-            real_rows, real_stats = load_archived_outcomes(
-                data_dir, window_days=window_days, shadow=False,
-                return_stats=True,
-            )
-            shadow_rows, shadow_stats = load_archived_outcomes(
-                data_dir, window_days=window_days, shadow=True,
-                return_stats=True,
+            (real_rows, real_stats), (shadow_rows, shadow_stats) = await asyncio.gather(
+                asyncio.to_thread(
+                    load_archived_outcomes, data_dir, window_days=window_days,
+                    shadow=False, return_stats=True,
+                ),
+                asyncio.to_thread(
+                    load_archived_outcomes, data_dir, window_days=window_days,
+                    shadow=True, return_stats=True,
+                ),
             )
             if real_rows or shadow_rows:
+                real_rows = await self._with_cached_paths(real_rows)
                 logger = logging.getLogger("macd_bot")
                 logger.info(
                     f"🗄️ Brain using file archive: {len(real_rows)} real, "

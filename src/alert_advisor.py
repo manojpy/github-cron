@@ -450,11 +450,17 @@ def _advise_pair_playbook(*, playbook: Optional[Dict[str, Any]] = None, playbook
         notes: List[str] = []
         capped = False
         if status in ("VALIDATED", "RECONFIRM_DUE") and isinstance(playbook.get("plan"), dict):
-            h = playbook.get("holdout") or {}
-            tag = "validated" if status == "VALIDATED" else "validation overdue"
-            ev = h.get("ev")
-            ev_txt = f", out-of-sample EV {float(ev):+.2f}% (n={int(h.get('n', 0))})" if isinstance(ev, (int, float)) else ""
-            advice.plan_line = f"🛡 {_pb_plan_text(playbook['plan'], kwargs.get('direction'), kwargs.get('price'))} · {tag} plan{ev_txt} [{ver}]"
+            try:
+                h = playbook.get("holdout") or {}
+                tag = "validated" if status == "VALIDATED" else "validation overdue"
+                ev = h.get("ev")
+                ev_txt = f", out-of-sample EV {float(ev):+.2f}% (n={int(h.get('n', 0))})" if isinstance(ev, (int, float)) else ""
+                advice.plan_line = f"🛡 {_pb_plan_text(playbook['plan'], kwargs.get('direction'), kwargs.get('price'))} · {tag} plan{ev_txt} [{ver}]"
+            except Exception:
+                # A malformed plan only loses the displayed plan text. It must not
+                # throw away the restrictions below (restrict-only overlay).
+                pass
+
             sm = playbook.get("size_mult")
             if isinstance(sm, (int, float)):
                 if sm <= 0:
@@ -470,7 +476,10 @@ def _advise_pair_playbook(*, playbook: Optional[Dict[str, Any]] = None, playbook
                           "EXPIRED": "its validated plan expired unconfirmed"}[status])
         if restrict == "WATCH":
             capped = True
-        rule = _pb_rule_hit(playbook, playbook_ctx)
+        try:
+            rule = _pb_rule_hit(playbook, playbook_ctx)
+        except Exception:
+            rule = None
         if rule is not None:
             capped = True
             notes.append(f"it lost money on unseen trades when {rule['text']}")

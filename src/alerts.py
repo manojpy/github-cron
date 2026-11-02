@@ -1483,8 +1483,11 @@ async def dispatch_combined_alerts(payloads: List[AlertPayload], telegram_queue:
                 )
         async with alerts_sent_lock:
             alerts_sent_ref[0] += sum(p.budget_count for p in sent_payloads)
-        for p in sent_payloads:
-            await _run_post_send_hooks(p, sdb, logger_run)
+        # Pairs are independent and each hook isolates its own errors, so run
+        # them together: bookkeeping time is the slowest pair, not the sum.
+        await asyncio.gather(
+            *(_run_post_send_hooks(p, sdb, logger_run) for p in sent_payloads)
+        )
         await _record_auto_positions(sdb, sent_payloads)
         logger_run.info(
             f"🔔 Combined dispatch sent {len(sent_payloads)} pair(s) in {len(messages)} message(s)"
@@ -2364,7 +2367,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 gaussian_cross_exception = (alert_key == "gaussian_cross_sell" and gaussian_cross_sell)
                 cirrus_cross_exception = (alert_key == "cirrus_cross_sell" and cirrus_cross_sell)
                 fib_reversal_exception = (alert_key == "fib_reversal_sell" and fib_reversal_sell)
-                if not (is_valid_for_sell or reversal_bullish or choch_exception or dynamic_flow_cross_exception or momentum_cross_exception or gaussian_cross_exception or cirrus_cross_exception or fib_reversal_exception):
+                if not (is_valid_for_sell or reversal_bearish or choch_exception or dynamic_flow_cross_exception or momentum_cross_exception or gaussian_cross_exception or cirrus_cross_exception or fib_reversal_exception):
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: not valid for sell (wick/body fail, no reversal pattern)")
                     continue
@@ -3628,8 +3631,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
                 # Nothing to cancel: pending outcomes are only written AFTER Telegram
                 # confirms delivery (deferred_record), so none exist for this candle.
+                await _persist_resets_when_blocked()
                 await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
-
                 return pair_name, {
                     "state": "COALESCED",
                     "ts": int(time.time()),
@@ -3822,8 +3825,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     )
                     DEDUP_STATS["kept_repaint"] += 1
                     await _release_dedup_claims()
+                    await _persist_resets_when_blocked()
                     await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
-
                     return pair_name, {
                         "state": "SUPPRESSED_REPAINT_CONFIRMED",
                         "ts": int(time.time()),
@@ -3863,6 +3866,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     )
                     DEDUP_STATS["kept_mark_disagree"] += 1
                     await _release_dedup_claims()
+                    await _persist_resets_when_blocked()
                     await sdb.set_last_processed_candle_ts(pair_name, ts_curr)
                     return pair_name, {
                         "state": "SUPPRESSED_MARK_DISAGREEMENT",

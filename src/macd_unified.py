@@ -1341,7 +1341,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             and state_db and not state_db.degraded and state_db._redis):
         try:      
             from outcome_storage import load_recent_outcomes
-            recent = load_recent_outcomes(hours=cfg.KILL_SWITCH_LOOKBACK_HOURS)
+            recent = await asyncio.to_thread(
+                load_recent_outcomes, hours=cfg.KILL_SWITCH_LOOKBACK_HOURS
+            )
             ks_state = engine.KillSwitch(
                 max_consecutive_losses=cfg.KILL_SWITCH_MAX_CONSECUTIVE_LOSSES,
                 max_drawdown_pct=cfg.KILL_SWITCH_MAX_DRAWDOWN_PCT,

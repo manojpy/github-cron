@@ -20,10 +20,10 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+KEY_RECON = "path_recon"     # Redis metadata key of the rebuilt-path cache (written by learner.py)
 CANDLE_SEC = 900
 FILL_TOL = 0.0005
 _ROUND = 4
-
 
 def cache_key(pair: Any, direction: Any, entry_ts: Any) -> str:
     return f"{pair}|{str(direction).lower()}|{int(entry_ts)}"
@@ -97,6 +97,19 @@ def apply_recon(row: Mapping[str, Any], rec: Mapping[str, Any]) -> Dict[str, Any
     r["path_source"] = "RECON"
     return r
 
+def apply_cached(rows: Sequence[Mapping[str, Any]], cache: Mapping[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
+    """Cache-only: give rows that have no stored path the one the learner already rebuilt.
+    No network. Rows with no usable cache entry are returned unchanged."""
+    out: List[Dict[str, Any]] = []
+    applied = 0
+    for r in rows:
+        if needs_recon(r):
+            p = cache.get(cache_key(r["pair"], r["direction"], r["entry_ts"]))
+            if isinstance(p, dict) and p.get("f"):
+                r = apply_recon(r, cache_unpack(p))
+                applied += 1
+        out.append(r if isinstance(r, dict) else dict(r))
+    return out, applied
 
 def cache_pack(rec: Mapping[str, Any]) -> Dict[str, Any]:
     return {"f": rec["path_fav"], "a": rec["path_adv"], "c": rec["path_close"],
