@@ -619,17 +619,24 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             cloud_down = None
 
         if pair_name == "BEATUSD":  # TEMP diagnostic: remove after comparing with TradingView
-            _g_line = gate_indicators["gaussian_line_15"]
-            logger_pair.info(
-                f"[GAUSSTRACE] bars={len(close_15m)} first={format_ist_time(int(data_15m.ts[0]))}"
+            from indicators import calculate_gaussian_trend_numpy as _cgt
+            _gx = _cgt(
+                data_15m.high, data_15m.low, close_15m, close_15m,
+                cfg.GAUSSIAN_PRESET, cfg.GAUSSIAN_LENGTH, cfg.GAUSSIAN_POLES,
+                cfg.GAUSSIAN_ATR_LENGTH, cfg.GAUSSIAN_FIXED_MULTIPLIER,
+                cfg.GAUSSIAN_ADAPTIVE_WIDTH, cfg.GAUSSIAN_EFFICIENCY_LENGTH,
+                cfg.GAUSSIAN_TREND_MULTIPLIER, cfg.GAUSSIAN_CHOP_MULTIPLIER,
+                cfg.GAUSSIAN_EFFICIENCY_SMOOTH,
             )
-            for _k in range(max(0, i15 - 71), i15 + 1):
+            for _k in range(max(0, i15 - 17), i15 + 1):
                 logger_pair.info(
                     f"[GAUSSTRACE] {format_ist_time(int(data_15m.ts[_k]))} "
-                    f"dir={int(gaussian_dir_arr[_k]):+d} line={_g_line[_k]:.5f} "
-                    f"close={close_15m[_k]:.5f}"
+                    f"H={data_15m.high[_k]:.5f} L={data_15m.low[_k]:.5f} C={close_15m[_k]:.5f} "
+                    f"filt={_gx['filtered_price'][_k]:.5f} eff={_gx['smoothed_efficiency'][_k]:.4f} "
+                    f"width={(_gx['upper_band'][_k] - _gx['lower_band'][_k]) / 2:.5f} "
+                    f"up={_gx['upper_band'][_k]:.5f} lo={_gx['lower_band'][_k]:.5f} "
+                    f"tl={_gx['trend_line'][_k]:.5f} dir={int(_gx['trend_dir'][_k]):+d}"
                 )
-
         if _use_5m_ichimoku_cross and i5 >= 1:
             tk_conv_arr = gate_indicators["ichimoku_conversion_line_5m"]
             tk_base_arr = gate_indicators["ichimoku_base_line_5m"]
