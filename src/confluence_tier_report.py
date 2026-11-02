@@ -37,11 +37,24 @@ def _wilson_lo(wins: int, n: int, z: float = 1.96) -> float:
     margin = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5)
     return max(0.0, (centre - margin) / denom)
 
+def _row_ev(r: Dict[str, Any], cost_pct: Optional[float]) -> Optional[float]:
+    """Net P&L % of one row. With cost_pct this is the bracket model the Brain uses
+    (stop/target exits at their level minus cost); without it, the stored
+    hold-to-horizon net_pnl_pct."""
+    if cost_pct is not None:
+        from threshold_stats import row_net_pnl_pct
+        try:
+            return float(row_net_pnl_pct(r, cost_pct))
+        except (KeyError, TypeError, ValueError):
+            return None
+    v = r.get("net_pnl_pct")
+    return None if v is None else float(v)
 
-def _stats(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+
+def _stats(rows: Sequence[Dict[str, Any]], cost_pct: Optional[float] = None) -> Dict[str, Any]:
     n = len(rows)
     wins = sum(1 for r in rows if r.get("win"))
-    evs = [float(r["net_pnl_pct"]) for r in rows if r.get("net_pnl_pct") is not None]
+    evs = [v for v in (_row_ev(r, cost_pct) for r in rows) if v is not None]
     return {
         "n": n,
         "wr": (wins / n) if n else None,
@@ -50,22 +63,20 @@ def _stats(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "n_ev": len(evs),
     }
 
-
-def tier_report(rows: Sequence[Dict[str, Any]], bar: float = 90.0) -> Dict[str, Any]:
+def tier_report(rows: Sequence[Dict[str, Any]], bar: float = 90.0, cost_pct: Optional[float] = None) -> Dict[str, Any]:
     """Pure: group rows by confluence tier (and tier x direction)."""
     out: Dict[str, Any] = {"n_total": len(rows), "bar": bar, "tiers": {}, "by_direction": {}}
     for name, lo, hi in TIERS:
         sel = [r for r in rows if r.get("conf_pct") is not None and lo <= float(r["conf_pct"]) < hi]
-        out["tiers"][name] = _stats(sel)
+        out["tiers"][name] = _stats(sel, cost_pct)
         for d in ("buy", "sell"):
             out["by_direction"].setdefault(d, {})[name] = _stats(
-                [r for r in sel if str(r.get("direction")) == d]
+                [r for r in sel if str(r.get("direction")) == d], cost_pct
             )
     above = [r for r in rows if r.get("conf_pct") is not None and float(r["conf_pct"]) >= bar]
-    out["at_or_above_bar"] = _stats(above)
+    out["at_or_above_bar"] = _stats(above, cost_pct)
     out["verdict"] = _verdict(out["at_or_above_bar"])
     return out
-
 
 def _verdict(s: Dict[str, Any]) -> str:
     if s["n"] < MIN_N_FOR_VERDICT:
@@ -115,7 +126,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     from archive_reader import load_archived_outcomes
     rows = load_archived_outcomes(args.data_dir, window_days=args.days, shadow=args.shadow)
-    rep = tier_report(rows, bar=args.bar)
+    # Same P&L basis as the Brain (bracket model after costs), not the stored
+    # hold-to-horizon figure, so these numbers agree with its report.
+    from bot_config import cfg
+    cost_pct = (float(cfg.BRAIN_FEE_PCT) * 2 + float(cfg.BRAIN_SLIPPAGE_PCT) * 2) * 100.0
+    rep = tier_report(rows, bar=args.bar, cost_pct=cost_pct)
     print(json.dumps(rep, indent=2) if args.json else render(rep))
     return 0
 

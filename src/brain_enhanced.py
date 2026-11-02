@@ -16,7 +16,7 @@ from pathlib import Path
 from brain_audit import DataCoverage, HealthStatus, get_audit, reset_audit, ACTION_GATE_MIN_ROWS
 from archive_reader import load_archived_outcomes
 from bot_config import cfg, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS, format_ist_time, json_dumps, json_loads
-from state import RedisKeyPrefix, RedisStateStore
+from state import RedisKeyPrefix, RedisStateStore, outcome_totals_from_rows
 from brain import BrainCore, _extract_p_value_for_fdr
 from pathrecon import KEY_RECON, apply_cached, needs_recon
 import threshold_engine as engine
@@ -1490,7 +1490,21 @@ class BrainEngineV2(BrainCore):
             # handler below falls back to the base technical report.
             recs["_plan_lifecycle"] = await self._load_plan_lifecycle()
             try:
-                recs["_outcome_totals"] = await self.sdb.get_cumulative_outcome_stats()
+                _cum = await self.sdb.get_cumulative_outcome_stats()
+                # Redis keeps these counters only while a pair/alert key stays active
+                # (STATE_EXPIRY_DAYS), so they can sit below the archive the rest of the
+                # report is built from. The archive is the durable record: when it holds
+                # more resolved trades than Redis, show the archive figure so the totals
+                # agree with the trade count printed above them.
+                try:
+                    _real, _shadow = await self._get_rows()
+                    for _label, _rows in (("Recorded", _real), ("Shadowed", _shadow)):
+                        _arch = outcome_totals_from_rows(_rows)
+                        if _arch["total"] > int((_cum.get(_label) or {}).get("total", 0)):
+                            _cum[_label] = _arch
+                except Exception as _arch_err:
+                    logger_run.debug(f"Archive totals unavailable for Brain report: {_arch_err}")
+                recs["_outcome_totals"] = _cum
             except Exception as e:
                 logger_run.debug(f"Outcome totals unavailable for Brain report: {e}")
             sections, stamp = build_brain_report_sections(recs, cfg)

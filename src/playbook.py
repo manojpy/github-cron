@@ -676,7 +676,10 @@ def format_summary(blob: Mapping[str, Any], changes: Sequence[Mapping[str, Any]]
         fam = key.startswith("fam:")
         body = key[4:] if fam else key
         a, _, d = body.partition("|")
-        return f"{'[family] ' if fam else ''}{name_fn(a)} {d.upper()}"
+        label, side = name_fn(a), d.upper()
+        # Alert names already end with their side ("CHoCH BUY"); family labels do not.
+        tail = "" if label.upper().endswith(side) else f" {side}"
+        return f"{'[family] ' if fam else ''}{label}{tail}"
 
     def pl(p: Optional[Mapping[str, Any]]) -> str:
         return (f"SL {p['sl']:g}% / TP {p['tp']:g}% / {p['h']}c{plan_exit_suffix(p)}") if p else "-"

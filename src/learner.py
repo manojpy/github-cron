@@ -187,8 +187,13 @@ async def recover_paths(rows: List[Dict[str, Any]], sdb: Any, max_calls: int, dr
                         break
                     end = min(end, last_open)
                     stats["calls"] += 1
-                    res = await fetcher.fetch_candles(pair, "15", 1900, end, expected_open_15=end)
-                    pdata = parse_candles_to_numpy(res) if res else None
+                    try:
+                        res = await fetcher.fetch_candles(pair, "15", 1900, end, expected_open_15=end)
+                        pdata = parse_candles_to_numpy(res) if res else None
+                    except Exception as e:
+                        # One failed window must not throw away the paths already rebuilt.
+                        _say(f"[learner] path recovery fetch failed for {pair}: {e!r}")
+                        continue
                     if pdata is None:
                         continue
                     d = pdata.as_dict()
@@ -296,7 +301,8 @@ async def run(args: argparse.Namespace) -> int:
     async def notify(text: str) -> None:
         if tq is not None:
             for chunk in _tg_chunks(text):
-                await tq.send(chunk)
+                if not await tq.send(chunk):
+                    _say("[learner] Telegram message was not delivered")
     try:
         if args.digest:
             led = _jl(await sdb.get_metadata(KEY_LEDGER, timeout=5.0), [])

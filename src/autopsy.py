@@ -652,7 +652,7 @@ def format_intelligence(blob: Mapping[str, Any], name_fn: Callable[[str], str] =
                     ec = "n/a" if c["early_caught"] is None else f"{c['early_caught']:.0%}"
                     wl = "n/a" if c["winners_lost"] is None else f"{c['winners_lost']:.0%}"
                     na = "n/a" if c["net_after"] is None else f"{c['net_after']:+.2f}"
-                    lines.append(f"  veto at >={c['score']}{' (configured)' if c.get('configured') else ''}: blocks{c['blocked']} | catches {ec} of early stops | "
+                    lines.append(f"  veto at >={c['score']}{' (configured)' if c.get('configured') else ''}: blocks {c['blocked']} | catches {ec} of early stops | "
                                  f"loses {wl} of winners | keeps {c['kept_share']:.0%} | net {c['net_before']:+.2f} -> {na}%")
     last = ((((blob.get("pops") or {}).get("LIVE") or {}).get("autopsy") or {}).get("autopsies") or [])[-3:]
     if last:
@@ -664,6 +664,13 @@ def format_intelligence(blob: Mapping[str, Any], name_fn: Callable[[str], str] =
             lines.append(f"  {a['pair']} {name_fn(str(a['alert_key']))} {a['dir']} {a['result']} {a['pnl']:+.2f}% ({a['mode_text']}) | "
                          f"prior {a['p_prior']:.0%} | helped: {helped} | hurt: {hurt}")
     lines.append("")
-    lines.append("Report only. L1 = exploratory, L2 = survives false-discovery control and both time halves. Nothing here changes a verdict.")
-    text = "\n".join(lines)
-    return text if len(text) <= max_chars else text[: max_chars - 3] + "..."
+    footer = "Report only. L1 = exploratory, L2 = survives false-discovery control and both time halves. Nothing here changes a verdict."
+    text = "\n".join(lines + [footer])
+    if len(text) <= max_chars:
+        return text
+    # Over budget: drop whole lines from the body (never cut one in half) and
+    # keep the footer, so the reader still sees that this is report-only.
+    room = max_chars - len(footer) - 6
+    body = "\n".join(lines)[:room]
+    body = body[: body.rfind("\n")] if "\n" in body else body
+    return body + "\n...\n" + footer

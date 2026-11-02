@@ -289,8 +289,18 @@ OUTCOME_WIN_LABEL = "Target Achieved"
 OUTCOME_LOSS_LABEL = "Stop loss Hit"
 OUTCOME_TIMEOUT_LABEL = "Timed out"
 
-
-
+def outcome_totals_from_rows(rows: Optional[List[Dict[str, Any]]]) -> Dict[str, int]:
+    """Totals in the same shape as the Redis counters, computed from archive rows."""
+    out = {"wins": 0, "losses": 0, "timeouts": 0, "timeout_wins": 0, "total": 0}
+    for r in rows or []:
+        if "win" not in r:
+            continue
+        win = bool(r.get("win"))
+        out["wins" if win else "losses"] += 1
+        if r.get("outcome_class") == "timeout":
+            out["timeout_wins" if win else "timeouts"] += 1
+    out["total"] = out["wins"] + out["losses"]
+    return out
 
 def format_outcome_totals(source: str, stats: Optional[Dict[str, int]], icon: str = "") -> str:
     """One-line all-time Recorded/Shadowed totals, for example

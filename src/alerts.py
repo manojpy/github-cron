@@ -571,12 +571,21 @@ def _cloud_vote_line(gr: "GateResult", is_buy: bool) -> str:
 
 def _record_status_line(status: str, active: Optional[Dict[str, Any]]) -> str:
     """One-line Telegram label for the one-active-trade rule."""
+
+    # A malformed active-trade record must never raise here: this label is built
+    # outside the safe message formatter, so an exception would drop the alert.
     if status == "IGNORED" and active:
         side = "buy" if str(active.get("direction", "")).lower() in ("buy", "long") else "sell"
-        since = format_ist_time(int(active["entry_ts"]), "%H:%M IST")
-        return f"⏭ Ignored — {active.get('pair', '')} {side} trade open since {since}, not recorded"
+        try:
+            since = " since " + format_ist_time(int(active["entry_ts"]), "%H:%M IST")
+        except (KeyError, TypeError, ValueError):
+            since = ""
+        return f"⏭ Ignored — {active.get('pair', '')} {side} trade open{since}, not recorded"
     if status == "COOLDOWN":
-        resume = format_ist_time(int((active or {}).get("until_ts", 0)) + 900, "%H:%M IST")
+        try:
+            resume = format_ist_time(int((active or {}).get("until_ts", 0)) + 900, "%H:%M IST")
+        except (TypeError, ValueError):
+            resume = "next"
         return f"⏸ Cooldown — same-direction trade recently closed, not recorded until the {resume} candle"
     return "📝 Recorded as trade"
 

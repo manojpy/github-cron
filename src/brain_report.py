@@ -1079,55 +1079,51 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     _lifecycle = _plan_lifecycle_text(F.get("plan_lifecycle") or {})
     if _lifecycle:
         out.append(_p(_lifecycle))
-    _ptr_lines = _prediction_track_lines((F.get("ai") or {}).get("prediction_track_record"))
-    if _ptr_lines:
-        out.append(_p("PREDICTION TRACK RECORD — did the Brain's stated odds match reality?"))
-        out.extend(_c_split(_ptr_lines))
-    _acct_lines = _accountability_lines(
-        (F.get("ai") or {}).get("family_accountability"),
-        str(getattr(cfg, "FAMILY_ACCOUNTABILITY_MODE", "shadow")),
-        (F.get("ai") or {}).get("control_summary"),
-    )
-    if _acct_lines:
-        out.append(_p("RECOMMENDATION ACCOUNTABILITY — did past changes help?"))
-        out.extend(_c_split(_acct_lines))
-    _df_lines = _data_foundation_lines((F.get("ai") or {}).get("data_foundation"))
-    if _df_lines:
-        out.append(_p("DATA FOUNDATION — is the evidence base consistent?"))
-        out.extend(_c_split(_df_lines))
-    _ly_lines = _layer_lines((F.get("ai") or {}).get("layer_audit"), str(getattr(cfg, "LAYER_BOUNDARY_MODE", "report")))
-    if _ly_lines:
-        out.append(_p("ARCHITECTURE BOUNDARY — research, validation, policy"))
-        out.extend(_c_split(_ly_lines))
-    _hg_lines = _hypothesis_gen_lines((F.get("ai") or {}).get("hypothesis_pool_summary"))
-    if _hg_lines:
-        out.append(_p("SELF-GENERATED RULES — proposed, tested, followed forward"))
-        out.extend(_c_split(_hg_lines))
-    _vh_lines = _vol_horizon_lines((F.get("ai") or {}).get("vol_horizon_study"))
-    if _vh_lines:
-        out.append(_p("VOLATILITY AND TRADE PLANS — do regimes need different stops and horizons?"))
-        out.extend(_c_split(_vh_lines))
-    _om_lines = _online_model_lines((F.get("ai") or {}).get("online_model"))
-    if _om_lines:
-        out.append(_p("ONLINE MODEL vs BATCH MODEL — does continuous learning help?"))
-        out.extend(_c_split(_om_lines))
-    _fe_lines = _future_edge_lines((F.get("ai") or {}).get("future_edge_record"))
-    if _fe_lines:
-        out.append(_p("FUTURE EDGE SCORE — noise vs ignorance"))
-        out.extend(_c_split(_fe_lines))
-    _nev_lines = _net_ev_audit_lines((F.get("ai") or {}).get("net_ev_audit"))
 
-    if _nev_lines:
-        out.append(_p("NET-EV MODEL vs SIMPLE RULES — does it pick better trades?"))
-        out.extend(_c_split(_nev_lines))
-    _hyp_lines = _hypothesis_lines((F.get("ai") or {}).get("hypothesis_ledger"))
-    if _hyp_lines:
-        out.append(_p("CONCLUSIONS THAT CHANGED — what the Brain used to believe"))
-        out.extend(_c_split(_hyp_lines))
-    _exp_lines = _experiment_lines((F.get("ai") or {}).get("experiment_ledger"))
-    if _exp_lines:
-        out.append(_p("EXPERIMENT LEDGER — how much was tried to find these results?"))
-        out.extend(_c_split(_exp_lines))
+    # Optional diagnostics. Each is isolated: a malformed field in one of them
+    # must not replace the gate table above with "section unavailable".
+    _ai = F.get("ai") or {}
+    _optional = (
+        ("PREDICTION TRACK RECORD — did the Brain's stated odds match reality?",
+         _prediction_track_lines, (_ai.get("prediction_track_record"),)),
+        ("RECOMMENDATION ACCOUNTABILITY — did past changes help?",
+         _accountability_lines, (_ai.get("family_accountability"),
+                                 str(getattr(cfg, "FAMILY_ACCOUNTABILITY_MODE", "shadow")),
+                                 _ai.get("control_summary"))),
+        ("DATA FOUNDATION — is the evidence base consistent?",
+         _data_foundation_lines, (_ai.get("data_foundation"),)),
+        ("ARCHITECTURE BOUNDARY — research, validation, policy",
+         _layer_lines, (_ai.get("layer_audit"), str(getattr(cfg, "LAYER_BOUNDARY_MODE", "report")))),
+        ("SELF-GENERATED RULES — proposed, tested, followed forward",
+         _hypothesis_gen_lines, (_ai.get("hypothesis_pool_summary"),)),
+        ("VOLATILITY AND TRADE PLANS — do regimes need different stops and horizons?",
+         _vol_horizon_lines, (_ai.get("vol_horizon_study"),)),
+        ("ONLINE MODEL vs BATCH MODEL — does continuous learning help?",
+         _online_model_lines, (_ai.get("online_model"),)),
+        ("FUTURE EDGE SCORE — noise vs ignorance",
+         _future_edge_lines, (_ai.get("future_edge_record"),)),
+        ("NET-EV MODEL vs SIMPLE RULES — does it pick better trades?",
+         _net_ev_audit_lines, (_ai.get("net_ev_audit"),)),
+        ("CONCLUSIONS THAT CHANGED — what the Brain used to believe",
+         _hypothesis_lines, (_ai.get("hypothesis_ledger"),)),
+        ("EXPERIMENT LEDGER — how much was tried to find these results?",
+         _experiment_lines, (_ai.get("experiment_ledger"),)),
+    )
+    for _title, _fn, _args in _optional:
+        try:
+            _lines = _fn(*_args)
+        except Exception as _e:
+            try:
+                get_audit().record_analysis_exception(f"report:{_fn.__name__}", _e)
+            except Exception:
+                pass
+            logging.getLogger("macd_bot").warning(
+                f"Brain report: '{_title.split(' — ')[0]}' block skipped: {type(_e).__name__}: {_e}"
+            )
+            continue
+        if _lines:
+            out.append(_p(_title))
+            out.extend(_c_split(_lines))
     return out
 
 ACTION_PLAN_SCHEMA = "brain_action_plan/1"
