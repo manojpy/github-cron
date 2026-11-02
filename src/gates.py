@@ -225,6 +225,10 @@ def _cloud_group_decision(cirrus_ok: Optional[bool], gaussian_ok: Optional[bool]
     min(Constants.CLOUD_GROUP_MIN_VOTES, number of enabled clouds) of them are
     exactly True. None (warmup / NaN / abstain) counts as NOT agreeing, so a cloud
     that is not ready can never help a trade through. No cloud enabled -> pass.
+
+    When CLOUD_GROUP_GAUSSIAN_VETO is True, Gaussian must be True and then
+    (need-1) of the remaining clouds complete the vote. When False (current
+    default) it is a pure N-of-M vote with no special veto.
     """
     enabled = []
     if cfg.RMA_CLOUD_ENABLED:
@@ -238,8 +242,7 @@ def _cloud_group_decision(cirrus_ok: Optional[bool], gaussian_ok: Optional[bool]
     if not enabled:
         return True
     need = min(Constants.CLOUD_GROUP_MIN_VOTES, len(enabled))
-    # Gaussian has veto power: it must agree, and then any (need - 1) of the other
-    # enabled clouds complete the group (default: Gaussian + any 2 of the other 3).
+    # Optional Gaussian veto (disabled when CLOUD_GROUP_GAUSSIAN_VETO is False).
     if Constants.CLOUD_GROUP_GAUSSIAN_VETO and cfg.GAUSSIAN_TREND_ENABLED and gaussian_ok is not True:
         return False
     return sum(1 for v in enabled if v is True) >= need
