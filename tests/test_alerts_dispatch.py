@@ -12,9 +12,8 @@ import json
 import logging
 import time
 from types import SimpleNamespace as NS
-
 import numpy as np
-
+import pytest
 import alerts as A
 import feedback
 import outcome_storage
@@ -274,6 +273,12 @@ def _bias(up, down, neutral):
 BIAS_UP = _bias(0.6, 0.2, 0.2)
 BIAS_DOWN = _bias(0.2, 0.57, 0.23)
 
+@pytest.fixture(autouse=True)
+def _no_run_cap(monkeypatch):
+    """The dispatch tests assume no per-run cap (config_macd.json sets one);
+    the cap itself is covered by test_run_cap_keeps_strongest_and_shadow_tracks_the_rest."""
+    monkeypatch.setattr(cfg, "ALERT_MAX_PAIRS_PER_RUN", 0, raising=False)
+    monkeypatch.setattr(cfg, "ALERT_MAX_PER_DIRECTION", 0, raising=False)
 
 class _Tg:
     def __init__(self):
@@ -351,6 +356,24 @@ def test_basket_note_when_three_same_direction_takes():
     text = _send(ps, BIAS_UP)
     assert text.count("size them as ONE basket") == 1 and "3 BUY TAKEs" in text
 
+def test_run_cap_keeps_strongest_and_shadow_tracks_the_rest(monkeypatch):
+    monkeypatch.setattr(cfg, "ALERT_MAX_PAIRS_PER_RUN", 3, raising=False)
+    monkeypatch.setattr(cfg, "ALERT_MAX_PER_DIRECTION", 2, raising=False)
+    seen = []
+
+    def _shadow(name):
+        async def _rec(reason):
+            seen.append((name, reason))
+        return _rec
+
+    ps = [_p("AAAUSD", "buy", 26, 27), _p("BBBUSD", "buy", 25, 27), _p("CCCUSD", "buy", 24, 27),
+          _p("DDDUSD", "sell", 20, 27), _p("EEEUSD", "sell", 19, 27)]
+    for p in ps:
+        p.record_shadow = _shadow(p.pair_name)
+    text = _send(ps, BIAS_UP)
+    names = ("AAAUSD", "BBBUSD", "CCCUSD", "DDDUSD", "EEEUSD")
+    assert [n for n in names if f"BODY-{n}" in text] == ["AAAUSD", "BBBUSD", "DDDUSD"]
+    assert sorted(seen) == [("CCCUSD", "run_cap"), ("EEEUSD", "run_cap")]
 
 def test_no_basket_note_below_threshold_or_for_watch():
     two = [_p("AAAUSD", "buy", 26, 27, "TAKE"), _p("BBBUSD", "buy", 25, 27, "TAKE")]
