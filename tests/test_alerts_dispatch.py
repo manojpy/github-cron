@@ -375,6 +375,70 @@ def test_run_cap_keeps_strongest_and_shadow_tracks_the_rest(monkeypatch):
     assert [n for n in names if f"BODY-{n}" in text] == ["AAAUSD", "BBBUSD", "DDDUSD"]
     assert sorted(seen) == [("CCCUSD", "run_cap"), ("EEEUSD", "run_cap")]
 
+def _veto_call(alert_key, pb, calls, **over):
+    async def _rec(sdb, pair, alerts, ts, px, **kw):
+        calls.append((pair, [a[2] for a in alerts], kw.get("block_reason")))
+    A._record_counterfactual_block, saved = _rec, A._record_counterfactual_block
+    try:
+        kw = dict(sdb=None, pair_name="ETHUSD", alert=("t", "e", alert_key), pb=pb,
+                  session="asian", conf_pct=70.0, adx=18.0, ts_curr=1_790_826_300,
+                  close_curr=100.0, confluence_scores=None, gr=None, context=None,
+                  logger_pair=LOG)
+        kw.update(over)
+        return asyncio.run(A._playbook_veto_drops(**kw))
+    finally:
+        A._record_counterfactual_block = saved
+
+
+def test_playbook_veto_modes(monkeypatch):
+    avoid = {"restrict": "AVOID"}
+    calls = []
+    monkeypatch.setattr(cfg, "ALERT_VETO_MODE", "off", raising=False)
+    assert _veto_call("pivot_up_R1", avoid, calls) is False and calls == []
+    monkeypatch.setattr(cfg, "ALERT_VETO_MODE", "shadow", raising=False)
+    assert _veto_call("pivot_up_R1", avoid, calls) is False and calls == []
+    monkeypatch.setattr(cfg, "ALERT_VETO_MODE", "live", raising=False)
+    assert _veto_call("pivot_up_R1", avoid, calls) is True
+    assert calls == [("ETHUSD", ["pivot_up_R1"], "playbook_veto")]
+
+
+def test_playbook_veto_fails_open(monkeypatch):
+    from playbook import PLAYBOOK_SCHEMA, playbook_lookup
+    monkeypatch.setattr(cfg, "ALERT_VETO_MODE", "live", raising=False)
+    calls = []
+    assert _veto_call("pivot_up_R1", None, calls) is False
+    assert _veto_call("pivot_up_R1", {"restrict": "WATCH"}, calls) is False
+    stale = {"schema": PLAYBOOK_SCHEMA, "generated_ts": 1_000,
+             "entries": {"pivot_up_R1|buy": {"restrict": "AVOID"}}}
+    entry = playbook_lookup(stale, "pivot_up_R1", "buy", now_ts=1_000 + 40 * 3600, max_age_sec=36 * 3600)
+    assert entry is None and _veto_call("pivot_up_R1", entry, calls) is False
+    fresh = playbook_lookup(stale, "pivot_up_R1", "buy", now_ts=1_000 + 3600, max_age_sec=36 * 3600)
+    assert _veto_call("pivot_up_R1", fresh, calls) is True
+    assert calls == [("ETHUSD", ["pivot_up_R1"], "playbook_veto")]
+
+
+def test_playbook_veto_rule_hit_needs_its_flag(monkeypatch):
+    monkeypatch.setattr(cfg, "ALERT_VETO_MODE", "live", raising=False)
+    pb = {"avoid_rules": [{"rule": [["session", "eq", "asian"]], "text": "session is asian"}]}
+    calls = []
+    monkeypatch.setattr(cfg, "ALERT_VETO_ON_RULES", False, raising=False)
+    assert _veto_call("dynamic_flow_buy", pb, calls) is False
+    monkeypatch.setattr(cfg, "ALERT_VETO_ON_RULES", True, raising=False)
+    assert _veto_call("dynamic_flow_buy", pb, calls) is True
+    assert _veto_call("dynamic_flow_buy", pb, calls, session="ny") is False
+    assert calls == [("ETHUSD", ["dynamic_flow_buy"], "playbook_veto")]
+
+
+def test_playbook_veto_mixed_keys_on_one_pair(monkeypatch):
+    monkeypatch.setattr(cfg, "ALERT_VETO_MODE", "live", raising=False)
+    calls = []
+    kept = [k for k, pb in (("pivot_up_R1", {"restrict": "AVOID"}),
+                            ("vwap_up", None),
+                            ("choch_buy", {"restrict": "AVOID"}))
+            if not _veto_call(k, pb, calls)]
+    assert kept == ["vwap_up"]
+    assert [c[1] for c in calls] == [["pivot_up_R1"], ["choch_buy"]]
+
 def test_no_basket_note_below_threshold_or_for_watch():
     two = [_p("AAAUSD", "buy", 26, 27, "TAKE"), _p("BBBUSD", "buy", 25, 27, "TAKE")]
     assert "basket" not in _send(two, BIAS_UP)
