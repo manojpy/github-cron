@@ -30,8 +30,9 @@ class AlertPayload:
     record_win_rate_after_send: Optional[Callable[[], Awaitable[None]]] = None
     mark_candle_processed: bool = False
     verdict: Optional[str] = None       # "TAKE" / "WATCH" / "AVOID" (None if unavailable)
+    record_shadow: Optional[Callable[[str], Awaitable[None]]] = None   # shadow-tracks this pair's alerts when the run cap drops it
 
-from alert_advisor import PairAdvice, advise_pair
+from alert_advisor import PairAdvice, advise_pair, _pb_rule_hit
 from feedback import build_keyboard, load_open_positions, record_auto_positions
 
 from bot_config import (
@@ -416,6 +417,21 @@ async def _notify_brain_filter(telegram_queue: "TelegramQueue", sdb: "RedisState
             logger_pair.debug(f"BRAIN FILTER Telegram failed for {alert_key}: {e}")
         return False
 
+def _playbook_veto_reason(pb: Optional[Dict[str, Any]], *, session: Optional[str], conf_pct: Optional[float], adx: Optional[float]) -> Optional[str]:
+    """Why the learner playbook says this alert must not be sent, or None.
+    Restrict-only and fail-open: no playbook entry (missing, stale, Redis down) -> None."""
+    if str(getattr(cfg, "ALERT_VETO_MODE", "off")) == "off" or not isinstance(pb, dict):
+        return None
+    if pb.get("restrict") == "AVOID":
+        return "playbook AVOID (proven losing setup on two consecutive learner cycles)"
+    if getattr(cfg, "ALERT_VETO_ON_RULES", False):
+        try:
+            rule = _pb_rule_hit(pb, {"session": session, "conf": conf_pct, "adx": adx})
+        except Exception:
+            rule = None
+        if rule is not None:
+            return f"playbook do-not-take rule: {rule.get('text', 'rule hit')}"
+    return None
 
 async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, alerts_to_send: List[Tuple[str, str, str]], ts_curr: int, close_curr: float, block_reason: str, *, confluence_scores: Optional[Dict[str, Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]]] = None, macro_shadow: Optional[Dict[str, Any]] = None, cluster_penalty: Optional[float] = None, effective_score: Optional[float] = None, effective_required: Optional[float] = None, gr: Optional[GateResult] = None, context: Optional[Dict[str, Any]] = None, logger_pair: Optional[logging.Logger] = None) -> None:
     """Shadow-log every alert that reached the dispatch stage but was then
@@ -1349,6 +1365,38 @@ async def dispatch_combined_alerts(payloads: List[AlertPayload], telegram_queue:
     buys.sort(key=_conf_pct, reverse=True)
     sells.sort(key=_conf_pct, reverse=True)
     ordered = (sells + buys) if dominant_sell else (buys + sells)
+
+    # ── Per-run selectivity cap (restrict-only; off while both limits are 0) ──
+    _cap_total = int(getattr(cfg, "ALERT_MAX_PAIRS_PER_RUN", 0))
+    _cap_dir = int(getattr(cfg, "ALERT_MAX_PER_DIRECTION", 0))
+    if ordered and (_cap_total > 0 or _cap_dir > 0):
+        _kept: List[AlertPayload] = []
+        _per_dir: Dict[str, int] = {"buy": 0, "sell": 0}
+        # Strongest confluence first. Confluence margin has not predicted outcome
+        # yet, so this order is a placeholder until some family validates.
+        for p in sorted(ordered, key=lambda x: -_conf_pct(x)):
+            if _cap_total > 0 and len(_kept) >= _cap_total:
+                break
+            if _cap_dir > 0 and _per_dir[p.direction] >= _cap_dir:
+                continue
+            _kept.append(p)
+            _per_dir[p.direction] += 1
+        _kept_ids = {id(p) for p in _kept}
+        _capped = [p for p in ordered if id(p) not in _kept_ids]
+        ordered = [p for p in ordered if id(p) in _kept_ids]
+        for p in _capped:
+            for dk in p.dedup_keys:
+                await sdb.release_recent_alert(p.pair_name, dk)
+            if p.record_shadow is not None:
+                try:
+                    await p.record_shadow("run_cap")
+                except Exception as e:
+                    logger_run.debug(f"run_cap shadow record failed for {p.pair_name}: {e}")
+        if _capped:
+            logger_run.info(
+                f"Run cap: sent {len(ordered)}, held back {len(_capped)}: "
+                f"{', '.join(p.pair_name for p in _capped[:10])}"
+            )
 
     # ── Global budget enforcement ──
     total_budget = sum(p.budget_count for p in ordered)
@@ -3173,6 +3221,28 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         except Exception:
                             alert_pb_by_key[alert_key] = None
 
+                        # ── Playbook veto (restrict-only delivery control) ──
+                        _veto_why = _playbook_veto_reason(
+                            alert_pb_by_key.get(alert_key),
+                            session=_get_session_from_ts(ts_curr),
+                            conf_pct=alert_score / alert_total * 100.0,
+                            adx=adx_val,
+                        )
+                        if _veto_why:
+                            if str(cfg.ALERT_VETO_MODE) == "live":
+                                logger_pair.info(f"[{pair_name}] 🚫 VETO {alert_key}: {_veto_why}")
+                                await _record_counterfactual_block(
+                                    sdb, pair_name,
+                                    [(alert_title, alert_extra, alert_key)],
+                                    ts_curr, close_curr,
+                                    block_reason="playbook_veto",
+                                    confluence_scores={alert_key: _confluence_for(alert_key)},
+                                    gr=gr, context=context,
+                                    logger_pair=logger_pair,
+                                )
+                                continue
+                            logger_pair.info(f"[{pair_name}] 🚫 VETO (shadow, still sent) {alert_key}: {_veto_why}")
+
                         if tq and tq.get("verdict"):
                             if tq.get("market_state_p_win") is not None:
                                 logger_pair.debug(
@@ -3919,6 +3989,15 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 for _, _, alert_key in alerts_to_send:
                     dedup_keys.append(alert_key)
 
+            async def _record_cap_shadow(reason: str, _alerts: List[Tuple[str, str, str]] = list(alerts_to_send)) -> None:
+                await _record_counterfactual_block(
+                    sdb, pair_name, _alerts, ts_curr, close_curr,
+                    block_reason=reason,
+                    confluence_scores={ak: _confluence_for(ak) for _, _, ak in _alerts},
+                    gr=gr, context=context,
+                    logger_pair=logger_pair,
+                )
+
             payload = AlertPayload(
                 pair_name=pair_name,
                 direction=direction,
@@ -3935,6 +4014,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 record_win_rate_after_send=None,
                 mark_candle_processed=True,    # dispatcher marks candle after delivery
                 verdict=pair_verdict,
+                record_shadow=_record_cap_shadow,
             )
             return pair_name, {
                 "state": "BATCHED",
