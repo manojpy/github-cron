@@ -66,7 +66,7 @@ class BotConfig(BaseModel):
     HTTP_TIMEOUT: int = 15
     CANDLE_FETCH_RETRIES: int = 3
     CANDLE_FETCH_BACKOFF: float = 1.5
-    RUN_TIMEOUT_SECONDS: int = 600
+    RUN_TIMEOUT_SECONDS: int = 480
     FETCH_PHASE_TIMEOUT_SEC: int = 90
     TCP_CONN_LIMIT: int = 16
     TCP_CONN_LIMIT_PER_HOST: int = 16
