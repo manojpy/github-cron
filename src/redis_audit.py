@@ -254,15 +254,15 @@ def collect(client: Any, max_keys: int = 200_000, scan_count: int = 500, sample_
         seen[name] = seen.get(name, 0) + 1
         sampled.append(rec)
     for i in range(0, len(sampled), scan_count):
-        chunk = sampled[i:i + scan_count]
+        sample_chunk = sampled[i:i + scan_count]
         try:
             pipe = client.pipeline(transaction=False)
-            for rec in chunk:
+            for rec in sample_chunk:
                 pipe.memory_usage(rec["key"])
             res = pipe.execute(raise_on_error=False)
         except Exception:
             break  # MEMORY USAGE unsupported on this server: sizes stay None
-        for rec, val in zip(chunk, res):
+        for rec, val in zip(sample_chunk, res):
             rec["bytes"] = None if isinstance(val, BaseException) else val
     streams: Dict[str, int] = {}
     for s in KNOWN_STREAMS:
