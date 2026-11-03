@@ -433,6 +433,25 @@ def _playbook_veto_reason(pb: Optional[Dict[str, Any]], *, session: Optional[str
             return f"playbook do-not-take rule: {rule.get('text', 'rule hit')}"
     return None
 
+async def _playbook_veto_drops(*, sdb: "RedisStateStore", pair_name: str, alert: Tuple[str, str, str], pb: Optional[Dict[str, Any]], session: Optional[str], conf_pct: Optional[float], adx: Optional[float], ts_curr: int, close_curr: float, confluence_scores: Optional[Dict[str, Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]]], gr: Optional[GateResult], context: Optional[Dict[str, Any]], logger_pair: logging.Logger) -> bool:
+    """True when this alert must be dropped (live veto). Shadow only logs and returns False.
+    A dropped alert is shadow-tracked as 'playbook_veto' so the Brain keeps learning from it."""
+    why = _playbook_veto_reason(pb, session=session, conf_pct=conf_pct, adx=adx)
+    if not why:
+        return False
+    if str(cfg.ALERT_VETO_MODE) != "live":
+        logger_pair.info(f"[{pair_name}] 🚫 VETO (shadow, still sent) {alert[2]}: {why}")
+        return False
+    logger_pair.info(f"[{pair_name}] 🚫 VETO {alert[2]}: {why}")
+    await _record_counterfactual_block(
+        sdb, pair_name, [alert], ts_curr, close_curr,
+        block_reason="playbook_veto",
+        confluence_scores=confluence_scores,
+        gr=gr, context=context,
+        logger_pair=logger_pair,
+    )
+    return True
+
 async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, alerts_to_send: List[Tuple[str, str, str]], ts_curr: int, close_curr: float, block_reason: str, *, confluence_scores: Optional[Dict[str, Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]]] = None, macro_shadow: Optional[Dict[str, Any]] = None, cluster_penalty: Optional[float] = None, effective_score: Optional[float] = None, effective_required: Optional[float] = None, gr: Optional[GateResult] = None, context: Optional[Dict[str, Any]] = None, logger_pair: Optional[logging.Logger] = None) -> None:
     """Shadow-log every alert that reached the dispatch stage but was then
     blocked by a non-win-rate gate (OOD, calibration, confluence, macro,
@@ -3222,27 +3241,17 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             alert_pb_by_key[alert_key] = None
 
                         # ── Playbook veto (restrict-only delivery control) ──
-                        _veto_why = _playbook_veto_reason(
-                            alert_pb_by_key.get(alert_key),
+                        if await _playbook_veto_drops(
+                            sdb=sdb, pair_name=pair_name,
+                            alert=(alert_title, alert_extra, alert_key),
+                            pb=alert_pb_by_key.get(alert_key),
                             session=_get_session_from_ts(ts_curr),
                             conf_pct=alert_score / alert_total * 100.0,
-                            adx=adx_val,
-                        )
-                        if _veto_why:
-                            if str(cfg.ALERT_VETO_MODE) == "live":
-                                logger_pair.info(f"[{pair_name}] 🚫 VETO {alert_key}: {_veto_why}")
-                                await _record_counterfactual_block(
-                                    sdb, pair_name,
-                                    [(alert_title, alert_extra, alert_key)],
-                                    ts_curr, close_curr,
-                                    block_reason="playbook_veto",
-                                    confluence_scores={alert_key: _confluence_for(alert_key)},
-                                    gr=gr, context=context,
-                                    logger_pair=logger_pair,
-                                )
-                                continue
-                            logger_pair.info(f"[{pair_name}] 🚫 VETO (shadow, still sent) {alert_key}: {_veto_why}")
-
+                            adx=adx_val, ts_curr=ts_curr, close_curr=close_curr,
+                            confluence_scores={alert_key: _confluence_for(alert_key)},
+                            gr=gr, context=context, logger_pair=logger_pair,
+                        ):
+                            continue
                         if tq and tq.get("verdict"):
                             if tq.get("market_state_p_win") is not None:
                                 logger_pair.debug(
