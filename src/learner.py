@@ -17,6 +17,7 @@ Usage (inside the bot image, OUTCOME_DATA_DIR = clone of the outcome-data repo):
     python learner.py --rollback         # restore the previous playbook version
     python learner.py --digest           # print the research ledger tail
     python learner.py --scoreboard       # print the last stored scoreboard
+    python learner.py --intel            # print the last stored intelligence report
     python learner.py --data-dir PATH    # override OUTCOME_DATA_DIR
 Exit codes: 0 ok, 1 learner error, 2 cannot reach Redis / no data dir.
 """
@@ -35,7 +36,8 @@ from alerts import TelegramQueue, escape_markdown_v2
 from archive_reader import load_archived_outcomes
 from autopsy import build_intelligence, format_intelligence
 from bot_config import _get_session_from_ts
-
+from brain_helpers import HYPOTHESIS_POOL_KEY
+from intelligence import KEY_INTEL, KEY_VETO_MON, build_report, delivered_trend, format_report, veto_monitor
 from feedback import (
     KEY_FEEDBACK, behaviour_report, format_behaviour, format_heat_gate, format_margin,
     heat_gate_report, margin_report,
@@ -320,6 +322,11 @@ async def run(args: argparse.Namespace) -> int:
             _say(format_intelligence(apj, name_fn=pretty_alert) if apj else "[learner] no autopsy stored yet")
             return 0
 
+        if args.intel:
+            ij = _jl(await sdb.get_metadata(KEY_INTEL, timeout=5.0), {})
+            _say(format_report(ij, veto_mode=str(cfg.VETO_MONITOR_MODE)) if ij else "[learner] no intelligence report stored yet")
+            return 0
+
         if args.rollback:
             prev = await _strict_get(sdb, KEY_PREV)
             prev_state_raw = await _strict_get(sdb, KEY_STATE_PREV)
@@ -425,12 +432,59 @@ async def run(args: argparse.Namespace) -> int:
                 _say(f"[learner] autopsy skipped: {e!r}")
                 ap_blob = None
 
+        # ── Coordinator: is the veto helping, is the delivered population improving ──
+        # Read-only except one thing: in VETO_MONITOR_MODE=live a proven-harmful veto is
+        # suspended (it logs but still sends) via a flag stored inside the playbook blob.
+        intel_blob: Optional[Dict[str, Any]] = None
+        intel_text = ""
+        intel_due = False
+        intel_failed = False
+        veto_res: Optional[Dict[str, Any]] = None
+        veto_state_new: Optional[Dict[str, Any]] = None
+        veto_mode = str(cfg.VETO_MONITOR_MODE)
+        if cfg.ENABLE_INTELLIGENCE:
+            try:
+                prev_intel = _jl(await _strict_get(sdb, KEY_INTEL), {})
+                prev_pb = _jl(await _strict_get(sdb, KEY_CURRENT), {})
+                hyp_pool = _jl(await _strict_get(sdb, HYPOTHESIS_POOL_KEY), {})
+                if veto_mode != "off":
+                    veto_res, veto_state_new = veto_monitor(
+                        blob, rows, fixed=fixed, cost_pct=cost_pct,
+                        prev_state=_jl(await _strict_get(sdb, KEY_VETO_MON), {}), now_ts=now_ts,
+                        params={"min_blocks": int(cfg.VETO_MONITOR_MIN_BLOCKS),
+                                "harm_cycles": int(cfg.VETO_MONITOR_HARM_CYCLES),
+                                "resume_cycles": int(cfg.VETO_MONITOR_RESUME_CYCLES)},
+                        family_fn=alert_family_of,
+                    )
+                    if veto_mode == "live" and veto_res["suspended"]:
+                        blob["veto_suspended"] = {"since": veto_res["since"], "reason": veto_res["reason"]}
+                intel_blob = build_report(
+                    now_ts=now_ts, blob=blob, sb=sb, autopsy=ap_blob, hyp_pool=hyp_pool, veto=veto_res,
+                    trend=delivered_trend(rows, fixed=fixed, cost_pct=cost_pct, now_ts=now_ts),
+                    n_rows=len(rows), n_path=n_path, prev_ts=prev_pb.get("generated_ts"),
+                    max_age_h=float(cfg.PLAYBOOK_MAX_AGE_HOURS), veto_mode=veto_mode,
+                )
+                intel_text = format_report(intel_blob, veto_mode=veto_mode)
+                last_sent = float(prev_intel.get("sent_ts") or 0)
+                hours = float(cfg.INTEL_NOTIFY_HOURS)
+                intel_due = hours > 0 and (now_ts - last_sent) >= hours * 3600
+                intel_blob["sent_ts"] = int(now_ts) if intel_due else int(last_sent)
+                _say(intel_text)
+            except Exception as e:
+                _say(f"[learner] intelligence skipped: {e!r}")
+                intel_blob, veto_res, veto_state_new, intel_failed = None, None, None, True
+
         if args.dry_run:
             _say("[learner] --dry-run: nothing written")
             return 0
-
         cur = await _strict_get(sdb, KEY_CURRENT)
         cur_state = await _strict_get(sdb, KEY_STATE)
+        if intel_failed:
+            # The monitor could not run: keep a suspension that is already in force instead of
+            # silently turning a suspended veto back on.
+            kept = _jl(cur, {}).get("veto_suspended")
+            if kept and veto_mode == "live":
+                blob["veto_suspended"] = kept
         led = _jl(await _strict_get(sdb, KEY_LEDGER), [])
         led = (led + [e for e in ledger if e.get("decision") != "COLLECTING"])[-_LEDGER_CAP:]
         writes: List[Tuple[str, str]] = []
@@ -446,6 +500,10 @@ async def run(args: argparse.Namespace) -> int:
         ]
         if ap_blob is not None:
             writes.append((KEY_AUTOPSY, json_dumps(ap_blob)))
+        if intel_blob is not None:
+            writes.append((KEY_INTEL, json_dumps(intel_blob)))
+        if veto_state_new is not None:
+            writes.append((KEY_VETO_MON, json_dumps(veto_state_new)))
         await _strict_set_many(sdb, writes, _TTL)
         _say(f"[learner] playbook {blob['label']} written ({len(blob['entries'])} entries, {len(changes)} change(s))")
 
@@ -454,6 +512,14 @@ async def run(args: argparse.Namespace) -> int:
             await notify(text)
         if ap_blob is not None and ap_due and ap_text:
             await notify(ap_text)
+        if veto_res is not None and veto_res.get("changed"):
+            acted = "" if veto_mode == "live" else " (shadow mode: nothing was changed)"
+            if veto_res["changed"] == "SUSPENDED":
+                await notify(f"🛑 PLAYBOOK VETO SUSPENDED{acted}\n{veto_res['reason']}\nAlerts are still sent and logged as VETO until the restriction is proven useful again.")
+            else:
+                await notify(f"✅ PLAYBOOK VETO RESUMED{acted}\nThe restricted alerts are proven losers again (or nothing is restricted).")
+        elif intel_blob is not None and intel_due and intel_text:
+            await notify(intel_text)
         return 0
     finally:
         try:
@@ -486,6 +552,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--digest", action="store_true")
     ap.add_argument("--scoreboard", action="store_true", help="print the last stored scoreboard")
     ap.add_argument("--autopsy", action="store_true", help="print the last stored autopsy / Trust Meter")
+    ap.add_argument("--intel", action="store_true", help="print the last stored intelligence report")
     ap.add_argument("--data-dir", default="")
     args = ap.parse_args(argv)
     try:

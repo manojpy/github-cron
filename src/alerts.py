@@ -439,8 +439,10 @@ async def _playbook_veto_drops(*, sdb: "RedisStateStore", pair_name: str, alert:
     why = _playbook_veto_reason(pb, session=session, conf_pct=conf_pct, adx=adx)
     if not why:
         return False
-    if str(cfg.ALERT_VETO_MODE) != "live":
-        logger_pair.info(f"[{pair_name}] 🚫 VETO (shadow, still sent) {alert[2]}: {why}")
+    suspended = bool((pb or {}).get("veto_suspended"))
+    if str(cfg.ALERT_VETO_MODE) != "live" or suspended:
+        tag = "suspended by the veto monitor, still sent" if suspended else "shadow, still sent"
+        logger_pair.info(f"[{pair_name}] 🚫 VETO ({tag}) {alert[2]}: {why}")
         return False
     logger_pair.info(f"[{pair_name}] 🚫 VETO {alert[2]}: {why}")
     await _record_counterfactual_block(

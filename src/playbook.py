@@ -667,7 +667,8 @@ def playbook_lookup(
     for i, k in enumerate(keys):
         e = entries.get(k)
         if e and (e.get("status") in SERVED_STATUSES + _NEGATIVE + ("PROMISING",) or e.get("restrict") or e.get("avoid_rules")):
-            return {**e, "key": k, "playbook_version": blob.get("label"), "via_family": i > 0}
+            return {**e, "key": k, "playbook_version": blob.get("label"), "via_family": i > 0,
+                    "veto_suspended": bool(blob.get("veto_suspended"))}
     return None
 
 # ── Human-readable summary (plain text; the caller escapes for Telegram) ──
