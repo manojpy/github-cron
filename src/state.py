@@ -1962,10 +1962,15 @@ class RedisStateStore:
         fee_pct = getattr(cfg, "BRAIN_FEE_PCT", 0.0006)
         slip_pct = getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003)
         base_cost_pct = (fee_pct * 2 + slip_pct * 2) * 100  # round-trip, in %
-
         sig_p = data.get("signal_price")
         fill_p = data.get("fill_price")
-        if sig_p and fill_p and float(sig_p) > 0:
+        if (
+            str(getattr(cfg, "OUTCOME_COST_MODEL", "flat")) == "stored"
+            and sig_p and fill_p and float(sig_p) > 0
+        ):
+            # Legacy model. P&L is already anchored at fill_price, so the
+            # signal-to-fill gap is counted twice here (and a favourable gap
+            # is charged as a cost). Kept only for OUTCOME_COST_MODEL=stored.
             sig_p = float(sig_p)
             fill_p = float(fill_p)
             if is_buy:

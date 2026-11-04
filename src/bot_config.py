@@ -432,6 +432,7 @@ class BotConfig(BaseModel):
     BRAIN_CUSUM_MIN_SAMPLE: int = 30
     BRAIN_FEE_PCT: float = Field(default=0.0006, ge=0.0, le=0.01, description="Taker fee per side (0.06%) used in EV/Kelly calculations")
     BRAIN_SLIPPAGE_PCT: float = Field(default=0.0003, ge=0.0, le=0.01, description="Estimated slippage per side used in EV/Kelly calculations")
+    OUTCOME_COST_MODEL: str = Field(default="flat", pattern="^(flat|stored)$", description="How a trade's round-trip cost is charged. flat = 2 x (BRAIN_FEE_PCT + BRAIN_SLIPPAGE_PCT) for every trade, and older stored rows are re-costed to the same figure when they are loaded (their gross P&L is untouched). stored = legacy behaviour: fees plus twice the absolute signal-to-fill gap, which double-counts a move already inside the fill-anchored P&L")
     BRAIN_OOD_ENABLED: bool = Field(default=True, description="Vote-count OOD gate on/off")
     BRAIN_REPORT_ON_DEMAND: bool = Field(default=False, description="If true, force a brain report to be generated and sent on this run regardless of the normal BRAIN_REPORT_INTERVAL_RUNS cadence")
     BRAIN_ARCHIVE_SHALLOW: bool = Field(default=False, description="Set by the workflow on alert-only runs that check out just a few days of the outcome archive. The Brain must never analyse a truncated archive, so report generation is skipped when this is true")

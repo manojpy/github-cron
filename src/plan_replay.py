@@ -120,7 +120,34 @@ def coerce_path_fields(raw: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def recost_rows(rows: Sequence[Dict[str, Any]], flat_cost_pct: float) -> int:
+    """Re-state each row's round-trip cost as `flat_cost_pct`, in place.
+
+    net = gross - cost, so a row costed at c_old becomes net + (c_old - flat).
+    Gross P&L is untouched; only the cost line moves.  Applies to net_pnl_pct and
+    net_pnl_hold_pct, and sets realized_cost_pct so every replay that prefers the
+    row's own cost sees the same figure.  Rows without a stored cost are left
+    alone (their consumers already fall back to the flat default).  Idempotent.
+    Returns how many rows changed."""
+    flat = float(flat_cost_pct)
+    changed = 0
+    for r in rows:
+        old = r.get("realized_cost_pct")
+        if old is None:
+            continue
+        delta = float(old) - flat
+        if abs(delta) < 1e-9:
+            continue
+        for k in ("net_pnl_pct", "net_pnl_hold_pct"):
+            v = r.get(k)
+            if v is not None:
+                r[k] = float(v) + delta
+        r["realized_cost_pct"] = flat
+        changed += 1
+    return changed
+
 # ── Exact replay ──────────────────────────────────────────────────────────
+
 def has_path(row: Mapping[str, Any]) -> bool:
     return bool(row.get("path_fav")) and bool(row.get("path_adv")) and bool(row.get("path_close"))
 

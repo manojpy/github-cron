@@ -842,7 +842,8 @@ def repair_shop_diagnosis(rows: List[Row], drift_alerts: List[Dict[str, Any]], c
             ),
             "action": (
                 "1) Increase CONFLUENCE_MIN_ABS_SCORE to filter weak signals. "
-                "2) Check if fee/slippage assumptions (0.06% + 0.03% per side) match your exchange. "
+                f"2) Check if fee/slippage assumptions ({float(cfg.BRAIN_FEE_PCT) * 100:.2f}% + "
+                f"{float(cfg.BRAIN_SLIPPAGE_PCT) * 100:.2f}% per side) match your exchange. "
                 "3) Consider widening OUTCOME_FAVORABLE_MOVE_PCT if TP is too tight."
             ),
             "expected_impact": "Positive EV is the minimum requirement for a viable strategy.",
@@ -872,6 +873,14 @@ def repair_shop_diagnosis(rows: List[Row], drift_alerts: List[Dict[str, Any]], c
     )
     if rc.get("valid") and rc["segments"]:
         seg = rc["segments"][0]
+        # WR of the trades that REMAIN if the segment is blocked. The segment's
+        # own gap to the overall WR (lift_vs_overall) overstates the gain,
+        # because the segment is only part of all trades.
+        _rest_n = rc["n"] - seg["segment_n"]
+        _rest_wr = (
+            (rc["overall_wr"] * rc["n"] - seg["segment_wr"] * seg["segment_n"]) / _rest_n
+            if _rest_n > 0 else rc["overall_wr"]
+        )
         repairs.append({
             "severity": "high",
             "category": "root_cause",
@@ -885,8 +894,8 @@ def repair_shop_diagnosis(rows: List[Row], drift_alerts: List[Dict[str, Any]], c
                 f"weight of the offending vote/feature."
             ),
             "expected_impact": (
-                f"Removing this segment lifts overall WR by "
-                f"~{seg['lift_vs_overall']:.0%}."
+                f"Blocking this segment would move overall WR from "
+                f"{rc['overall_wr']:.0%} to ~{_rest_wr:.0%} on the remaining trades."
             ),
             "p_value": seg["p_value"],
             # Scope: the exact subset the segment rule selects — the only

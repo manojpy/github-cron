@@ -8,7 +8,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from plan_replay import coerce_path_fields
+from bot_config import cfg
+from plan_replay import coerce_path_fields, recost_rows
 from outcome_storage import (
     OUTCOME_SCHEMA_VERSION as CURRENT_SCHEMA_VERSION,
     MINIMUM_VIABLE_FIELDS,
@@ -379,4 +380,6 @@ def load_archived_outcomes(data_dir: str, window_days: int = 30, shadow: bool = 
             f"dup-sid={stats['dropped_duplicate_sid']}, "
             f"malformed={stats['lines_malformed']}"
         )
+    if str(getattr(cfg, "OUTCOME_COST_MODEL", "flat")) == "flat":
+        recost_rows(rows, (float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100.0)
     return (rows, stats) if return_stats else rows

@@ -15,7 +15,7 @@ from alerts import escape_markdown_v2
 
 from bot_config import cfg, json_dumps, json_loads, format_ist_time, CONFLUENCE_WEIGHTS
 from state import RedisKeyPrefix, RedisStateStore, _rc
-from plan_replay import coerce_path_fields
+from plan_replay import coerce_path_fields, recost_rows
 from playbook import KEY_CURRENT as PLAYBOOK_KEY, playbook_lookup
 import threshold_engine as engine
 from threshold_engine import CUSUMDetector, StabilityGate
@@ -999,6 +999,8 @@ class BrainCore:
             except (KeyError, ValueError) as e:
                 logging.getLogger("macd_bot").debug(f"Brain: dropping malformed outcome row: {e}")
                 continue
+        if str(getattr(cfg, "OUTCOME_COST_MODEL", "flat")) == "flat":
+            recost_rows(parsed, (float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100.0)
         return parsed
 
     async def _get_rows(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
