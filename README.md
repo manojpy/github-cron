@@ -239,7 +239,7 @@ The cooldown (`trade_cooldown:{pair}`) is started only by **Recorded** trades. S
 
 This line is logged on every run (every 15 minutes) and is also included in the Brain report, which is sent every 12 hours (00:00 and 12:00 UTC). Both use the same formatter (`format_outcome_totals` in `state.py`).
 
-- These are **all-time** totals of completed trades, not a rolling 24-hour counter.
+- These are cumulative totals of completed trades, not a rolling 24-hour counter. They are rebuilt daily from the per-pair stats keys, which expire after `STATE_EXPIRY_DAYS` (11 days), so the logged line covers roughly the last 11 days. The Brain report uses the full outcome archive instead whenever that holds more trades, so its totals can be higher than the logged line.
 - A trade counts as Target Achieved if its target is hit before its stop, and as Stop loss Hit if the stop comes first. If neither is hit within `OUTCOME_LOOKAHEAD_CANDLES` (12 candles = 3 h), it is counted by whether it closed in profit, so those timeouts are folded into the two counts.
 - Trades are counted as soon as their target or stop is hit, even before the 12 candles are over. A `<Recorded|Shadowed> trade closed | …` line is logged at that moment.
 - A new shadow registration does not change the total until it resolves, which can take up to 12 candles. `Pre-scanned N shadow pending outcome(s)` at run start shows how many are still open.
