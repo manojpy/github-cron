@@ -1,12 +1,9 @@
 name: ♻️ Replay Un-pushed Outcomes
 
 on:
-  workflow_run:
-    workflows: ["🤖 Run MACD Unified Bot (Hybrid)"]
-    types: [completed]
-    branches: [main]
+  # External Cronjobs.org will hit this via workflow_dispatch every 15 min
   workflow_dispatch:
-
+  
 # Never let two replays race each other for the same artifacts.
 concurrency:
   group: replay-outcomes
@@ -18,7 +15,6 @@ permissions:
 
 jobs:
   replay:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion != 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
