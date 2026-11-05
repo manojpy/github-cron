@@ -1,10 +1,5 @@
 name: 🤖 Run MACD Unified Bot (Hybrid)
 on:
-  # Fired automatically when the replay workflow finishes successfully
-  workflow_run:
-    workflows: ["♻️ Replay Un-pushed Outcomes"]
-    types: [completed]
-    branches: [main]
   workflow_dispatch:
     inputs:
       dry_run:
@@ -53,11 +48,6 @@ env:
 
 jobs:
   run-bot:
-    # Always run on manual dispatch.
-    # On workflow_run, only start when the upstream replay completed successfully.
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-24.04
     timeout-minutes: 16
     permissions:
@@ -139,9 +129,7 @@ jobs:
 
           echo "🕐 Last 15m candle closed ${AGE}s ago (need ${BUFFER}s buffer, max staleness ${STALENESS}s)"
 
-          if [ "$AGE" -lt "$BUFFER" ]; then
-            echo "⚠️ WARNING: Only ${AGE}s since candle close (buffer=${BUFFER}s) — may be rejected as unstable" >> $GITHUB_STEP_SUMMARY
-          elif [ "$AGE" -gt $(( STALENESS - 900 )) ]; then
+          if [ "$AGE" -gt $(( STALENESS - 900 )) ]; then
             # STALENESS is measured from the candle OPEN (1200 = 300s after the close);
             # AGE is measured from the CLOSE, so compare against STALENESS - 900.
             echo "⚠️ WARNING: Candle closed ${AGE}s ago (max=$(( STALENESS - 900 ))s) — every pair will be rejected as stale" >> $GITHUB_STEP_SUMMARY
@@ -343,6 +331,21 @@ jobs:
             exit $EXIT_CODE
           fi
           echo "✅ Apply-brain step finished — see logs above for applied changes." >> $GITHUB_STEP_SUMMARY
+
+      - name: ⏱️ Align start to the candle close
+        if: inputs.apply_brain_plan != true
+        env:
+          TARGET_START_AGE: "55"   # seconds after the 15m close; must stay above CANDLE_MIN_AGE_BUFFER (45)
+        run: |
+          NOW=$(date +%s)
+          AGE=$(( NOW - (NOW / 900) * 900 ))
+          if [ "$AGE" -lt "$TARGET_START_AGE" ]; then
+            WAIT=$(( TARGET_START_AGE - AGE ))
+            echo "⏳ ${AGE}s after the 15m close — waiting ${WAIT}s so the bot starts at ${TARGET_START_AGE}s"
+            sleep "$WAIT"
+          else
+            echo "▶️ ${AGE}s after the 15m close — already past the ${TARGET_START_AGE}s target, starting now"
+          fi
 
       - name: 🚀 Execute MACD Bot
         if: inputs.apply_brain_plan != true
