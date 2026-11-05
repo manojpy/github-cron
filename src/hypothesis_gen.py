@@ -23,7 +23,11 @@ ladder, and remembers every one it ever tried:
                if it never gathered enough. Confirmed rules keep being checked
                and are REVOKED if later trades stop losing.
 
-A confirmed rule is only a candidate for human review. Nothing is blocked."""
+This module never applies anything. The learner publishes confirmed rules
+(`compact_rules`); the alert path may use them only when ALERT_HYPOTHESIS_VETO_MODE
+is live. `direction="win"` runs the SAME ladder on negated P&L, so a confirmed rule
+there is a 'take when' candidate: it is reported, never applied."""
+
 from __future__ import annotations
 
 import hashlib
@@ -69,6 +73,26 @@ def _match(atom: Sequence[Any], f: Dict[str, Any]) -> bool:
         return not isinstance(v, (str, bool)) and v < atom[2]
     return v == atom[2]
 
+def rules_hit(rules: Sequence[Dict[str, Any]], feats: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """First published rule whose every condition matches `feats`, else None."""
+    for rule in rules:
+        atoms = rule.get("atoms") or []
+        if atoms and all(_match(a, feats) for a in atoms):
+            return rule
+    return None
+
+
+def compact_rules(pool: Optional[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
+    """Confirmed rules in the small form the alert path needs, best forward evidence first."""
+    out: List[Dict[str, Any]] = []
+    for rec in ((pool or {}).get("confirmed") or {}).values():
+        fwd = rec.get("fwd") or {}
+        if not rec.get("atoms") or fwd.get("mean") is None:
+            continue
+        out.append({"id": rec["id"], "atoms": rec["atoms"], "text": rec.get("text", ""), "since_ts": rec.get("since_ts"),
+                    "fwd_n": fwd.get("n"), "fwd_mean": fwd.get("mean")})
+    out.sort(key=lambda x: (x["fwd_mean"], -(x["fwd_n"] or 0)))
+    return out[:max(0, int(limit))]
 
 def describe_atom(a: Sequence[Any]) -> str:
     name = str(a[0]).replace("ctx:", "").replace("vote:", "")
@@ -147,7 +171,8 @@ def _forward(rec: Dict[str, Any], feats: List[Dict[str, Any]], ts: List[float], 
 def update_hypothesis_pool(prev: Optional[Dict[str, Any]], rows: Sequence[Row], now: int, *, cost_pct: float,
                            budget: int = 300, shadow_max: int = 10, forward_min_n: int = 30,
                            expire_days: int = 30, alpha: float = 0.05, min_train: int = 30,
-                           min_hold: int = 15, max_cover: float = 0.5, min_rows: int = 200) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+                           min_hold: int = 15, max_cover: float = 0.5, min_rows: int = 200,
+                           direction: str = "lose") -> Tuple[Dict[str, Any], Dict[str, Any]]:
     prev = prev if isinstance(prev, dict) else {}
     pool: Dict[str, Any] = {
         "tried_count": int(prev.get("tried_count") or 0),
@@ -164,7 +189,8 @@ def update_hypothesis_pool(prev: Optional[Dict[str, Any]], rows: Sequence[Row], 
                                "events": events}
     feats = [row_features(r) for r in usable]
     ts = [float(r["entry_ts"]) for r in usable]
-    pnls = [row_net_pnl_pct(r, cost_pct) for r in usable]
+    sign = -1.0 if direction == "win" else 1.0          # "win" searches the negated series: a rule that loses on it wins
+    pnls = [sign * row_net_pnl_pct(r, cost_pct) for r in usable]
 
     def log(rec: Dict[str, Any], status: str) -> None:
         ev = {"ts": int(now), "id": rec["id"], "text": rec["text"], "status": status, "forward": rec.get("fwd")}

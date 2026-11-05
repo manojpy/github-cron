@@ -3045,7 +3045,10 @@ class RedisStateStore:
                                     "effective_required": result.get("effective_required"),
                                     "macro_multiplier": result.get("macro_multiplier"),
                                     "cluster_penalty": result.get("cluster_penalty"),
-                                    "gate_passed": result.get("gate_passed")
+                                    "gate_passed": result.get("gate_passed"),
+                                    # Only the rows a delivery control dropped keep their context: the learner needs the
+                                    # features / stored verdict to re-test the rule or verdict group that dropped them.
+                                    **({"context": row_context} if shadow_rejection_reason in ("hypothesis_veto", "verdict_firewall") else {}),
                                 })
                     except Exception as e:
                         logger_pair.debug(

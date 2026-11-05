@@ -708,6 +708,22 @@ class BrainCore:
             logging.getLogger("macd_bot").debug(f"playbook lookup failed: {e}")
             return None
 
+    def playbook_extra(self, name: str) -> Any:
+        """Top-level playbook field published by the learner ('hyp_rules', 'firewall'), or None.
+        Reads the 5-minute cache that get_playbook_entry() fills (call that first); same staleness
+        rule as the entries: a playbook older than PLAYBOOK_MAX_AGE_HOURS yields None (fail open).
+        Never raises and does no I/O."""
+        try:
+            blob = self._playbook_cache
+            if not blob or getattr(cfg, "PLAYBOOK_MODE", "off") == "off":
+                return None
+            age = time.time() - float(blob.get("generated_ts", 0))
+            if age > float(getattr(cfg, "PLAYBOOK_MAX_AGE_HOURS", 36)) * 3600.0:
+                return None
+            return blob.get(name)
+        except Exception:
+            return None
+
     async def get_trade_quality(self, pair: str, alert_key: str, direction: str, conf_pct: float, adx_val: Optional[float] = None, live_context: Optional[Dict[str, Any]] = None, votes: Optional[Dict[str, bool]] = None, session: str = "unknown") -> Optional[Dict[str, Any]]:
         """Dispatch hook: report-only trade-quality verdict for one
         prospective alert, from the per-alert EV/regime evidence the last

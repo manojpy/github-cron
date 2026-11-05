@@ -37,7 +37,14 @@ from archive_reader import load_archived_outcomes
 from autopsy import build_intelligence, format_intelligence
 from bot_config import _get_session_from_ts
 from brain_helpers import HYPOTHESIS_POOL_KEY
-from intelligence import KEY_INTEL, KEY_VETO_MON, build_report, delivered_trend, format_report, veto_monitor
+from autotune import FIELD as AT_FIELD, KEY_AUTOTUNE
+from autotune import committed as at_committed, evaluate_pending as at_evaluate, observe as at_observe, propose as at_propose
+from hypothesis_gen import compact_rules, update_hypothesis_pool
+from intelligence import (
+    KEY_FIREWALL, KEY_INTEL, KEY_ISSUES, KEY_PROMO_LEDGER, KEY_VETO_MON, KEY_WIN_POOL,
+    build_report, delivered_trend, firewall_contract, format_report, ledger_append, ledger_event,
+    update_issue_state, veto_monitor, verdict_items, win_candidates,
+)
 from feedback import (
     KEY_FEEDBACK, behaviour_report, format_behaviour, format_heat_gate, format_margin,
     heat_gate_report, margin_report,
@@ -324,7 +331,7 @@ async def run(args: argparse.Namespace) -> int:
 
         if args.intel:
             ij = _jl(await sdb.get_metadata(KEY_INTEL, timeout=5.0), {})
-            _say(format_report(ij, veto_mode=str(cfg.VETO_MONITOR_MODE)) if ij else "[learner] no intelligence report stored yet")
+            _say(format_report(ij, veto_mode=str(cfg.VETO_MONITOR_MODE), firewall_mode=str(cfg.ALERT_FIREWALL_MODE)) if ij else "[learner] no intelligence report stored yet")
             return 0
 
         if args.rollback:
@@ -432,21 +439,39 @@ async def run(args: argparse.Namespace) -> int:
                 _say(f"[learner] autopsy skipped: {e!r}")
                 ap_blob = None
 
-        # ── Coordinator: is the veto helping, is the delivered population improving ──
-        # Read-only except one thing: in VETO_MONITOR_MODE=live a proven-harmful veto is
-        # suspended (it logs but still sends) via a flag stored inside the playbook blob.
+        # ── Coordinator ──
+        # Writes no trading rule. It (1) judges every AVOID veto separately and can suspend one that is proven
+        # harmful, (2) decides which advisor-verdict groups the delivery firewall may drop, (3) publishes the
+        # forward-confirmed skip rules, (4) proposes / judges ONE bounded CONFLUENCE_MIN_PCT tightening, (5) runs the
+        # weekly take-side search (report only) and (6) ranks what needs attention. Every action is restrict-only,
+        # has its own mode switch and is written to the promotion ledger. Nothing is written under --dry-run.
         intel_blob: Optional[Dict[str, Any]] = None
         intel_text = ""
         intel_due = False
         intel_failed = False
+        pub: Dict[str, Any] = {}                       # fields added to the playbook blob, applied only if everything succeeded
         veto_res: Optional[Dict[str, Any]] = None
         veto_state_new: Optional[Dict[str, Any]] = None
+        fw_res: Optional[Dict[str, Any]] = None
+        fw_state_new: Optional[Dict[str, Any]] = None
+        at_state_new: Optional[Dict[str, Any]] = None
+        win_pool_new: Optional[Dict[str, Any]] = None
+        issues_new: Optional[Dict[str, Any]] = None
+        fresh_ids: List[str] = []
+        events: List[Dict[str, Any]] = []
         veto_mode = str(cfg.VETO_MONITOR_MODE)
+        fw_mode = str(cfg.ALERT_FIREWALL_MODE)
+        at_mode = str(cfg.AUTOTUNE_MODE)
+        live_ts = [float(r["entry_ts"]) for r in rows if r.get("source") == "LIVE" and r.get("entry_ts") is not None]
+        newest_ts = max(live_ts) if live_ts else None
+        data_ok = bool(rows) and n_path / len(rows) >= 0.6
         if cfg.ENABLE_INTELLIGENCE:
             try:
                 prev_intel = _jl(await _strict_get(sdb, KEY_INTEL), {})
                 prev_pb = _jl(await _strict_get(sdb, KEY_CURRENT), {})
                 hyp_pool = _jl(await _strict_get(sdb, HYPOTHESIS_POOL_KEY), {})
+
+                # 1. veto monitor (per rule)
                 if veto_mode != "off":
                     veto_res, veto_state_new = veto_monitor(
                         blob, rows, fixed=fixed, cost_pct=cost_pct,
@@ -454,36 +479,134 @@ async def run(args: argparse.Namespace) -> int:
                         params={"min_blocks": int(cfg.VETO_MONITOR_MIN_BLOCKS),
                                 "harm_cycles": int(cfg.VETO_MONITOR_HARM_CYCLES),
                                 "resume_cycles": int(cfg.VETO_MONITOR_RESUME_CYCLES)},
-                        family_fn=alert_family_of,
+                        family_fn=alert_family_of, data_ok=data_ok,
                     )
                     if veto_mode == "live" and veto_res["suspended"]:
-                        blob["veto_suspended"] = {"since": veto_res["since"], "reason": veto_res["reason"]}
+                        pub["veto_suspended"] = veto_res["suspended"]
+                    for ch in veto_res["changed"]:
+                        events.append(ledger_event("VETO", ch["key"], f"{ch['event']} veto {ch['key']}: {ch['reason'] or 'proven useful again'}",
+                                                   now_ts, event=ch["event"], mode=veto_mode))
+
+                # 2. delivery firewall contract
+                if fw_mode != "off":
+                    fw_res, fw_state_new = firewall_contract(
+                        verdict_items(rows, fixed=fixed, cost_pct=cost_pct), now_ts=now_ts, newest_ts=newest_ts,
+                        n_rows=len(rows), n_path=n_path, prev_state=_jl(await _strict_get(sdb, KEY_FIREWALL), {}),
+                        candidates=tuple(str(cfg.ALERT_FIREWALL_DROP).split(",")),
+                    )
+                    pub["firewall"] = {"armed": fw_res["armed"], "ts": int(now_ts)}
+                    for ch in fw_res["changed"]:
+                        events.append(ledger_event("FIREWALL", ch["verdict"], f"{ch['event']} firewall for {ch['verdict']}", now_ts,
+                                                   event=ch["event"], mode=fw_mode, evidence=fw_res["per_verdict"][ch["verdict"]]["group"]))
+
+                # 3. publish forward-confirmed skip rules
+                if str(cfg.ALERT_HYPOTHESIS_VETO_MODE) != "off" and data_ok:
+                    pub["hyp_rules"] = compact_rules(hyp_pool, int(cfg.ALERT_HYPOTHESIS_MAX_RULES))
+                    was_ids = {str(x.get("id")) for x in (prev_pb.get("hyp_rules") or [])}
+                    now_ids = {str(x["id"]) for x in pub["hyp_rules"]}
+                    for rid in sorted(now_ids - was_ids):
+                        events.append(ledger_event("HYPOTHESIS_RULE", rid, f"PUBLISHED skip rule {rid} ({cfg.ALERT_HYPOTHESIS_VETO_MODE})", now_ts,
+                                                   text_rule=next(x["text"] for x in pub["hyp_rules"] if str(x["id"]) == rid)))
+                    for rid in sorted(was_ids - now_ids):
+                        events.append(ledger_event("HYPOTHESIS_RULE", rid, f"WITHDRAWN skip rule {rid}", now_ts))
+
+                # 4. bounded autotune (CONFLUENCE_MIN_PCT, tighten only)
+                at_report: Optional[Dict[str, Any]] = None
+                if at_mode != "off":
+                    at_override = await sdb.get_config_override()
+                    cur_pct = float(at_override.get(AT_FIELD, cfg.CONFLUENCE_MIN_PCT))
+                    at_params = {"step": float(cfg.AUTOTUNE_STEP_PCT), "ceiling": float(cfg.AUTOTUNE_CEILING_PCT),
+                                 "cooldown_h": float(cfg.AUTOTUNE_COOLDOWN_HOURS), "eval_h": float(cfg.AUTOTUNE_EVAL_HOURS),
+                                 "max_age_h": float(cfg.PLAYBOOK_MAX_AGE_HOURS)}
+                    st_obs, ext = at_observe(_jl(await _strict_get(sdb, KEY_AUTOTUNE), {}), cur_pct, now_ts)
+                    for x in ext:
+                        events.append(ledger_event("AUTOTUNE", AT_FIELD, x["text"], now_ts, event=x["event"], old=x["old"], new=x["new"]))
+                        at_report = {"status": "EXTERNAL_CHANGE", "text": x["text"], "evidence": {}}
+                    st_fin: Dict[str, Any] = st_obs
+                    done_this_cycle = False
+                    if at_mode == "live" and st_obs.get("pending"):
+                        ev_res, st_ev = at_evaluate(rows, st_obs, now_ts=now_ts, fixed=fixed, cost_pct=cost_pct, params=at_params)
+                        if ev_res["status"] == "ROLLBACK" and not args.dry_run:
+                            rs = ev_res["restore"]
+                            ok = (await sdb.remove_config_override_field(AT_FIELD)) if rs["remove"] else (await sdb.write_config_override(AT_FIELD, rs["value"]))
+                            if ok:
+                                st_fin, done_this_cycle = st_ev, True
+                                at_report = {"status": "ROLLED_BACK", "text": ev_res["text"], "evidence": ev_res["evidence"]}
+                                events.append(ledger_event("AUTOTUNE", AT_FIELD, ev_res["text"], now_ts, event="ROLLED_BACK", old=ev_res["old"], new=ev_res["new"], evidence=ev_res["evidence"]))
+                            else:
+                                at_report = {"status": "WRITE_FAILED", "text": f"rollback of {AT_FIELD} could not be written", "evidence": ev_res["evidence"]}
+                        elif ev_res["status"] == "ROLLBACK":
+                            at_report = {"status": "WOULD_APPLY", "text": "--dry-run: " + ev_res["text"], "evidence": ev_res["evidence"]}
+                        elif ev_res["status"] in ("KEPT", "INSUFFICIENT"):
+                            st_fin, done_this_cycle = st_ev, True
+                            at_report = {"status": "KEPT", "text": ev_res["text"], "evidence": ev_res.get("evidence") or {}}
+                            events.append(ledger_event("AUTOTUNE", AT_FIELD, ev_res["text"], now_ts, event="KEPT", evidence=ev_res.get("evidence") or {}))
+                    if not st_fin.get("pending") and not done_this_cycle and at_report is None:
+                        dec, st_fin = at_propose(
+                            rows, cur_pct=cur_pct, macro_live=bool(cfg.MACRO_CONTEXT_LIVE), state=st_fin, now_ts=now_ts, fixed=fixed, cost_pct=cost_pct,
+                            newest_ts=newest_ts, n_rows=len(rows), n_path=n_path, data_ok=data_ok, params=at_params,
+                        )
+                        if dec["action"] == "APPLY":
+                            if at_mode == "live" and not args.dry_run:
+                                if await sdb.write_config_override(AT_FIELD, dec["new"]):
+                                    st_fin = at_committed(st_fin, dec, now_ts, had_override=AT_FIELD in at_override, prev_override=at_override.get(AT_FIELD))
+                                    at_report = {"status": "APPLIED", "text": dec["text"], "evidence": dec["evidence"]}
+                                    events.append(ledger_event("AUTOTUNE", AT_FIELD, "APPLIED " + dec["text"], now_ts, event="APPLIED", old=dec["old"], new=dec["new"], evidence=dec["evidence"]))
+                                else:
+                                    at_report = {"status": "WRITE_FAILED", "text": f"{AT_FIELD} {dec['old']:g} -> {dec['new']:g} could not be written", "evidence": dec["evidence"]}
+                            else:
+                                at_report = {"status": "WOULD_APPLY", "text": dec["text"], "evidence": dec["evidence"]}
+                    at_state_new = st_fin
+
+                # 5. weekly take-side search (report only)
+                win: List[Dict[str, Any]] = []
+                win_days = int(cfg.INTEL_WIN_SEARCH_DAYS)
+                if win_days > 0:
+                    wp_prev = _jl(await _strict_get(sdb, KEY_WIN_POOL), {})
+                    due_win = (now_ts - float(wp_prev.get("last_run_ts") or 0)) >= win_days * 86400
+                    wp, wsum = update_hypothesis_pool(
+                        wp_prev, [r for r in rows if r.get("source") == "LIVE"], int(now_ts), cost_pct=cost_pct,
+                        budget=int(cfg.INTEL_WIN_BUDGET) if due_win else 0, shadow_max=int(cfg.HYPOTHESIS_SHADOW_MAX),
+                        forward_min_n=int(cfg.HYPOTHESIS_FORWARD_MIN_N), expire_days=int(cfg.HYPOTHESIS_EXPIRE_DAYS), direction="win",
+                    )
+                    last_run = int(now_ts) if (due_win and str((wsum or {}).get("status")) == "ran") else int(wp_prev.get("last_run_ts") or 0)
+                    wp["last_run_ts"] = last_run
+                    win_pool_new = wp
+                    win = win_candidates(wp, rows, cost_pct)
+
+                # 6. one ranked, fingerprinted issue list
                 intel_blob = build_report(
                     now_ts=now_ts, blob=blob, sb=sb, autopsy=ap_blob, hyp_pool=hyp_pool, veto=veto_res,
                     trend=delivered_trend(rows, fixed=fixed, cost_pct=cost_pct, now_ts=now_ts),
                     n_rows=len(rows), n_path=n_path, prev_ts=prev_pb.get("generated_ts"),
                     max_age_h=float(cfg.PLAYBOOK_MAX_AGE_HOURS), veto_mode=veto_mode,
+                    firewall=fw_res, firewall_mode=fw_mode, autotune=at_report, win=win,
+                    newest_ts=newest_ts, data_ok=data_ok,
                 )
-                intel_text = format_report(intel_blob, veto_mode=veto_mode)
+                issues_new, fresh_ids = update_issue_state(_jl(await _strict_get(sdb, KEY_ISSUES), {}), intel_blob["issues"], now_ts)
+                intel_text = format_report(intel_blob, veto_mode=veto_mode, firewall_mode=fw_mode, fresh_ids=fresh_ids)
                 last_sent = float(prev_intel.get("sent_ts") or 0)
                 hours = float(cfg.INTEL_NOTIFY_HOURS)
                 intel_due = hours > 0 and (now_ts - last_sent) >= hours * 3600
                 intel_blob["sent_ts"] = int(now_ts) if intel_due else int(last_sent)
+                blob.update(pub)
                 _say(intel_text)
             except Exception as e:
                 _say(f"[learner] intelligence skipped: {e!r}")
-                intel_blob, veto_res, veto_state_new, intel_failed = None, None, None, True
+                intel_blob, veto_res, veto_state_new, fw_state_new, win_pool_new, issues_new = None, None, None, None, None, None
+                intel_failed = True
 
         if args.dry_run:
             _say("[learner] --dry-run: nothing written")
             return 0
+
         cur = await _strict_get(sdb, KEY_CURRENT)
         cur_state = await _strict_get(sdb, KEY_STATE)
         if intel_failed:
             # The monitor could not run: keep a suspension that is already in force instead of
             # silently turning a suspended veto back on.
             kept = _jl(cur, {}).get("veto_suspended")
-            if kept and veto_mode == "live":
+            if isinstance(kept, dict) and kept and veto_mode == "live":
                 blob["veto_suspended"] = kept
         led = _jl(await _strict_get(sdb, KEY_LEDGER), [])
         led = (led + [e for e in ledger if e.get("decision") != "COLLECTING"])[-_LEDGER_CAP:]
@@ -504,6 +627,16 @@ async def run(args: argparse.Namespace) -> int:
             writes.append((KEY_INTEL, json_dumps(intel_blob)))
         if veto_state_new is not None:
             writes.append((KEY_VETO_MON, json_dumps(veto_state_new)))
+        if fw_state_new is not None:
+            writes.append((KEY_FIREWALL, json_dumps(fw_state_new)))
+        if at_state_new is not None:
+            writes.append((KEY_AUTOTUNE, json_dumps(at_state_new)))
+        if win_pool_new is not None:
+            writes.append((KEY_WIN_POOL, json_dumps(win_pool_new)))
+        if issues_new is not None:
+            writes.append((KEY_ISSUES, json_dumps(issues_new)))
+        if events:
+            writes.append((KEY_PROMO_LEDGER, json_dumps(ledger_append(_jl(await _strict_get(sdb, KEY_PROMO_LEDGER), []), events))))
         await _strict_set_many(sdb, writes, _TTL)
         _say(f"[learner] playbook {blob['label']} written ({len(blob['entries'])} entries, {len(changes)} change(s))")
 
@@ -512,14 +645,18 @@ async def run(args: argparse.Namespace) -> int:
             await notify(text)
         if ap_blob is not None and ap_due and ap_text:
             await notify(ap_text)
-        if veto_res is not None and veto_res.get("changed"):
-            acted = "" if veto_mode == "live" else " (shadow mode: nothing was changed)"
-            if veto_res["changed"] == "SUSPENDED":
-                await notify(f"🛑 PLAYBOOK VETO SUSPENDED{acted}\n{veto_res['reason']}\nAlerts are still sent and logged as VETO until the restriction is proven useful again.")
-            else:
-                await notify(f"✅ PLAYBOOK VETO RESUMED{acted}\nThe restricted alerts are proven losers again (or nothing is restricted).")
-        elif intel_blob is not None and intel_due and intel_text:
-            await notify(intel_text)
+        if intel_blob is not None:
+            urgent = [e for e in events if e["kind"] in ("VETO", "FIREWALL", "AUTOTUNE", "HYPOTHESIS_RULE")]
+            high_new = [i for i in intel_blob["issues"] if i["id"] in set(fresh_ids) and i["sev"] == "HIGH"]
+            head = ""
+            if urgent:
+                shadow_note = {"VETO": veto_mode, "FIREWALL": fw_mode, "AUTOTUNE": at_mode}
+                head = "🧭 INTELLIGENCE — changes this cycle\n" + "\n".join(
+                    f"• {e['text']}" + (" (shadow: nothing changed)" if shadow_note.get(e["kind"]) == "shadow" else "") for e in urgent)
+            if intel_text and (intel_due or high_new):
+                await notify((head + "\n\n" if head else "") + intel_text)
+            elif head:
+                await notify(head)
         return 0
     finally:
         try:

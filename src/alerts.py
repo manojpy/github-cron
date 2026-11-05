@@ -31,6 +31,7 @@ class AlertPayload:
     mark_candle_processed: bool = False
     verdict: Optional[str] = None       # "TAKE" / "WATCH" / "AVOID" (None if unavailable)
     record_shadow: Optional[Callable[[str], Awaitable[None]]] = None   # shadow-tracks this pair's alerts when the run cap drops it
+    firewall_drop: bool = False         # True = the delivery firewall (live) drops this pair message; the dispatcher shadow-tracks it
 
 from alert_advisor import PairAdvice, advise_pair, _pb_rule_hit
 from feedback import build_keyboard, load_open_positions, record_auto_positions
@@ -454,7 +455,37 @@ async def _playbook_veto_drops(*, sdb: "RedisStateStore", pair_name: str, alert:
     )
     return True
 
-async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, alerts_to_send: List[Tuple[str, str, str]], ts_curr: int, close_curr: float, block_reason: str, *, confluence_scores: Optional[Dict[str, Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]]] = None, macro_shadow: Optional[Dict[str, Any]] = None, cluster_penalty: Optional[float] = None, effective_score: Optional[float] = None, effective_required: Optional[float] = None, gr: Optional[GateResult] = None, context: Optional[Dict[str, Any]] = None, logger_pair: Optional[logging.Logger] = None) -> None:
+async def _hypothesis_veto_drops(*, sdb: "RedisStateStore", pair_name: str, alert: Tuple[str, str, str], rules: Optional[List[Dict[str, Any]]], feats: Optional[Dict[str, Any]], ts_curr: int, close_curr: float, confluence_scores: Optional[Dict[str, Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]]], gr: Optional[GateResult], context: Optional[Dict[str, Any]], extra_context: Optional[Dict[str, Any]], logger_pair: logging.Logger) -> bool:
+    """True when this alert must be dropped by a forward-confirmed self-generated 'skip when' rule
+    (live mode only). Shadow mode logs and returns False. Fails open on any problem. A dropped alert is
+    shadow-tracked as 'hypothesis_veto' WITH the features the rule uses, so the learner keeps re-testing
+    the rule on the trades it blocks and can revoke it."""
+    mode = str(getattr(cfg, "ALERT_HYPOTHESIS_VETO_MODE", "off"))
+    if mode == "off" or not rules or not feats:
+        return False
+    try:
+        from hypothesis_gen import rules_hit
+        hit = rules_hit(rules, feats)
+    except Exception:
+        return False
+    if hit is None:
+        return False
+    why = f"forward-confirmed skip rule: {hit.get('text', hit.get('id'))}"
+    if mode != "live":
+        logger_pair.info(f"[{pair_name}] 🧪 HYPOTHESIS VETO (shadow, still sent) {alert[2]}: {why}")
+        return False
+    logger_pair.info(f"[{pair_name}] 🧪 HYPOTHESIS VETO {alert[2]}: {why}")
+    await _record_counterfactual_block(
+        sdb, pair_name, [alert], ts_curr, close_curr,
+        block_reason="hypothesis_veto",
+        confluence_scores=confluence_scores,
+        gr=gr, context=context,
+        logger_pair=logger_pair,
+        extra_context={**(extra_context or {}), "hypothesis_rule": hit.get("id")},
+    )
+    return True
+
+async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, alerts_to_send: List[Tuple[str, str, str]], ts_curr: int, close_curr: float, block_reason: str, *, confluence_scores: Optional[Dict[str, Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]]] = None, macro_shadow: Optional[Dict[str, Any]] = None, cluster_penalty: Optional[float] = None, effective_score: Optional[float] = None, effective_required: Optional[float] = None, gr: Optional[GateResult] = None, context: Optional[Dict[str, Any]] = None, logger_pair: Optional[logging.Logger] = None, extra_context: Optional[Dict[str, Any]] = None) -> None:
     """Shadow-log every alert that reached the dispatch stage but was then
     blocked by a non-win-rate gate (OOD, calibration, confluence, macro,
     cluster, portfolio-heat). The win-rate path already has its own shadow
@@ -513,6 +544,7 @@ async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, a
                 confluence_total=total,
                 confluence_votes=votes,
                 context={
+                    **(extra_context or {}),
                     "rejection_reason": block_reason,
                     "macro_shadow": macro_shadow,
                     "cluster_penalty": cluster_penalty,
@@ -1385,7 +1417,27 @@ async def dispatch_combined_alerts(payloads: List[AlertPayload], telegram_queue:
 
     buys.sort(key=_conf_pct, reverse=True)
     sells.sort(key=_conf_pct, reverse=True)
+
     ordered = (sells + buys) if dominant_sell else (buys + sells)
+
+    # ── Delivery firewall (restrict-only): verdict groups the learner has armed are not sent ──
+    _fw_held = [p for p in ordered if p.firewall_drop]
+    if _fw_held:
+        _fw_ids = {id(p) for p in _fw_held}
+        ordered = [p for p in ordered if id(p) not in _fw_ids]
+        for p in _fw_held:
+            for dk in p.dedup_keys:
+                await sdb.release_recent_alert(p.pair_name, dk)
+            if p.record_shadow is not None:
+                try:
+                    await p.record_shadow("verdict_firewall")
+                except Exception as e:
+                    logger_run.debug(f"verdict_firewall shadow record failed for {p.pair_name}: {e}")
+        logger_run.info(
+            f"Firewall: held back {len(_fw_held)} ({', '.join(p.pair_name for p in _fw_held[:10])}), sending {len(ordered)}"
+        )
+        if not ordered:
+            return 0
 
     # ── Per-run selectivity cap (restrict-only; off while both limits are 0) ──
     _cap_total = int(getattr(cfg, "ALERT_MAX_PAIRS_PER_RUN", 0))
@@ -3181,6 +3233,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     # Passed both gates — keep it.
                     # ── Trade-quality label (advisory; hard-blocks only when ENABLE_QUALITY_HARD_BLOCK) ──
                     if brain_engine and alert_total and alert_total > 0 and alert_score is not None:
+                        hyp_ctx: Optional[Dict[str, Any]] = None
                         try:
                             live_context = {
                                 "rsi_curr": context.get("rsi_curr"),
@@ -3223,6 +3276,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 "gaussian_gate_ok_buy": gr.gaussian_gate_ok_buy,
                                 "gaussian_gate_ok_sell": gr.gaussian_gate_ok_sell,
                             }
+                            hyp_ctx = live_context
                             tq = await brain_engine.get_trade_quality(
                                 pair_name, alert_key, direction,
                                 alert_score / alert_total * 100.0, adx_val,
@@ -3254,6 +3308,28 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             gr=gr, context=context, logger_pair=logger_pair,
                         ):
                             continue
+
+                        # ── Forward-confirmed self-generated skip rules (restrict-only, fail-open) ──
+                        if str(getattr(cfg, "ALERT_HYPOTHESIS_VETO_MODE", "off")) != "off" and hyp_ctx is not None:
+                            try:
+                                from hypothesis_gen import row_features as _hyp_features
+                                _hyp_rules = brain_engine.playbook_extra("hyp_rules")
+                                _hyp_feats = _hyp_features({
+                                    "context": hyp_ctx, "votes": alert_votes,
+                                    "session": _get_session_from_ts(ts_curr), "direction": direction,
+                                }) if _hyp_rules else None
+                            except Exception:
+                                _hyp_rules, _hyp_feats = None, None
+                            if await _hypothesis_veto_drops(
+                                sdb=sdb, pair_name=pair_name,
+                                alert=(alert_title, alert_extra, alert_key),
+                                rules=_hyp_rules, feats=_hyp_feats,
+                                ts_curr=ts_curr, close_curr=close_curr,
+                                confluence_scores={alert_key: _confluence_for(alert_key)},
+                                gr=gr, context=context, extra_context=hyp_ctx,
+                                logger_pair=logger_pair,
+                            ):
+                                continue
                         if tq and tq.get("verdict"):
                             if tq.get("market_state_p_win") is not None:
                                 logger_pair.debug(
@@ -4000,15 +4076,29 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 for _, _, alert_key in alerts_to_send:
                     dedup_keys.append(alert_key)
 
-            async def _record_cap_shadow(reason: str, _alerts: List[Tuple[str, str, str]] = list(alerts_to_send)) -> None:
+            async def _record_cap_shadow(reason: str, _alerts: List[Tuple[str, str, str]] = list(alerts_to_send), _adv: Dict[str, Any] = dict(advisor_seen)) -> None:
                 await _record_counterfactual_block(
                     sdb, pair_name, _alerts, ts_curr, close_curr,
                     block_reason=reason,
                     confluence_scores={ak: _confluence_for(ak) for _, _, ak in _alerts},
                     gr=gr, context=context,
                     logger_pair=logger_pair,
+                    extra_context={"advisor_seen": _adv} if _adv else None,
                 )
 
+            # ── Delivery firewall flag (restrict-only; live drops, shadow only logs; fail-open) ──
+            _fw_drop = False
+            _fw_mode = str(getattr(cfg, "ALERT_FIREWALL_MODE", "off"))
+            if _fw_mode != "off" and pair_verdict and pair_verdict != "TAKE" and brain_engine is not None:
+                try:
+                    _fw = brain_engine.playbook_extra("firewall") or {}
+                    if pair_verdict in set(_fw.get("armed") or []) and pair_verdict in set(str(cfg.ALERT_FIREWALL_DROP).split(",")):
+                        if _fw_mode == "live":
+                            _fw_drop = True
+                        else:
+                            logger_pair.info(f"[{pair_name}] 🛡️ FIREWALL (shadow, still sent) {pair_verdict} pair message")
+                except Exception:
+                    _fw_drop = False
             payload = AlertPayload(
                 pair_name=pair_name,
                 direction=direction,
@@ -4026,6 +4116,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 mark_candle_processed=True,    # dispatcher marks candle after delivery
                 verdict=pair_verdict,
                 record_shadow=_record_cap_shadow,
+                firewall_drop=_fw_drop,
             )
             return pair_name, {
                 "state": "BATCHED",

@@ -1218,8 +1218,11 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
     if str(getattr(cfg, "HYPOTHESIS_GEN_MODE", "shadow")) != "off" and not self.sdb.degraded:
         try:
             _hp_raw = await self.sdb.get_metadata(HYPOTHESIS_POOL_KEY)
+            # Alerts a confirmed rule dropped (live veto) never become real trades; their shadow rows keep
+            # the rule's forward sample alive so it can still be revoked.
+            _hp_rows = list(real_rows) + [r for r in (shadow_rows or []) if r.get("rejection_reason") == "hypothesis_veto"]
             _hp_pool, _hp_sum = update_hypothesis_pool(
-                json_loads(_hp_raw) if _hp_raw else {}, list(real_rows), int(time.time()),
+                json_loads(_hp_raw) if _hp_raw else {}, _hp_rows, int(time.time()),
                 cost_pct=(float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100,
                 budget=int(getattr(cfg, "HYPOTHESIS_BUDGET", 300)),
                 shadow_max=int(getattr(cfg, "HYPOTHESIS_SHADOW_MAX", 10)),
