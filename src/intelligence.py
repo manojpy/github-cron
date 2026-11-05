@@ -43,6 +43,7 @@ import math
 from statistics import NormalDist
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
+from hypothesis_gen import row_features, rules_hit
 from plan_replay import Row, has_path, replay_plan
 from playbook import group_rows
 from scoreboard import _pool as _fwd_pool
@@ -373,6 +374,93 @@ def firewall_contract(
     return result, {"armed": armed, "streak": streak, "last_ts": int(now_ts)}
 
 
+# ── Skip-rule lift test ───────────────────────────────────────────────────────
+
+def default_lift_params() -> Dict[str, Any]:
+    return {"alpha": 0.05, "min_matched": 30, "min_blocks": 15, "max_share": 0.4, "min_cell": 5}
+
+
+def rule_lift(
+    rules: Sequence[Mapping[str, Any]], rows: Sequence[Row], *, fixed: Mapping[str, float], cost_pct: float,
+    params: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Which confirmed skip rules actually make the delivered book better?
+    The hypothesis search confirms a rule when its later trades lose money (mean < 0).  When the whole book
+    loses money after costs, almost any large slice 'loses money', so that test cannot tell a useful rule from a
+    slice that is merely typical.  Here each rule is judged against the REST of the delivered book over the same
+    period, stratified by session and direction, at a Bonferroni-adjusted confidence:
+      keep  <=>  enough independent blocks AND matched trades lose money AND the matched-minus-rest gap has an
+                 upper bound below zero (matched trades are significantly WORSE than the rest).
+    Kept rules are then added best-first until together they would have removed `max_share` of the book.
+    Population: delivered (LIVE) trades plus the trades a live hypothesis veto dropped (shadow-tracked), so a rule
+    keeps being judged after it starts blocking."""
+    P = default_lift_params()
+    P.update(params or {})
+    sl, tp, h = _fixed_tuple(fixed)
+    pop: List[Tuple[Row, Dict[str, Any], float, bool]] = []          # (row, features, net pnl, is_live)
+    for r in rows:
+        src = r.get("source")
+        live = src == "LIVE"
+        if not (live or (src == "SHADOW" and r.get("rejection_reason") == "hypothesis_veto")):
+            continue
+        if r.get("entry_ts") is None or not has_path(r) or not isinstance(r.get("context"), dict):
+            continue
+        res = replay_plan(r, sl, tp, h, cost_pct)
+        if res is not None:
+            pop.append((r, row_features(r), res[1], live))
+    per: Dict[str, Any] = {}
+    matched_ids: Dict[str, Set[Tuple[Any, Any, Any]]] = {}
+    stage: Dict[str, Tuple[Items, Items]] = {}
+    for rule in rules:
+        rid = str(rule["id"])
+        since = float(rule.get("since_ts") or 0)
+        rdict = dict(rule)
+        m_items: Items = []
+        rest: Items = []
+        ids: Set[Tuple[Any, Any, Any]] = set()
+        for r, feats, pnl, live in pop:
+            if r["entry_ts"] <= since:
+                continue
+            if rules_hit([rdict], feats) is not None:
+                m_items.append((r, pnl, sl))
+                ids.add(_rid(r))
+            elif live:
+                rest.append((r, pnl, sl))
+        stage[rid], matched_ids[rid] = (m_items, rest), ids
+    evaluable = [rid for rid, (m, _) in stage.items()
+                 if len(m) >= int(P["min_matched"]) and _fwd_pool(m)["n_blocks"] >= int(P["min_blocks"])]
+    z_b = _z(float(P["alpha"]), len(evaluable))
+    scored: List[Tuple[float, str]] = []
+    for rid, (m_items, rest) in stage.items():
+        pm = _fwd_pool(m_items)
+        gap, gse, cells = _stratified_gap(m_items, rest, int(P["min_cell"]))
+        gap_ucb = None if gap is None or gse is None else gap + z_b * gse
+        if rid not in evaluable:
+            verdict = "COLLECTING"
+        elif gap is None:
+            verdict = "UNTESTABLE"
+        elif pm["ev"] is not None and float(pm["ev"]) < 0 and gap_ucb is not None and gap_ucb < 0:
+            verdict = "LIFT"
+            scored.append((gap, rid))
+        else:
+            verdict = "NO_LIFT"
+        per[rid] = {"verdict": verdict, "matched": _brief(pm), "gap": _rnd(gap), "gap_ucb": _rnd(gap_ucb), "cells": cells,
+                    "rest_ev": _rnd(_fwd_pool(rest)["ev"])}
+    scored.sort()
+    keep: List[str] = []
+    union: Set[Tuple[Any, Any, Any]] = set()
+    base = {_rid(r) for r, _f, _p, _l in pop}
+    for _gap_v, rid in scored:
+        cand = union | matched_ids[rid]
+        if base and len(cand) / len(base) > float(P["max_share"]):
+            per[rid]["verdict"] = "OVER_COVERAGE"
+            continue
+        union = cand
+        keep.append(rid)
+    return {"keep": keep, "per_rule": per, "union_share": _rnd(len(union) / len(base), 3) if base else None, "z_adj": round(z_b, 2),
+            "n_rules": len(per)}
+
+
 # ── Take-side candidates (weekly search) ──────────────────────────────────────
 
 def win_candidates(pool: Optional[Mapping[str, Any]], rows: Sequence[Row], cost_pct: float, limit: int = 5) -> List[Dict[str, Any]]:
@@ -432,7 +520,7 @@ def build_report(
     n_rows: int, n_path: int, prev_ts: Optional[float] = None, max_age_h: float = 36.0, min_path_share: float = 0.6,
     veto_mode: str = "off", firewall: Optional[Mapping[str, Any]] = None, firewall_mode: str = "off",
     autotune: Optional[Mapping[str, Any]] = None, win: Optional[Sequence[Mapping[str, Any]]] = None,
-    newest_ts: Optional[float] = None, data_ok: bool = True,
+    newest_ts: Optional[float] = None, data_ok: bool = True, hyp_lift: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """One ranked issue list (with evidence and an automation-safety flag) from what the learner computed."""
     issues: List[Dict[str, Any]] = []
@@ -510,10 +598,17 @@ def build_report(
 
     confirmed = (hyp_pool or {}).get("confirmed") or {}
     if confirmed:
-        top = sorted(confirmed.values(), key=lambda v: -(v.get("confirmed_at") or 0))[:3]
-        issues.append(_issue("INFO", "HYPOTHESES_CONFIRMED", f"{len(confirmed)} self-generated 'skip when' rule(s) passed forward testing: " +
-                             "; ".join(str(v.get("text", "?")) for v in top) + ".",
-                             "They only block alerts if ALERT_HYPOTHESIS_VETO_MODE=live; otherwise shadow-logged.", evidence={"n": len(confirmed)}))
+        per = (hyp_lift or {}).get("per_rule") or {}
+        n_keep = len((hyp_lift or {}).get("keep") or [])
+        counts: Dict[str, int] = {}
+        for d in per.values():
+            counts[d["verdict"]] = counts.get(d["verdict"], 0) + 1
+        top = [str(v.get("text", "?")) for k, v in confirmed.items() if (per.get(k) or {}).get("verdict") == "LIFT"][:3]
+        issues.append(_issue("INFO", "HYPOTHESES_CONFIRMED",
+                             f"{len(confirmed)} self-generated 'skip when' rule(s) passed forward testing; {n_keep} also beat the REST of the delivered book "
+                             f"({', '.join(f'{v} {k}' for k, v in sorted(counts.items())) or 'not judged'})" + (": " + "; ".join(top) if top else "") + ".",
+                             "Only rules that beat the rest of the book are published to the alert path, and only block if ALERT_HYPOTHESIS_VETO_MODE=live.",
+                             evidence={"n": len(confirmed)}))
 
     for c in (win or [])[:3]:
         issues.append(_issue("INFO", "TAKE_SIDE_CANDIDATE", f"Take-side candidate: {c.get('text')} — forward EV {c.get('rule_ev'):+.2f}% vs delivered book {c.get('baseline_ev') if c.get('baseline_ev') is not None else 'n/a'}% "

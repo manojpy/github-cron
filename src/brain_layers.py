@@ -43,6 +43,7 @@ LAYER_OF: Dict[str, str] = {
     "threshold_engine": RESEARCH, "archive_reader": RESEARCH, "scoreboard": RESEARCH,
     "confluence_tier_report": RESEARCH, "learner": RESEARCH, "autopsy": RESEARCH,
     "brain_recommend_baseline": RESEARCH, "brain_recommend_full": RESEARCH,
+    "intelligence": RESEARCH, "autotune": RESEARCH,
     # ── validation ──
     "threshold_validation": VALIDATION, "repair_ledger": VALIDATION, "brain_audit": VALIDATION,
     # ── policy ──
@@ -61,9 +62,8 @@ LAYER_OF: Dict[str, str] = {
 PURE = frozenset({
     "feature_store", "hypothesis_gen", "plan_replay", "rulemine", "autopsy", "threshold_stats",
     "threshold_analysis", "threshold_models", "threshold_quality", "threshold_repair",
-    "threshold_validation",
+    "threshold_validation", "intelligence", "autotune",
 })
-
 # State-store methods that change what the bot does.
 POLICY_WRITERS = frozenset({
     "write_config_override", "set_alert_key_disabled", "set_pair_threshold",
@@ -83,8 +83,10 @@ KNOWN_EXCEPTIONS: Dict[Tuple[str, str], str] = {
         "protective auto-disable, and re-enable only after the action gate passes",
     ("brain_recommend_full", "clear_dynamic_weights"):
         "auto-rollback of a weight repair that was measured as harmful",
+    ("learner", "write_config_override"):
+        "autotune: one bounded CONFLUENCE_MIN_PCT tightening (AUTOTUNE_MODE=live only) and its rollback; "
+        "decided by the pure autotune module after all readiness checks pass, and recorded in the promotion ledger",
 }
-
 # Research modules that import a policy module today, only for text / delivery
 # helpers (no state changes). Documented so they are visible; a new one is a violation.
 ALLOWED_IMPORTS: Dict[Tuple[str, str], str] = {

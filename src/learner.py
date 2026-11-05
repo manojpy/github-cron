@@ -43,7 +43,7 @@ from hypothesis_gen import compact_rules, update_hypothesis_pool
 from intelligence import (
     KEY_FIREWALL, KEY_INTEL, KEY_ISSUES, KEY_PROMO_LEDGER, KEY_VETO_MON, KEY_WIN_POOL,
     build_report, delivered_trend, firewall_contract, format_report, ledger_append, ledger_event,
-    update_issue_state, veto_monitor, verdict_items, win_candidates,
+    rule_lift, update_issue_state, veto_monitor, verdict_items, win_candidates,
 )
 from feedback import (
     KEY_FEEDBACK, behaviour_report, format_behaviour, format_heat_gate, format_margin,
@@ -499,16 +499,22 @@ async def run(args: argparse.Namespace) -> int:
                         events.append(ledger_event("FIREWALL", ch["verdict"], f"{ch['event']} firewall for {ch['verdict']}", now_ts,
                                                    event=ch["event"], mode=fw_mode, evidence=fw_res["per_verdict"][ch["verdict"]]["group"]))
 
-                # 3. publish forward-confirmed skip rules
+                # 3. publish only the confirmed skip rules that beat the REST of the delivered book
+                hyp_lift: Optional[Dict[str, Any]] = None
                 if str(cfg.ALERT_HYPOTHESIS_VETO_MODE) != "off" and data_ok:
-                    pub["hyp_rules"] = compact_rules(hyp_pool, int(cfg.ALERT_HYPOTHESIS_MAX_RULES))
+                    cand_rules = compact_rules(hyp_pool, 50)
+                    hyp_lift = rule_lift(cand_rules, rows, fixed=fixed, cost_pct=cost_pct)
+                    by_id = {str(x["id"]): x for x in cand_rules}
+                    pub["hyp_rules"] = [by_id[i] for i in hyp_lift["keep"]][:int(cfg.ALERT_HYPOTHESIS_MAX_RULES)]
                     was_ids = {str(x.get("id")) for x in (prev_pb.get("hyp_rules") or [])}
                     now_ids = {str(x["id"]) for x in pub["hyp_rules"]}
                     for rid in sorted(now_ids - was_ids):
-                        events.append(ledger_event("HYPOTHESIS_RULE", rid, f"PUBLISHED skip rule {rid} ({cfg.ALERT_HYPOTHESIS_VETO_MODE})", now_ts,
-                                                   text_rule=next(x["text"] for x in pub["hyp_rules"] if str(x["id"]) == rid)))
+                        rtxt = next(x["text"] for x in pub["hyp_rules"] if str(x["id"]) == rid)
+                        events.append(ledger_event("HYPOTHESIS_RULE", rid, f"PUBLISHED skip rule ({cfg.ALERT_HYPOTHESIS_VETO_MODE}): {rtxt}", now_ts,
+                                                   evidence=hyp_lift["per_rule"].get(rid)))
                     for rid in sorted(was_ids - now_ids):
-                        events.append(ledger_event("HYPOTHESIS_RULE", rid, f"WITHDRAWN skip rule {rid}", now_ts))
+                        why = (hyp_lift["per_rule"].get(rid) or {}).get("verdict", "no longer confirmed")
+                        events.append(ledger_event("HYPOTHESIS_RULE", rid, f"WITHDRAWN skip rule {rid}: {why}", now_ts))
 
                 # 4. bounded autotune (CONFLUENCE_MIN_PCT, tighten only)
                 at_report: Optional[Dict[str, Any]] = None
@@ -581,7 +587,7 @@ async def run(args: argparse.Namespace) -> int:
                     n_rows=len(rows), n_path=n_path, prev_ts=prev_pb.get("generated_ts"),
                     max_age_h=float(cfg.PLAYBOOK_MAX_AGE_HOURS), veto_mode=veto_mode,
                     firewall=fw_res, firewall_mode=fw_mode, autotune=at_report, win=win,
-                    newest_ts=newest_ts, data_ok=data_ok,
+                    newest_ts=newest_ts, data_ok=data_ok, hyp_lift=hyp_lift,
                 )
                 issues_new, fresh_ids = update_issue_state(_jl(await _strict_get(sdb, KEY_ISSUES), {}), intel_blob["issues"], now_ts)
                 intel_text = format_report(intel_blob, veto_mode=veto_mode, firewall_mode=fw_mode, fresh_ids=fresh_ids)
