@@ -31,10 +31,10 @@ High-performance cryptocurrency trading alert bot with AOT/Cython/Numba compilat
 
 | Workflow | File | Trigger | Cadence |
 |----------|------|---------|---------|
-| Run MACD Unified Bot | `run-bot.yml` | Cronjobs.org → `workflow_dispatch` | Every 15 min (:01, :16, :31, :46) |
+| Run MACD Unified Bot | `run-bot.yml` | Cronjobs.org → `workflow_dispatch` | Every 15 min (:00, :15, :30, :45) |
 | Watchdog | `watchdog.yml` | Cronjobs.org → `workflow_dispatch` | Every 30 min |
 | Learner | `learner.yml` | Cronjobs.org → `workflow_dispatch` | Every 6 hours |
-| Cleanup outcomes | `cleanup-outcomes.yml` | Cronjobs.org → `workflow_dispatch` | Daily at 02:00 (timezone as set on the Cronjobs.org job) |
+| Cleanup outcomes | `cleanup-outcomes.yml` | Cronjobs.org → `workflow_dispatch` | Daily at 02:10 (timezone as set on the Cronjobs.org job) |
 | Redis audit | `redis-audit.yml` | `workflow_run` after the Learner completes | Chained, once per Learner run |
 | Replay un-pushed outcomes | `replay-outcomes.yml` | `workflow_run` after the bot run completes | Does work only after a non-successful bot run |
 | Build AOT image | `build.yml` | Push to `main` (src / Dockerfile / requirements) + pull request (build and test only, nothing pushed) + weekly GitHub `schedule` (`0 2 * * 0`, Sunday 02:00 UTC) + manual | On code change and weekly |
