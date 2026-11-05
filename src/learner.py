@@ -657,7 +657,7 @@ async def run(args: argparse.Namespace) -> int:
             high_new = [i for i in intel_blob["issues"] if i["id"] in set(fresh_ids) and i["sev"] == "HIGH"]
             head = ""
             if urgent:
-                shadow_note = {"VETO": veto_mode, "FIREWALL": fw_mode, "AUTOTUNE": at_mode}
+                shadow_note = {"VETO": veto_mode, "FIREWALL": fw_mode, "AUTOTUNE": at_mode, "HYPOTHESIS_RULE": str(cfg.ALERT_HYPOTHESIS_VETO_MODE)}
                 head = "🧭 INTELLIGENCE — changes this cycle\n" + "\n".join(
                     f"• {e['text']}" + (" (shadow: nothing changed)" if shadow_note.get(e["kind"]) == "shadow" else "") for e in urgent)
             if intel_text and (intel_due or high_new):
