@@ -11,7 +11,7 @@ High-performance cryptocurrency trading alert bot with AOT/Cython/Numba compilat
 | Aspect | Detail |
 |--------|--------|
 | **What** | Analyzes crypto pairs with 20+ technical indicators and confluence gates |
-| **When** | Every 15 minutes at :01, :16, :31, :46, triggered externally by Cronjobs.org |
+| **When** | Every 15 minutes at :00, :15, :30, :45, triggered externally by Cronjobs.org |
 | **Outputs** | Telegram alerts with smart deduplication + optional Brain reports |
 | **Speed** | Typically 15–45 s for a full cycle (AOT path) |
 | **Memory** | Soft limit ~850 MB, container hard limit 900 MB |
@@ -22,7 +22,7 @@ High-performance cryptocurrency trading alert bot with AOT/Cython/Numba compilat
 ## 🏭 Production Context (important)
 
 - The main bot (`run-bot.yml` → `macd_unified.py`) is triggered by an **external Cronjobs.org job**, not by a GitHub Actions `schedule`.
-- **Schedule**: every 15 minutes at minutes **1, 16, 31, 46** of every hour (`:01`, `:16`, `:31`, `:46`), one minute after each 15 m candle close.
+- **Schedule**: every 15 minutes at minutes of every hour.
 - **Purpose of each run**: fetch market data, evaluate signals, and send Telegram alerts when conditions are met.
 - **Redis** is the shared state store. **Telegram** is the only outbound notification channel.
 - The bot is safe to run frequently: no duplicate alerts, no wasted API calls, no unbounded Redis growth, and minimal round-trips.
@@ -104,7 +104,7 @@ This triggers `build.yml` → multi-stage Docker image with Cython + AOT compila
 
 ### 5. Set Up the External Triggers
 
-Create one Cronjobs.org job per workflow in the table above. Each job calls the GitHub API `workflow_dispatch` endpoint for that workflow file on the `main` branch, using a token that is allowed to dispatch workflows. For the main bot use the cron expression `1,16,31,46 * * * *`.
+Create one Cronjobs.org job per workflow in the table above. Each job calls the GitHub API `workflow_dispatch` endpoint for that workflow file on the `main` branch, using a token that is allowed to dispatch workflows. For the main bot use the cron expression `00,15,30,45 * * * *`.
 
 To test without the scheduler: Actions → **Run MACD Unified Bot** → Run workflow. Optional inputs: dry-run, Brain report, apply Brain plan, clear Redis, clear kill-switch.
 
