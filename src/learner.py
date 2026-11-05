@@ -42,7 +42,7 @@ from autotune import committed as at_committed, evaluate_pending as at_evaluate,
 from hypothesis_gen import compact_rules, update_hypothesis_pool
 from intelligence import (
     KEY_FIREWALL, KEY_INTEL, KEY_ISSUES, KEY_PROMO_LEDGER, KEY_VETO_MON, KEY_WIN_POOL,
-    build_report, delivered_trend, firewall_contract, format_report, ledger_append, ledger_event,
+    build_report, conviction_anatomy, delivered_trend, firewall_contract, format_report, ledger_append, ledger_event,
     rule_lift, update_issue_state, veto_monitor, verdict_items, win_candidates,
 )
 from feedback import (
@@ -588,6 +588,7 @@ async def run(args: argparse.Namespace) -> int:
                     max_age_h=float(cfg.PLAYBOOK_MAX_AGE_HOURS), veto_mode=veto_mode,
                     firewall=fw_res, firewall_mode=fw_mode, autotune=at_report, win=win,
                     newest_ts=newest_ts, data_ok=data_ok, hyp_lift=hyp_lift,
+                    anatomy=conviction_anatomy(rows, fixed=fixed, cost_pct=cost_pct),
                 )
                 issues_new, fresh_ids = update_issue_state(_jl(await _strict_get(sdb, KEY_ISSUES), {}), intel_blob["issues"], now_ts)
                 intel_text = format_report(intel_blob, veto_mode=veto_mode, firewall_mode=fw_mode, fresh_ids=fresh_ids)

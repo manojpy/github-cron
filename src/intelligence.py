@@ -461,6 +461,107 @@ def rule_lift(
             "n_rules": len(per)}
 
 
+# ── Conviction anatomy ────────────────────────────────────────────────────────
+
+ANATOMY_FEATURES = ("conviction", "net_ev", "ev_p5", "p_ev_positive", "ensemble_p", "quality_score", "market_state_p_win",
+                    "gate_margin", "conf_pct")
+
+
+def _anatomy_value(r: Row, name: str) -> Optional[float]:
+    """The value of one conviction ingredient as it was stored BEFORE the outcome existed."""
+    ctx = r.get("context")
+    ctx = ctx if isinstance(ctx, dict) else {}
+    try:
+        if name == "conviction":
+            seen = ctx.get("advisor_seen")
+            v = seen.get("conviction") if isinstance(seen, dict) else None
+        elif name in ("gate_margin", "conf_pct"):
+            es, rq, total = r.get("effective_score"), r.get("effective_required"), r.get("total")
+            if es is None or not total or float(total) <= 0:
+                return None
+            if name == "conf_pct":
+                v = float(es) / float(total)
+            else:
+                if not rq or float(total) <= float(rq):
+                    return None
+                v = (float(es) - float(rq)) / (float(total) - float(rq))
+        else:
+            ps = ctx.get("prediction_seen")
+            v = ps.get(name) if isinstance(ps, dict) else None
+        if v is None or isinstance(v, bool):
+            return None
+        f = float(v)
+        return f if f == f else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _auc(pos: Sequence[float], neg: Sequence[float]) -> Optional[float]:
+    """P(score of a winner > score of a loser), ties count half (Mann-Whitney)."""
+    if not pos or not neg:
+        return None
+    allv = sorted([(v, 1) for v in pos] + [(v, 0) for v in neg])
+    ranks: List[float] = [0.0] * len(allv)
+    i = 0
+    while i < len(allv):
+        j = i
+        while j + 1 < len(allv) and allv[j + 1][0] == allv[i][0]:
+            j += 1
+        for k in range(i, j + 1):
+            ranks[k] = (i + j) / 2.0 + 1.0
+        i = j + 1
+    r_pos = sum(ranks[k] for k in range(len(allv)) if allv[k][1] == 1)
+    return (r_pos - len(pos) * (len(pos) + 1) / 2.0) / (len(pos) * len(neg))
+
+
+def conviction_anatomy(
+    rows: Sequence[Row], *, fixed: Mapping[str, float], cost_pct: float, params: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Does each ingredient of the advisor's conviction (and the conviction itself) rank delivered trades the way
+    reality did?  For every ingredient: AUC against 'trade won after costs' and the EV of the top third minus the EV
+    of the bottom third, with cluster-robust standard errors over 3h blocks and a Bonferroni-adjusted confidence
+    across ingredients.  PREDICTIVE = top third significantly better; ANTI = top third significantly WORSE (the score
+    ranks backwards); NO_SIGNAL otherwise.  Uses the stored pre-outcome values only.  Report only."""
+    P = {"min_n": 60, "alpha": 0.05, "min_side": 20}
+    P.update(params or {})
+    sl, tp, h = _fixed_tuple(fixed)
+    base: List[Tuple[Row, float]] = []
+    for r in rows:
+        if r.get("source") != "LIVE" or r.get("entry_ts") is None or not has_path(r):
+            continue
+        res = replay_plan(r, sl, tp, h, cost_pct)
+        if res is not None:
+            base.append((r, res[1]))
+    data: Dict[str, List[Tuple[Row, float, float]]] = {}
+    for name in ANATOMY_FEATURES:
+        vals = [(r, pnl, v) for r, pnl in base for v in [_anatomy_value(r, name)] if v is not None]
+        data[name] = vals
+    evaluable = [n for n, vals in data.items() if len(vals) >= int(P["min_n"]) and len({round(x[2], 9) for x in vals}) > 2]
+    z_b = _z(float(P["alpha"]), len(evaluable))
+    out: Dict[str, Any] = {}
+    for name, vals in data.items():
+        if name not in evaluable:
+            out[name] = {"verdict": "INSUFFICIENT", "n": len(vals)}
+            continue
+        xs = sorted(x[2] for x in vals)
+        lo, hi = xs[len(xs) // 3], xs[(2 * len(xs)) // 3]
+        bottom: Items = [(r, p, sl) for r, p, v in vals if v <= lo]
+        top: Items = [(r, p, sl) for r, p, v in vals if v >= hi]
+        auc = _auc([v for _r, p, v in vals if p > 0], [v for _r, p, v in vals if p <= 0])
+        if lo >= hi or len(top) < int(P["min_side"]) or len(bottom) < int(P["min_side"]):
+            out[name] = {"verdict": "NO_SIGNAL", "n": len(vals), "auc": _rnd(auc), "note": "too many ties to split into thirds"}
+            continue
+        pt, pb = _fwd_pool(top), _fwd_pool(bottom)
+        gap, gse, _l = _gap(pt, pb)
+        if gap is None or gse is None:
+            out[name] = {"verdict": "NO_SIGNAL", "n": len(vals), "auc": _rnd(auc)}
+            continue
+        verdict = "PREDICTIVE" if gap - z_b * gse > 0 else "ANTI" if gap + z_b * gse < 0 else "NO_SIGNAL"
+        out[name] = {"verdict": verdict, "n": len(vals), "auc": _rnd(auc), "gap": _rnd(gap), "top": _brief(pt), "bottom": _brief(pb),
+                     "cut_lo": _rnd(lo, 4), "cut_hi": _rnd(hi, 4)}
+    return {"features": out, "z_adj": round(z_b, 2), "n_rows": len(base)}
+
+
 # ── Take-side candidates (weekly search) ──────────────────────────────────────
 
 def win_candidates(pool: Optional[Mapping[str, Any]], rows: Sequence[Row], cost_pct: float, limit: int = 5) -> List[Dict[str, Any]]:
@@ -521,6 +622,7 @@ def build_report(
     veto_mode: str = "off", firewall: Optional[Mapping[str, Any]] = None, firewall_mode: str = "off",
     autotune: Optional[Mapping[str, Any]] = None, win: Optional[Sequence[Mapping[str, Any]]] = None,
     newest_ts: Optional[float] = None, data_ok: bool = True, hyp_lift: Optional[Mapping[str, Any]] = None,
+    anatomy: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """One ranked issue list (with evidence and an automation-safety flag) from what the learner computed."""
     issues: List[Dict[str, Any]] = []
@@ -610,6 +712,18 @@ def build_report(
                              "Only rules that beat the rest of the book are published to the alert path, and only block if ALERT_HYPOTHESIS_VETO_MODE=live.",
                              evidence={"n": len(confirmed)}))
 
+    feats = (anatomy or {}).get("features") or {}
+    if feats:
+        anti = [k for k, d in feats.items() if d.get("verdict") == "ANTI"]
+        conv = feats.get("conviction") or {}
+        if conv.get("verdict") in ("ANTI", "NO_SIGNAL", "INSUFFICIENT") or anti:
+            sev = "MED" if conv.get("verdict") == "ANTI" else "LOW"
+            issues.append(_issue(sev, "CONVICTION_NOT_PREDICTIVE",
+                                 f"Conviction {conv.get('verdict', 'n/a')} (AUC {conv.get('auc') if conv.get('auc') is not None else 'n/a'}); "
+                                 + (f"ingredients ranking backwards: {', '.join(anti)}." if anti else "no ingredient ranks backwards yet."),
+                                 "Do not trust a TAKE or AVOID for ranking until conviction is PREDICTIVE; report only, nothing is changed.",
+                                 evidence={"n": conv.get("n")}))
+
     for c in (win or [])[:3]:
         issues.append(_issue("INFO", "TAKE_SIDE_CANDIDATE", f"Take-side candidate: {c.get('text')} — forward EV {c.get('rule_ev'):+.2f}% vs delivered book {c.get('baseline_ev') if c.get('baseline_ev') is not None else 'n/a'}% "
                              f"(lift {c.get('lift') if c.get('lift') is not None else 'n/a'}, n={c.get('n')}).",
@@ -629,7 +743,7 @@ def build_report(
 
     issues.sort(key=lambda i: _SEV_ORDER.get(i["sev"], 9))
     return {"ts": int(now_ts), "playbook": blob.get("label"), "status": issues[0]["sev"] if issues else "OK", "issues": issues,
-            "trend": trend, "veto": veto, "firewall": firewall, "autotune": autotune, "win": list(win or [])}
+            "trend": trend, "veto": veto, "firewall": firewall, "autotune": autotune, "win": list(win or []), "anatomy": anatomy}
 
 
 def update_issue_state(prev: Optional[Mapping[str, Any]], issues: Sequence[Mapping[str, Any]], now_ts: float,
@@ -698,6 +812,16 @@ def format_report(rep: Mapping[str, Any], *, veto_mode: str = "off", firewall_mo
         lines += ["", f"FIREWALL [{firewall_mode}] — armed: {', '.join(fw.get('armed') or []) or 'none'}"]
         for name, d in (fw.get("per_verdict") or {}).items():
             lines.append(f"  · {name}: {stat(d['group'])}; checks failed: {', '.join(c for c, ok in d['checks'].items() if not ok) or 'none'}")
+    an = (rep.get("anatomy") or {}).get("features") or {}
+    if an:
+        lines += ["", "CONVICTION ANATOMY — does each score rank trades the way reality did? (top third vs bottom third, after costs)"]
+        for k, d in an.items():
+            if d["verdict"] == "INSUFFICIENT":
+                lines.append(f"  · {k}: not enough stored values (n={d['n']})")
+            elif d.get("gap") is None:
+                lines.append(f"  · {k}: {d['verdict']} (AUC {d.get('auc')}) {d.get('note', '')}".rstrip())
+            else:
+                lines.append(f"  · {k}: {d['verdict']} — AUC {d['auc']}, top EV {d['top']['ev']:+.2f}% vs bottom {d['bottom']['ev']:+.2f}% (gap {d['gap']:+.2f}%, n={d['n']})")
     iss = rep.get("issues") or []
     fresh = set(fresh_ids or [])
     lines += ["", "ISSUES" if iss else "No issues found."]
