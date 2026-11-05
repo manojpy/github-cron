@@ -1,5 +1,10 @@
 name: 🤖 Run MACD Unified Bot (Hybrid)
 on:
+  # Fired automatically when the replay workflow finishes successfully
+  workflow_run:
+    workflows: ["♻️ Replay Un-pushed Outcomes"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       dry_run:
@@ -48,6 +53,11 @@ env:
 
 jobs:
   run-bot:
+    # Always run on manual dispatch.
+    # On workflow_run, only start when the upstream replay completed successfully.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-24.04
     timeout-minutes: 16
     permissions:
