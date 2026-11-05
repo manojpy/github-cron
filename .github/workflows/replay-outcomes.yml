@@ -3,12 +3,7 @@ name: ♻️ Replay Un-pushed Outcomes
 on:
   # External Cronjobs.org will hit this via workflow_dispatch every 15 min
   workflow_dispatch:
-  # Keep the recovery path so a failed bot run can still trigger a replay
-  workflow_run:
-    workflows: ["🤖 Run MACD Unified Bot (Hybrid)"]
-    types: [completed]
-    branches: [main]
-
+  
 # Never let two replays race each other for the same artifacts.
 concurrency:
   group: replay-outcomes
@@ -20,11 +15,6 @@ permissions:
 
 jobs:
   replay:
-    # Always run on workflow_dispatch (Cronjobs / manual).
-    # On workflow_run, only run when the bot did NOT succeed (recovery).
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion != 'success')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
