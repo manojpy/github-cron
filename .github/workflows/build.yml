@@ -24,6 +24,12 @@ on:
         required: false
         default: 'false'
 
+# Two overlapping builds could finish out of order and leave :latest on the OLDER
+# commit (run-bot.yml falls back to :latest). Queue them instead of racing.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot

@@ -67,12 +67,32 @@ jobs:
 
       - name: 🔥 Start image pull (background)
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA}"
+          BASE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          IMAGE="${BASE}:sha-${GITHUB_SHA}"
           echo "RUN_IMAGE=$IMAGE" >> "$GITHUB_ENV"
           echo "PULL_STARTED=$(date +%s)" >> "$GITHUB_ENV"
-          rm -f /tmp/image-pull.rc /tmp/image-pull.log
-          nohup sh -c "docker pull --quiet --platform linux/amd64 '$IMAGE' > /tmp/image-pull.log 2>&1; echo \$? > /tmp/image-pull.rc" > /dev/null 2>&1 &
-          echo "🐳 Pulling $IMAGE in the background"
+          rm -f /tmp/image-pull.rc /tmp/image-pull.log /tmp/image-pull.used
+
+          # The sha-<commit> tag only exists for commits that triggered build.yml
+          # (src/, requirements, Dockerfile...). After a config/README/workflow-only
+          # commit it is missing, so the :latest fallback must start HERE, inside the
+          # background job. Doing it later in the wait step meant a second, serial pull
+          # on the critical path of every run.
+          cat > /tmp/pull-image.sh <<'EOF'
+          #!/bin/sh
+          SHA_IMAGE="$1"; LATEST_IMAGE="$2"
+          if docker pull --quiet --platform linux/amd64 "$SHA_IMAGE" > /tmp/image-pull.log 2>&1; then
+            echo "$SHA_IMAGE" > /tmp/image-pull.used
+            echo 0 > /tmp/image-pull.rc
+          elif docker pull --quiet --platform linux/amd64 "$LATEST_IMAGE" >> /tmp/image-pull.log 2>&1; then
+            echo "$LATEST_IMAGE" > /tmp/image-pull.used
+            echo 0 > /tmp/image-pull.rc
+          else
+            echo 1 > /tmp/image-pull.rc
+          fi
+          EOF
+          nohup sh /tmp/pull-image.sh "$IMAGE" "${BASE}:latest" > /dev/null 2>&1 &
+          echo "🐳 Pulling $IMAGE in the background (falls back to :latest if that tag does not exist)"
 
       # PHASE 1: VALIDATION & SETUP
       - name: 🔥 Checkout repository (for config_macd.json)
@@ -116,24 +136,6 @@ jobs:
             exit 1
           fi
           echo "✅ Config loaded from repository: config_macd.json"
-
-      - name: ⏱️ Check Dispatch Latency
-        if: inputs.apply_brain_plan != true
-        run: |
-          BUFFER=$(python3 -c "import json; print(json.load(open('config_macd.json')).get('CANDLE_MIN_AGE_BUFFER', 60))" 2>/dev/null || echo 60)
-          STALENESS=$(python3 -c "import json; print(json.load(open('config_macd.json')).get('MAX_CANDLE_STALENESS_SEC', 1200))" 2>/dev/null || echo 1200)
-
-          NOW=$(date +%s)
-          LAST_CLOSE=$(( (NOW / 900) * 900 ))  # The :00, :15, :30, :45 boundary
-          AGE=$(( NOW - LAST_CLOSE ))
-
-          echo "🕐 Last 15m candle closed ${AGE}s ago (need ${BUFFER}s buffer, max staleness ${STALENESS}s)"
-
-          if [ "$AGE" -gt $(( STALENESS - 900 )) ]; then
-            # STALENESS is measured from the candle OPEN (1200 = 300s after the close);
-            # AGE is measured from the CLOSE, so compare against STALENESS - 900.
-            echo "⚠️ WARNING: Candle closed ${AGE}s ago (max=$(( STALENESS - 900 ))s) — every pair will be rejected as stale" >> $GITHUB_STEP_SUMMARY
-          fi
 
       - name: 🧠 Decide Brain archive depth
         if: inputs.apply_brain_plan != true
@@ -246,25 +248,22 @@ jobs:
 
       - name: ⏳ Wait for image
         run: |
-          BASE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           WAIT_START=$(date +%s)
-          for _ in $(seq 1 240); do
+          # 0.2 s polling (was 1 s): the pull usually finishes between two polls
+          for _ in $(seq 1 1200); do
             [ -f /tmp/image-pull.rc ] && break
-            sleep 1
+            sleep 0.2
           done
           if [ "$(cat /tmp/image-pull.rc 2>/dev/null || echo 1)" != "0" ]; then
-            echo "::warning::Image for commit ${GITHUB_SHA} not available — trying :latest"
+            echo "::error::Neither sha-${GITHUB_SHA} nor :latest is available in the registry"
             cat /tmp/image-pull.log 2>/dev/null || true
+            exit 1
+          fi
+          IMAGE=$(cat /tmp/image-pull.used)
+          if [ "$IMAGE" != "${{ env.RUN_IMAGE }}" ]; then
+            echo "::warning::Image for commit ${GITHUB_SHA} not available — running on :latest"
             echo "⚠️ Ran on :latest because sha-${GITHUB_SHA} was not available" >> "$GITHUB_STEP_SUMMARY"
-            IMAGE="$BASE:latest"
-
-            if ! docker pull --quiet --platform linux/amd64 "$IMAGE"; then
-              echo "::error::Neither sha-${GITHUB_SHA} nor :latest is available in the registry"
-              exit 1
-            fi
             echo "RUN_IMAGE=$IMAGE" >> "$GITHUB_ENV"
-          else
-            IMAGE="${{ env.RUN_IMAGE }}"
           fi
           if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
             echo "::error::Image $IMAGE is not present locally after pull"
@@ -336,10 +335,21 @@ jobs:
         if: inputs.apply_brain_plan != true
         env:
           TARGET_START_AGE: "55"   # seconds after the 15m close; must stay above CANDLE_MIN_AGE_BUFFER (45)
+          # EARLY_DISPATCH_WINDOW: 0 = off (default, behaviour unchanged).
+          # Set it to 150 ONLY if the Cloudflare cron is moved one minute earlier
+          # (14,29,44,59 * * * *). A run that wakes up within this many seconds BEFORE a
+          # close then waits for that close + TARGET_START_AGE instead of treating the
+          # previous candle as "already past the target" and starting on a stale candle.
+          EARLY_DISPATCH_WINDOW: "0"
         run: |
           NOW=$(date +%s)
           AGE=$(( NOW - (NOW / 900) * 900 ))
-          if [ "$AGE" -lt "$TARGET_START_AGE" ]; then
+          TO_NEXT=$(( 900 - AGE ))
+          if [ "$EARLY_DISPATCH_WINDOW" -gt 0 ] && [ "$TO_NEXT" -le "$EARLY_DISPATCH_WINDOW" ]; then
+            WAIT=$(( TO_NEXT + TARGET_START_AGE ))
+            echo "⏳ ${TO_NEXT}s BEFORE the next 15m close — waiting ${WAIT}s so the bot starts at ${TARGET_START_AGE}s after it"
+            sleep "$WAIT"
+          elif [ "$AGE" -lt "$TARGET_START_AGE" ]; then
             WAIT=$(( TARGET_START_AGE - AGE ))
             echo "⏳ ${AGE}s after the 15m close — waiting ${WAIT}s so the bot starts at ${TARGET_START_AGE}s"
             sleep "$WAIT"

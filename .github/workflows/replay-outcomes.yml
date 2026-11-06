@@ -146,15 +146,26 @@ jobs:
                       fh.write("\n".join(new) + "\n")
                   merged += len(new)
                   print(f"replayed {len(new)} row(s) into {rel}")
-          print(f"dead-letter replay: merged={merged}")
+          # Brain reports are whole files named by timestamp: restore any the
+          # data repo does not already have (never overwrite an existing one).
+          restored = 0
+          for src in sorted(glob.glob(f"{SRC}/reports/*.md")):
+              dst = f"{DST}/reports/{os.path.basename(src)}"
+              if os.path.exists(dst):
+                  continue
+              os.makedirs(os.path.dirname(dst), exist_ok=True)
+              with open(src, "rb") as fi, open(dst, "wb") as fo:
+                  fo.write(fi.read())
+              restored += 1
+              print(f"restored report {os.path.basename(src)}")
+          print(f"dead-letter replay: merged={merged} reports={restored}")
           PY
             echo "$ID" >> "$RUNNER_TEMP/replayed_ids"
           done < "$RUNNER_TEMP/candidate_ids"
-
           cd /tmp/data-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f outcomes shadow 2>/dev/null || true
+          git add -f outcomes shadow reports 2>/dev/null || true
 
           if git diff --cached --quiet; then
             echo "::warning::Replay produced no data changes to push"
