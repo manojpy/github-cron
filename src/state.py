@@ -621,11 +621,12 @@ class RedisStateStore:
                         logger.debug(f"Shutting down Redis pool | url={url} | Age: {pool_age:.1f}s | Reuses: {reuse_count}")
 
                         await pool.aclose()
-                        await asyncio.sleep(0.25)
+                        # One loop tick (was a fixed 0.25s sleep on every run's
+                        # critical path) lets the transport finish closing.
+                        await asyncio.sleep(0.02)
 
                     except Exception as e:
                         logger.error(f"Error shutting down Redis pool {url}: {e}")
-
                 cls._global_pools.pop(url, None)
                 cls._pool_healthy.pop(url, None)
                 cls._pool_created_at.pop(url, None)

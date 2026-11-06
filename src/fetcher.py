@@ -1180,10 +1180,14 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[PriceDa
             logger.warning("parse_candles_to_numpy: empty candle array (n=0)")
             return None
     
+        # n is len(timestamp); every OHLCV array must match it. (The old check
+        # only compared OHLCV with each other, so five equal-length arrays that
+        # differed from the timestamp array slipped through and mis-aligned
+        # every index downstream.)
         lengths = {k: len(data[k]) for k in ["open", "high", "low", "close", "volume"]}
-        if len(set(lengths.values())) != 1:
+        if any(v != n for v in lengths.values()):
             bad = {k: v for k, v in lengths.items() if v != n}
-            logger.error(f"Length mismatch: {bad}")
+            logger.error(f"Length mismatch vs timestamp (n={n}): {bad}")
             return None
     
         ts_arr = cast(np.ndarray, data["timestamp"])

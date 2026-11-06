@@ -1108,7 +1108,12 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
             }
             _missing = [ak for ak in _seen_aks if ak not in _states]
             if _missing:
-                for _ak, (_wm, _st) in ((await self.sdb.load_cusum_bulk(_missing)) or {}).items():
+                _bulk_missing = await self.sdb.load_cusum_bulk(_missing)
+                if _bulk_missing is None:
+                    # Read failed: do NOT treat as "no drift" (fail-open).
+                    # The except below sets _cusum_read_failed -> gate closed.
+                    raise RuntimeError("load_cusum_bulk returned None (Redis read failed)")
+                for _ak, (_wm, _st) in _bulk_missing.items():
                     if _st:
                         _states[_ak] = _st
             for _ak, _cusum_state in _states.items():

@@ -448,7 +448,9 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
         raise
     
     except Exception as e:
-        logger_main.error(f"Error in {p_name} evaluation: {e}", exc_info=False)
+        # exc_info=True: a bare "{e}" (often just a KeyError name) made
+        # evaluation failures undiagnosable from the run log.
+        logger_main.error(f"Error in {p_name} evaluation: {e!r}", exc_info=True)
         return None
 
 async def _compute_directional_cluster(prepared_tasks: List[Tuple[str, str, Dict[str, Any]]], state_db: RedisStateStore, correlation_id: str, reference_time: int, oi_gate_data: Optional[Dict[str, Dict[str, Any]]], parsed_cache: Optional[Dict[str, Any]] = None) -> Tuple[Optional[ClusterContext], Dict[str, Any]]:
@@ -719,9 +721,16 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             state_db, float(cfg.PORTFOLIO_POSITION_MAX_AGE_MIN) * 60.0,
             source=cfg.PORTFOLIO_POSITION_SOURCE,
         )
-
     def _oi_hist_keys() -> List[str]:
         return [f"oi_hist:{p}" for p in pairs_to_process if products_map.get(p)]
+
+    async def _make_warm_brain_engine() -> Any:
+        _eng = BrainEngine(state_db)
+        await _eng.warm_dispatch_caches()
+        return _eng
+
+    async def _make_brain_engine() -> Any:
+        return BrainEngine(state_db)
 
     if _redis_ready:
         if cfg.ENABLE_WIN_RATE_FILTER:
@@ -741,9 +750,14 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             preloads.start("kill_switch", _kill_switch_flag)
         preloads.start("last_processed",
                        lambda: state_db.get_last_processed_candle_ts_bulk(pairs_to_process))
+        if cfg.ENABLE_BRAIN:
+            # Build the shared Brain engine and load its per-alert blobs
+            # (calibration, market-state model, ML calibration, quality inputs)
+            # concurrently while candles are being fetched, so the alert path
+            # finds warm caches instead of paying 4 serial Redis round trips.
+            preloads.start("brain_warm", _make_warm_brain_engine)
         if cfg.ENABLE_OI_FUNDING_FILTER:
             preloads.start("oi_hist", lambda: state_db.batch_get_metadata(_oi_hist_keys()))
-
     ticker_task = None
     if cfg.ENABLE_OI_FUNDING_FILTER:
         ticker_task = asyncio.create_task(fetcher.fetch_tickers_batch())
@@ -1059,7 +1073,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     brain_engine_shared: Optional[Any] = None
     if cfg.ENABLE_BRAIN and state_db and not state_db.degraded:
         try:
-            brain_engine_shared = BrainEngine(state_db)
+            brain_engine_shared = await preloads.take("brain_warm", _make_brain_engine)
         except Exception as e:
             logger_main.warning(
                 f"Shared brain engine init failed (fail-open): {e}"
@@ -1616,13 +1630,24 @@ async def run_once() -> Optional[bool]:
 
         # Three independent startup reads, issued together (one wait instead of three).
         valkey_usage_start: Dict[str, Optional[float]] = {}
+        _reset_prefetch_ok = False
+        _reset_prefetch_val: Optional[str] = None
         if sdb and not sdb.degraded:
-            _snap_r, _cb_r, _ovr_r = await asyncio.gather(
+            async def _no_read() -> None:
+                return None
+            _snap_r, _cb_r, _ovr_r, _reset_r = await asyncio.gather(
                 sdb.get_valkey_usage_snapshot(),
                 sdb.get_metadata("circuit_breaker_state"),
                 sdb.load_config_override(),
+                # Daily-reset marker: needed ~100 lines later; read it in the
+                # same round trip instead of a separate serial one.
+                sdb.get_metadata("global:last_reset_date")
+                if (cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP) else _no_read(),
                 return_exceptions=True,
             )
+            if not isinstance(_reset_r, BaseException):
+                _reset_prefetch_ok = True
+                _reset_prefetch_val = _reset_r
             if isinstance(_snap_r, BaseException):
                 logger_run.debug(f"Valkey start snapshot unavailable: {_snap_r}")
             else:
@@ -1662,6 +1687,7 @@ async def run_once() -> Optional[bool]:
         if os.getenv("CLEAR_REDIS", "false").lower() == "true":
             if sdb and not sdb.degraded:
                 logger_run.warning("🚨 CLEAR_REDIS requested — purging ALL Redis states...")
+                _reset_prefetch_ok = False  # purge removes the marker: re-read it later
 
                 st, dd, pend, sp, ast, sst, shc, strm, dcache = await _clear_all_redis_states(
                     sdb, pairs_to_process, logger_run,
@@ -1746,14 +1772,15 @@ async def run_once() -> Optional[bool]:
         if sdb and not sdb.degraded and (cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP):
             logger_run.debug("Checking daily reset conditions...")
             day_tracker_key = "global:last_reset_date"
-            current_date_str = get_utc_date_key(reference_time)
-            
+            current_date_str = get_utc_date_key(reference_time)          
             last_reset_date_str = None
             try:
-                last_reset_date_str = await sdb.get_metadata(day_tracker_key)
+                if _reset_prefetch_ok:
+                    last_reset_date_str = _reset_prefetch_val
+                else:
+                    last_reset_date_str = await sdb.get_metadata(day_tracker_key)
             except Exception as e:
                 logger_run.warning(f"Failed to get last reset date: {e}")
-
             if should_reset_daily_state(reference_time, last_reset_date_str):
                 logger_run.info(f"🔄 New day detected ({current_date_str}). Resetting daily states...")
     

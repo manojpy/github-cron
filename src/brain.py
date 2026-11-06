@@ -392,23 +392,73 @@ class BrainCore:
                 f"(gate continues on previous curve if present): {e}"
             )
     
-    async def _load_calibration_curve(self, alert_key: str) -> Optional[Dict[str, Any]]:
+    # ── Shared 5-minute JSON-blob cache (calibration / market model / ML
+    # calibration / quality inputs) ───────────────────────────────────────
+    # Before: only HITS were cached and concurrent callers each issued their
+    # own GET, so a missing key (or a Redis timeout) cost one 2s-capped round
+    # trip PER ALERT per loader. Now: single-flight per key + a short negative
+    # cache for empty/failed reads. Attribute names are unchanged (tests and
+    # other modules set `_calib_cache` etc. directly) and the extra state is
+    # created lazily so engines built via cls.__new__ keep working.
+    _BLOB_MISS_TTL_SEC = 30.0
+
+    async def _load_json_cached(self, attr: str, ts_attr: str, key: str, label: str, post=None):
         now = time.time()
-        if self._calib_cache is None or now - self._calib_cache_ts > 300:
-            if self.sdb.degraded or not self.sdb._redis:
+        cached = getattr(self, attr, None)
+        if cached is not None and now - getattr(self, ts_attr, 0.0) <= 300:
+            return cached
+        misses = self.__dict__.setdefault("_blob_miss_ts", {})
+        if now - misses.get(key, 0.0) < self._BLOB_MISS_TTL_SEC:
+            return None
+        if self.sdb.degraded or not self.sdb._redis:
+            return None
+        lock = self.__dict__.setdefault("_blob_locks", {}).setdefault(key, asyncio.Lock())
+        async with lock:
+            # Another task may have filled the cache while we waited.
+            now = time.time()
+            cached = getattr(self, attr, None)
+            if cached is not None and now - getattr(self, ts_attr, 0.0) <= 300:
+                return cached
+            if now - misses.get(key, 0.0) < self._BLOB_MISS_TTL_SEC:
                 return None
             raw = await self.sdb._safe_redis_op(
-                lambda: _rc(self.sdb._redis).get(CALIBRATION_CURVES_KEY),
-                2.0, "calibration_load",
+                lambda: _rc(self.sdb._redis).get(key), 2.0, label,
             )
             if not raw:
+                misses[key] = time.time()
                 return None
             try:
-                self._calib_cache = json.loads(raw).get("curves", {})
+                parsed = json.loads(raw)
+                value = post(parsed) if post else parsed
             except Exception:
+                misses[key] = time.time()
                 return None
-            self._calib_cache_ts = now
-        return self._calib_cache.get(alert_key) if self._calib_cache else None
+            setattr(self, attr, value)
+            setattr(self, ts_attr, time.time())
+            misses.pop(key, None)
+            return value
+
+    async def warm_dispatch_caches(self) -> None:
+        """Load every per-alert Brain blob concurrently (one RTT, not four in
+        series). Called while candles are still being fetched so the alert
+        path finds warm caches. Never raises."""
+        try:
+            await asyncio.gather(
+                self._load_calibration_curve("__warm__"),
+                self._load_batch_market_state_model(),
+                self._load_ml_calibration_curve(),
+                self._load_quality_inputs(),
+                return_exceptions=True,
+            )
+        except Exception as e:
+            logging.getLogger("macd_bot").debug(f"brain cache warm-up failed (non-fatal): {e!r}")
+
+    async def _load_calibration_curve(self, alert_key: str) -> Optional[Dict[str, Any]]:
+        curves = await self._load_json_cached(
+            "_calib_cache", "_calib_cache_ts", CALIBRATION_CURVES_KEY,
+            "calibration_load", post=lambda d: d.get("curves", {}),
+        )
+        return curves.get(alert_key) if curves else None
 
     # ── Market-state model (report-only trained fit, item #12) ────────
     async def _persist_market_state_model(self, model: Dict[str, Any]) -> None:
@@ -575,25 +625,14 @@ class BrainCore:
                 info["bytes"] = len(blob)
             except Exception as e:
                 logging.getLogger("macd_bot").warning(f"Feature dataset cache save failed (non-fatal): {e!r}")
+
         return ds, info
 
     async def _load_batch_market_state_model(self) -> Optional[Dict[str, Any]]:
-        now = time.time()
-        if self._market_model_cache is None or now - self._market_model_cache_ts > 300:
-            if self.sdb.degraded or not self.sdb._redis:
-                return None
-            raw = await self.sdb._safe_redis_op(
-                lambda: _rc(self.sdb._redis).get(MARKET_STATE_MODEL_KEY),
-                2.0, "market_state_model_load",
-            )
-            if not raw:
-                return None
-            try:
-                self._market_model_cache = json.loads(raw)
-            except Exception:
-                return None
-            self._market_model_cache_ts = now
-        return self._market_model_cache
+        return await self._load_json_cached(
+            "_market_model_cache", "_market_model_cache_ts", MARKET_STATE_MODEL_KEY,
+            "market_state_model_load",
+        )
 
     # ── ML calibration curve (bins on model p_win, not conf_pct) ─────
     async def _persist_ml_calibration_curve(self, curve: Dict[str, Any]) -> None:
@@ -623,23 +662,10 @@ class BrainCore:
             )
 
     async def _load_ml_calibration_curve(self) -> Optional[Dict[str, Any]]:
-        now = time.time()
-        if self._ml_calib_cache is None or now - self._ml_calib_cache_ts > 300:
-            if self.sdb.degraded or not self.sdb._redis:
-                return None
-            raw = await self.sdb._safe_redis_op(
-                lambda: _rc(self.sdb._redis).get(ML_CALIBRATION_KEY),
-                2.0, "ml_calibration_load",
-            )
-            if not raw:
-                return None
-            try:
-                self._ml_calib_cache = json.loads(raw)
-            except Exception:
-                return None
-            self._ml_calib_cache_ts = now
-
-        return self._ml_calib_cache
+        return await self._load_json_cached(
+            "_ml_calib_cache", "_ml_calib_cache_ts", ML_CALIBRATION_KEY,
+            "ml_calibration_load",
+        )
 
     # ── Trade quality score (report-only) ───────────────────────────────
     async def _persist_quality_inputs(self, quality_inputs: Dict[str, Any]) -> None:
@@ -669,22 +695,10 @@ class BrainCore:
             )
 
     async def _load_quality_inputs(self) -> Optional[Dict[str, Any]]:
-        now = time.time()
-        if self._quality_cache is None or now - self._quality_cache_ts > 300:
-            if self.sdb.degraded or not self.sdb._redis:
-                return None
-            raw = await self.sdb._safe_redis_op(
-                lambda: _rc(self.sdb._redis).get(QUALITY_INPUTS_KEY),
-                2.0, "quality_inputs_load",
-            )
-            if not raw:
-                return None
-            try:
-                self._quality_cache = json.loads(raw)
-            except Exception:
-                return None
-            self._quality_cache_ts = now
-        return self._quality_cache
+        return await self._load_json_cached(
+            "_quality_cache", "_quality_cache_ts", QUALITY_INPUTS_KEY,
+            "quality_inputs_load",
+        )
 
     async def get_playbook_entry(self, alert_key: str, direction: str) -> Optional[Dict[str, Any]]:
         """Learner playbook entry for an alert (None = none / stale / Redis down).

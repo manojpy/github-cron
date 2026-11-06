@@ -204,11 +204,22 @@ def load_recent_outcomes(days: int = 30, shadow: bool = False, hours: Optional[i
                         rows.append(row)
         except Exception:
             continue
+
     return rows
 
 def save_report(markdown: str) -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M")
-    path = os.path.join(_OUTCOME_DIR, "reports", f"{ts}.md")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(markdown)
-    return path
+    # Seconds in the name + exclusive create: two reports in the same minute
+    # (manual dispatch next to a scheduled run) must not overwrite each other.
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+    reports_dir = os.path.join(_OUTCOME_DIR, "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    path = os.path.join(reports_dir, f"{ts}.md")
+    n = 1
+    while True:
+        try:
+            with open(path, "x", encoding="utf-8") as f:
+                f.write(markdown)
+            return path
+        except FileExistsError:
+            n += 1
+            path = os.path.join(reports_dir, f"{ts}_{n}.md")

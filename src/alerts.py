@@ -3113,6 +3113,18 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         if alerts_to_send and getattr(cfg, "BRAIN_OOD_ENABLED", True):
             ood_survivors = []
+            # Fetch every distinct alert key's vote history in ONE concurrent
+            # wave (results land in the per-run cache); the loop below then
+            # reads them without a serial Redis round trip per alert.
+            _ood_keys = list(dict.fromkeys(
+                _ak for _, _, _ak in alerts_to_send
+                if _confluence_for(_ak)[2] is not None
+            ))
+            if len(_ood_keys) > 1:
+                await asyncio.gather(
+                    *(sdb.get_vote_count_history(_ak) for _ak in _ood_keys),
+                    return_exceptions=True,
+                )
             for alert_title, alert_extra, alert_key in alerts_to_send:
                 _, _, alert_votes = _confluence_for(alert_key)
                 if alert_votes is None:
