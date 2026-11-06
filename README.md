@@ -11,7 +11,7 @@ High-performance cryptocurrency trading alert bot with AOT/Cython/Numba compilat
 | Aspect | Detail |
 |--------|--------|
 | **What** | Analyzes crypto pairs with 20+ technical indicators and confluence gates |
-| **When** | Every 15 minutes at :00, :15, :30, :45, triggered externally by Cronjobs.org |
+| **When** | Every 15 minutes at :00, :15, :30, :45, triggered externally by Cloudflare |
 | **Outputs** | Telegram alerts with smart deduplication + optional Brain reports |
 | **Speed** | Typically 15–45 s for a full cycle (AOT path) |
 | **Memory** | Soft limit ~850 MB, container hard limit 900 MB |
@@ -21,7 +21,7 @@ High-performance cryptocurrency trading alert bot with AOT/Cython/Numba compilat
 
 ## 🏭 Production Context (important)
 
-- The main bot (`run-bot.yml` → `macd_unified.py`) is triggered by an **external Cronjobs.org job**, not by a GitHub Actions `schedule`.
+- The main bot (`run-bot.yml` → `macd_unified.py`) is triggered by an **external Cloudflare**, not by a GitHub Actions `schedule`.
 - **Schedule**: every 15 minutes at minutes of every hour.
 - **Purpose of each run**: fetch market data, evaluate signals, and send Telegram alerts when conditions are met.
 - **Redis** is the shared state store. **Telegram** is the only outbound notification channel.
@@ -31,7 +31,7 @@ High-performance cryptocurrency trading alert bot with AOT/Cython/Numba compilat
 
 | Workflow | File | Trigger | Cadence |
 |----------|------|---------|---------|
-| Run MACD Unified Bot | `run-bot.yml` | Cronjobs.org → `workflow_dispatch` | Every 15 min (:00, :15, :30, :45) |
+| Run MACD Unified Bot | `run-bot.yml` | Cloudflare → `workflow_dispatch` | Every 15 min (:00, :15, :30, :45) |
 | Watchdog | `watchdog.yml` | Cronjobs.org → `workflow_dispatch` | Every 30 min |
 | Learner | `learner.yml` | Cronjobs.org → `workflow_dispatch` | Every 6 hours |
 | Cleanup outcomes | `cleanup-outcomes.yml` | Cronjobs.org → `workflow_dispatch` | Daily at 02:10 (timezone as set on the Cronjobs.org job) |
@@ -380,7 +380,7 @@ github-cron/
 ## 🎯 Runtime Architecture (simplified)
 
 ```
-Cronjobs.org (:01 :16 :31 :46)
+Cloudflare (:00 :15 :30 :45)
         │  workflow_dispatch
         ▼
 run-bot.yml
