@@ -1,6 +1,6 @@
 # 🤖 MACD Unified Bot
 
-High-performance cryptocurrency trading alert bot with AOT/Cython/Numba compilation, Redis state management, outcome tracking, and Telegram notifications. Runs on GitHub Actions, triggered every 15 minutes by an external scheduler (Cronjobs.org).
+High-performance cryptocurrency trading alert bot with AOT/Cython/Numba compilation, Redis state management, outcome tracking, and Telegram notifications. Runs on GitHub Actions, triggered every 15 minutes by an external scheduler (Clouflare/Cronjobs.org).
 
 **Version**: 1.8.x | **Python**: 3.11 | **Last audited**: 2026-10-10
 
