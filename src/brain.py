@@ -18,6 +18,9 @@ from state import RedisKeyPrefix, RedisStateStore, _rc
 from plan_replay import coerce_path_fields, recost_rows
 from playbook import KEY_CURRENT as PLAYBOOK_KEY, playbook_lookup
 import threshold_engine as engine
+
+# Sentinel: the GET succeeded and the key is genuinely absent (vs. timeout/error -> None).
+_BLOB_ABSENT = "__blob_absent__"
 from threshold_engine import CUSUMDetector, StabilityGate
 from brain_audit import get_audit, HealthStatus
 import brain_recommend_baseline as _baseline
@@ -157,6 +160,11 @@ class BrainCore:
                     "Redis write may not have completed."
                 )
                 return False
+            # The key now exists: forget any "absent" verdict and the stale cached copy so
+            # the very next read sees the curves we just wrote.
+            self.__dict__.get("_blob_miss_ts", {}).pop(CALIBRATION_CURVES_KEY, None)
+            self._calib_cache = calib.get("curves", {})
+            self._calib_cache_ts = time.time()
             return True
 
         except Exception as e:
@@ -403,7 +411,7 @@ class BrainCore:
     # cache for empty/failed reads. Attribute names are unchanged (tests and
     # other modules set `_calib_cache` etc. directly) and the extra state is
     # created lazily so engines built via cls.__new__ keep working.
-    _BLOB_MISS_TTL_SEC = 30.0
+    _BLOB_MISS_TTL_SEC = 30.0   # applies only to a CONFIRMED-absent key (see _load_json_cached)
 
     async def _load_json_cached(self, attr: str, ts_attr: str, key: str, label: str, post=None):
         now = time.time()
@@ -424,17 +432,23 @@ class BrainCore:
                 return cached
             if now - misses.get(key, 0.0) < self._BLOB_MISS_TTL_SEC:
                 return None
-            raw = await self.sdb._safe_redis_op(
-                lambda: _rc(self.sdb._redis).get(key), 2.0, label,
-            )
-            if not raw:
+            async def _get_or_absent():
+                v = await _rc(self.sdb._redis).get(key)
+                return v if v else _BLOB_ABSENT
+            raw = await self.sdb._safe_redis_op(_get_or_absent, 2.0, label)
+            if raw is None:
+                # timeout / Redis error: _safe_redis_op cannot tell us the key is missing,
+                # so do NOT negative-cache (the next caller retries; the lock above still
+                # stops concurrent callers from each paying the timeout).
+                return None
+            if raw == _BLOB_ABSENT:
                 misses[key] = time.time()
                 return None
             try:
                 parsed = json.loads(raw)
                 value = post(parsed) if post else parsed
             except Exception:
-                misses[key] = time.time()
+                misses[key] = time.time()   # present but unparsable: stable, safe to cache
                 return None
             setattr(self, attr, value)
             setattr(self, ts_attr, time.time())
@@ -625,8 +639,15 @@ class BrainCore:
             try:
                 blob = pack_dataset(ds, LABEL_HORIZONS, cost_pct)
                 if len(blob) <= int(getattr(cfg, "FEATURE_DATASET_MAX_BYTES", 3000000)):
-                    await self.sdb.set_metadata(FEATURE_DATASET_KEY, blob, timeout=8.0, ttl=30 * 86400)
-                    info["persisted"] = True
+                    # set_metadata returns False (never raises) on timeout/error: do not
+                    # claim the cache was stored when Redis did not confirm the write.
+                    info["persisted"] = bool(
+                        await self.sdb.set_metadata(FEATURE_DATASET_KEY, blob, timeout=8.0, ttl=30 * 86400)
+                    )
+                    if not info["persisted"]:
+                        logging.getLogger("macd_bot").warning(
+                            f"Feature dataset cache not stored: Redis did not confirm the write ({len(blob)} bytes)"
+                        )
                 else:
                     info["skipped"] = "too_large"
                 info["bytes"] = len(blob)

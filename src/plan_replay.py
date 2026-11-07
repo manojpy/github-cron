@@ -151,7 +151,7 @@ def recost_rows(rows: Sequence[Dict[str, Any]], flat_cost_pct: float) -> int:
 def has_path(row: Mapping[str, Any]) -> bool:
     return bool(row.get("path_fav")) and bool(row.get("path_adv")) and bool(row.get("path_close"))
 
-def replay_exit(fav: Sequence[float], adv: Sequence[float], cls: Sequence[float], sl: float, tp: float, horizon: int, be: float = 0.0, trail: float = 0.0) -> Optional[Tuple[str, float]]:
+def replay_exit(fav: Sequence[float], adv: Sequence[float], cls: Sequence[float], sl: float, tp: float, horizon: int, be: float = 0.0, trail: float = 0.0, *, allow_prefix: bool = False) -> Optional[Tuple[str, float]]:
     """Exact replay of a bracket that may also move its stop.
 
     be     once a candle's best move reaches +be% the stop moves to breakeven (0 = off)
@@ -165,6 +165,8 @@ def replay_exit(fav: Sequence[float], adv: Sequence[float], cls: Sequence[float]
     exit).  Levels are in favourable % from the fill; adv is unclamped, so a candle
     whose low stayed above the fill has a negative adv."""
     n = len(fav)
+    if n <= horizon and not allow_prefix:
+        return None
     stop = -sl
     be_on = False
     best = -1e9
@@ -188,23 +190,28 @@ def replay_exit(fav: Sequence[float], adv: Sequence[float], cls: Sequence[float]
         return None                     # censored (path ends at the exit candle, no touch seen)
     return "timeout", float(cls[horizon])
 
-def replay_plan(row: Mapping[str, Any], sl_pct: float, tp_pct: float, horizon: int, default_cost_pct: float, be: float = 0.0, trail: float = 0.0) -> Optional[Tuple[str, float]]:
+def replay_plan(row: Mapping[str, Any], sl_pct: float, tp_pct: float, horizon: int, default_cost_pct: float, be: float = 0.0, trail: float = 0.0, *, allow_prefix: bool = False) -> Optional[Tuple[str, float]]:
     """(outcome_class, net_pnl_pct) this trade WOULD have produced under the
-    given plan, or None if the row has no path / too few candles."""
+    given plan, or None if the row has no path / too few candles.
+
+    allow_prefix=False (default, used by every plan COMPARISON: autotune, intelligence,
+    playbook, scoreboard, feedback): a path shorter than the horizon returns None, so all
+    plans in a comparison are evaluated on the same set of trades.
+    allow_prefix=True: an early-closed trade (stop/target touched before the horizon) stores
+    its path only up to the exit candle; a touch INSIDE that prefix is exact, an untouched
+    prefix stays None (censored). Only safe for a single-plan, per-row label (feature_store),
+    never for ranking plans against each other, because each plan would then be scored on a
+    different subset of trades."""
     if not has_path(row) or sl_pct <= 0 or tp_pct <= 0 or horizon < 0:
         return None
     fav, adv, cls = row["path_fav"], row["path_adv"], row["path_close"]
-    # An early-closed trade (stop or bonus target touched before the horizon)
-    # stores its path only up to the exit candle. A stop/target touched INSIDE
-    # that observed prefix is an exact result for any horizon; only a prefix
-    # with no touch is unknown (censored -> None). Returning None for every
-    # short path, as before, silently dropped exactly the early stop-outs and
-    # early winners and left only trades that ran the full distance.
     n = len(fav)
+    if n <= horizon and not allow_prefix:
+        return None
     cost = row.get("realized_cost_pct")
     cost = float(cost) if cost is not None else float(default_cost_pct)
     if be > 0 or trail > 0:
-        res = replay_exit(fav, adv, cls, sl_pct, tp_pct, horizon, be, trail)
+        res = replay_exit(fav, adv, cls, sl_pct, tp_pct, horizon, be, trail, allow_prefix=allow_prefix)
         return None if res is None else (res[0], res[1] - cost)
     for i in range(min(horizon + 1, n)):
         hit_sl = adv[i] >= sl_pct

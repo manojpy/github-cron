@@ -311,13 +311,14 @@ class BrainEngineV2(BrainCore):
         The learner rebuilds those paths and caches them in Redis; reuse that cache here
         (one GET, no network fetch). Any problem returns the rows unchanged."""
         try:
-            if not any(needs_recon(r) for r in rows):
+            full_len = int(cfg.OUTCOME_LOOKAHEAD_CANDLES) + 1
+            if not any(needs_recon(r, full_len) for r in rows):
                 return rows
             raw = await self.sdb.get_metadata(KEY_RECON, timeout=5.0)
             cache = json_loads(raw) if raw else None
             if not isinstance(cache, dict) or not cache:
                 return rows
-            out, applied = apply_cached(rows, cache)
+            out, applied = apply_cached(rows, cache, full_len)
             if applied:
                 logging.getLogger("macd_bot").info(
                     f"🧩 Brain: {applied}/{len(rows)} archived alerts got their candle path from the learner cache"

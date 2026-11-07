@@ -87,7 +87,9 @@ def row_labels(row: Row, horizons: Sequence[int] = LABEL_HORIZONS,
     cost = float(cost) if cost is not None else float(default_cost_pct)
     for h in horizons:
         h = int(h)
-        rep = replay_plan(row, float(sl), float(tp), h, default_cost_pct) if (sl and tp) else None
+        # allow_prefix: this is the row's OWN plan (no cross-plan ranking), so an exact
+        # touch inside an early-closed trade's stored path is a valid training label.
+        rep = replay_plan(row, float(sl), float(tp), h, default_cost_pct, allow_prefix=True) if (sl and tp) else None
         if len(fav) <= h:
             # Path ends before this horizon (trade closed early). The bracket
             # result is still exact if a stop/target was touched inside the
@@ -144,6 +146,9 @@ def build_point_in_time_dataset(rows: Sequence[Row], horizons: Sequence[int] = L
             "direction": r.get("direction"),
             "version": row_feature_version(r),
             "x": x,
+            # Stored path length: a row whose path was later COMPLETED (pathrecon) has
+            # different labels, so a cached row with another plen must be rebuilt.
+            "plen": len(r.get("path_fav") or []),
             "labels": row_labels(r, horizons, default_cost_pct=default_cost_pct),
         })
     return {
@@ -153,7 +158,7 @@ def build_point_in_time_dataset(rows: Sequence[Row], horizons: Sequence[int] = L
 
 _SPARSE_BY_DESIGN = frozenset({"ctx:macro_would_block"})
 
-DATASET_CACHE_VERSION = 2   # 2: early-closed trades now carry bracket labels (was None)
+DATASET_CACHE_VERSION = 3   # 2: early-closed trades carry bracket labels; 3: rows carry plen, stale rows rebuilt
 
 
 def pack_dataset(ds: Dict[str, Any], horizons: Sequence[int], default_cost_pct: float) -> str:
@@ -201,7 +206,7 @@ def _ds_row_diff(a: Optional[Dict[str, Any]], b: Optional[Dict[str, Any]]) -> Op
     """Name of the first field in which two dataset rows differ, or None if equal."""
     if not a or not b:
         return "missing_row"
-    for k in ("id", "ts", "pair", "alert_key", "direction", "version"):
+    for k in ("id", "ts", "pair", "alert_key", "direction", "version", "plen"):
         if a.get(k) != b.get(k):
             return k
     xa, xb = a.get("x") or [], b.get("x") or []
@@ -273,12 +278,15 @@ def build_point_in_time_dataset_cached(rows: Sequence[Row], cached: Optional[Dic
     by_id = {r["id"]: r for r in cached["rows"]}
     if len(set(ids)) != len(ids) or len(by_id) != len(cached["rows"]):
         return _full("duplicate_ids")
-    have = [i for i in ids if i in by_id]
+    row_of = dict(zip(ids, usable))
+    # Rows whose stored path changed since they were cached (e.g. an early-closed trade whose
+    # path pathrecon has since completed) carry different labels: rebuild just those.
+    stale = {i for i in ids if i in by_id and by_id[i].get("plen") != len(row_of[i].get("path_fav") or [])}
+    have = [i for i in ids if i in by_id and i not in stale]
     if have:
         k = max(1, int(verify_n))
         picks = sorted({0, len(have) - 1, *(int(j * (len(have) - 1) / max(1, k - 1)) for j in range(k))})
         sample = [have[j] for j in picks]
-        row_of = dict(zip(ids, usable))
         fresh = {r["id"]: r for r in build_point_in_time_dataset([row_of[i] for i in sample], hz, names, default_cost_pct)["rows"]}
         for i in sample:
             why = _ds_row_diff(fresh.get(i), by_id[i])
@@ -290,10 +298,10 @@ def build_point_in_time_dataset_cached(rows: Sequence[Row], cached: Optional[Dic
                 info["mismatch"] = f"{i}: {why}"
                 return _full("verification_failed")
         info["verified"] = True
-    new_rows = [r for r, i in zip(usable, ids) if i not in by_id]
+    new_rows = [r for r, i in zip(usable, ids) if i not in by_id or i in stale]
     built = {r["id"]: r for r in build_point_in_time_dataset(new_rows, hz, names, default_cost_pct)["rows"]} if new_rows else {}
-    out_rows = [by_id[i] if i in by_id else built[i] for i in ids]
-    info.update({"hit": len(have), "built": len(new_rows), "reason": "reused"})
+    out_rows = [built[i] if i in built else by_id[i] for i in ids]
+    info.update({"hit": len(have), "built": len(new_rows), "stale": len(stale), "reason": "reused"})
     return {
         "feature_names": names, "feature_hash": fhash, "rows": out_rows,
         "stats": {"n_input": len(rows), "n_rows": len(out_rows), "leaked_keys": leaked},

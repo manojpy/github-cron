@@ -60,7 +60,7 @@ from scoreboard import build_scoreboard, format_scoreboard
 from state import RedisStateStore
 _TTL = 90 * 86400
 KEY_AUTOPSY = "brain_autopsy"
-_RECON_CAP = 5000
+_RECON_CAP = 8000   # was 5000: completed early-closed paths now share this cache (~360 B/entry, ~3 MB at the cap)
 _LEDGER_CAP = 600
 _CANDLE_SEC = 900
 
@@ -164,10 +164,13 @@ async def recover_paths(rows: List[Dict[str, Any]], sdb: Any, max_calls: int, dr
     """Give REAL archived alerts that have no stored candle path one, rebuilt from the
     exchange's candle history (see pathrecon.py).  Results are cached in Redis so each
     row is fetched once.  Never raises: on any problem the rows are returned as they were."""
-    stats = {"missing": 0, "from_cache": 0, "rebuilt": 0, "rejected": 0, "calls": 0}
+    stats = {"missing": 0, "from_cache": 0, "rebuilt": 0, "rejected": 0, "calls": 0,
+             "short": 0, "extended": 0}
     try:
-        need = [r for r in rows if needs_recon(r)]
-        stats["missing"] = len(need)
+        full_len = int(cfg.OUTCOME_LOOKAHEAD_CANDLES) + 1
+        need = [r for r in rows if needs_recon(r, full_len)]
+        stats["missing"] = sum(1 for r in need if not r.get("path_fav"))
+        stats["short"] = len(need) - stats["missing"]      # early-closed: path ends at the exit candle
         if not need:
             return rows, stats
         cache: Dict[str, Any] = _jl(await sdb.get_metadata(KEY_RECON, timeout=5.0), {})
@@ -179,6 +182,8 @@ async def recover_paths(rows: List[Dict[str, Any]], sdb: Any, max_calls: int, dr
             if p and p.get("f"):
                 found[k] = cache_unpack(p)
                 stats["from_cache"] += 1
+                if r.get("path_fav"):
+                    stats["extended"] += 1
             elif p and p.get("x"):
                 stats["rejected"] += 1
             else:
@@ -217,7 +222,8 @@ async def recover_paths(rows: List[Dict[str, Any]], sdb: Any, max_calls: int, dr
                         if k in found or k in cache:
                             continue
                         rec = recon_path(ts, o, h, lo, c, entry_ts=et, direction=str(r["direction"]),
-                                         fill_price=r.get("fill_price"), fill_delay=fd, lookahead=la)
+                                         fill_price=r.get("fill_price"), fill_delay=fd, lookahead=la,
+                                         expect_prefix=r if r.get("path_fav") else None)
                         if rec is None:
                             covered = len(ts) > 0 and et + (fd + la + 2) * _CANDLE_SEC <= int(ts[-1])
                             if covered:
@@ -228,6 +234,8 @@ async def recover_paths(rows: List[Dict[str, Any]], sdb: Any, max_calls: int, dr
                         found[k] = rec
                         cache[k] = cache_pack(rec)
                         stats["rebuilt"] += 1
+                        if r.get("path_fav"):
+                            stats["extended"] += 1
                         dirty = True
             try:
                 from fetcher import SessionManager
@@ -237,11 +245,13 @@ async def recover_paths(rows: List[Dict[str, Any]], sdb: Any, max_calls: int, dr
         if dirty and not dry_run:
             if len(cache) > _RECON_CAP:
                 keep_keys = sorted(cache, key=lambda x: int(x.rsplit("|", 1)[-1]))[-_RECON_CAP:]
+                _say(f"[learner] path cache over its cap: dropping the {len(cache) - _RECON_CAP} oldest entries "
+                     f"(rows older than that are re-fetched when still inside the window)")
                 cache = {k: cache[k] for k in keep_keys}
             await sdb.set_metadata(KEY_RECON, json_dumps(cache), ttl=_TTL, timeout=10.0)
         out = []
         for r in rows:
-            if needs_recon(r):
+            if needs_recon(r, full_len):
                 k = cache_key(r["pair"], r["direction"], r["entry_ts"])
                 if k in found:
                     r = apply_recon(r, found[k])
@@ -402,10 +412,15 @@ async def run(args: argparse.Namespace) -> int:
             text += "\n\n" + format_heat_gate(heat_gate_report(rows, fixed=fixed, cost_pct=cost_pct))
         if cfg.ENABLE_ALERT_WHY_SURVIVED:
             text += "\n\n" + format_margin(margin_report(rows, fixed=fixed, cost_pct=cost_pct))
-        if rstats.get("rebuilt") or rstats.get("from_cache"):
-
-            text += (f"\n\n🧩 Recovered candle paths for {rstats.get('rebuilt', 0) + rstats.get('from_cache', 0)} "
+        _rec_all = rstats.get("rebuilt", 0) + rstats.get("from_cache", 0)
+        _rec_ext = rstats.get("extended", 0)
+        if _rec_all - _rec_ext > 0:
+            text += (f"\n\n🧩 Recovered candle paths for {_rec_all - _rec_ext} "
                      f"older real alert(s) from exchange history (tagged RECON).")
+        if _rec_ext > 0 or rstats.get("short"):
+            text += (f"\n\n🧩 Completed the forward path of {_rec_ext} early-closed trade(s) "
+                     f"(tagged RECON_EXT); {max(0, rstats.get('short', 0) - _rec_ext)} still short "
+                     f"(horizon not closed yet, API budget, or history did not match).")
 
         _say(text)
 

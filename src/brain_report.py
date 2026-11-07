@@ -1494,7 +1494,12 @@ def _data_foundation_lines(cov: Optional[Dict[str, Any]]) -> List[str]:
             lines.append(
                 f"Dataset cache: {ch.get('hit', 0)} rows reused, {ch.get('built', 0)} built this run"
                 + (" (spot-check passed)" if ch.get("verified") else "")
-                + (f"; not stored ({ch['skipped'].replace('_', ' ')})" if ch.get("skipped") else "") + "."
+                + (f"; full rebuild because: {str(ch['reason']).replace('_', ' ')}"
+                   if not ch.get("hit") and ch.get("reason") and ch.get("reason") != "reused" else "")
+                + (f"; not stored ({ch['skipped'].replace('_', ' ')})" if ch.get("skipped") else "")
+                + ("; NOT stored (Redis write not confirmed)"
+                   if ch.get("built") and not ch.get("skipped") and ch.get("persisted") is False else "")
+                + "."
             )
     weak = cov.get("mostly_empty_features") or []
     if weak:
