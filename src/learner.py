@@ -416,7 +416,8 @@ async def run(args: argparse.Namespace) -> int:
         _rec_ext = rstats.get("extended", 0)
         if _rec_all - _rec_ext > 0:
             text += (f"\n\n🧩 Recovered candle paths for {_rec_all - _rec_ext} "
-                     f"older real alert(s) from exchange history (tagged RECON).")
+                     f"alert(s) archived without one (real and shadowed; early-closed trades and "
+                     f"older rows) from exchange history (tagged RECON).")
         if _rec_ext > 0 or rstats.get("short"):
             text += (f"\n\n🧩 Completed the forward path of {_rec_ext} early-closed trade(s) "
                      f"(tagged RECON_EXT); {max(0, rstats.get('short', 0) - _rec_ext)} still short "

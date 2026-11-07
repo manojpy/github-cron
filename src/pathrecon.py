@@ -1,13 +1,12 @@
 """pathrecon — recover the candle path of REAL alerts that were archived without one,
 and COMPLETE the path of trades that closed early.
 
-Early-closed trades (stop or bonus target touched before OUTCOME_LOOKAHEAD_CANDLES) are
-archived with a path that ends at the exit candle. Every plan replay then sees them as
-"too short" and drops them, so plan comparisons only ever saw trades that ran the full
-distance (survivor bias). needs_recon(row, full_len) flags those rows too; recon_path then
-rebuilds the full forward path and, for such rows, REQUIRES the rebuilt prefix to equal
-the stored one (expect_prefix), anchored on the stored fill_price, so a misaligned
-candle history can never silently replace a real path.
+A row that carries a path SHORTER than the horizon (the archive writes no path at all
+for trades that closed early, and those are rebuilt in full below; a short path can still
+come from other sources, e.g. the Redis outcome stream) is completed too: needs_recon(row,
+full_len) flags it, and recon_path then rebuilds the full forward path and, for such rows,
+REQUIRES the rebuilt prefix to equal the stored one (expect_prefix), anchored on the stored
+fill_price, so a misaligned candle history can never silently replace a real path.
 
 Alerts that fired before path capture existed (or whose path failed to store) have
 no stored candle path, so they are invisible to the plan lab and the learner.  The
