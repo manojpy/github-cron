@@ -164,12 +164,11 @@ def replay_exit(fav: Sequence[float], adv: Sequence[float], cls: Sequence[float]
     was moved into profit exits with that profit; class is then still "sl" (a stop
     exit).  Levels are in favourable % from the fill; adv is unclamped, so a candle
     whose low stayed above the fill has a negative adv."""
-    if len(fav) <= horizon:
-        return None
+    n = len(fav)
     stop = -sl
     be_on = False
     best = -1e9
-    for i in range(horizon + 1):
+    for i in range(min(horizon + 1, n)):
         if -adv[i] <= stop:             # stop touched (a tie with the target goes to the stop)
             return "sl", stop
         if fav[i] >= tp:
@@ -185,6 +184,8 @@ def replay_exit(fav: Sequence[float], adv: Sequence[float], cls: Sequence[float]
             lvl = best - trail
         if lvl > stop:
             stop = lvl
+    if n <= horizon:
+        return None                     # censored (path ends at the exit candle, no touch seen)
     return "timeout", float(cls[horizon])
 
 def replay_plan(row: Mapping[str, Any], sl_pct: float, tp_pct: float, horizon: int, default_cost_pct: float, be: float = 0.0, trail: float = 0.0) -> Optional[Tuple[str, float]]:
@@ -193,20 +194,27 @@ def replay_plan(row: Mapping[str, Any], sl_pct: float, tp_pct: float, horizon: i
     if not has_path(row) or sl_pct <= 0 or tp_pct <= 0 or horizon < 0:
         return None
     fav, adv, cls = row["path_fav"], row["path_adv"], row["path_close"]
-    if len(fav) <= horizon:
-        return None
+    # An early-closed trade (stop or bonus target touched before the horizon)
+    # stores its path only up to the exit candle. A stop/target touched INSIDE
+    # that observed prefix is an exact result for any horizon; only a prefix
+    # with no touch is unknown (censored -> None). Returning None for every
+    # short path, as before, silently dropped exactly the early stop-outs and
+    # early winners and left only trades that ran the full distance.
+    n = len(fav)
     cost = row.get("realized_cost_pct")
     cost = float(cost) if cost is not None else float(default_cost_pct)
     if be > 0 or trail > 0:
         res = replay_exit(fav, adv, cls, sl_pct, tp_pct, horizon, be, trail)
         return None if res is None else (res[0], res[1] - cost)
-    for i in range(horizon + 1):
+    for i in range(min(horizon + 1, n)):
         hit_sl = adv[i] >= sl_pct
         hit_tp = fav[i] >= tp_pct
         if hit_sl:                      # same-candle tie -> stop (pessimistic)
             return "sl", -sl_pct - cost
         if hit_tp:
             return "tp", tp_pct - cost
+    if n <= horizon:
+        return None                     # censored: exited before the horizon, no touch seen
     return "timeout", float(cls[horizon]) - cost
 
 

@@ -1603,10 +1603,17 @@ def cross_check_15m_against_5m(data_5m: PriceData, ts_curr: int, cached: CandleS
     ok = _eq(agg_o, cached.open) and _eq(agg_h, cached.high) \
          and _eq(agg_l, cached.low) and _eq(agg_c, cached.close)
     if not ok:
+        # Adaptive precision: fixed .4f hid the difference on low-priced pairs
+        # (HUSD 0.0513 vs 0.0511 looked like a rounding artefact). The check
+        # itself stays strict (rel 1e-6, abs floor 1e-8).
+        _ref = max(abs(cached.close), abs(agg_c), 1e-12)
+        _dp = 4 if _ref >= 100 else 6 if _ref >= 1 else 8
         logger_pair.warning(
             f"[{pair_name}] 15m/5m ENDPOINT MISMATCH (data-integrity, not repaint) | "
-            f"15m: O={cached.open:.4f} H={cached.high:.4f} L={cached.low:.4f} C={cached.close:.4f} | "
-            f"5m-agg: O={agg_o:.4f} H={agg_h:.4f} L={agg_l:.4f} C={agg_c:.4f} — suppressing"
+            f"15m: O={cached.open:.{_dp}f} H={cached.high:.{_dp}f} L={cached.low:.{_dp}f} C={cached.close:.{_dp}f} | "
+            f"5m-agg: O={agg_o:.{_dp}f} H={agg_h:.{_dp}f} L={agg_l:.{_dp}f} C={agg_c:.{_dp}f} | "
+            f"delta(5m-15m): O={agg_o - cached.open:+.{_dp}g} H={agg_h - cached.high:+.{_dp}g} "
+            f"L={agg_l - cached.low:+.{_dp}g} C={agg_c - cached.close:+.{_dp}g} — suppressing"
         )
     return ok
 

@@ -103,9 +103,32 @@ def compress_large_files(data_dir: Path, max_size_mb: int, dry_run: bool = False
                         print(f"🔎 [DRY RUN] Would compress: {month_file.name}")
                     else:
                         print(f"💾 Compressing large file: {month_file.name}")
-                        with open(month_file, "rb") as f_in:
-                            with gzip.open(gz_file, "wb", compresslevel=6) as f_out:
-                                shutil.copyfileobj(f_in, f_out)
+                        # Write to a temp name, read it back and compare the
+                        # decompressed size with the source BEFORE the original
+                        # is removed: a truncated gzip (disk full, killed step)
+                        # must never replace the only copy of the data.
+                        tmp_gz = gz_file.with_name(gz_file.name + ".tmp")
+                        try:
+                            with open(month_file, "rb") as f_in:
+                                with gzip.open(tmp_gz, "wb", compresslevel=6) as f_out:
+                                    shutil.copyfileobj(f_in, f_out)
+                            expected = month_file.stat().st_size
+                            got = 0
+                            with gzip.open(tmp_gz, "rb") as f_chk:
+                                while True:
+                                    chunk = f_chk.read(1024 * 1024)
+                                    if not chunk:
+                                        break
+                                    got += len(chunk)
+                            if got != expected:
+                                raise OSError(
+                                    f"verify failed: {got} bytes after decompress, expected {expected}"
+                                )
+                            tmp_gz.replace(gz_file)
+                        except Exception as exc:
+                            print(f"⚠️ Compression of {month_file.name} failed ({exc}) — original kept")
+                            tmp_gz.unlink(missing_ok=True)
+                            continue
                         month_file.unlink()
                     compressed += 1
     

@@ -627,6 +627,7 @@ class RedisStateStore:
 
                     except Exception as e:
                         logger.error(f"Error shutting down Redis pool {url}: {e}")
+
                 cls._global_pools.pop(url, None)
                 cls._pool_healthy.pop(url, None)
                 cls._pool_created_at.pop(url, None)

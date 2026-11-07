@@ -204,7 +204,6 @@ def load_recent_outcomes(days: int = 30, shadow: bool = False, hours: Optional[i
                         rows.append(row)
         except Exception:
             continue
-
     return rows
 
 def save_report(markdown: str) -> str:

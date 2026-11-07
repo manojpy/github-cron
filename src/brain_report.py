@@ -363,14 +363,29 @@ def _shadow_line(F: Dict[str, Any]) -> Optional[str]:
     return text
 
 def _outcome_totals_lines(F: Dict[str, Any]) -> Optional[str]:
-    """All-time Recorded / Shadowed totals, in the same format as the per-run log."""
+    """Recorded / Shadowed live-counter totals, in the same format as the per-run log.
+
+    These are Redis running totals reseeded from the per-alert stats keys, and a
+    stats key expires STATE_EXPIRY_DAYS after its last update — so they cover
+    recently active alert keys, NOT the whole archive. The note below stops them
+    being compared with the (larger) archive-based counts in the same report."""
     cum = F.get("outcome_totals") or {}
     if not cum:
         return None
-    return "\n".join(
+    try:
+        from bot_config import cfg as _cfg
+        _days = int(getattr(_cfg, "STATE_EXPIRY_DAYS", 11))
+    except Exception:
+        _days = 11
+    lines = [
         format_outcome_totals(source, cum.get(source), icon)
         for source, icon in (("Recorded", "📝"), ("Shadowed", "👁"))
+    ]
+    lines.append(
+        f"(Live counters for alert keys active in the last {_days} days; "
+        f"archive-based counts elsewhere in this report can be larger.)"
     )
+    return "\n".join(lines)
 
 def _profit_status(net_ev: float, n: int, known: bool = True) -> str:
     if n == 0:
@@ -1473,7 +1488,8 @@ def _data_foundation_lines(cov: Optional[Dict[str, Any]]) -> List[str]:
     ch = cov.get("cache") or {}
     if ch.get("enabled"):
         if ch.get("verified") is False:
-            lines.append("Warning: the stored dataset failed its spot-check and was rebuilt from the archive.")
+            lines.append("Warning: the stored dataset failed its spot-check and was rebuilt from the archive."
+                         + (f" First difference: {ch['mismatch']}." if ch.get("mismatch") else ""))
         else:
             lines.append(
                 f"Dataset cache: {ch.get('hit', 0)} rows reused, {ch.get('built', 0)} built this run"

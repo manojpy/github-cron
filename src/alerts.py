@@ -564,8 +564,10 @@ async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, a
             for title, _extra, alert_key in alerts_to_send:
                 detail_bits = [f"reason={block_reason}"]
                 if effective_score is not None and effective_required is not None:
+                    # effective score (after cluster/macro adjustments) vs the
+                    # floor it had to clear; "x/y" read like a fraction of a total.
                     detail_bits.append(
-                        f"score={effective_score:.1f}/{effective_required:.1f}"
+                        f"score={effective_score:.1f} vs required={effective_required:.1f}"
                     )
                 if confluence_scores and alert_key in confluence_scores:
                     sc, tot, _ = confluence_scores[alert_key]

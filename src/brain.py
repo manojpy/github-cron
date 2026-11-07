@@ -241,9 +241,11 @@ class BrainCore:
         calib["online_updates"] = int(calib.get("online_updates") or 0) + folded_total
         calib["online_folded_at"] = int(time.time())
         ok = await self._persist_calibration_curves(calib)
+        _e = calib.get("ece_mean")
         logger_run.info(
             f"🎯 Online calibration: folded {folded_total} new outcome(s) "
-            f"(persisted={ok}, ECE={calib.get('ece_mean')})"
+            f"(persisted={ok}, ECE={f'{_e:.4f}' if isinstance(_e, (int, float)) else 'n/a'}, "
+            f"total online updates={calib['online_updates']})"
         )
 
     async def maybe_refresh_calibration(self, logger_run: logging.Logger) -> None:
@@ -374,7 +376,8 @@ class BrainCore:
                 calib["stream_cursors"] = stream_tips
             ok = await self._persist_calibration_curves(calib)
             n_keys = len(calib["curves"])
-            ece = calib.get("ece_mean")
+            _e = calib.get("ece_mean")
+            ece = f"{_e:.4f}" if isinstance(_e, (int, float)) else "n/a"
             if ok:
                 logger_run.info(
                     f"✅ Calibration curves rebuilt & persisted "
@@ -614,6 +617,10 @@ class BrainCore:
             return build_point_in_time_dataset(rows, default_cost_pct=cost_pct), {"enabled": True, "reason": "cache_error"}
         info["enabled"] = True
         info["persisted"] = False
+        if info.get("verified") is False:
+            logging.getLogger("macd_bot").warning(
+                f"Feature dataset cache spot-check failed, rebuilt from archive | first difference: {info.get('mismatch')}"
+            )
         if info.get("built"):
             try:
                 blob = pack_dataset(ds, LABEL_HORIZONS, cost_pct)
@@ -625,7 +632,6 @@ class BrainCore:
                 info["bytes"] = len(blob)
             except Exception as e:
                 logging.getLogger("macd_bot").warning(f"Feature dataset cache save failed (non-fatal): {e!r}")
-
         return ds, info
 
     async def _load_batch_market_state_model(self) -> Optional[Dict[str, Any]]:

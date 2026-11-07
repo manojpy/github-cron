@@ -87,10 +87,17 @@ def row_labels(row: Row, horizons: Sequence[int] = LABEL_HORIZONS,
     cost = float(cost) if cost is not None else float(default_cost_pct)
     for h in horizons:
         h = int(h)
-        if len(fav) <= h:
-            out[h] = None
-            continue
         rep = replay_plan(row, float(sl), float(tp), h, default_cost_pct) if (sl and tp) else None
+        if len(fav) <= h:
+            # Path ends before this horizon (trade closed early). The bracket
+            # result is still exact if a stop/target was touched inside the
+            # path; hold/mfe/mae over the full horizon are unknown -> None.
+            out[h] = None if rep is None else {
+                "net": round(rep[1], 6), "class": rep[0],
+                "hold": None, "mfe": None, "mae": None, "t_mfe": None,
+                "censored": True,
+            }
+            continue
         window = fav[: h + 1]
         out[h] = {
             "net": None if rep is None else round(rep[1], 6),
@@ -144,7 +151,9 @@ def build_point_in_time_dataset(rows: Sequence[Row], horizons: Sequence[int] = L
         "stats": {"n_input": len(rows), "n_rows": len(out_rows), "leaked_keys": leaked},
     }
 
-DATASET_CACHE_VERSION = 1
+_SPARSE_BY_DESIGN = frozenset({"ctx:macro_would_block"})
+
+DATASET_CACHE_VERSION = 2   # 2: early-closed trades now carry bracket labels (was None)
 
 
 def pack_dataset(ds: Dict[str, Any], horizons: Sequence[int], default_cost_pct: float) -> str:
@@ -179,29 +188,46 @@ def _num_eq(a: Any, b: Any) -> bool:
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
         if isinstance(a, float) and isinstance(b, float) and math.isnan(a) and math.isnan(b):
             return True
+        # Exact equality first: abs(inf - inf) is nan, so two identical
+        # infinities used to compare UNEQUAL and failed the cache spot-check on
+        # every run (full rebuild each time, cache never reused).
+        if a == b:
+            return True
         return abs(float(a) - float(b)) <= 1e-9
     return a == b
 
 
-def _same_ds_row(a: Optional[Dict[str, Any]], b: Optional[Dict[str, Any]]) -> bool:
+def _ds_row_diff(a: Optional[Dict[str, Any]], b: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Name of the first field in which two dataset rows differ, or None if equal."""
     if not a or not b:
-        return False
+        return "missing_row"
     for k in ("id", "ts", "pair", "alert_key", "direction", "version"):
         if a.get(k) != b.get(k):
-            return False
+            return k
     xa, xb = a.get("x") or [], b.get("x") or []
-    if len(xa) != len(xb) or not all(_num_eq(u, v) for u, v in zip(xa, xb)):
-        return False
+    if len(xa) != len(xb):
+        return "x:length"
+    for j, (u, v) in enumerate(zip(xa, xb)):
+        if not _num_eq(u, v):
+            return f"x[{j}]"
     la, lb = a.get("labels") or {}, b.get("labels") or {}
     if set(la) != set(lb):
-        return False
+        return "labels:horizons"
     for h in la:
         ha, hb = la[h], lb[h]
         if (ha is None) != (hb is None):
-            return False
-        if ha is not None and (set(ha) != set(hb) or not all(_num_eq(ha[f], hb[f]) for f in ha)):
-            return False
-    return True
+            return f"labels[{h}]:{'path_appeared' if ha is None else 'path_vanished'}"
+        if ha is not None:
+            if set(ha) != set(hb):
+                return f"labels[{h}]:fields"
+            for f in ha:
+                if not _num_eq(ha[f], hb[f]):
+                    return f"labels[{h}].{f}"
+    return None
+
+
+def _same_ds_row(a: Optional[Dict[str, Any]], b: Optional[Dict[str, Any]]) -> bool:
+    return _ds_row_diff(a, b) is None
 
 
 def build_point_in_time_dataset_cached(rows: Sequence[Row], cached: Optional[Dict[str, Any]], horizons: Sequence[int] = LABEL_HORIZONS,
@@ -254,9 +280,15 @@ def build_point_in_time_dataset_cached(rows: Sequence[Row], cached: Optional[Dic
         sample = [have[j] for j in picks]
         row_of = dict(zip(ids, usable))
         fresh = {r["id"]: r for r in build_point_in_time_dataset([row_of[i] for i in sample], hz, names, default_cost_pct)["rows"]}
-        if not all(_same_ds_row(fresh.get(i), by_id[i]) for i in sample):
-            info["verified"] = False
-            return _full("verification_failed")
+        for i in sample:
+            why = _ds_row_diff(fresh.get(i), by_id[i])
+            if why is not None:
+                info["verified"] = False
+                # Say WHICH row/field differed: "path_appeared" means the archive
+                # row legitimately gained data since it was cached (harmless, the
+                # rebuilt cache is stored); anything else is a real inconsistency.
+                info["mismatch"] = f"{i}: {why}"
+                return _full("verification_failed")
         info["verified"] = True
     new_rows = [r for r, i in zip(usable, ids) if i not in by_id]
     built = {r["id"]: r for r in build_point_in_time_dataset(new_rows, hz, names, default_cost_pct)["rows"]} if new_rows else {}
@@ -300,7 +332,12 @@ def dataset_coverage(ds: Dict[str, Any], horizons: Sequence[int] = LABEL_HORIZON
         k = len(rows[0]["x"])
         zeros = [sum(1 for r in rows if not r["x"][j]) / n for j in range(1, k)]
         names = ds.get("feature_names") or []
-        worst = sorted(zip(names, zeros), key=lambda t: -t[1])[:5]
+        # Sparse BY DESIGN, so not an actionable data problem: macro_would_block is
+        # only set on the path where the confluence gate runs (None -> 0.0
+        # elsewhere). Opposition itself is already captured, on every row, by
+        # ctx:macro_multiplier (1.0 = not opposed), so no new feature is added.
+        worst = sorted(((nm, z) for nm, z in zip(names, zeros) if nm not in _SPARSE_BY_DESIGN),
+                       key=lambda t: -t[1])[:5]
         zero_share = [(nm, round(z, 3)) for nm, z in worst if z >= 0.5]
     mixed = len([v for v in versions if v != LEGACY_VERSION]) > 1
     return {

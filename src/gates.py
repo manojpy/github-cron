@@ -156,8 +156,8 @@ class GateResult:
     oi_funding_ok_buy: Optional[bool] = None
     oi_funding_ok_sell: Optional[bool] = None
     oi_funding_reason: Optional[str] = None
-    
-# -- order block / supply-demand (optional confluence vote) --
+
+    # -- order block / supply-demand (optional confluence vote) --
     ob_gate_ok_buy: Optional[bool] = None
     ob_gate_ok_sell: Optional[bool] = None
     ob_gate_reason: Optional[str] = None

@@ -721,6 +721,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             state_db, float(cfg.PORTFOLIO_POSITION_MAX_AGE_MIN) * 60.0,
             source=cfg.PORTFOLIO_POSITION_SOURCE,
         )
+
     def _oi_hist_keys() -> List[str]:
         return [f"oi_hist:{p}" for p in pairs_to_process if products_map.get(p)]
 
@@ -758,6 +759,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             preloads.start("brain_warm", _make_warm_brain_engine)
         if cfg.ENABLE_OI_FUNDING_FILTER:
             preloads.start("oi_hist", lambda: state_db.batch_get_metadata(_oi_hist_keys()))
+
     ticker_task = None
     if cfg.ENABLE_OI_FUNDING_FILTER:
         ticker_task = asyncio.create_task(fetcher.fetch_tickers_batch())
@@ -982,7 +984,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
             state_db._shadow_pending_outcome_keys_by_pair = shadow_by_pair
             total = sum(len(v) for v in shadow_by_pair.values())
-            logger_main.info(f"👻 Pre-scanned {total} shadow pending outcome(s) across {len(shadow_by_pair)} pair(s)")
+            if total:   # same rule as the real-pending line above: quiet when empty
+                logger_main.info(f"👻 Pre-scanned {total} shadow pending outcome(s) across {len(shadow_by_pair)} pair(s)")
         except Exception as e:
             logger_main.warning(f"Shadow pending outcome pre-scan failed: {e}")
             state_db._shadow_pending_outcome_keys_by_pair = None
@@ -1027,10 +1030,12 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                             f"(expected refresh is approximately {_expected_cadence_hr:.0f}h). "
                             f"Live calibration gate remains active."
                         )
+                _ece_v = payload.get("ece_mean")
+                _ece_s = f"{_ece_v:.4f}" if isinstance(_ece_v, (int, float)) else "n/a"
                 logger_main.info(
                     f"🎯 Calibration curves pre-loaded: "
                     f"{len(calibration_curves)} alert_key(s) "
-                    f"(mean-per-alert ECE={payload.get('ece_mean')}, "
+                    f"(mean-per-alert ECE={_ece_s}, "
                     f"built {built_age_hr}h ago)"
                 )
             else:
@@ -1772,7 +1777,8 @@ async def run_once() -> Optional[bool]:
         if sdb and not sdb.degraded and (cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP):
             logger_run.debug("Checking daily reset conditions...")
             day_tracker_key = "global:last_reset_date"
-            current_date_str = get_utc_date_key(reference_time)          
+            current_date_str = get_utc_date_key(reference_time)
+            
             last_reset_date_str = None
             try:
                 if _reset_prefetch_ok:
@@ -1781,6 +1787,7 @@ async def run_once() -> Optional[bool]:
                     last_reset_date_str = await sdb.get_metadata(day_tracker_key)
             except Exception as e:
                 logger_run.warning(f"Failed to get last reset date: {e}")
+
             if should_reset_daily_state(reference_time, last_reset_date_str):
                 logger_run.info(f"🔄 New day detected ({current_date_str}). Resetting daily states...")
     
