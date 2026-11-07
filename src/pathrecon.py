@@ -59,12 +59,13 @@ def recon_path(ts: np.ndarray, o: np.ndarray, h: np.ndarray, l: np.ndarray, c: n
     target_idx = fill_idx + int(lookahead)
     if target_idx >= len(ts):                       # path not fully closed yet
         return None
+    anchor: float
     if expect_prefix is not None:
         anchor = float(fill_price)                   # live anchor; the prefix check below is the validation
     else:
-        anchor = float(o[fill_idx]) if fill_delay > 0 else None
-        if anchor is None:
+        if fill_delay <= 0:
             return None
+        anchor = float(o[fill_idx])
         if abs(anchor - fill_price) / fill_price > tol:
             return None                              # candle history does not match what was archived
     path_start = fill_idx if fill_delay > 0 else entry_idx + 1
@@ -79,7 +80,7 @@ def recon_path(ts: np.ndarray, o: np.ndarray, h: np.ndarray, l: np.ndarray, c: n
         fav = (anchor - lo) / anchor * 100.0
         adv = (hi - anchor) / anchor * 100.0
         cls = (anchor - cl) / anchor * 100.0
-    out = {
+    out: Dict[str, Any] = {
         "path_fav": [round(float(x), _ROUND) for x in fav],
         "path_adv": [round(float(x), _ROUND) for x in adv],
         "path_close": [round(float(x), _ROUND) for x in cls],
