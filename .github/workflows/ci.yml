@@ -1,6 +1,13 @@
 name: 🛑 CI Bot
 
-on: [push, pull_request, workflow_dispatch]
+# push is limited to main: with a bare `push` every PR commit ran the whole suite twice
+# (once for the push, once for the pull_request) because the two events use different
+# concurrency groups.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: "${{ github.workflow }}-${{ github.head_ref || github.ref }}"

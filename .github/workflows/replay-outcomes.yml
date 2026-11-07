@@ -162,6 +162,7 @@ jobs:
           PY
             echo "$ID" >> "$RUNNER_TEMP/replayed_ids"
           done < "$RUNNER_TEMP/candidate_ids"
+
           cd /tmp/data-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

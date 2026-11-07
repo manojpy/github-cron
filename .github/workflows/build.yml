@@ -7,6 +7,7 @@ on:
       - 'requirements.txt'
       - 'Dockerfile'
       - 'setup.py'
+      - '.dockerignore'
       - '.github/workflows/build.yml'
   pull_request:
     paths:
@@ -14,6 +15,7 @@ on:
       - 'requirements.txt'
       - 'Dockerfile'
       - 'setup.py'
+      - '.dockerignore'
       - '.github/workflows/build.yml'
   schedule:
     - cron: "0 2 * * 0"  # Weekly security rebuild
@@ -113,6 +115,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=MACD Unified Bot
             org.opencontainers.image.description=AOT-compiled trading alert bot
+            org.opencontainers.image.revision=${{ github.sha }}
             maintainer=${{ github.actor }}
 
       # PHASE 2: BUILD A LOCAL CANDIDATE & VERIFY IT (nothing is pushed yet)

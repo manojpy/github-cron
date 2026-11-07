@@ -63,7 +63,16 @@ jobs:
 
           ALERT=""
 
-          if [ "$LATEST_STATUS" = "completed" ] && [ "$LATEST_CONCLUSION" != "success" ] \
+          # Age of the latest run. A failed run already sent its own Telegram
+          # failure notice, so only repeat it while it is fresh; an old failure
+          # with no newer success is covered by the silence alert below.
+          LATEST_AGE_MIN=0
+          if [ "$LATEST_CREATED" != "none" ]; then
+            LATEST_AGE_MIN=$(( (NOW_EPOCH - $(date -u -d "$LATEST_CREATED" +%s)) / 60 ))
+          fi
+
+          if [ "$LATEST_AGE_MIN" -le "${MAX_SILENCE_MIN}" ] \
+             && [ "$LATEST_STATUS" = "completed" ] && [ "$LATEST_CONCLUSION" != "success" ] \
              && [ "$LATEST_CONCLUSION" != "cancelled" ] && [ "$LATEST_CONCLUSION" != "skipped" ]; then
             ALERT="⚠️ Latest run-bot.yml run finished with conclusion: ${LATEST_CONCLUSION}"$'\n'"Run: ${LATEST_URL}"
           fi

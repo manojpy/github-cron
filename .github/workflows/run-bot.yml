@@ -247,6 +247,11 @@ jobs:
           echo "data_checkout_seconds=$(( $(date +%s) - START ))"
 
       - name: ⏳ Wait for image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # true = refuse to run on a :latest image that is older than this commit in
+          # anything the image contains. Default false: a late alert beats no alert.
+          STRICT_IMAGE_PROVENANCE: "false"
         run: |
           WAIT_START=$(date +%s)
           # 0.2 s polling (was 1 s): the pull usually finishes between two polls
@@ -264,6 +269,32 @@ jobs:
             echo "::warning::Image for commit ${GITHUB_SHA} not available — running on :latest"
             echo "⚠️ Ran on :latest because sha-${GITHUB_SHA} was not available" >> "$GITHUB_STEP_SUMMARY"
             echo "RUN_IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+            # Provenance: is the :latest we fell back to missing code from this commit?
+            # Only files the image is built from matter (src/, requirements, Dockerfile,
+            # setup.py, .dockerignore, build.yml); docs/workflow-only commits are harmless.
+            REV=$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$IMAGE" 2>/dev/null || true)
+            STALE=unknown
+            if [ -z "$REV" ] || [ "$REV" = "<no value>" ]; then
+              echo "::warning::Fallback image has no revision label - cannot tell whether it contains this commit's code"
+            elif [ "$REV" = "$GITHUB_SHA" ]; then
+              STALE=no
+            else
+              N=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${REV}...${GITHUB_SHA}" \
+                    --jq '[.files[].filename | select(test("^(src/|requirements\\.txt$|Dockerfile$|setup\\.py$|\\.dockerignore$|\\.github/workflows/build\\.yml$)"))] | length' 2>/dev/null || echo "?")
+              case "$N" in
+                0)   STALE=no ;;
+                ''|'?'|*[!0-9]*) echo "::warning::Could not compare image revision ${REV:0:12} with ${GITHUB_SHA:0:12}" ;;
+                *)   STALE=yes
+                     echo "::warning::Fallback :latest (built from ${REV:0:12}) is MISSING ${N} image-relevant file change(s) from ${GITHUB_SHA:0:12}"
+                     echo "🚧 :latest is behind this commit by ${N} image-relevant file(s) (image rev ${REV:0:12})" >> "$GITHUB_STEP_SUMMARY" ;;
+              esac
+            fi
+            echo "Image provenance: stale=${STALE}"
+            if [ "$STALE" = "yes" ] && [ "${STRICT_IMAGE_PROVENANCE}" = "true" ]; then
+              echo "::error::STRICT_IMAGE_PROVENANCE=true and the fallback image lacks this commit's code - not running"
+              exit 1
+            fi
           fi
           if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
             echo "::error::Image $IMAGE is not present locally after pull"

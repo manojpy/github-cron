@@ -99,6 +99,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 🔥 Pull Image (commit-matched only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # true = fail when the fallback :latest lacks this commit's image-relevant code.
+          STRICT_IMAGE_PROVENANCE: "false"
         run: |
           set -euo pipefail
 
@@ -115,6 +119,32 @@ jobs:
             echo "⚠️ Ran on :latest because sha-${GITHUB_SHA} was not available" >> "$GITHUB_STEP_SUMMARY"
             IMAGE="$BASE:latest"
             docker pull --quiet --platform linux/amd64 "$IMAGE"
+
+            # Verify the "no sha image => same code" assumption instead of trusting it:
+            # compare the image's build revision with this commit, counting only files
+            # the image is built from. (A build still in progress also lands here.)
+            REV=$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$IMAGE" 2>/dev/null || true)
+            STALE=unknown
+            if [ -z "$REV" ] || [ "$REV" = "<no value>" ]; then
+              echo "::warning::Fallback image has no revision label - cannot tell whether it contains this commit's code"
+            elif [ "$REV" = "$GITHUB_SHA" ]; then
+              STALE=no
+            else
+              N=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${REV}...${GITHUB_SHA}" \
+                    --jq '[.files[].filename | select(test("^(src/|requirements\\.txt$|Dockerfile$|setup\\.py$|\\.dockerignore$|\\.github/workflows/build\\.yml$)"))] | length' 2>/dev/null || echo "?")
+              case "$N" in
+                0)   STALE=no ;;
+                ''|'?'|*[!0-9]*) echo "::warning::Could not compare image revision ${REV:0:12} with ${GITHUB_SHA:0:12}" ;;
+                *)   STALE=yes
+                     echo "::warning::Fallback :latest (built from ${REV:0:12}) is MISSING ${N} image-relevant file change(s) from ${GITHUB_SHA:0:12}"
+                     echo "🚧 :latest is behind this commit by ${N} image-relevant file(s) (image rev ${REV:0:12})" >> "$GITHUB_STEP_SUMMARY" ;;
+              esac
+            fi
+            echo "Image provenance: stale=${STALE}"
+            if [ "$STALE" = "yes" ] && [ "${STRICT_IMAGE_PROVENANCE}" = "true" ]; then
+              echo "::error::STRICT_IMAGE_PROVENANCE=true and the fallback image lacks this commit's code"
+              exit 1
+            fi
           fi
 
           echo "RUN_IMAGE=$IMAGE" >> "$GITHUB_ENV"

@@ -96,3 +96,19 @@ jobs:
           else
             echo "::warning::Telegram notice NOT delivered: ${RESP:0:200}"
           fi
+
+      - name: 📨 Notify Telegram if the dependency check itself crashed
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          MSG="🟠 Dependency check workflow FAILED"$'\n'"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          RESP=$(curl -sS --max-time 20 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" || true)
+          if echo "$RESP" | grep -q '"ok":true'; then
+            echo "Telegram notify delivered"
+          else
+            echo "::warning::Failure notice NOT delivered: ${RESP:0:200}"
+          fi
