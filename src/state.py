@@ -350,7 +350,7 @@ class RedisKeyPrefix:
 class RedisStateStore:
     POOL_MAX_AGE_SECONDS = 3600
     SCRIPT_RELOAD_LOCK_TIMEOUT = 2.0
-
+    PREWARM_CONNECTIONS = 4
     _global_pools: ClassVar[Dict[str, Optional[redis.Redis]]] = {}
     _pool_healthy: ClassVar[Dict[str, bool]] = {}
     _pool_created_at: ClassVar[Dict[str, float]] = {}
@@ -467,7 +467,7 @@ class RedisStateStore:
                 logger.info("♻️ Redis recovered mid-run — degraded mode cleared")
             return reconnected
 
-    async def _attempt_connect(self, timeout: float = 5.0) -> bool:
+    async def _attempt_connect(self, timeout: float = 5.0, prewarm: bool = False) -> bool:
         try:
             self._redis = redis.from_url(
                 self.redis_url,
@@ -477,11 +477,9 @@ class RedisStateStore:
                 max_connections=32,
                 decode_responses=True,
             )
-
-            ok = await self._ping_with_retry(timeout)
+            ok = await (self._ping_and_prewarm(timeout) if prewarm else self._ping_with_retry(timeout))
             if not ok:
                 raise RedisConnectionError("ping failed after retries")
-
             logger.info("Redis connected")
             self.degraded = False
             self.degraded_alerted = False
@@ -565,7 +563,7 @@ class RedisStateStore:
             return
 
         for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
-            if await self._attempt_connect(timeout):
+            if await self._attempt_connect(timeout, prewarm=True):
                 max_conn = getattr(_rc(self._redis).connection_pool, "max_connections", "?")
                 logger.info(f"✅ Redis connected ({max_conn} max)")
                 self.degraded = False
@@ -637,6 +635,31 @@ class RedisStateStore:
         result = await self._safe_redis_op(lambda: _rc(self._redis).ping(), timeout, "ping")
 
         return bool(result)
+
+    async def _ping_and_prewarm(self, timeout: float) -> bool:
+        """PING, and open PREWARM_CONNECTIONS - 1 more pooled connections at the same moment.
+
+        A fresh process pays one TLS handshake per connection (about 1.5 s to Aiven Valkey from a
+        GitHub runner). run_once then issues several startup reads together, and each needs its own
+        connection, so without this the second wave of handshakes only starts after the first PING
+        returns and costs another full handshake on the critical path. Starting them together makes
+        the wait one handshake instead of two. The extra pings are best effort: any failure is ignored
+        because the pool opens connections on demand anyway."""
+        extra = max(0, int(self.PREWARM_CONNECTIONS) - 1)
+        client = _rc(self._redis)
+
+        async def _warm() -> None:
+            try:
+                await asyncio.wait_for(client.ping(), timeout=timeout)
+            except Exception:
+                pass
+
+        warm = [asyncio.ensure_future(_warm()) for _ in range(extra)]
+        try:
+            return await self._ping_with_retry(timeout)
+        finally:
+            if warm:
+                await asyncio.gather(*warm, return_exceptions=True)
 
     async def _safe_redis_op(self, fn: Callable[[], Any], timeout: float, op_name: str, parser: Optional[Callable[[Any], Any]] = None):
         if not self._redis:
@@ -1726,7 +1749,7 @@ class RedisStateStore:
             )
             return "failed"
 
-    # ── Vote-count history (OOD gate) ────────────────────────────────────────
+    # ── Vote-count history (OOD gate) ─────────────────────────────��────────��─
 
     async def record_vote_count(self, alert_key: str, votes: Dict[str, bool]) -> None:
         if self.degraded or not self._redis:

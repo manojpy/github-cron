@@ -31,8 +31,10 @@ directly to Redis's "metadata:config_override" key — same key
 state.py reads — so it works whether or not you have the rest of the
 bot's dependencies (numba, aot_bridge, etc.) installed locally.
 """
+
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -70,10 +72,12 @@ def parse_kv(s: str):
         )
     try:
         parsed_value = float(value.strip())
+    
     except ValueError:
         sys.exit(f"Value for {field} must be a number, got: {value!r}")
+    if not math.isfinite(parsed_value):
+        sys.exit(f"Value for {field} must be a finite number, got: {value!r}")
     return field, parsed_value
-
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

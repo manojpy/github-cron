@@ -192,15 +192,16 @@ def load_recent_outcomes(days: int = 30, shadow: bool = False, hours: Optional[i
                     except json.JSONDecodeError:
                         continue
 
-                    # Drop signal-only rows (no resolution yet).
-                    if "win" not in row:
+                    # Drop signal-only rows (no resolution yet) and lines that are not rows.
+                    if not isinstance(row, dict) or "win" not in row:
                         continue
                     sid = row.get("_stream_id")
                     if sid:
                         if sid in seen_ids:
                             continue
-                        seen_ids.add(sid)
-                    if row.get("entry_ts", 0) >= cutoff:
+                        seen_ids.add(sid)                
+                    ts = row.get("entry_ts")
+                    if isinstance(ts, (int, float)) and ts >= cutoff:
                         rows.append(row)
         except Exception:
             continue

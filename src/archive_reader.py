@@ -299,7 +299,11 @@ def load_archived_outcomes(data_dir: str, window_days: int = 30, shadow: bool = 
                     stats["lines_total"] += 1
                     try:
                         raw = json.loads(line)
+                    
                     except json.JSONDecodeError:
+                        stats["lines_malformed"] += 1
+                        continue
+                    if not isinstance(raw, dict):      # a valid JSON line that is not a row (e.g. 123, [1])
                         stats["lines_malformed"] += 1
                         continue
 
@@ -321,8 +325,13 @@ def load_archived_outcomes(data_dir: str, window_days: int = 30, shadow: bool = 
                                 continue
                         else:
                             seen_ids[sid] = None
+                
                     # Time filter
-                    ts = int(raw.get("entry_ts", 0))
+                    try:
+                        ts = int(raw.get("entry_ts") or 0)
+                    except (TypeError, ValueError):    # null / non-numeric entry_ts: skip the row, not the archive
+                        stats["dropped_unparseable"] += 1
+                        continue
                     if ts < cutoff:
                         stats["dropped_before_window"] += 1
                         continue
@@ -330,8 +339,13 @@ def load_archived_outcomes(data_dir: str, window_days: int = 30, shadow: bool = 
                         stats["dropped_missing_win"] += 1
                         continue
                     migrated = False
+         
                     if drop_stale_schema:
-                        row_schema = int(raw.get("schema_version", 1))
+                        try:
+                            row_schema = int(raw.get("schema_version") or 1)
+                        except (TypeError, ValueError):
+                            stats["dropped_unparseable"] += 1
+                            continue
                         if row_schema != CURRENT_SCHEMA_VERSION:
                             # Check if migratable before counting as dropped
                             missing_viable = MINIMUM_VIABLE_FIELDS - set(raw.keys())
