@@ -2209,9 +2209,9 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             cirrus_cross_sell = bool(sell_common_relaxed_wick and cirrus_cross_down)
 
             if cirrus_cross_buy:
-                cirrus_cross_reason = f"Close crossed above the top Cirrus line (cloud green, {cfg.CROSS_ALERT_TF})"
+                cirrus_cross_reason = f"Close crossed above the top Cirrus line (cloud green, {cfg.CIRRUS_CROSS_TF})"
             elif cirrus_cross_sell:
-                cirrus_cross_reason = f"Close crossed below the bottom Cirrus line (cloud red, {cfg.CROSS_ALERT_TF})"
+                cirrus_cross_reason = f"Close crossed below the bottom Cirrus line (cloud red, {cfg.CIRRUS_CROSS_TF})"
 
         fib_reversal_buy, fib_reversal_sell = False, False
         fib_reversal_reason = None

@@ -941,7 +941,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
                     )
 
         # ── Cirrus Cloud cross: the 15m close crosses the TOP Cirrus line while the cloud is
-        # green (buy), or the BOTTOM line while it is red (sell). CROSS_ALERT_TF picks the Cirrus:
+        # green (buy), or the BOTTOM line while it is red (sell). CIRRUS_CROSS_TF picks the Cirrus:
         # '5m' = the 5m Cirrus read at the 5m bar that closes with this 15m candle (and the one
         # before it for the previous close); '15m' = a Cirrus calculated on 15m closes. ──
         cirrus_cross_up = False
@@ -950,7 +950,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         if cfg.ENABLE_CIRRUS_CROSS_ALERT and cfg.CIRRUS_CLOUD_ENABLED and i15 >= 1:
             _cx_up = _cx_dn = False
             _cx_top_c = _cx_top_p = _cx_bot_c = _cx_bot_p = float("nan")
-            if cfg.CROSS_ALERT_TF == "5m":
+            if cfg.CIRRUS_CROSS_TF == "5m":
                 _t15 = int(normalize_timestamp(int(data_15m.ts[i15])))
                 _want = np.array([_t15 + 600, _t15 - 300], dtype=np.int64)   # last 5m bar of this / the previous 15m candle
                 _pos = np.searchsorted(ts_5m_arr, _want)

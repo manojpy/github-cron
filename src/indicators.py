@@ -979,8 +979,8 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['cirrus_top_5m'] = np.full(len(close_5m), np.nan, dtype=np.float64)
             results['cirrus_bot_5m'] = np.full(len(close_5m), np.nan, dtype=np.float64)
 
-        # ── Cirrus Cloud on 15m closes (only for the Cirrus cross alert when CROSS_ALERT_TF is 15m) ──
-        if cfg.CIRRUS_CLOUD_ENABLED and cfg.ENABLE_CIRRUS_CROSS_ALERT and cfg.CROSS_ALERT_TF == "15m":
+        # ── Cirrus Cloud on 15m closes (only for the Cirrus cross alert when CIRRUS_CROSS_TF is 15m) ──
+        if cfg.CIRRUS_CLOUD_ENABLED and cfg.ENABLE_CIRRUS_CROSS_ALERT and cfg.CIRRUS_CROSS_TF == "15m":
             _cirrus_15 = calculate_cirrus_cloud_numpy(
                 close_15m, cfg.CIRRUS_X1, cfg.CIRRUS_X2, cfg.CIRRUS_X3, cfg.CIRRUS_X4,
                 cfg.CIRRUS_MIN_GAP_PCT
