@@ -127,15 +127,16 @@ def setup_advice(feats: Dict[str, Any], win_rules: Optional[Sequence[Dict[str, A
         lo = rules_hit(list(loss_rules or []), feats)
     except Exception:
         return None
-    if w is None and lo is None:
+    hit = w if w is not None else lo
+    if hit is None:
         return None
     if w is not None and lo is not None:
         return {"kind": "mixed", "id": str(w.get("id")), "text": str(w.get("text", "")), "ev": w.get("ev"),
                 "n": w.get("fwd_n"), "loss_id": str(lo.get("id")), "loss_text": str(lo.get("text", "")),
                 "loss_ev": lo.get("fwd_mean")}
-    h, kind = (w, "win") if w is not None else (lo, "loss")
-    ev = h.get("ev") if kind == "win" else h.get("fwd_mean")
-    return {"kind": kind, "id": str(h.get("id")), "text": str(h.get("text", "")), "ev": ev, "n": h.get("fwd_n")}
+    kind = "win" if w is not None else "loss"
+    ev = hit.get("ev") if kind == "win" else hit.get("fwd_mean")
+    return {"kind": kind, "id": str(hit.get("id")), "text": str(hit.get("text", "")), "ev": ev, "n": hit.get("fwd_n")}
 
 
 def compact_rules(pool: Optional[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
