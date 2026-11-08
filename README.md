@@ -104,7 +104,7 @@ This triggers `build.yml` → multi-stage Docker image with Cython + AOT compila
 
 ### 5. Set Up the External Triggers
 
-Create one Cronjobs.org job per workflow in the table above. Each job calls the GitHub API `workflow_dispatch` endpoint for that workflow file on the `main` branch, using a token that is allowed to dispatch workflows. For the main bot use the cron expression `00,15,30,45 * * * *`.
+The main bot (`run-bot.yml`) is dispatched by the Cloudflare Worker `bot-dispatch` with the cron expression `0,15,30,45 * * * *` and a `GH_TOKEN` Worker secret. Create one Cronjobs.org job for each of the other workflows in the table above. Each job calls the GitHub API `workflow_dispatch` endpoint for that workflow file on the `main` branch, using a token that is allowed to dispatch workflows.
 
 To test without the scheduler: Actions → **Run MACD Unified Bot** → Run workflow. Optional inputs: dry-run, Brain report, apply Brain plan, clear Redis, clear kill-switch.
 
@@ -278,8 +278,8 @@ docker run --rm \
 ## 🐛 Troubleshooting
 
 ### Bot never runs on its own
-- Open the Cronjobs.org job for the bot and check its execution history and last HTTP response (a failing GitHub token shows up there).
-- Confirm the cron expression is `1,16,31,46 * * * *` and that the job targets the `main` branch.
+- The bot is triggered by the Cloudflare Worker `bot-dispatch` (cron `0,15,30,45 * * * *`), not by Cronjobs.org. Open the Worker's Triggers / Logs page and check the last run and the GitHub API response (an expired `GH_TOKEN` secret shows up as a 401/403 there).
+- Confirm the Worker still calls `workflow_dispatch` on `run-bot.yml` for the `main` branch.
 - Check Telegram for Watchdog silence alerts. If the Watchdog is silent too, check its own Cronjobs.org job.
 
 ### Learner / Redis audit / Cleanup did not run
