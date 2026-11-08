@@ -11,7 +11,7 @@ import threshold_engine as engine
 from threshold_quality import gate_shadow_comparison, prediction_track_record, future_edge_track_record
 from feature_store import dataset_coverage
 from plan_replay import volatility_plan_study
-from hypothesis_gen import update_hypothesis_pool
+from hypothesis_gen import shadow_pool_rows, update_hypothesis_pool
 from brain_layers import cached_audit
 from brain_audit import get_audit, HealthStatus
 from brain_helpers import (
@@ -1220,7 +1220,8 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             _hp_raw = await self.sdb.get_metadata(HYPOTHESIS_POOL_KEY)
             # Alerts a confirmed rule dropped (live veto) never become real trades; their shadow rows keep
             # the rule's forward sample alive so it can still be revoked.
-            _hp_rows = list(real_rows) + [r for r in (shadow_rows or []) if r.get("rejection_reason") == "hypothesis_veto"]
+            _hp_rows = (list(real_rows) + [r for r in (shadow_rows or []) if r.get("rejection_reason") == "hypothesis_veto"]
+                        + shadow_pool_rows(shadow_rows or []))
             _hp_pool, _hp_sum = update_hypothesis_pool(
                 json_loads(_hp_raw) if _hp_raw else {}, _hp_rows, int(time.time()),
                 cost_pct=(float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100,

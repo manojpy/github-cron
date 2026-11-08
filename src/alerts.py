@@ -1838,6 +1838,20 @@ def exhaustion_message_line(context: Dict[str, Any], direction: str, keys: List[
     return (f"⏳ Late-trend risk {info['score']}/6 ({', '.join(info.get('reasons', []))}) | "
             f"{info['ext_atr']:.1f} ATR from EMA{cfg.EXHAUSTION_BASELINE_EMA}, {info['legs']} swing legs")
 
+def setup_message_line(setup_by_key: Dict[str, Optional[Dict[str, Any]]], keys: List[str]) -> Optional[str]:
+    """One advisory line when an alert matches a published historical setup. Information only."""
+    hit = next((setup_by_key[k] for k in keys if setup_by_key.get(k)), None)
+    if not hit:
+        return None
+    def _ev(v: Any) -> str:
+        return f"{float(v):+.2f}%" if isinstance(v, (int, float)) else "n/a"
+    if hit["kind"] == "win":
+        return f"🧩 Historical setup match: {hit['text']} | later trades averaged {_ev(hit.get('ev'))} (n={hit.get('n')}). Advisory only."
+    if hit["kind"] == "loss":
+        return f"⚠️ Historical losing setup: {hit['text']} | later trades averaged {_ev(hit.get('ev'))} (n={hit.get('n')}). Advisory only."
+    return (f"⚖️ Conflicting setup evidence: {hit['text']} ({_ev(hit.get('ev'))}) vs {hit.get('loss_text')} "
+            f"({_ev(hit.get('loss_ev'))}). Advisory only.")
+
 def exhaustion_info_for_verdict(context: Dict[str, Any], direction: str, keys: List[str]) -> Optional[Dict[str, Any]]:
     """Exhaustion info handed to the TAKE/WATCH/AVOID advisor (None = leave the verdict alone)."""
     if cfg.EXHAUSTION_MODE == "off" or cfg.EXHAUSTION_VERDICT_MODE == "off":
@@ -3175,6 +3189,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         # Structured Telegram metadata (filled during quality pass; used at send)
         alert_tq_by_key: Dict[str, Optional[Dict[str, Any]]] = {}
         alert_pb_by_key: Dict[str, Optional[Dict[str, Any]]] = {}
+        alert_setup_by_key: Dict[str, Optional[Dict[str, Any]]] = {}
 
         if alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER:
             alert_keys_to_check = [ak for _, _, ak in alerts_to_send]
@@ -3289,6 +3304,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 "rvol_ok": gr.rvol_ok,
                                 "gaussian_gate_ok_buy": gr.gaussian_gate_ok_buy,
                                 "gaussian_gate_ok_sell": gr.gaussian_gate_ok_sell,
+                                # Same exhaustion fields trigger_context stores, so a rule mined from them can match live.
+                                **exhaustion_trade_fields(
+                                    context, "buy" if alert_key in BUY_ALERT_KEYS else "sell"),
                             }
                             hyp_ctx = live_context
                             tq = await brain_engine.get_trade_quality(
@@ -3331,7 +3349,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 _hyp_feats = _hyp_features({
                                     "context": hyp_ctx, "votes": alert_votes,
                                     "session": _get_session_from_ts(ts_curr), "direction": direction,
-                                }) if _hyp_rules else None
+                                    "alert_key": alert_key, "pair": pair_name,
+                                }, setup=True) if _hyp_rules else None
                             except Exception:
                                 _hyp_rules, _hyp_feats = None, None
                             if await _hypothesis_veto_drops(
@@ -3344,6 +3363,23 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 logger_pair=logger_pair,
                             ):
                                 continue
+
+                        # ── Historical setup match (ADVISORY: annotates the alert, never drops, resizes or edits it) ──
+                        alert_setup_by_key[alert_key] = None
+                        if str(getattr(cfg, "ALERT_SETUP_ADVISORY_MODE", "off")) != "off" and hyp_ctx is not None:
+                            try:
+                                from hypothesis_gen import row_features as _setup_features, setup_advice as _setup_advice
+                                _win_rules = brain_engine.playbook_extra("win_rules")
+                                _loss_rules = brain_engine.playbook_extra("hyp_rules")
+                                if _win_rules or _loss_rules:
+                                    alert_setup_by_key[alert_key] = _setup_advice(_setup_features({
+                                        "context": hyp_ctx, "votes": alert_votes,
+                                        "session": _get_session_from_ts(ts_curr), "direction": direction,
+                                        "alert_key": alert_key, "pair": pair_name,
+                                    }, setup=True), _win_rules, _loss_rules)
+                            except Exception as e:
+                                alert_setup_by_key[alert_key] = None
+                                logger_pair.debug(f"Setup advisory lookup failed for {alert_key}: {e}")
                         if tq and tq.get("verdict"):
                             if tq.get("market_state_p_win") is not None:
                                 logger_pair.debug(
@@ -3683,6 +3719,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     ),
                     "gate_shadow": _gate_shadow_for(alert_key),
                     "playbook_seen": _playbook_seen_for(alert_key),
+                    "setup_seen": alert_setup_by_key.get(alert_key),
                     "prediction_seen": _prediction_seen_for(alert_key),
                     "advisor_seen": (dict(advisor_seen) if advisor_seen else None),
                     "co_fired_keys": (
@@ -3959,6 +3996,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 pullback_line=_join_lines(
                     pullback_message_line(context, direction, keys),
                     exhaustion_message_line(context, direction, keys),
+                    setup_message_line(alert_setup_by_key, keys),
                 ),
                 decision_sink=advisor_seen,
                 exhaustion=exhaustion_info_for_verdict(context, direction, keys),
@@ -4219,6 +4257,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 pullback_line=_join_lines(
                     pullback_message_line(context, direction, keys),
                     exhaustion_message_line(context, direction, keys),
+                    setup_message_line(alert_setup_by_key, keys),
                 ),
                 decision_sink=advisor_seen,
                 exhaustion=exhaustion_info_for_verdict(context, direction, keys),

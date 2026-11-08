@@ -39,11 +39,11 @@ from bot_config import _get_session_from_ts
 from brain_helpers import HYPOTHESIS_POOL_KEY
 from autotune import FIELD as AT_FIELD, KEY_AUTOTUNE
 from autotune import committed as at_committed, evaluate_pending as at_evaluate, observe as at_observe, propose as at_propose
-from hypothesis_gen import compact_rules, update_hypothesis_pool
+from hypothesis_gen import compact_rules, shadow_pool_rows, update_hypothesis_pool
 from intelligence import (
     KEY_FIREWALL, KEY_INTEL, KEY_ISSUES, KEY_PROMO_LEDGER, KEY_VETO_MON, KEY_WIN_POOL,
     build_report, conviction_anatomy, delivered_trend, firewall_contract, format_report, ledger_append, ledger_event,
-    rule_lift, update_issue_state, veto_monitor, verdict_items, win_candidates,
+    rule_lift, setup_scorecard, update_issue_state, veto_monitor, verdict_items, win_candidates,
 )
 from feedback import (
     KEY_FEEDBACK, behaviour_report, format_behaviour, format_heat_gate, format_margin,
@@ -580,14 +580,18 @@ async def run(args: argparse.Namespace) -> int:
                                 at_report = {"status": "WOULD_APPLY", "text": dec["text"], "evidence": dec["evidence"]}
                     at_state_new = st_fin
 
-                # 5. weekly take-side search (report only)
+                # 5. weekly take-side search; its forward-confirmed setups that beat the rest of the book are published
+                #    as an ADVISORY library (ALERT_SETUP_ADVISORY_MODE); nothing here can drop or edit an alert
                 win: List[Dict[str, Any]] = []
+                win_lift: Optional[Dict[str, Any]] = None
+                setup_card: Optional[Dict[str, Any]] = None
                 win_days = int(cfg.INTEL_WIN_SEARCH_DAYS)
                 if win_days > 0:
                     wp_prev = _jl(await _strict_get(sdb, KEY_WIN_POOL), {})
                     due_win = (now_ts - float(wp_prev.get("last_run_ts") or 0)) >= win_days * 86400
                     wp, wsum = update_hypothesis_pool(
-                        wp_prev, [r for r in rows if r.get("source") == "LIVE"], int(now_ts), cost_pct=cost_pct,
+                        wp_prev, [r for r in rows if r.get("source") == "LIVE"]
+                        + shadow_pool_rows([r for r in rows if r.get("source") == "SHADOW"]), int(now_ts), cost_pct=cost_pct,
                         budget=int(cfg.INTEL_WIN_BUDGET) if due_win else 0, shadow_max=int(cfg.HYPOTHESIS_SHADOW_MAX),
                         forward_min_n=int(cfg.HYPOTHESIS_FORWARD_MIN_N), expire_days=int(cfg.HYPOTHESIS_EXPIRE_DAYS), direction="win",
                     )
@@ -595,6 +599,23 @@ async def run(args: argparse.Namespace) -> int:
                     wp["last_run_ts"] = last_run
                     win_pool_new = wp
                     win = win_candidates(wp, rows, cost_pct)
+                    if str(cfg.ALERT_SETUP_ADVISORY_MODE) != "off" and data_ok:
+                        cand_win = compact_rules(wp, 50)               # pool P&L is negated: best setups have the lowest fwd_mean
+                        win_lift = rule_lift(cand_win, rows, fixed=fixed, cost_pct=cost_pct, side="win")
+                        by_win = {str(x["id"]): x for x in cand_win}
+                        pub["win_rules"] = [dict(by_win[i], ev=round(-float(by_win[i]["fwd_mean"]), 4))
+                                            for i in win_lift["keep"]][:int(cfg.ALERT_SETUP_MAX_RULES)]
+                        was_w = {str(x.get("id")) for x in (prev_pb.get("win_rules") or [])}
+                        now_w = {str(x["id"]) for x in pub["win_rules"]}
+                        for rid in sorted(now_w - was_w):
+                            rtxt = next(x["text"] for x in pub["win_rules"] if str(x["id"]) == rid)
+                            events.append(ledger_event("SETUP_RULE", rid, f"PUBLISHED take-side setup (advisory): {rtxt}", now_ts,
+                                                       evidence=win_lift["per_rule"].get(rid)))
+                        for rid in sorted(was_w - now_w):
+                            why = (win_lift["per_rule"].get(rid) or {}).get("verdict", "no longer confirmed")
+                            events.append(ledger_event("SETUP_RULE", rid, f"WITHDRAWN take-side setup {rid}: {why}", now_ts))
+                if str(cfg.ALERT_SETUP_ADVISORY_MODE) != "off":
+                    setup_card = setup_scorecard(rows, fixed=fixed, cost_pct=cost_pct)
 
                 # 6. one ranked, fingerprinted issue list
                 intel_blob = build_report(
@@ -605,6 +626,9 @@ async def run(args: argparse.Namespace) -> int:
                     firewall=fw_res, firewall_mode=fw_mode, autotune=at_report, win=win,
                     newest_ts=newest_ts, data_ok=data_ok, hyp_lift=hyp_lift,
                     anatomy=conviction_anatomy(rows, fixed=fixed, cost_pct=cost_pct),
+                    setups=({"mode": str(cfg.ALERT_SETUP_ADVISORY_MODE), "published": pub.get("win_rules") or [],
+                             "lift": win_lift, "scorecard": setup_card}
+                            if str(cfg.ALERT_SETUP_ADVISORY_MODE) != "off" else None),
                 )
                 issues_new, fresh_ids = update_issue_state(_jl(await _strict_get(sdb, KEY_ISSUES), {}), intel_blob["issues"], now_ts)
                 intel_text = format_report(intel_blob, veto_mode=veto_mode, firewall_mode=fw_mode, fresh_ids=fresh_ids)

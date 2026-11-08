@@ -382,7 +382,7 @@ def default_lift_params() -> Dict[str, Any]:
 
 def rule_lift(
     rules: Sequence[Mapping[str, Any]], rows: Sequence[Row], *, fixed: Mapping[str, float], cost_pct: float,
-    params: Optional[Mapping[str, Any]] = None,
+    params: Optional[Mapping[str, Any]] = None, side: str = "lose",
 ) -> Dict[str, Any]:
     """Which confirmed skip rules actually make the delivered book better?
     The hypothesis search confirms a rule when its later trades lose money (mean < 0).  When the whole book
@@ -393,21 +393,24 @@ def rule_lift(
                  upper bound below zero (matched trades are significantly WORSE than the rest).
     Kept rules are then added best-first until together they would have removed `max_share` of the book.
     Population: delivered (LIVE) trades plus the trades a live hypothesis veto dropped (shadow-tracked), so a rule
-    keeps being judged after it starts blocking."""
+    keeps being judged after it starts blocking.
+    side="win" is the mirror image for take-side setups: keep <=> matched trades MAKE money AND the matched-minus-rest
+    gap has a LOWER bound above zero (significantly BETTER than the rest). Population: delivered (LIVE) trades only."""
     P = default_lift_params()
+    sign = 1.0 if side != "win" else -1.0
     P.update(params or {})
     sl, tp, h = _fixed_tuple(fixed)
     pop: List[Tuple[Row, Dict[str, Any], float, bool]] = []          # (row, features, net pnl, is_live)
     for r in rows:
         src = r.get("source")
         live = src == "LIVE"
-        if not (live or (src == "SHADOW" and r.get("rejection_reason") == "hypothesis_veto")):
+        if not (live or (sign > 0 and src == "SHADOW" and r.get("rejection_reason") == "hypothesis_veto")):
             continue
         if r.get("entry_ts") is None or not has_path(r) or not isinstance(r.get("context"), dict):
             continue
         res = replay_plan(r, sl, tp, h, cost_pct)
         if res is not None:
-            pop.append((r, row_features(r), res[1], live))
+            pop.append((r, row_features(r, setup=True), res[1], live))
     per: Dict[str, Any] = {}
     matched_ids: Dict[str, Set[Tuple[Any, Any, Any]]] = {}
     stage: Dict[str, Tuple[Items, Items]] = {}
@@ -434,17 +437,18 @@ def rule_lift(
     for rid, (m_items, rest) in stage.items():
         pm = _fwd_pool(m_items)
         gap, gse, cells = _stratified_gap(m_items, rest, int(P["min_cell"]))
-        gap_ucb = None if gap is None or gse is None else gap + z_b * gse
+        gap_ucb = None if gap is None or gse is None else gap + sign * z_b * gse
         if rid not in evaluable:
             verdict = "COLLECTING"
         elif gap is None:
             verdict = "UNTESTABLE"
-        elif pm["ev"] is not None and float(pm["ev"]) < 0 and gap_ucb is not None and gap_ucb < 0:
+        elif pm["ev"] is not None and sign * float(pm["ev"]) < 0 and gap_ucb is not None and sign * gap_ucb < 0:
             verdict = "LIFT"
-            scored.append((gap, rid))
+            scored.append((sign * gap, rid))
         else:
             verdict = "NO_LIFT"
-        per[rid] = {"verdict": verdict, "matched": _brief(pm), "gap": _rnd(gap), "gap_ucb": _rnd(gap_ucb), "cells": cells,
+        per[rid] = {"verdict": verdict, "matched": _brief(pm), "gap": _rnd(gap),
+                    "gap_ucb" if sign > 0 else "gap_lcb": _rnd(gap_ucb), "cells": cells,
                     "rest_ev": _rnd(_fwd_pool(rest)["ev"])}
     scored.sort()
     keep: List[str] = []
@@ -460,6 +464,40 @@ def rule_lift(
     return {"keep": keep, "per_rule": per, "union_share": _rnd(len(union) / len(base), 3) if base else None, "z_adj": round(z_b, 2),
             "n_rules": len(per)}
 
+def setup_scorecard(rows: Sequence[Row], *, fixed: Mapping[str, float], cost_pct: float, min_n: int = 30,
+                    min_blocks: int = 15) -> Dict[str, Any]:
+    """Did alerts that carried a historical-setup note (context.setup_seen, stored when the alert fired) do what
+    the note said? Delivered trades only, fixed bracket, after costs, matched vs the REST of the delivered book,
+    stratified by session and direction. Win-kind notes should beat the rest (gap lower bound > 0); loss-kind
+    notes should trail it (gap upper bound < 0). Report only."""
+    sl, tp, h = _fixed_tuple(fixed)
+    buckets: Dict[str, Items] = {"win": [], "loss": [], "mixed": [], "rest": []}
+    for r in rows:
+        if r.get("source") != "LIVE" or r.get("entry_ts") is None or not has_path(r):
+            continue
+        res = replay_plan(r, sl, tp, h, cost_pct)
+        if res is None:
+            continue
+        ctx = r.get("context")
+        seen = ctx.get("setup_seen") if isinstance(ctx, dict) else None
+        kind = seen.get("kind") if isinstance(seen, dict) else None
+        buckets[kind if kind in ("win", "loss", "mixed") else "rest"].append((r, res[1], sl))
+    out: Dict[str, Any] = {k: _brief(_fwd_pool(v)) for k, v in buckets.items()}
+    for kind in ("win", "loss"):
+        pm = _fwd_pool(buckets[kind])
+        if pm["n"] < min_n or pm["n_blocks"] < min_blocks:
+            out[f"{kind}_verdict"] = "COLLECTING"
+            continue
+        gap, gse, _cells = _stratified_gap(buckets[kind], buckets["rest"], 5)
+        if gap is None or gse is None:
+            out[f"{kind}_verdict"] = "UNTESTABLE"
+            continue
+        out[f"{kind}_gap"] = _rnd(gap)
+        if kind == "win":
+            out["win_verdict"] = "AS_ADVERTISED" if gap - Z * gse > 0 else ("WORSE_THAN_ADVERTISED" if gap + Z * gse < 0 else "NOT_PROVEN")
+        else:
+            out["loss_verdict"] = "AS_ADVERTISED" if gap + Z * gse < 0 else ("WORSE_THAN_ADVERTISED" if gap - Z * gse > 0 else "NOT_PROVEN")
+    return out
 
 # ── Conviction anatomy ────────────────────────────────────────────────────────
 
@@ -622,7 +660,7 @@ def build_report(
     veto_mode: str = "off", firewall: Optional[Mapping[str, Any]] = None, firewall_mode: str = "off",
     autotune: Optional[Mapping[str, Any]] = None, win: Optional[Sequence[Mapping[str, Any]]] = None,
     newest_ts: Optional[float] = None, data_ok: bool = True, hyp_lift: Optional[Mapping[str, Any]] = None,
-    anatomy: Optional[Mapping[str, Any]] = None,
+    anatomy: Optional[Mapping[str, Any]] = None, setups: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """One ranked issue list (with evidence and an automation-safety flag) from what the learner computed."""
     issues: List[Dict[str, Any]] = []
@@ -743,8 +781,7 @@ def build_report(
 
     issues.sort(key=lambda i: _SEV_ORDER.get(i["sev"], 9))
     return {"ts": int(now_ts), "playbook": blob.get("label"), "status": issues[0]["sev"] if issues else "OK", "issues": issues,
-            "trend": trend, "veto": veto, "firewall": firewall, "autotune": autotune, "win": list(win or []), "anatomy": anatomy}
-
+            "trend": trend, "veto": veto, "firewall": firewall, "autotune": autotune, "win": list(win or []), "anatomy": anatomy, "setups": setups}
 
 def update_issue_state(prev: Optional[Mapping[str, Any]], issues: Sequence[Mapping[str, Any]], now_ts: float,
                        keep_days: int = 7) -> Tuple[Dict[str, Any], List[str]]:
@@ -822,6 +859,26 @@ def format_report(rep: Mapping[str, Any], *, veto_mode: str = "off", firewall_mo
                 lines.append(f"  · {k}: {d['verdict']} (AUC {d.get('auc')}) {d.get('note', '')}".rstrip())
             else:
                 lines.append(f"  · {k}: {d['verdict']} — AUC {d['auc']}, top EV {d['top']['ev']:+.2f}% vs bottom {d['bottom']['ev']:+.2f}% (gap {d['gap']:+.2f}%, n={d['n']})")
+
+    su = rep.get("setups") or {}
+    if su:
+        pubs = su.get("published") or []
+        lines += ["", f"SETUP INTELLIGENCE [{su.get('mode')}] — advisory only; no alert is dropped or changed",
+                  f"  take-side setups published: {len(pubs)}"]
+        for p in pubs[:5]:
+            lines.append(f"  · ✅ {p.get('text')} — later trades averaged {p.get('ev'):+.2f}% (n={p.get('fwd_n')})")
+        per = (su.get("lift") or {}).get("per_rule") or {}
+        if per and not pubs:
+            counts: Dict[str, int] = {}
+            for d in per.values():
+                counts[d["verdict"]] = counts.get(d["verdict"], 0) + 1
+            lines.append("  confirmed take-side rules, none beats the rest of the book yet: "
+                         + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+        sc = su.get("scorecard") or {}
+        for kind, label in (("win", "take-side"), ("loss", "skip-side")):
+            d = sc.get(kind) or {}
+            if d.get("n"):
+                lines.append(f"  live {label} notes: {stat(d)} → {sc.get(kind + '_verdict')} (rest of book: {stat(sc.get('rest') or {})})")
     iss = rep.get("issues") or []
     fresh = set(fresh_ids or [])
     lines += ["", "ISSUES" if iss else "No issues found."]

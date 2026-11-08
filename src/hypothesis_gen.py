@@ -36,6 +36,7 @@ import random
 from statistics import NormalDist
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+from alert_registry import alert_family_of
 from plan_replay import cluster_se
 from threshold_stats import row_net_pnl_pct
 from threshold_models import _PRICE_LEVEL_CTX
@@ -45,9 +46,26 @@ Atom = Tuple[str, str, Any]          # (feature, op, value); op: ge | lt | eq
 _CANDLE_SEC = 900
 _MAX_TRIED = 5000
 
+# Setup cohort keys (added by row_features(setup=True)): the alert family + side, the exact alert key, the pair.
+COHORT_FEATURES = ("fam", "key", "pair")
+_COHORT_LABEL = {"fam": "alert family", "key": "alert", "pair": "pair"}
+# Shadow rows that may join the rule search. Only alerts that cleared every signal and confluence gate and were
+# dropped by the per-run cap: an unbiased sample of what would have been delivered. Rows dropped by an
+# outcome-aware control (playbook_veto, verdict_firewall) or by a feature-selecting gate (confluence_gate,
+# ood_gate, calibration_gate, portfolio_heat) are left out on purpose. "hypothesis_veto" rows are added by the
+# callers themselves (they keep their context).
+SHADOW_POOL_REASONS = ("run_cap",)
 
-def row_features(r: Row) -> Dict[str, Any]:
-    """Everything knowable when the alert fired, flattened to one dict."""
+
+def shadow_pool_rows(rows: Sequence[Row]) -> List[Row]:
+    """The shadow rows allowed into the rule search (see SHADOW_POOL_REASONS)."""
+    return [r for r in rows if r.get("rejection_reason") in SHADOW_POOL_REASONS]
+
+
+def row_features(r: Row, setup: bool = False) -> Dict[str, Any]:
+    """Everything knowable when the alert fired, flattened to one dict.
+    setup=True (rule search, rule lift, live veto) also adds the cohort keys fam / key / pair and falls back to
+    the row's top-level adx_val, so shadow rows that stored no context can still be mined and matched live."""
     f: Dict[str, Any] = {}
     for k, v in (r.get("context") or {}).items():
         if isinstance(v, bool) or k in _PRICE_LEVEL_CTX:
@@ -60,6 +78,22 @@ def row_features(r: Row) -> Dict[str, Any]:
         f["session"] = r["session"]
     if r.get("direction"):
         f["dir"] = r["direction"]
+    if setup:
+        adx = r.get("adx_val")
+        if ("ctx:adx_val" not in f and isinstance(adx, (int, float)) and not isinstance(adx, bool)
+                and math.isfinite(float(adx))):
+            f["ctx:adx_val"] = float(adx)
+        atr, adxp = f.get("ctx:atr_pctl"), f.get("ctx:adx_pctl")
+        if atr is not None and adxp is not None:
+            # Market regime from two percentile ranks (0-1) that the live and the stored context both carry.
+            f["regime"] = "volatile" if atr >= 0.8 else ("trending" if adxp >= 0.6 else "ranging")
+        ak = r.get("alert_key")
+        if ak:
+            f["key"] = str(ak)
+            fam = alert_family_of(str(ak))
+            f["fam"] = f"{fam}|{r['direction']}" if r.get("direction") else fam
+        if r.get("pair"):
+            f["pair"] = str(r["pair"])
     return f
 
 
@@ -82,6 +116,28 @@ def rules_hit(rules: Sequence[Dict[str, Any]], feats: Dict[str, Any]) -> Optiona
     return None
 
 
+def setup_advice(feats: Dict[str, Any], win_rules: Optional[Sequence[Dict[str, Any]]],
+                 loss_rules: Optional[Sequence[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+    """Advisory annotation for ONE alert from the published setup library, or None when nothing matches.
+    kind 'win'  = a published take-side setup matches (ev = its later average net result, %);
+    kind 'loss' = a published skip setup matches but did not drop the alert (veto mode is not live);
+    kind 'mixed' = both match, so the evidence conflicts. Never raises, never changes the alert."""
+    try:
+        w = rules_hit(list(win_rules or []), feats)
+        lo = rules_hit(list(loss_rules or []), feats)
+    except Exception:
+        return None
+    if w is None and lo is None:
+        return None
+    if w is not None and lo is not None:
+        return {"kind": "mixed", "id": str(w.get("id")), "text": str(w.get("text", "")), "ev": w.get("ev"),
+                "n": w.get("fwd_n"), "loss_id": str(lo.get("id")), "loss_text": str(lo.get("text", "")),
+                "loss_ev": lo.get("fwd_mean")}
+    h, kind = (w, "win") if w is not None else (lo, "loss")
+    ev = h.get("ev") if kind == "win" else h.get("fwd_mean")
+    return {"kind": kind, "id": str(h.get("id")), "text": str(h.get("text", "")), "ev": ev, "n": h.get("fwd_n")}
+
+
 def compact_rules(pool: Optional[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
     """Confirmed rules in the small form the alert path needs, best forward evidence first."""
     out: List[Dict[str, Any]] = []
@@ -96,6 +152,8 @@ def compact_rules(pool: Optional[Dict[str, Any]], limit: int = 5) -> List[Dict[s
 
 def describe_atom(a: Sequence[Any]) -> str:
     name = str(a[0]).replace("ctx:", "").replace("vote:", "")
+    if a[0] in _COHORT_LABEL:
+        return f"{_COHORT_LABEL[a[0]]} = {a[2]}"
     if a[0].startswith("vote:"):
         return f"{name} vote {'on' if a[2] else 'off'}"
     if a[1] == "ge":
@@ -114,11 +172,16 @@ def rule_id(atoms: Sequence[Sequence[Any]]) -> str:
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
-def build_atom_pool(train_feats: Sequence[Dict[str, Any]]) -> List[Atom]:
-    """Candidate conditions, thresholds taken from the older trades only."""
+def build_atom_pool(train_feats: Sequence[Dict[str, Any]], min_cohort: int = 0, n_ctx: int = 0) -> List[Atom]:
+    """Candidate conditions, thresholds taken from the older trades only.
+    min_cohort: a cohort value (fam / key / pair) needs at least this many older trades to become an atom.
+    n_ctx: older trades that carry the full stored context. Numeric fields need 70% coverage of THOSE, so
+    context-free shadow rows do not push every numeric field below the coverage floor (0 = all trades)."""
     n = len(train_feats)
+    denom = n_ctx if n_ctx > 0 else n
     numeric: Dict[str, List[float]] = {}
     cats: Dict[str, Set[Any]] = {}
+    cohort_n: Dict[Tuple[str, Any], int] = {}
     for f in train_feats:
         for k, v in f.items():
             if k.startswith("ctx:"):
@@ -127,9 +190,11 @@ def build_atom_pool(train_feats: Sequence[Dict[str, Any]]) -> List[Atom]:
                 cats.setdefault(k, set()).update((True, False))
             else:
                 cats.setdefault(k, set()).add(v)
+                if k in COHORT_FEATURES:
+                    cohort_n[(k, v)] = cohort_n.get((k, v), 0) + 1
     atoms: List[Atom] = []
     for name, vals in sorted(numeric.items()):
-        if len(vals) < 0.7 * n or len(set(vals)) < 20:
+        if len(vals) < 0.7 * denom or len(set(vals)) < 20:
             continue
         s = sorted(vals)
         for q in (0.2, 0.4, 0.6, 0.8):
@@ -138,6 +203,8 @@ def build_atom_pool(train_feats: Sequence[Dict[str, Any]]) -> List[Atom]:
             atoms.append((name, "lt", t))
     for name, vs in sorted(cats.items()):
         for v in sorted(vs, key=str):
+            if name in COHORT_FEATURES and cohort_n.get((name, v), 0) < min_cohort:
+                continue
             atoms.append((name, "eq", v))
     return list(dict.fromkeys(atoms))
 
@@ -168,11 +235,68 @@ def _forward(rec: Dict[str, Any], feats: List[Dict[str, Any]], ts: List[float], 
             "se": None if st["se"] is None else round(st["se"], 4)}
 
 
+def _deepen(cohort_atoms: Sequence[Atom], free_atoms: Sequence[Atom], hits: Any, tr_set: Set[int],
+            pnls: Sequence[float], skip: Set[str], *, min_train: int, max_atoms: int,
+            budget: int) -> Dict[str, Tuple[Atom, ...]]:
+    """Beam search from each cohort (one alert family / alert / pair) to rules of up to max_atoms conditions,
+    one condition per level. Children are chosen ONLY from the older trades: a child must keep at least
+    min_train of them, drop at least 10% of its parent's trades, and have a lower upper confidence bound (mean + 1.645 SE) than its parent. The beam keeps
+    the best budget // (max_atoms - 1) improving children per level, even while their bound is still above
+    zero (a 3-condition edge often needs a weaker 2-condition step on the way); only children whose bound is
+    below zero are RETURNED. The newer (holdout) trades are never looked at here, so they stay an untouched
+    test. Every child returned will be tested on the holdout and the caller counts each one in the ledger."""
+    def key(combo: Sequence[Atom]) -> Tuple[Atom, ...]:
+        return tuple(sorted(combo, key=lambda a: (a[0], a[1], str(a[2]))))
+
+    def ub(m: Set[int]) -> float:
+        n = len(m)
+        vals = [pnls[i] for i in m]
+        mu = sum(vals) / n
+        var = sum((v - mu) ** 2 for v in vals) / (n - 1) if n > 1 else 0.0
+        return mu + 1.645 * math.sqrt(var / n)
+
+    out: Dict[str, Tuple[Atom, ...]] = {}
+    quota = max(1, budget // max(1, max_atoms - 1))
+    level: List[Tuple[float, Tuple[Atom, ...], Set[int]]] = []
+    for a in cohort_atoms:
+        m = hits(a) & tr_set
+        if len(m) >= 2 * min_train:
+            level.append((ub(m), (a,), m))
+    for _depth in range(2, max_atoms + 1):
+        if not level or len(out) >= budget:
+            break
+        grown: Dict[str, Tuple[float, Tuple[Atom, ...], Set[int]]] = {}
+        for base_ub, combo, m in level:
+            used = {a[0] for a in combo}
+            for a in free_atoms:
+                if a[0] in used:
+                    continue
+                mc = m & hits(a)
+                if len(mc) < min_train or len(mc) > 0.9 * len(m):      # a real refinement removes >= 10% of its parent
+                    continue
+                u = ub(mc)
+                if u >= base_ub:
+                    continue
+                child = key(combo + (a,))
+                cid = rule_id(child)
+                if cid in skip or cid in out:
+                    continue
+                if cid not in grown or u < grown[cid][0]:
+                    grown[cid] = (u, child, mc)
+        take = sorted(grown.items(), key=lambda kv: (kv[1][0], kv[0]))[:quota]
+        for cid, (u, child, _mc) in take:
+            if u < 0 and len(out) < budget:
+                out[cid] = child
+        level = [v for _cid, v in take if len(v[2]) >= 2 * min_train]
+    return out
+
+
 def update_hypothesis_pool(prev: Optional[Dict[str, Any]], rows: Sequence[Row], now: int, *, cost_pct: float,
                            budget: int = 300, shadow_max: int = 10, forward_min_n: int = 30,
                            expire_days: int = 30, alpha: float = 0.05, min_train: int = 30,
                            min_hold: int = 15, max_cover: float = 0.5, min_rows: int = 200,
-                           direction: str = "lose") -> Tuple[Dict[str, Any], Dict[str, Any]]:
+                           direction: str = "lose", deep_budget: int = 100,
+                           max_atoms: int = 4) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     prev = prev if isinstance(prev, dict) else {}
     pool: Dict[str, Any] = {
         "tried_count": int(prev.get("tried_count") or 0),
@@ -182,12 +306,14 @@ def update_hypothesis_pool(prev: Optional[Dict[str, Any]], rows: Sequence[Row], 
         "history": list(prev.get("history") or []),
     }
     events: List[Dict[str, Any]] = []
-    usable = sorted((r for r in rows if r.get("entry_ts") is not None and isinstance(r.get("context"), dict)),
+    usable = sorted((r for r in rows if r.get("entry_ts") is not None
+                     and (isinstance(r.get("context"), dict) or isinstance(r.get("votes"), dict))),
                     key=lambda r: r["entry_ts"])
     summary: Dict[str, Any] = {"status": "insufficient_data", "n_rows": len(usable), "n_tested": 0,
+                               "n_context_rows": sum(1 for r in usable if r.get("context")),
                                "tried_total": pool["tried_count"], "z_required": None, "survivors": 0,
                                "events": events}
-    feats = [row_features(r) for r in usable]
+    feats = [row_features(r, setup=True) for r in usable]
     ts = [float(r["entry_ts"]) for r in usable]
     sign = -1.0 if direction == "win" else 1.0          # "win" searches the negated series: a rule that loses on it wins
     pnls = [sign * row_net_pnl_pct(r, cost_pct) for r in usable]
@@ -234,15 +360,30 @@ def update_hypothesis_pool(prev: Optional[Dict[str, Any]], rows: Sequence[Row], 
         embargo = 14 * _CANDLE_SEC
         tr_idx = [i for i in range(cut) if ts[i] <= split_ts - embargo]
         ho_idx = list(range(cut, len(usable)))
-        atoms = build_atom_pool([feats[i] for i in tr_idx])
+        atoms = build_atom_pool([feats[i] for i in tr_idx], min_cohort=min_train,
+                                n_ctx=sum(1 for i in tr_idx if usable[i].get("context")))
+        # Cohort atoms (alert family / alert / pair) anchor most candidates, so a rule describes ONE kind of alert
+        # instead of pooling unrelated alerts; the remaining candidates keep the old unanchored search.
+        free_atoms = [a for a in atoms if a[0] not in COHORT_FEATURES]
+        by_cohort: Dict[str, List[Atom]] = {}
+        for a in atoms:
+            if a[0] in COHORT_FEATURES:
+                by_cohort.setdefault(a[0], []).append(a)
+        cohort_names = sorted(by_cohort)
         if len(atoms) >= 4 and len(tr_idx) >= min_train and len(ho_idx) >= min_hold:
             rng = random.Random(int(now // 86400))
             cands: Dict[str, Tuple[Atom, ...]] = {}
             tries = 0
             while len(cands) < budget and tries < budget * 20:
                 tries += 1
-                k = 1 if rng.random() < 0.3 else 2
-                pick = rng.sample(atoms, k)
+                if cohort_names and free_atoms and rng.random() < 0.7:
+                    anchor = rng.choice(by_cohort[rng.choice(cohort_names)])
+                    pick = [anchor, rng.choice(free_atoms)]
+                    k = 2
+                else:
+                    base = free_atoms if len(free_atoms) >= 2 else atoms
+                    k = 1 if rng.random() < 0.3 else 2
+                    pick = rng.sample(base, k)
                 if k == 2 and pick[0][0] == pick[1][0]:
                     continue
                 combo = tuple(sorted(pick, key=lambda a: (a[0], a[1], str(a[2]))))
@@ -250,15 +391,6 @@ def update_hypothesis_pool(prev: Optional[Dict[str, Any]], rows: Sequence[Row], 
                 if cid in pool["tried"] or cid in cands:
                     continue
                 cands[cid] = combo
-            pool["tried_count"] += len(cands)
-            for cid in cands:
-                pool["tried"][cid] = int(now)
-            if len(pool["tried"]) > _MAX_TRIED:
-                keep = sorted(pool["tried"].items(), key=lambda kv: -kv[1])[:_MAX_TRIED]
-                pool["tried"] = dict(keep)
-            z_adj = _z(alpha, pool["tried_count"])
-            summary.update({"status": "ran", "n_tested": len(cands), "tried_total": pool["tried_count"],
-                            "z_required": round(z_adj, 2)})
             cache: Dict[Atom, Set[int]] = {}
 
             def hits(a: Atom) -> Set[int]:
@@ -267,6 +399,22 @@ def update_hypothesis_pool(prev: Optional[Dict[str, Any]], rows: Sequence[Row], 
                 return cache[a]
 
             tr_set, ho_set = set(tr_idx), set(ho_idx)
+            n_deep = 0
+            if deep_budget > 0 and max_atoms > 2:
+                deep = _deepen([a for a in atoms if a[0] in COHORT_FEATURES], free_atoms, hits, tr_set, pnls,
+                               set(pool["tried"]) | set(cands),
+                               min_train=min_train, max_atoms=max_atoms, budget=deep_budget)
+                n_deep = len(deep)
+                cands.update(deep)
+            pool["tried_count"] += len(cands)
+            for cid in cands:
+                pool["tried"][cid] = int(now)
+            if len(pool["tried"]) > _MAX_TRIED:
+                keep = sorted(pool["tried"].items(), key=lambda kv: -kv[1])[:_MAX_TRIED]
+                pool["tried"] = dict(keep)
+            z_adj = _z(alpha, pool["tried_count"])
+            summary.update({"status": "ran", "n_tested": len(cands), "n_deep": n_deep,
+                            "tried_total": pool["tried_count"], "z_required": round(z_adj, 2)})
             passed: List[Tuple[float, str, Tuple[Atom, ...], Dict[str, Any], Dict[str, Any], Set[int]]] = []
             for cid, combo in cands.items():
                 m = set.intersection(*(hits(a) for a in combo))

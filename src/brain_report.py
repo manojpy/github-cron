@@ -1425,6 +1425,8 @@ def _hypothesis_gen_lines(sm: Optional[Dict[str, Any]]) -> List[str]:
             f"Proposed {sm['n_tested']} new candidate rules this cycle ({sm['tried_total']} ever tried); "
             f"a rule needed a {sm['z_required']}-sigma loss on newer trades to survive. {sm.get('survivors', 0)} survived."
         )
+        if sm.get("n_context_rows") is not None:
+            lines.append(f"Search pool: {sm['n_rows']} trades, {sm['n_context_rows']} with full context and {sm['n_rows'] - sm['n_context_rows']} context-free shadow trades; {sm.get('n_deep', 0)} of this cycle's candidates have 3-4 conditions.")
     for c in sm.get("confirmed") or []:
         f = c.get("fwd") or {}
         lines.append(f"CONFIRMED: skip when {c['text']} — {f.get('n')} later trades averaged {f.get('mean')}% each")
