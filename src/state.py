@@ -1749,7 +1749,7 @@ class RedisStateStore:
             )
             return "failed"
 
-    # ── Vote-count history (OOD gate) ─────────────────────────────��────────��─
+    # ── Vote-count history (OOD gate) ──────────────────────────────────────
 
     async def record_vote_count(self, alert_key: str, votes: Dict[str, bool]) -> None:
         if self.degraded or not self._redis:
