@@ -456,7 +456,7 @@ class BrainCore:
             return value
 
     async def warm_dispatch_caches(self) -> None:
-        """Load every per-alert Brain blob concurrently (one RTT, not four in
+        """Load every per-alert Brain blob concurrently (one RTT, not five in
         series). Called while candles are still being fetched so the alert
         path finds warm caches. Never raises."""
         try:
@@ -465,6 +465,7 @@ class BrainCore:
                 self._load_batch_market_state_model(),
                 self._load_ml_calibration_curve(),
                 self._load_quality_inputs(),
+                *([self._load_playbook_blob()] if getattr(cfg, "PLAYBOOK_MODE", "off") != "off" else []),
                 return_exceptions=True,
             )
         except Exception as e:
@@ -733,6 +734,29 @@ class BrainCore:
             "quality_inputs_load",
         )
 
+    async def _load_playbook_blob(self) -> Optional[Dict[str, Any]]:
+        """The learner playbook blob, cached for 5 minutes. Single-flight: pairs are
+        evaluated concurrently, so without the lock each of them issued its own GET
+        the first time the cache was cold. None = Redis unavailable; {} = no playbook
+        (missing or unreadable), which is cached too so it is not re-read per alert."""
+        now = time.time()
+        if self._playbook_cache is not None and now - self._playbook_cache_ts <= 300:
+            return self._playbook_cache
+        if self.sdb.degraded or not self.sdb._redis:
+            return None
+        async with self.__dict__.setdefault("_playbook_lock", asyncio.Lock()):
+            now = time.time()
+            if self._playbook_cache is not None and now - self._playbook_cache_ts <= 300:
+                return self._playbook_cache
+            raw = await self.sdb.get_metadata(PLAYBOOK_KEY)
+            try:
+                blob = json.loads(raw) if raw else {}
+            except (TypeError, ValueError):
+                blob = {}
+            self._playbook_cache_ts = time.time()
+            self._playbook_cache = blob if isinstance(blob, dict) else {}
+            return self._playbook_cache
+
     async def get_playbook_entry(self, alert_key: str, direction: str) -> Optional[Dict[str, Any]]:
         """Learner playbook entry for an alert (None = none / stale / Redis down).
         Never raises; the playbook is cached for 5 minutes."""
@@ -740,12 +764,8 @@ class BrainCore:
             return None
         try:
             now = time.time()
-            if self._playbook_cache is None or now - self._playbook_cache_ts > 300:
-                if self.sdb.degraded or not self.sdb._redis:
-                    return None
-                raw = await self.sdb.get_metadata(PLAYBOOK_KEY)
-                self._playbook_cache_ts = now
-                self._playbook_cache = json.loads(raw) if raw else {}
+            if await self._load_playbook_blob() is None:
+                return None
             from alert_registry import alert_family_of
             return playbook_lookup(
                 self._playbook_cache, alert_key, direction, family_fn=alert_family_of,
@@ -933,11 +953,14 @@ class BrainCore:
         if self.sdb.degraded or not self.sdb._redis:
             return False
         try:
-            await self.sdb._safe_redis_op(
+            deleted = await self.sdb._safe_redis_op(
                 lambda: _rc(self.sdb._redis).delete(KILL_SWITCH_KEY),
                 2.0, "kill_switch_clear",
             )
-            return True
+            # _safe_redis_op swallows Redis errors and answers None. DEL itself
+            # answers 0 (key already gone) or 1, so None means the delete did not
+            # complete and the kill switch is still on.
+            return deleted is not None
         except Exception:
             return False
 

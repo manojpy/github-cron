@@ -420,8 +420,12 @@ class BrainEngineV2(BrainCore):
         self._recent_rows_cache = None
         self._layered_rows_cache = None
         result = await self._generate_recommendations_full()
+
         self._recs_cache = result
-        self._recs_cache_ts = now
+        # Stamp the cache when the compute FINISHES: the pipeline can run longer
+        # than the 120 s window, and a start-time stamp made the entry expire
+        # before the second caller (e.g. the fallback report) could reuse it.
+        self._recs_cache_ts = time.time()
         return result
 
     async def _generate_recommendations_full(self) -> Dict[str, Any]:
@@ -541,6 +545,16 @@ class BrainEngineV2(BrainCore):
                     .get("action_gate", {})
                     .get("actionable", False)
             )
+            # A reinstate only makes sense for a key that is disabled right now.
+            # "recovered_alert" is emitted for every healthy alert, so without this
+            # check each report planned a no-op "reinstate" for keys that were never
+            # disabled. If the disabled set cannot be read, plan no reinstates
+            # (re-enabling is the risk-increasing direction).
+            try:
+                _disabled_now = set(await self.sdb.get_disabled_alert_keys())
+            except Exception as _e:
+                logging.getLogger("macd_bot").debug(f"Plan: disabled keys unreadable, no reinstates planned: {_e!r}")
+                _disabled_now = set()
 
             for rec in recs.get("recommendations", []):
                 rec_type = rec.get("type")
@@ -562,8 +576,9 @@ class BrainEngineV2(BrainCore):
                 elif rec_type in ("reinstate_alert", "recovered_alert", "auto_reenabled"):
                     if not action_gate_passed:
                         continue
+
                     ak = rec.get("alert") or rec.get("alert_key")
-                    if ak:
+                    if ak and ak in _disabled_now:
                         reinstate_alerts.append(ak)
 
                 elif rec_type == "repair_shop" and rec.get("category") == "root_cause":
