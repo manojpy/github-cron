@@ -495,7 +495,7 @@ def actionable_condition_ablation(rows: List[Row], min_sample: int = 40, n_permu
             })
     return out
 
-def _pnl_sample_weights(rows: List[Row], fee_pct: float = 0.0006, slippage_pct: float = 0.0003, min_weight: float = 0.15) -> List[float]:
+def _pnl_sample_weights(rows: List[Row], fee_pct: Optional[float] = None, slippage_pct: Optional[float] = None, min_weight: float = 0.15) -> List[float]:
     """Per-row training weights from actual net P&L magnitude (item #13):
     a trade that made/lost 2% should pull the fit harder than one that
     made/lost 0.05%, instead of every row counting as one classification
@@ -507,6 +507,11 @@ def _pnl_sample_weights(rows: List[Row], fee_pct: float = 0.0006, slippage_pct: 
     therefore existing min_sample/l2 tuning) stays comparable to plain
     uniform weighting, and floored at min_weight so a near-zero-P&L row
     still contributes rather than vanishing from the fit entirely."""
+
+    if fee_pct is None:
+        fee_pct = float(getattr(cfg, "BRAIN_FEE_PCT", 0.0006))
+    if slippage_pct is None:
+        slippage_pct = float(getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003))
     total_cost = (fee_pct * 2 + slippage_pct * 2) * 100
     raw: List[float] = []
 
@@ -1001,7 +1006,8 @@ def net_ev_baseline_audit(rows: List[Row], horizon: int = 12, min_train: int = 1
         take["key_rule"].append(bool(key_ok.get(r["alert_key"], False)))
         past = [v for t, v in hist.get(r["alert_key"], []) if t + reach <= r["ts"]]
         take["trailing"].append(len(past) >= 5 and sum(past) / len(past) > 0)
-    for r in test:   # test trades become history for LATER test trades only
+        # This trade becomes history for LATER test trades only (the `reach` filter
+        # above keeps it out of any trade that opens before its own window closes).
         hist.setdefault(r["alert_key"], []).append((r["ts"], net(r)))
 
     stamps = [float(r["ts"]) for r in test]

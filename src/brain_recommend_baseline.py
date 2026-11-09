@@ -740,12 +740,12 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
         gap = mfe_wr - close_wr
         summary_msg = (
             f"📐 Three-Metric Evaluation (n={mm_summary['n']}):\n"
-            f"  Close WR (point-in-time): {close_wr:.0%} "
+            f"  • Close WR (point-in-time): {close_wr:.0%} "
             f"[{mm_summary['close_wilson'][0]:.0%}-{mm_summary['close_wilson'][1]:.0%}]\n"
             f"  • MFE WR (TP ever hit):    {mfe_wr:.0%} "
             f"[{mm_summary['mfe_wilson'][0]:.0%}-{mm_summary['mfe_wilson'][1]:.0%}]\n"
             f"  • MAE Loss Rate (SL hit):  {mae_rate:.0%}\n"
-            f" Clean Win (TP w/o SL):   {clean_wr:.0%}"
+            f"  • Clean Win (TP w/o SL):   {clean_wr:.0%}"
         )
         if gap > 0.05:
             # FIX (Priority 8): MFE is opportunity/target-reach rate,
@@ -1283,7 +1283,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             if _cands:
                 _top = sorted(
                     _cands.values(),
-                    key=lambda c: (not c.get("passed"), -(c.get("delta_ev") or -9.0)),
+                    key=lambda c: (not c.get("passed"), -(c["delta_ev"] if c.get("delta_ev") is not None else -9.0)),
                 )[:5]
                 recommendations.append({
                     "type": "zone_profiles", "severity": "low",
@@ -1480,7 +1480,17 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             fee_pct=getattr(cfg, "BRAIN_FEE_PCT", 0.0006),
             slippage_pct=getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003),
         )
+
         ks_state = ks.evaluate(real_rows)
+        # Same net-EV check as the 15-minute run (macd_unified): a streak or drawdown
+        # does not trip the switch while the lookback window's net EV is still positive.
+        if ks_state["tripped"]:
+            _ks_cut = time.time() - float(getattr(cfg, "KILL_SWITCH_LOOKBACK_HOURS", 24)) * 3600.0
+            _ks_recent = [r for r in real_rows if r.get("entry_ts", 0) >= _ks_cut]
+            _ks_ev = engine.ev_first_objective(_ks_recent, min_sample=5) if _ks_recent else {}
+            if _ks_ev.get("valid") and _ks_ev["net_ev"] > 0:
+                ks_state["tripped"] = False
+                ks_state["reason"] = f"DOWNGRADED: {ks_state['reason']} (EV positive)"
         ai_metrics["kill_switch"] = ks_state
         ai_metrics["kill_switch_mode"] = _ks_mode
         if _ks_mode == "shadow":
@@ -1490,7 +1500,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                 )
                 recommendations.append({
                     "type": "kill_switch_shadow",
-                    "severity": "warning",
+                    "severity": "medium",
                     "message": (
                         f"🧠 Kill-switch would have fired (shadow, not blocking): "
                         f"{ks_state['reason']}"
@@ -1499,17 +1509,25 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             ai_metrics["kill_switch_shadow_log"] = await load_kill_switch_shadow_log(self.sdb)
         elif ks_state["tripped"]:
             ttl = int(getattr(cfg, "KILL_SWITCH_COOLDOWN_HOURS", 12) * 3600)
+            _ks_written = False
             if self.sdb._redis and not self.sdb.degraded:
-                await self.sdb._safe_redis_op(                   
+                _ks_written = await self.sdb._safe_redis_op(               
                     lambda: _rc(self.sdb._redis).set(KILL_SWITCH_KEY, json_dumps(ks_state), ex=ttl),
                     2.0, "kill_switch_set",
                 )
+
+            _ks_block_note = (
+                f"Dispatch blocked for {ttl // 3600}h or until cleared. "
+                if _ks_written else
+                "The block flag could NOT be written to Redis, so this report did not "
+                "block dispatch (the next 15-minute run re-evaluates it). "
+            )
             recommendations.append({
                 "type": "kill_switch",
                 "severity": "critical",
                 "message": (
                     f"🛑 KILL SWITCH TRIPPED: {ks_state['reason']}. "
-                    f"Dispatch blocked for {ttl // 3600}h or until cleared. "
+                    f"{_ks_block_note}"
                     f"CUSUM catches slow per-key decay; this catches the fast "
                     f"cross-key bleed it can't see."
                 ),

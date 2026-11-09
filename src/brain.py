@@ -554,7 +554,13 @@ class BrainCore:
             return {}
         from threshold_models import online_challenger_step
         now = int(time.time())
-        lag = int(getattr(cfg, "OUTCOME_LOOKAHEAD_CANDLES", 12)) * 900 + 3600
+
+        # A trade resolves (lookahead + fill delay) candles after its signal; the
+        # extra hour is slack for a late or skipped bot run.
+        lag = (
+            int(getattr(cfg, "OUTCOME_LOOKAHEAD_CANDLES", 12))
+            + max(0, int(getattr(cfg, "OUTCOME_FILL_DELAY_CANDLES", 1)))
+        ) * 900 + 3600
         prev = await self._load_online_model_state(fresh=True)
         res = online_challenger_step(
             prev, champion, rows, now, lag_sec=lag,
