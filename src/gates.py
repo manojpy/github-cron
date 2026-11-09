@@ -102,6 +102,10 @@ class GateResult:
     gaussian_gate_ok_buy: Optional[bool]; gaussian_gate_ok_sell: Optional[bool]
     confirmation_buy: bool; confirmation_sell: bool
     cloud_group_ok_buy: bool; cloud_group_ok_sell: bool
+    ichimoku_filter_ok_buy: Optional[bool]
+    ichimoku_filter_ok_sell: Optional[bool]
+    ichimoku_future_green: bool
+    ichimoku_future_red: bool
 
     # -- Tenkan/Kijun lines (cross alerts only) + Momentum Oscillator vote --
     tk_conversion_curr: float; tk_conversion_prev: float
@@ -603,11 +607,27 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             cloud_lower_val = cloud_lower_arr[i5]
             cloud_upper_prev = cloud_upper_arr[i5 - 1]
             cloud_lower_prev = cloud_lower_arr[i5 - 1]
+
         else:
             cloud_upper_val = ichimoku_cloud_upper[i15]
             cloud_lower_val = ichimoku_cloud_lower[i15]
             cloud_upper_prev = ichimoku_cloud_upper[i15 - 1]
             cloud_lower_prev = ichimoku_cloud_lower[i15 - 1]
+
+        # Future-cloud colour (always taken from the 15m series used by the common filter)
+        _fg_arr = gate_indicators.get("ichimoku_future_green")
+        _fr_arr = gate_indicators.get("ichimoku_future_red")
+        if (
+            _fg_arr is not None
+            and _fr_arr is not None
+            and i15 < len(_fg_arr)
+            and i15 < len(_fr_arr)
+        ):
+            ichimoku_future_green = bool(_fg_arr[i15])
+            ichimoku_future_red = bool(_fr_arr[i15])
+        else:
+            ichimoku_future_green = False
+            ichimoku_future_red = False
 
         # Gaussian Filter Trend (unchanged)
         if cfg.GAUSSIAN_TREND_ENABLED and bool(gaussian_valid_arr[i15]):
@@ -1105,15 +1125,52 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         trend_gate_ok_buy = cloud_group_ok_buy and oscillator_group_ok_buy
         trend_gate_ok_sell = cloud_group_ok_sell and oscillator_group_ok_sell
 
+
+        # ── Ichimoku common filter (togglable) ──────────────────────────────
+        # Always uses the 15m cloud (BIAS_ICHIMOKU_* periods), independent of
+        # ICHIMOKU_CROSS_ALERT_TF (which only affects cross-alert detection).
+        # Fail-closed when the filter is enabled but data is not ready.
+        ichimoku_filter_ok_buy: Optional[bool] = None
+        ichimoku_filter_ok_sell: Optional[bool] = None
+
+        if cfg.ENABLE_ICHIMOKU_COMMON_FILTER and cfg.ICHIMOKU_CLOUD_ENABLED:
+            _cu = ichimoku_cloud_upper[i15]
+            _cl = ichimoku_cloud_lower[i15]
+            if (
+                not np.isnan(_cu)
+                and not np.isnan(_cl)
+                and not np.isnan(close_curr)
+            ):
+                ichimoku_filter_ok_buy = bool(
+                    close_curr > _cu and ichimoku_future_green
+                )
+                ichimoku_filter_ok_sell = bool(
+                    close_curr < _cl and ichimoku_future_red
+                )
+            else:
+                ichimoku_filter_ok_buy = False
+                ichimoku_filter_ok_sell = False
+                if cfg.DEBUG_MODE:
+                    logger_pair.debug(
+                        f"[{pair_name}] Ichimoku common filter blocked "
+                        f"(cloud or close NaN at i15={i15})"
+                    )
+        else:
+            # Filter disabled → do not constrain
+            ichimoku_filter_ok_buy = True
+            ichimoku_filter_ok_sell = True
+
         buy_trend_common = (
             base_buy_trend
             and volatility_filter_ok and effective_cpr_ok
             and trend_gate_ok_buy
+            and bool(ichimoku_filter_ok_buy)
         )
         sell_trend_common = (
             base_sell_trend
             and volatility_filter_ok and effective_cpr_ok
             and trend_gate_ok_sell
+            and bool(ichimoku_filter_ok_sell)
         )
         buy_common  = buy_trend_common and is_valid_for_buy
         sell_common = sell_trend_common and is_valid_for_sell
@@ -1121,11 +1178,13 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             base_buy_trend
             and effective_cpr_ok
             and trend_gate_ok_buy
+            and bool(ichimoku_filter_ok_buy)
         )
         sell_trend_common_relaxed = (
             base_sell_trend
             and effective_cpr_ok
             and trend_gate_ok_sell
+            and bool(ichimoku_filter_ok_sell)
         )
         reversal_candidate = (
             (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT
@@ -1142,6 +1201,14 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
                 reasons.append("base_trend=False")
             if not confirmation_buy and not confirmation_sell:
                 reasons.append("cloud_align=False")
+            if cfg.ENABLE_ICHIMOKU_COMMON_FILTER and cfg.ICHIMOKU_CLOUD_ENABLED:
+                if not ichimoku_filter_ok_buy and not ichimoku_filter_ok_sell:
+                    reasons.append(
+                        f"ichimoku_filter=False "
+                        f"(close={close_curr:.4f} upper={ichimoku_cloud_upper[i15]:.4f} "
+                        f"lower={ichimoku_cloud_lower[i15]:.4f} "
+                        f"green={ichimoku_future_green} red={ichimoku_future_red})"
+                    )
             if not volatility_filter_ok:
                 reasons.append(
                     f"market_filter=False (adx={adx_val:.1f}, "
@@ -1256,6 +1323,10 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             cloud_up=cloud_up, cloud_down=cloud_down,
             cloud_upper_val=cloud_upper_val, cloud_lower_val=cloud_lower_val,
             cloud_upper_prev=cloud_upper_prev, cloud_lower_prev=cloud_lower_prev,
+            ichimoku_filter_ok_buy=ichimoku_filter_ok_buy,
+            ichimoku_filter_ok_sell=ichimoku_filter_ok_sell,
+            ichimoku_future_green=ichimoku_future_green,
+            ichimoku_future_red=ichimoku_future_red,
             gaussian_gate_ok_buy=gaussian_gate_ok_buy, gaussian_gate_ok_sell=gaussian_gate_ok_sell,
             confirmation_buy=confirmation_buy, confirmation_sell=confirmation_sell,
             cloud_group_ok_buy=cloud_group_ok_buy, cloud_group_ok_sell=cloud_group_ok_sell,

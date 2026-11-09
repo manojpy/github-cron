@@ -203,6 +203,7 @@ class BotConfig(BaseModel):
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
     SANITIZE_BAD_CANDLES: bool = Field(default=False, description="If True, drop individual invalid candles instead of rejecting the whole fetch")
     ICHIMOKU_CLOUD_ENABLED: bool = Field(default=True, description="Compute the Ichimoku cloud (BIAS_ICHIMOKU_* = 23/65/130/65) used by the cloud-cross alerts. It no longer votes in the cloud group (Gaussian Trend does)")
+    ENABLE_ICHIMOKU_COMMON_FILTER: bool = Field(default=False, description="When True, every buy alert additionally requires 15m close above the Ichimoku cloud (close > cloud_upper) AND future cloud green (Span A >= Span B). Every sell alert requires 15m close below the cloud (close < cloud_lower) AND future cloud red (Span A <= Span B). Uses the same 23/65/130/65 periods as ICHIMOKU_CLOUD_ENABLED. Fails closed (blocks) when cloud data is not ready.")
     GAUSSIAN_TREND_ENABLED: bool = Field(default=True, description="Gaussian Filter Trend (QuantAlgo Pine port) as the trend-cloud vote of the cloud group; replaces the old Ichimoku 9/26/52/26 cloud vote")
     GAUSSIAN_PRESET: Literal['Default', 'Fast Response', 'Smooth Trend'] = Field(default='Default', description="Pine preset. Anything other than Default overrides the GAUSSIAN_* length/pole/ATR/efficiency inputs below, exactly like the Pine script")
     GAUSSIAN_SOURCE: Literal['close', 'hl2', 'hlc3'] = Field(default='close', description="Price source passed through the Gaussian filter (Pine: Price Source)")
@@ -745,7 +746,7 @@ class BotConfig(BaseModel):
             raise ValueError(
                 f'EXHAUSTION_VERDICT_WATCH_SCORE ({self.EXHAUSTION_VERDICT_WATCH_SCORE}) must not exceed '
                 f'EXHAUSTION_VERDICT_AVOID_SCORE ({self.EXHAUSTION_VERDICT_AVOID_SCORE})'
-            )
+            ) 
         if self.RMA_CLOUD_ENABLED and self.RMA_CLOUD_FAST_PERIOD >= self.RMA_50_PERIOD:
             raise ValueError(
                 f'RMA_CLOUD_FAST_PERIOD ({self.RMA_CLOUD_FAST_PERIOD}) must be strictly less than '
@@ -823,7 +824,11 @@ class BotConfig(BaseModel):
                 f'COALESCE_DEDUP_WINDOW_SEC={self.COALESCE_DEDUP_WINDOW_SEC} is longer than one 15m candle: '
                 f'a same-direction alert on the NEXT candle is suppressed. Use <= 900 to dedup within a candle only.'
             )
-
+        if self.ENABLE_ICHIMOKU_COMMON_FILTER and not self.ICHIMOKU_CLOUD_ENABLED:
+            warnings.append(
+                "ENABLE_ICHIMOKU_COMMON_FILTER is True but ICHIMOKU_CLOUD_ENABLED is False — "
+                "the Ichimoku common filter will have no effect"
+            )
         if self.MAX_ALERTS_PER_PAIR > 15:
             warnings.append(
                 f'MAX_ALERTS_PER_PAIR={self.MAX_ALERTS_PER_PAIR} is very high, may cause spam'
