@@ -553,9 +553,11 @@ def _apply_exhaustion(advice: PairAdvice, info: Optional[Dict[str, Any]], mode: 
         advice.conviction = new_c
         if new_v != old_v:
             advice.verdict = new_v
-            advice.qualifier = ""
-            if new_v == AVOID:
+            if new_v == AVOID or advice.qualifier:
+                # A qualified TAKE ("small size" / "validated plan") carries a size
+                # that only made sense for that TAKE; the lowered verdict must not keep it.
                 advice.size_line = ""
+            advice.qualifier = ""
             advice.why_line += " Held back by late-trend exhaustion."
         advice.risk_label = "Risk"
         advice.risk_line = f"late-trend exhaustion {score}/6 ({reasons}); " + advice.risk_line

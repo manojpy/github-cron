@@ -648,6 +648,9 @@ def learn_repair_effectiveness(ledger_records: List[Dict[str, Any]], current_sta
         "p_help_by_category": preds,
     }
 
+
+
+
 def repair_shop_diagnosis(rows: List[Row], drift_alerts: List[Dict[str, Any]], config: Dict[str, Any], target_wr: float = 0.55, disable_wr: float = 0.40, min_sample: int = 20) -> List[Dict[str, Any]]:
     """One-stop repair shop: diagnoses the system's health and produces
     prioritized, actionable fix recommendations. Each item has:
@@ -980,10 +983,13 @@ def repair_shop_diagnosis(rows: List[Row], drift_alerts: List[Dict[str, Any]], c
     repairs.sort(key=lambda x: severity_order.get(x["severity"], 4))
     shop_max = getattr(cfg, "BRAIN_REPAIR_SHOP_MAX", 3)
     if len(repairs) > shop_max:
-        # The cap must not silently drop the two categories that drive automatic
-        # follow-ups (revert-patch proposal and root-cause weight cut).
+
+        # The cap must not silently drop a critical repair, nor the two categories
+        # that drive automatic follow-ups (revert-patch proposal and root-cause
+        # weight cut).
         _must_keep = {"config_regression_pinpoint", "root_cause"}
         kept = repairs[:shop_max]
-        kept += [r for r in repairs[shop_max:] if r.get("category") in _must_keep]
+        kept += [r for r in repairs[shop_max:]
+                 if r.get("severity") == "critical" or r.get("category") in _must_keep]
         repairs = kept
     return repairs

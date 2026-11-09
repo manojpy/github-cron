@@ -252,10 +252,10 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
         disable_wr=disable_wr,
         min_sample=min_sample,
     )
-    # BRAIN_REPAIR_SHOP_MAX caps report noise. The list is already sorted by severity
-    # (critical first); critical repairs are never cut by the cap.
-    _n_critical = sum(1 for r in repairs if r.get("severity") == "critical")
-    repairs = repairs[:max(int(cfg.BRAIN_REPAIR_SHOP_MAX), _n_critical)]
+
+    # BRAIN_REPAIR_SHOP_MAX is applied inside repair_shop_diagnosis(), which keeps every
+    # critical repair plus the two categories that drive automatic follow-ups
+    # (revert-patch proposal, root-cause weight cut). The list is not cut again here.
     for repair in repairs:
         wrapped = {
             "type": "repair_shop",
