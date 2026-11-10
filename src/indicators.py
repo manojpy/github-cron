@@ -1795,9 +1795,13 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
                 continue
 
             fvg_fn = _bullish_fvg_at if is_buy else _bearish_fvg_at
+            # k = r + 1 completes the classic FVG (displacement candle in the middle), but
+            # the array also holds the still-forming candle at i15 + 1. Never read past
+            # i15: an FVG ending on an unclosed candle repaints between runs. A gap whose
+            # third candle closes later is picked up on the next run through persistence.
             has_fvg = any(
                 fvg_fn(h, l, k)
-                for k in range(max(sweep_idx, 2), min(r + 2, len(h)))
+                for k in range(max(sweep_idx, 2), min(r + 2, i15 + 1, len(h)))
             )
             if cfg_obj.CHOCH_REQUIRE_FVG and not has_fvg:
                 continue
