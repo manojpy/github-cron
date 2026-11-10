@@ -3094,7 +3094,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     raw_score = confluence_score
                     confluence_score = confluence_score * (1 - cfg.CLUSTER_PENALTY_PCT)
                     logger_pair.info(
-                        f"[{pair_name}] 🌐 Correlation cluster penalty: "
+                        f"[{pair_name}] �� Correlation cluster penalty: "
                         f"{'buy' if is_buy_batch else 'sell'} cluster at {cluster_pct:.0%} of "
                         f"{cluster_context.total_pairs} pairs (> {cfg.CLUSTER_PCT_THRESHOLD:.0%} threshold) — "
                         f"confluence score {raw_score:.1f} -> {confluence_score:.1f}"
@@ -4022,6 +4022,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         f"claim released; separate 'unconfirmed' notice sent instead"
                     )
                     await _release_dedup_claims()
+                    await _persist_resets_when_blocked()
                     await _notify_unconfirmed_signal(
                         telegram_queue, pair_name, alerts_to_send, ts_curr,
                         "candle data unavailable", logger_pair,
@@ -4062,6 +4063,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         f"claim released; separate 'unconfirmed' notice sent instead"
                     )
                     await _release_dedup_claims()
+                    await _persist_resets_when_blocked()
                     await _notify_unconfirmed_signal(
                         telegram_queue, pair_name, alerts_to_send, ts_curr,
                         "mark price unavailable", logger_pair,
