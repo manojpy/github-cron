@@ -1223,6 +1223,10 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                             ref_pair, btc_15m, btc_5m, btc_daily, state_db, correlation_id, reference_time, btc_oi,
                             resolve_outcomes=False,
                         )
+                    # Correlation input: closed candles only. The fetched array also holds
+                    # the candle that has just opened, which would repaint the value.
+                    _btc_i15 = get_last_closed_index_from_array(btc_15m.ts, 15, reference_time, ref_pair)
+                    _btc_closes = btc_15m.close if _btc_i15 is None else btc_15m.close[:_btc_i15 + 1]
                     _mref = (
                         btc_gr[1].get("macro_ref")
                         if isinstance(btc_gr, tuple) and len(btc_gr) == 2 and isinstance(btc_gr[1], dict)
@@ -1235,7 +1239,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                             adx_ok=btc_gr.adx_ok,
                             close=btc_gr.c,
                             open=btc_gr.o,
-                            closes=btc_15m.close,
+                            closes=_btc_closes,
                         )
                     elif _mref:
                         # BTC's own gate exited early (NO_SIGNAL) but still knows its
@@ -1246,7 +1250,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                             adx_ok=bool(_mref["adx_ok"]),
                             close=float(_mref["close"]),
                             open=float(_mref["open"]),
-                            closes=btc_15m.close,
+                            closes=_btc_closes,
                         )
                         logger_main.info(
                             f"Macro context: {ref_pair} built from its early-exit gate "

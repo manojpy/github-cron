@@ -3013,7 +3013,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             # opposed trades against. Only an opposed batch gets a multiplier != 1.0,
             # so live behaviour is unchanged.
             corr = rolling_correlation(
-                _pct_returns(data_15m.close), _pct_returns(macro_context.closes),
+                _pct_returns(data_15m.close[:gr.i15 + 1]), _pct_returns(macro_context.closes),
                 window=Constants.MACRO_CORR_WINDOW,
             )
             relative_strength = None
