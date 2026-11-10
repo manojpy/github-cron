@@ -1389,18 +1389,27 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             elif ks_state["tripped"]:
                 kill_switch_tripped_this_run = True
                 ttl = int(cfg.KILL_SWITCH_COOLDOWN_HOURS * 3600)
-
-                await state_db._safe_redis_op(
+                _ks_saved = await state_db._safe_redis_op(
                     lambda: _rc(state_db._redis).set(
                         KILL_SWITCH_KEY, json_dumps(ks_state), ex=ttl,
                     ),
                     2.0, "kill_switch_set",
                 )
                 logger_main.critical(f" KILL SWITCH: {ks_state['reason']}")
+                if not _ks_saved:
+                    logger_main.error(
+                        "Kill switch flag could NOT be written to Redis: this run's alerts "
+                        "are blocked, the next run re-evaluates it"
+                    )
                 try:
                     await telegram_queue.send(escape_markdown_v2(
                         f"🛑 KILL SWITCH TRIPPED: {ks_state['reason']}\n"
-                        f"Dispatch blocked for {ttl // 3600}h."
+                        + (
+                            f"Dispatch blocked for {ttl // 3600}h."
+                            if _ks_saved else
+                            "Dispatch blocked for THIS run only: the block could not be saved "
+                            "to Redis, so the next run re-evaluates it."
+                        )
                     ))
                 except Exception as e:
                     logger_main.error(

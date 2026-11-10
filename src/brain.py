@@ -1416,7 +1416,10 @@ class BrainCore:
 
         try:
             await self._deliver_report(pairs, telegram_queue, logger_run)
-        except Exception:
+        except (Exception, asyncio.CancelledError):
+            # CancelledError is what the Brain-report time budget (asyncio.wait_for in
+            # run_once) raises inside this coroutine. It is not an Exception, so the
+            # slot used to stay consumed and the next report waited a full interval.
             await self._rollback_run_count()
             raise
 
