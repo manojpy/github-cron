@@ -13,6 +13,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from plan_replay import outcome_path_fields, outcome_path_stream_fields
 from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError, CONFIG_OVERRIDE_ALLOWED_FIELDS, CONFIG_OVERRIDE_METADATA_KEY, BRAIN_DISABLED_KEYS_METADATA_KEY, PAIR_THRESHOLDS_METADATA_KEY, _get_session_from_ts
 from fetcher import compute_backoff
+from alert_registry import is_elliott_key
 
 StreamField = Union[bytes, memoryview, str, int, float]
 BRAIN_KEY_HISTORY_METADATA_KEY = "brain_alert_key_history"
@@ -1601,7 +1602,14 @@ class RedisStateStore:
             return True
         if self.degraded:
             return False
-        _cd_hit = await self.in_trade_cooldown(pair, entry_ts, direction=direction)
+        # Elliott Wave rows are exempt from the legacy re-entry cooldown BY DESIGN:
+        # the Elliott module is independent of the MACD alerts and keeps its own
+        # duplicate prevention (one claim per wave structure) and its own per-run cap.
+        # Do not "fix" this: a MACD target hit must never silence a wave count.
+        _cd_hit = (
+            None if is_elliott_key(alert_key)
+            else await self.in_trade_cooldown(pair, entry_ts, direction=direction)
+        )
 
         if _cd_hit is not None:
             logger.info(
@@ -1682,7 +1690,10 @@ class RedisStateStore:
 
         # Live cooldown (Recorded trades only). It no longer blocks shadowing;
         # it is only stored as a flag on the row.
-        _cd_hit = await self.in_trade_cooldown(pair, entry_ts)
+        # Elliott rows never see the legacy cooldown (see record_pending_outcome) and
+        # never share the legacy "one open shadow trade per pair" slot (see below).
+        _is_ew = is_elliott_key(alert_key)
+        _cd_hit = None if _is_ew else await self.in_trade_cooldown(pair, entry_ts)
         cooldown_active = _cd_hit is not None
 
         key = f"{RedisKeyPrefix.SHADOW_PENDING}{pair}:{alert_key}:{entry_ts}"
@@ -1691,7 +1702,7 @@ class RedisStateStore:
             if confluence_score is not None and confluence_total else -1.0
         )
         replace_key: Optional[str] = None
-        if getattr(cfg, "ENABLE_SINGLE_ACTIVE_SHADOW", True):
+        if getattr(cfg, "ENABLE_SINGLE_ACTIVE_SHADOW", True) and not _is_ew:
             mine = self._shadow_registered_this_run.get(pair)
             if mine is not None and mine[0] == int(entry_ts):
                 if ratio <= mine[1]:
@@ -2335,14 +2346,20 @@ class RedisStateStore:
                 if bonus_idx is not None:
                     return max(hit_idx, bonus_idx), closed_json, not already
             return None, closed_json, not already
+
         except Exception:
             return None, None, False
 
-    async def get_active_trade(self, pair: str) -> Optional[Dict[str, Any]]:
+    async def get_active_trade(self, pair: str, elliott: bool = False) -> Optional[Dict[str, Any]]:
         """The open recorded trade for this pair, or None.
+
+        `elliott=False` (the default, used by every legacy caller) looks only at
+        non-Elliott rows, so an open Elliott trade can never block a MACD alert;
+        `elliott=True` looks only at Elliott rows.
 
         Open = a pending-outcome row that exists and is not marked closed.
         Uses the run-level key pre-scan (no extra SCAN); costs one pipelined
+
         GET batch, and only when the pair has pending keys at all."""
         if self.degraded or not self._redis:
             return None
@@ -2364,9 +2381,10 @@ class RedisStateStore:
                 if d.get("closed_ts") is not None:
                     continue
                 ets = int(d["entry_ts"])
+                parts = str(k).split(":")
+                if is_elliott_key(parts[-2] if len(parts) >= 2 else "") != elliott:
+                    continue
                 if best is None or ets > best["entry_ts"]:
-                    key_s = str(k)
-                    parts = key_s.split(":")
                     best = {"pair": pair, "alert_key": parts[-2] if len(parts) >= 2 else "",
                             "direction": str(d.get("direction", "")), "entry_ts": ets}
             return best
@@ -2374,7 +2392,7 @@ class RedisStateStore:
             logger.warning(f"get_active_trade failed for {pair}: {e}")
             return None
 
-    async def get_active_shadow_trade(self, pair: str) -> Optional[Dict[str, Any]]:
+    async def get_active_shadow_trade(self, pair: str, elliott: bool = False) -> Optional[Dict[str, Any]]:
         """The open shadow trade for this pair, or None. Same meaning of 'open' as
         get_active_trade (pending row exists and is not marked closed), read from
         the shadow pending keys. Fails open: a Redis problem means 'none open'."""
@@ -2398,8 +2416,10 @@ class RedisStateStore:
                 if d.get("closed_ts") is not None:
                     continue
                 ets = int(d["entry_ts"])
+                parts = str(k).split(":")
+                if is_elliott_key(parts[-2] if len(parts) >= 2 else "") != elliott:
+                    continue
                 if best is None or ets > best["entry_ts"]:
-                    parts = str(k).split(":")
                     best = {"pair": pair, "alert_key": parts[-2] if len(parts) >= 2 else "",
                             "direction": str(d.get("direction", "")), "entry_ts": ets}
             return best
@@ -2514,29 +2534,38 @@ class RedisStateStore:
                 continue
             direction = "buy" if str(d.get("direction", "")).lower() in ("buy", "long") else "sell"
             ident = (pair, source, direction, entry_ts)
+
             if ident in self._close_event_ids:
                 continue
             self._close_event_ids.add(ident)
+            _ctx = d.get("context")
+            is_ew = isinstance(_ctx, dict) and bool(_ctx.get("elliott_wave_family"))
             reason = str(d.get("closed_reason") or "")
             hit_ts = d.get("closed_candle_ts")
             logger_pair.info(
                 f"[{pair}] {source} trade closed | {reason or 'closed'} | {direction} | "
                 f"entry_ts={entry_ts} | hit_ts={hit_ts}"
             )
-            self.trade_close_events.append({
-                "pair": pair,
-                "source": source,
-                "direction": direction,
-                "entry_ts": entry_ts,
-                "reason": reason,
-                "hit_ts": int(hit_ts) if hit_ts is not None else None,
-                "pct": d.get("horizon_pct"),
-                "win": d.get("horizon_win"),
-            })
-            starts_cooldown = reason == "target" or (
+            # Shadowed outcomes are still tracked and reported by the Brain; they are
+            # only left out of the Telegram "Trade updates" message unless
+            # TRADE_CLOSE_NOTICE_SHADOW is switched on.
+            if source != "Shadowed" or getattr(cfg, "TRADE_CLOSE_NOTICE_SHADOW", False):
+                self.trade_close_events.append({
+                    "pair": pair,
+                    "source": source,
+                    "direction": direction,
+                    "entry_ts": entry_ts,
+                    "reason": reason,
+                    "hit_ts": int(hit_ts) if hit_ts is not None else None,
+                    "pct": d.get("horizon_pct"),
+                    "win": d.get("horizon_win"),
+                    "elliott": is_ew,
+                })
+            # Elliott closes never start the legacy re-entry cooldown (by design).
+            starts_cooldown = not is_ew and (reason == "target" or (
                 reason in ("stop", "both")
                 and getattr(cfg, "TRADE_CLOSE_COOLDOWN_ON_STOP", False)
-            )
+            ))
             if starts_cooldown and hit_ts is not None and int(hit_ts) >= (cooldown_hit_ts or 0):
                 cooldown_hit_ts = int(hit_ts)
                 cooldown_dir = direction

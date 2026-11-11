@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from alert_registry import is_elliott_key
 from bot_config import cfg
 from plan_replay import coerce_path_fields, recost_rows
 from outcome_storage import (
@@ -44,9 +45,9 @@ def _outcome_rank(raw: dict) -> int:
         return 2
     return 1 if _coerce_bool(raw.get("final"), default=False) else 0
 
-def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[dict]:
+def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True, include_elliott: bool = False) -> Optional[dict]:
     """Convert archived JSONL row → Brain _parse_rows format.
-
+        
     Filters out two classes of row that would silently corrupt
     downstream statistics:
 
@@ -77,6 +78,11 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True) -> Optional[d
         # for *presence*, not truthiness. Presence of `win` is the
         # canonical marker of "this row describes an outcome."
         if "win" not in raw:
+            return None
+
+        # Elliott Wave rows are archived for their own report, but their 0-100 score is
+        # not a confluence score: keep them out of every legacy Brain / threshold analysis.
+        if not include_elliott and is_elliott_key(str(raw.get("alert_key") or "")):
             return None
 
         # ── Class 2: migrate rows written under an older schema ──
@@ -230,7 +236,7 @@ def _opt_fill_price(v: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
-def load_archived_outcomes(data_dir: str, window_days: int = 30, shadow: bool = False, *, drop_stale_schema: bool = True, return_stats: bool = False):
+def load_archived_outcomes(data_dir: str, window_days: int = 30, shadow: bool = False, *, drop_stale_schema: bool = True, return_stats: bool = False, include_elliott: bool = False):
     """Load outcomes from archived JSONL files (newest first).
 
     Rows are filtered on three axes:
@@ -355,10 +361,11 @@ def load_archived_outcomes(data_dir: str, window_days: int = 30, shadow: bool = 
                             # Migratable — let _parse_jsonl_row handle it
                             migrated = True
 
-                    parsed = _parse_jsonl_row(raw, drop_stale_schema=drop_stale_schema)
+                    parsed = _parse_jsonl_row(raw, drop_stale_schema=drop_stale_schema, include_elliott=include_elliott)
                     if parsed and replace_idx is not None:
                         rows[replace_idx] = parsed          # early row upgraded to full row
                         stats["upgraded_early"] += 1
+
                     elif parsed:
                         rows.append(parsed)
                         if sid:

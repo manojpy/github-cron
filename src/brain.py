@@ -9,9 +9,11 @@ import asyncio
 import json
 import logging
 import time
+
 from collections import defaultdict, Counter
 from typing import Any, Dict, List, Optional, Tuple
 from alerts import escape_markdown_v2
+from alert_registry import is_elliott_key
 
 from bot_config import cfg, json_dumps, json_loads, format_ist_time, CONFLUENCE_WEIGHTS
 from state import RedisKeyPrefix, RedisStateStore, _rc
@@ -989,6 +991,10 @@ class BrainCore:
         cutoff = int(time.time()) - window_days * 86400 if window_days else None
         for f in rows:
             try:
+                # Elliott Wave outcomes live in the same streams but carry a 0-100 wave
+                # score, not a confluence score: never feed them to legacy analysis.
+                if is_elliott_key(str(f.get("alert_key") or "")):
+                    continue
                 score = float(f["score"])
                 total = float(f["total"])
                 if total <= 0:
@@ -1663,7 +1669,7 @@ class BrainCore:
             ))
             lines.append("")
 
-        # ── 📉 WEAK / AVOID ──
+        # ── 📉 WEAK / AVOID ���─
         disable_alerts = [r for r in recs["recommendations"] if r["type"] == "disable_alert"]
         if disable_alerts:
             lines.append("*📉 UNDERPERFORMING (candidate for disable)*")

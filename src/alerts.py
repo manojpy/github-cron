@@ -1320,11 +1320,14 @@ async def replay_telegram_dlq(sdb: Optional[RedisStateStore], telegram_queue: Te
 def _buttons_on(queue: Any) -> bool:
     """Took/Skip buttons only when switched on AND the sender supports markup."""
     return (getattr(cfg, "ENABLE_TAKE_SKIP_BUTTONS", False) is True
+
             and callable(getattr(queue, "send_with_markup", None)))
 
 async def send_trade_close_notices(sdb: RedisStateStore, telegram_queue: TelegramQueue, logger_run: logging.Logger) -> int:
-    """One Telegram message for every Recorded/Shadowed trade that touched its
-    target or stop since the last run. Returns the number of trades announced."""
+    """One Telegram message for every trade that touched its target or stop since
+    the last run. Only Recorded trades are announced; Shadowed ones are included
+    solely when TRADE_CLOSE_NOTICE_SHADOW is True (see RedisStateStore._publish_close_events).
+    Returns the number of trades announced."""
     events = list(getattr(sdb, "trade_close_events", None) or [])
     if not events or not getattr(cfg, "ENABLE_TRADE_CLOSE_NOTICE", True):
         return 0
@@ -1349,15 +1352,17 @@ async def send_trade_close_notices(sdb: RedisStateStore, telegram_queue: Telegra
         e for e in events
         if e["source"] == "Recorded" or (e["pair"], e["entry_ts"]) not in _recorded
     ]
+
     lines = ["🎯 Trade updates"]
     for e in events[:30]:
         side = "BUY" if e["direction"] == "buy" else "SELL"
+        src_txt = f"{e['source']} · Elliott" if e.get("elliott") else str(e["source"])
         if e["reason"] == "horizon":
             _pct = e.get("pct")
             _pct_txt = f", {_pct:+.2f}% at close" if isinstance(_pct, (int, float)) else ""
             _hicon = "✅" if e.get("win") is True else "⛔" if e.get("win") is False else icon["horizon"]
             lines.append(
-                f"{_hicon} {e['pair']} ({e['source']}) {label['horizon']} — {side} from "
+                f"{_hicon} {e['pair']} ({src_txt}) {label['horizon']} — {side} from "
                 f"{format_ist_time(int(e['entry_ts']), '%H:%M')} candle{_pct_txt}"
             )
             continue
@@ -1367,7 +1372,7 @@ async def send_trade_close_notices(sdb: RedisStateStore, telegram_queue: Telegra
             if hit else "latest candle"
         )
         lines.append(
-            f"{icon.get(e['reason'], '•')} {e['pair']} ({e['source']}) "
+            f"{icon.get(e['reason'], '•')} {e['pair']} ({src_txt}) "
             f"{label.get(e['reason'], 'Closed')} — {side} from "
             f"{format_ist_time(int(e['entry_ts']), '%H:%M')} candle, hit in {when}"
         )
@@ -1405,7 +1410,7 @@ async def dispatch_combined_alerts(payloads: List[AlertPayload], telegram_queue:
 
     TELEGRAM_LIMIT = 4096
 
-    # ── Order: sell first if dominant bias is sell, else buy first ──
+    # ── Order: sell first if dominant bias is sell, else buy first ��─
     dominant_sell = (
         bias_context is not None and bias_context.down_pct > bias_context.up_pct
     )
@@ -3558,7 +3563,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     "rejection_reason": "win_rate_filter",
                     "failing_wr": failing_rate,
                     "fail_note": fail_note,      
-                    # ── FIX (Priority 5): Same numeric state as real rows ──
+                    # ── FIX (Priority 5): Same numeric state as real rows ─��
                     "ppo_gate_curr": gr.ppo_gate_curr,
                     "rsi_guard_smooth_curr": gr.rsi_guard_smooth_curr,
                     "rma_cloud_fast_curr": gr.rma_cloud_fast_curr,

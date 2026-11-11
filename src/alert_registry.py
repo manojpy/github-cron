@@ -29,6 +29,7 @@ __all__ = [
     "ALERT_CONFIG_MAP", "ALERT_CONFIG_PREFIX_MAP",
     "pretty_alert", "alert_family_of", "resolve_alert_config_path",
     "get_spec", "keys_for", "redis_key_of", "direction_of", "registry_problems",
+    "ELLIOTT_REGISTRY", "ELLIOTT_KEYS", "is_elliott_key",
 ]
 
 BUY = "buy"
@@ -63,6 +64,7 @@ FAMILY_PREFIXES: List[Tuple[str, str]] = [
     ("momentum_cross_", "Confluence"),
     ("gaussian_cross_", "Confluence"),
     ("cirrus_cross_", "Confluence"),
+    ("elliott_", "Elliott Wave"),
 ]
 
 # ── display names ────────────────────────────────────────────────────────
@@ -73,8 +75,8 @@ TOKEN_NAMES: Dict[str, str] = {
     "sell": "SELL", "s1": "S1", "s2": "S2", "s3": "S3", "r1": "R1", "r2": "R2",
     "r3": "R3", "p": "P", "ob": "OB", "fvg": "FVG", "bos": "BOS", "atr": "ATR",
     "ema": "EMA", "sma": "SMA", "bb": "BB",
+    "elliott": "Elliott", "wave3": "Wave 3", "wave5": "Wave 5", "abc": "ABC",
 }
-
 
 def pretty_alert(key: str) -> str:
     """strong_reversal_buy -> 'Strong Reversal BUY'."""
@@ -200,7 +202,32 @@ def _build() -> Dict[str, AlertSpec]:
     return specs
 
 REGISTRY: Dict[str, AlertSpec] = _build()
+
+# ── Elliott Wave keys ────────────────────────────────────────────────────
+# Deliberately NOT part of REGISTRY / ALERT_KEYS / BUY_ALERT_KEYS / SELL_ALERT_KEYS /
+# ALERT_DEFINITIONS: those drive the legacy per-pair evaluation, state reset and
+# validation loops, and Elliott alerts are evaluated by their own module
+# (elliott_alerts.py) after the legacy dispatch. They are visible only to the
+# lookups below, so the Brain can still name their family and config flag.
+# The flag is the DELIVERY switch: disabling it stops Telegram for that family
+# while detection and shadow recording continue.
+_ELLIOTT_ROWS: List[Tuple[str, str, str]] = [
+    ("elliott_wave3_buy", BUY, "ELLIOTT_WAVE_DELIVER_WAVE3"),
+    ("elliott_wave3_sell", SELL, "ELLIOTT_WAVE_DELIVER_WAVE3"),
+    ("elliott_wave5_buy", BUY, "ELLIOTT_WAVE_DELIVER_WAVE5"),
+    ("elliott_wave5_sell", SELL, "ELLIOTT_WAVE_DELIVER_WAVE5"),
+    ("elliott_abc_buy", BUY, "ELLIOTT_WAVE_DELIVER_ABC"),
+    ("elliott_abc_sell", SELL, "ELLIOTT_WAVE_DELIVER_ABC"),
+]
+ELLIOTT_REGISTRY: Dict[str, AlertSpec] = {
+    k: AlertSpec(key=k, family="Elliott Wave", display_name=pretty_alert(k), direction=d,
+                 config_flag=flag, kind="elliott")
+    for k, d, flag in _ELLIOTT_ROWS
+}
+ELLIOTT_KEYS: Dict[str, str] = {k: sp.redis_key for k, sp in ELLIOTT_REGISTRY.items()}
+
 _BY_KEY_LOWER: Dict[str, AlertSpec] = {k.lower(): s for k, s in REGISTRY.items()}
+_BY_KEY_LOWER.update({k.lower(): s for k, s in ELLIOTT_REGISTRY.items()})
 
 # ── derived views ────────────────────────────────────────────────────────
 ALERT_KEYS: Dict[str, str] = {k: s.redis_key for k, s in REGISTRY.items()}
@@ -216,19 +243,22 @@ ALERT_CONFIG_MAP: Dict[str, str] = {
 ALERT_CONFIG_PREFIX_MAP: Dict[str, str] = {}
 
 # ── helpers ──────────────────────────────────────────────────────────────
+def is_elliott_key(key: str) -> bool:
+    return str(key or "").lower() in ELLIOTT_REGISTRY
+
+
 def get_spec(key: str) -> Optional[AlertSpec]:
-    return REGISTRY.get(key)
+    return REGISTRY.get(key) or ELLIOTT_REGISTRY.get(key)
 
 
 def redis_key_of(key: str) -> Optional[str]:
-    spec = REGISTRY.get(key)
+    spec = get_spec(key)
     return spec.redis_key if spec else None
 
 
 def direction_of(key: str) -> Optional[str]:
-    spec = REGISTRY.get(key)
+    spec = get_spec(key)
     return spec.direction if spec else None
-
 
 def keys_for(*, kind: Optional[str] = None, family: Optional[str] = None, direction: Optional[str] = None, config_flag: Optional[str] = None) -> List[str]:
     out: List[str] = []
@@ -242,19 +272,23 @@ def keys_for(*, kind: Optional[str] = None, family: Optional[str] = None, direct
         if config_flag is not None and s.config_flag != config_flag:
             continue
         out.append(k)
+
     return out
 
 def resolve_alert_config_path(alert_key: str) -> Optional[str]:
-    return ALERT_CONFIG_MAP.get(str(alert_key))
+    flag = ALERT_CONFIG_MAP.get(str(alert_key))
+    if flag is None:
+        sp = ELLIOTT_REGISTRY.get(str(alert_key))
+        flag = sp.config_flag if sp else None
+    return flag
 
 
 def registry_problems() -> List[str]:
     problems: List[str] = []
 
-    for k, s in REGISTRY.items():
+    for k, s in list(REGISTRY.items()) + list(ELLIOTT_REGISTRY.items()):
         if not s.family or s.family == "Other":
             problems.append(f"{k}: no canonical family assigned")
-
         if s.direction not in (BUY, SELL):
             problems.append(f"{k}: bad direction {s.direction!r}")
 

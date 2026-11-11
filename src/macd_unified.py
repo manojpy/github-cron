@@ -51,6 +51,7 @@ from alerts import (
     send_trade_close_notices, _record_counterfactual_block, send_pullback_watch, flush_pullback_watch,
 )
 from alert_registry import ALERT_KEYS, BUY_ALERT_KEYS, keys_for
+from elliott_alerts import run_elliott_scan
 
 _pair_eval_counter = 0
 STALE_NOTICE_COOLDOWN_SEC = 7200   # repeat a stale-candle Telegram notice at most every 2h
@@ -1503,8 +1504,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     if (cfg.ENABLE_PORTFOLIO_HEAT_GATE
             and cfg.PORTFOLIO_POSITION_SOURCE in ("alerts", "both")
             and not state_db.degraded):
+        # Elliott trades never occupied a heat-gate slot, so they free none.
         _closed = [(e["pair"], int(e["entry_ts"])) for e in state_db.trade_close_events
-                   if e.get("source") == "Recorded"]
+                   if e.get("source") == "Recorded" and not e.get("elliott")]
         if _closed:
             _freed = await release_closed_auto_positions(
                 state_db, _closed,
@@ -1518,6 +1520,17 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             logger_main.info(f"🎯 Trade-update notice sent for {announced} closed trade(s)")
     except Exception as e:
         logger_main.warning(f"Trade-update notice failed (non-fatal): {e}")
+
+    # Elliott Wave module: independent of every legacy alert above, runs last and
+    # once per run. It bypasses the legacy one-open-trade / cooldown logic BY DESIGN
+    # but keeps its own dedup (one claim per wave structure) and per-run cap.
+    # Switch off with ENABLE_ELLIOTT_WAVE=false: nothing above changes either way.
+    if cfg.ENABLE_ELLIOTT_WAVE:
+        await run_elliott_scan(
+            parsed_cache, [t[0] for t in prepared_tasks], reference_time,
+            state_db, telegram_queue, logger_main,
+            suppress_delivery=bool(kill_switch_active_run or kill_switch_tripped_this_run),
+        )
 
     # All-time Recorded / Shadowed totals (from beginning of data collection).
     # Always log on every run so operators see the current win-rate snapshot
