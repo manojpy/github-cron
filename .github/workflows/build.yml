@@ -78,6 +78,7 @@ jobs:
              src/apply_config_override.py src/hypothesis_gen.py src/archive_reader.py src/repair_ledger.py src/playbook.py \
              src/rulemine.py src/feature_store.py src/scoreboard.py src/feedback.py src/pathrecon.py src/autopsy.py \
              src/intelligence.py src/autotune.py \
+             src/elliott_wave.py src/elliott_alerts.py \
              src/redis_audit.py src/cleanup_outcomes.py \
             --ignore-missing-imports 2>&1 | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
@@ -238,6 +239,8 @@ jobs:
                 "/app/src/autopsy.py"
                 "/app/src/intelligence.py"
                 "/app/src/autotune.py"
+                "/app/src/elliott_wave.py"
+                "/app/src/elliott_alerts.py"
                 "/app/src/plan_replay.py"
                 "/app/src/redis_audit.py"
                 "/app/src/cleanup_outcomes.py"
