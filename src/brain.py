@@ -1669,7 +1669,7 @@ class BrainCore:
             ))
             lines.append("")
 
-        # ── 📉 WEAK / AVOID ���─
+        # ── 📉 WEAK / AVOID ─
         disable_alerts = [r for r in recs["recommendations"] if r["type"] == "disable_alert"]
         if disable_alerts:
             lines.append("*📉 UNDERPERFORMING (candidate for disable)*")

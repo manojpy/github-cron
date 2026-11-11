@@ -1410,7 +1410,7 @@ async def dispatch_combined_alerts(payloads: List[AlertPayload], telegram_queue:
 
     TELEGRAM_LIMIT = 4096
 
-    # ── Order: sell first if dominant bias is sell, else buy first ��─
+    # ── Order: sell first if dominant bias is sell, else buy first ─
     dominant_sell = (
         bias_context is not None and bias_context.down_pct > bias_context.up_pct
     )
@@ -3099,7 +3099,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     raw_score = confluence_score
                     confluence_score = confluence_score * (1 - cfg.CLUSTER_PENALTY_PCT)
                     logger_pair.info(
-                        f"[{pair_name}] �� Correlation cluster penalty: "
+                        f"[{pair_name}] Correlation cluster penalty: "
                         f"{'buy' if is_buy_batch else 'sell'} cluster at {cluster_pct:.0%} of "
                         f"{cluster_context.total_pairs} pairs (> {cfg.CLUSTER_PCT_THRESHOLD:.0%} threshold) — "
                         f"confluence score {raw_score:.1f} -> {confluence_score:.1f}"
@@ -3265,7 +3265,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
                 if failing_rate is None:
                     # Passed both gates — keep it.
-                    # ── Trade-quality label (advisory; hard-blocks only when ENABLE_QUALITY_HARD_BLOCK) ──
+                    # ── Trade-quality label (advisory; hard-blocks only when ENABLE_QUALITY_HARD_BLOCK) ─
                     if brain_engine and alert_total and alert_total > 0 and alert_score is not None:
                         hyp_ctx: Optional[Dict[str, Any]] = None
                         try:
@@ -3563,7 +3563,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     "rejection_reason": "win_rate_filter",
                     "failing_wr": failing_rate,
                     "fail_note": fail_note,      
-                    # ── FIX (Priority 5): Same numeric state as real rows ─��
+                    # ── FIX (Priority 5): Same numeric state as real rows ─
                     "ppo_gate_curr": gr.ppo_gate_curr,
                     "rsi_guard_smooth_curr": gr.rsi_guard_smooth_curr,
                     "rma_cloud_fast_curr": gr.rma_cloud_fast_curr,
