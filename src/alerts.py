@@ -3099,7 +3099,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     raw_score = confluence_score
                     confluence_score = confluence_score * (1 - cfg.CLUSTER_PENALTY_PCT)
                     logger_pair.info(
-                        f"[{pair_name}] Correlation cluster penalty: "
+                        f"[{pair_name}] 🌐 Correlation cluster penalty: "
                         f"{'buy' if is_buy_batch else 'sell'} cluster at {cluster_pct:.0%} of "
                         f"{cluster_context.total_pairs} pairs (> {cfg.CLUSTER_PCT_THRESHOLD:.0%} threshold) — "
                         f"confluence score {raw_score:.1f} -> {confluence_score:.1f}"
