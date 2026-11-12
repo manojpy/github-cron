@@ -310,15 +310,17 @@ async def update_all(sdb: RedisStateStore, parsed_cache: Dict[str, Tuple[Any, An
             # Fallback: best-effort sequential (still better than silent loss)
             for sid, rec in to_save:
                 try:
+                    _sid, _rec = sid, rec
                     await sdb._safe_redis_op(
-                        lambda sid=sid, rec=rec: _rc(sdb._redis).hset(_tk(sdb), sid, json_dumps(rec)),
+                        lambda: _rc(sdb._redis).hset(_tk(sdb), _sid, json_dumps(_rec)),
                         2.0, "ew_track_save_fb")
                 except Exception:
                     pass
             for sid, (rec, prog) in zip(to_delete, to_count):
                 try:
+                    _sid = sid
                     removed = await sdb._safe_redis_op(
-                        lambda sid=sid: _rc(sdb._redis).hdel(_tk(sdb), sid), 2.0, "ew_track_del_fb")
+                        lambda: _rc(sdb._redis).hdel(_tk(sdb), _sid), 2.0, "ew_track_del_fb")
                     if removed:
                         await _count_sequential(sdb, rec, prog)
                         stats["resolved"] += 1
@@ -340,7 +342,8 @@ async def _count_sequential(sdb: RedisStateStore, rec: Dict[str, Any], prog: Dic
     if outcome in ("stop", "invalidated"):
         fields.append(f"{base}:adverse")
     for f in fields:
-        await sdb._safe_redis_op(lambda f=f: _rc(sdb._redis).hincrby(key, f, 1), 2.0, "ew_stats_inc")
+        _f = f
+        await sdb._safe_redis_op(lambda: _rc(sdb._redis).hincrby(key, _f, 1), 2.0, "ew_stats_inc")
     await sdb._safe_redis_op(lambda: _rc(sdb._redis).expire(key, 90 * 86400), 2.0, "ew_stats_ttl")
 
 async def verdict_for(sdb: RedisStateStore, family: str) -> str:

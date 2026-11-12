@@ -543,20 +543,17 @@ async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stat
         claim_map = await _claim_many(
             sdb, "s", [s.structure_id for _, s, _ in shadow_candidates]
         )
-        owned = [
+        owned_shadows: List[Tuple[str, WaveSetup, str]] = [
             (pair, s, disp)
             for pair, s, disp in shadow_candidates
             if claim_map.get(s.structure_id)
         ]
 
-        if owned:
+        if owned_shadows:
             try:
-                from bot_config import json_dumps as _jd
-                from state import RedisKeyPrefix
-
                 client = _rc(sdb._redis)
                 async with client.pipeline(transaction=False) as pipe:
-                    for pair, s, disp in owned:
+                    for pair, s, disp in owned_shadows:
                         key = (
                             f"{RedisKeyPrefix.SHADOW_PENDING}"
                             f"{pair}:{alert_key_of(s)}:{int(s.signal_ts)}"
@@ -578,10 +575,10 @@ async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stat
                             (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60,
                             24 * 3600,
                         )
-                        pipe.set(key, _jd(payload), ex=ttl_out)
+                        pipe.set(key, json_dumps(payload), ex=ttl_out)
                     await asyncio.wait_for(pipe.execute(), timeout=3.0)
 
-                for pair, s, disp in owned:
+                for pair, s, disp in owned_shadows:
                     recorded_for_tracking.append((pair, s, disp))
                     stats["shadowed"] += 1
                     log.info(
@@ -592,7 +589,7 @@ async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stat
             except Exception as exc:
                 log.warning(f"Elliott batch shadow record failed: {exc!r}")
                 stats["errors"] += 1
-                for _, s, _ in owned:
+                for _, s, _ in owned_shadows:
                     await _release(sdb, "s", s.structure_id)
 
         elif not claim_map and shadow_candidates:
