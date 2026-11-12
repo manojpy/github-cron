@@ -46,13 +46,13 @@ import numpy as np
 import elliott_tracker as tracker
 from alert_registry import ELLIOTT_REGISTRY
 from alerts import escape_markdown_v2, queue_failed_alert
-from bot_config import Constants, cfg, format_ist_time
+from bot_config import Constants, cfg, format_ist_time, json_dumps
 from elliott_wave import (
     Analysis, ElliottParams, FEATURE_VERSION, WaveEvent, WaveSetup, analyze, family_rank,
 )
 from fetcher import detect_reversal_candle_pattern_with_context, get_last_closed_index_from_array
 from gates import LEGACY_COMMON_SNAPSHOT
-from state import RedisStateStore, _rc
+from state import RedisStateStore, RedisKeyPrefix, _rc
 
 __all__ = ["params_from_cfg", "scan_pair", "legacy_gate", "run_elliott_scan", "format_elliott_message"]
 
@@ -333,6 +333,30 @@ async def _release_pair_slot(sdb: RedisStateStore, pair: str, k: int) -> None:
         pass
 
 
+async def _claim_many(
+    sdb: RedisStateStore,
+    kind: str,
+    structure_ids: List[str],
+) -> Dict[str, bool]:
+    """Batch SET NX EX for many structure claims in one pipeline.
+
+    Returns {structure_id: owned}. Empty dict on Redis failure (caller should
+    fall back to sequential _claim or treat everything as not-owned).
+    """
+    if not structure_ids or sdb.degraded or not sdb._redis:
+        return {}
+    ttl = int(cfg.ELLIOTT_WAVE_EVENT_TTL_HOURS) * 3600
+    prefix = f"{sdb.meta_prefix}notice:ew{kind}:"
+    try:
+        client = _rc(sdb._redis)
+        async with client.pipeline(transaction=False) as pipe:
+            for sid in structure_ids:
+                pipe.set(f"{prefix}{sid}", "1", nx=True, ex=ttl)
+            results = await asyncio.wait_for(pipe.execute(), timeout=3.0)
+        return {sid: bool(ok) for sid, ok in zip(structure_ids, results)}
+    except Exception:
+        return {}
+
 # ── run-level entry point ────────────────────────────────────────────────
 
 async def run_elliott_scan(
@@ -444,23 +468,39 @@ async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stat
     selected: List[Tuple[str, WaveSetup]] = []
     slots: Dict[str, Tuple[str, int]] = {}      # event_id -> (pair, slot)
     duplicates: set = set()
+
+    # Pre-claim structures for the candidates we might actually take.
+    # Cap is small (default 3), so we only need the first few after sorting.
+    # Batching turns N sequential SET NX into one pipeline.
+    candidates = deliverable[: max(cap * 3, cap + 5)]  # small buffer for dups / pair limits
+    claim_map = await _claim_many(sdb, "d", [s.structure_id for _, s in candidates])
+
     for pair, s in deliverable:
         if len(selected) >= cap:
             why_not[s.event_id] = "over_cap"
             continue
         try:
-            # structure first: a repeat of an already-alerted structure is a duplicate
-            # (never a pair-limit case, never re-recorded as Shadowed)
-            owned = await _claim(sdb, "d", s.structure_id)
+            # Prefer the batched result; fall back to a live claim if the batch
+            # missed this structure (e.g. buffer too small or Redis hiccup).
+            if s.structure_id in claim_map:
+                owned = claim_map[s.structure_id]
+            else:
+                owned = await _claim(sdb, "d", s.structure_id)
             if not owned:
                 duplicates.add(s.event_id)
                 stats["duplicates"] += 1
                 continue
+            # Pair-slot claim stays sequential: MAX_ALERTS_PER_PAIR is 1 and
+            # the total number of selected is tiny (≤ cap). Cost is negligible.
             slot = await _claim_pair_slot(sdb, pair)
         except Exception as exc:
             log.warning(f"[{pair}] Elliott claim failed: {exc!r}")
             stats["errors"] += 1
             why_not[s.event_id] = "claim_error"
+            # If we already own the structure claim from the batch, release it
+            # so the next run can try again.
+            if s.structure_id in claim_map and claim_map[s.structure_id]:
+                await _release(sdb, "d", s.structure_id)
             continue
         if slot is None:
             # the structure stays claimed: it is not delivered later, only recorded
@@ -481,7 +521,11 @@ async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stat
                 await _release_pair_slot(sdb, *slots[s.event_id])
 
     # ── shadow recording of everything not delivered (once per structure) ──
+    # Collect candidates first, then claim + write in two pipelines so we pay
+    # ~2 RTTs instead of 2–4 × N sequential round-trips.
     recorded_for_tracking: List[Tuple[str, WaveSetup, str]] = []
+    shadow_candidates: List[Tuple[str, WaveSetup, str]] = []  # (pair, setup, disp)
+
     for pair, s, _p in all_c:
         if s.event_id in delivered_ids:
             recorded_for_tracking.append((pair, s, why_not.get(s.event_id, "delivered")))
@@ -493,20 +537,87 @@ async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stat
             continue
         if disp.startswith("rejected:") and not cfg.ELLIOTT_WAVE_SHADOW_REJECTED:
             continue
-        recorded_for_tracking.append((pair, s, disp))
-        try:
-            if not await _claim(sdb, "s", s.structure_id):
-                continue
-            res_s = await sdb.record_shadow_pending_outcome(**_outcome_kwargs(pair, s, disp))
-            if res_s == "failed":
-                await _release(sdb, "s", s.structure_id)
+        shadow_candidates.append((pair, s, disp))
+
+    if shadow_candidates and not sdb.degraded and sdb._redis:
+        claim_map = await _claim_many(
+            sdb, "s", [s.structure_id for _, s, _ in shadow_candidates]
+        )
+        owned = [
+            (pair, s, disp)
+            for pair, s, disp in shadow_candidates
+            if claim_map.get(s.structure_id)
+        ]
+
+        if owned:
+            try:
+                from bot_config import json_dumps as _jd
+                from state import RedisKeyPrefix
+
+                client = _rc(sdb._redis)
+                async with client.pipeline(transaction=False) as pipe:
+                    for pair, s, disp in owned:
+                        key = (
+                            f"{RedisKeyPrefix.SHADOW_PENDING}"
+                            f"{pair}:{alert_key_of(s)}:{int(s.signal_ts)}"
+                        )
+                        payload = {
+                            "direction": s.direction,
+                            "entry_ts": int(s.signal_ts),
+                            "entry_price": float(s.entry_price),
+                            "confluence_score": float(s.score),
+                            "confluence_total": 100.0,
+                            "confluence_votes": None,
+                            "context": {
+                                **_jsonable(_context(s, disp)),
+                                "cooldown_active": False,
+                                "cooldown_hit_ts": None,
+                            },
+                        }
+                        ttl_out = max(
+                            (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60,
+                            24 * 3600,
+                        )
+                        pipe.set(key, _jd(payload), ex=ttl_out)
+                    await asyncio.wait_for(pipe.execute(), timeout=3.0)
+
+                for pair, s, disp in owned:
+                    recorded_for_tracking.append((pair, s, disp))
+                    stats["shadowed"] += 1
+                    log.info(
+                        f"[{pair}] Shadow pending created: {alert_key_of(s)} "
+                        f"@ {int(s.signal_ts)} → "
+                        f"shadow_pending:{pair}:{alert_key_of(s)}:{int(s.signal_ts)}"
+                    )
+            except Exception as exc:
+                log.warning(f"Elliott batch shadow record failed: {exc!r}")
                 stats["errors"] += 1
-            elif res_s == "created":
-                stats["shadowed"] += 1
-        except Exception as exc:
-            log.warning(f"[{pair}] Elliott shadow record failed: {exc!r}")
-            stats["errors"] += 1
-            await _release(sdb, "s", s.structure_id)
+                for _, s, _ in owned:
+                    await _release(sdb, "s", s.structure_id)
+
+        elif not claim_map and shadow_candidates:
+            # Batch claim failed (empty map) — fall back to sequential so we
+            # do not silently drop every shadow for the run.
+            for pair, s, disp in shadow_candidates:
+                try:
+                    if not await _claim(sdb, "s", s.structure_id):
+                        continue
+                    res_s = await sdb.record_shadow_pending_outcome(
+                        **_outcome_kwargs(pair, s, disp)
+                    )
+                    if res_s == "failed":
+                        await _release(sdb, "s", s.structure_id)
+                        stats["errors"] += 1
+                    elif res_s == "created":
+                        recorded_for_tracking.append((pair, s, disp))
+                        stats["shadowed"] += 1
+                except Exception as e2:
+                    log.warning(f"[{pair}] Elliott shadow record failed: {e2!r}")
+                    stats["errors"] += 1
+                    await _release(sdb, "s", s.structure_id)
+    else:
+        for pair, s, disp in shadow_candidates:
+            recorded_for_tracking.append((pair, s, disp))
 
     # ── follow-up: register new structures / events, then advance all of them ──
     for pair, s, disp in recorded_for_tracking:
@@ -531,9 +642,15 @@ async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stat
             await tracker.register(sdb, rec, snap, log)
         except Exception as exc:
             log.warning(f"[{pair}] Elliott event register failed: {exc!r}")
+
+    # One TTL refresh for the whole track hash (replaces the old per-register EXPIRE)
+    try:
+        await tracker.ensure_track_ttl(sdb)
+    except Exception:
+        pass
+
     prog = await tracker.update_all(sdb, parsed_cache, last_idx, log)
     stats["tracked"], stats["resolved"] = prog["tracked"], prog["resolved"]
-
     log.info(
         f"🌊 Elliott: {stats['pairs']} pair(s), {stats['candidates']} candidate(s), "
         f"{stats['eligible']} eligible, {stats['gated']} vetoed by legacy gate, "
