@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import logging
 import time
-import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -43,8 +42,7 @@ from elliott_wave import evaluate_progress
 from outcome_storage import append_outcome_batch
 from state import RedisStateStore, _rc
 
-__all__ = ["make_record", "register", "ensure_track_ttl", "update_all", "verdict_for",
-           "TRACK_KEY", "STATS_KEY"]
+__all__ = ["make_record", "register", "update_all", "verdict_for", "TRACK_KEY", "STATS_KEY"]
 
 TRACK_KEY = "ew:track"
 STATS_KEY = "ew:stats"
@@ -140,11 +138,11 @@ def _write_rows(rows: List[Dict[str, Any]], log: logging.Logger) -> bool:
         log.warning(f"Elliott event archive write failed: {exc!r}")
         return False
 
+
 async def register(sdb: RedisStateStore, rec: Dict[str, Any], snapshot: Dict[str, Any],
                    log: logging.Logger) -> bool:
     """Start following a structure and archive its immutable signal snapshot.
-    A structure already tracked is left exactly as it was (HSETNX).
-    TTL is refreshed once per run via ensure_track_ttl — not on every add."""
+    A structure already tracked is left exactly as it was (HSETNX)."""
     rec = dict(rec)
     rec["feature_version"] = snapshot.get("elliott_feature_version")
     key = _tk(sdb)
@@ -153,6 +151,7 @@ async def register(sdb: RedisStateStore, rec: Dict[str, Any], snapshot: Dict[str
         2.0, "ew_track_add")
     if not added:
         return False
+    await sdb._safe_redis_op(lambda: _rc(sdb._redis).expire(key, _REDIS_TTL_SEC), 2.0, "ew_track_ttl")
     _write_rows([_event_row(rec, "signal", {
         "status": rec["status"], "score": rec["score"], "disposition": rec["disposition"],
         "legacy_gate": rec["gate"], "entry": rec["entry"], "atr": rec["atr"],
@@ -161,18 +160,6 @@ async def register(sdb: RedisStateStore, rec: Dict[str, Any], snapshot: Dict[str
     }, ts=rec["signal_ts"])], log)
     return True
 
-
-async def ensure_track_ttl(sdb: RedisStateStore) -> None:
-    """One EXPIRE for the whole track hash. Call once after a batch of registers."""
-    if sdb.degraded or not sdb._redis:
-        return
-    try:
-        await sdb._safe_redis_op(
-            lambda: _rc(sdb._redis).expire(_tk(sdb), _REDIS_TTL_SEC),
-            2.0, "ew_track_ttl",
-        )
-    except Exception:
-        pass
 
 async def _load_all(sdb: RedisStateStore) -> Dict[str, Dict[str, Any]]:
     raw = await sdb._safe_redis_op(lambda: _rc(sdb._redis).hgetall(_tk(sdb)), 3.0, "ew_track_load")
@@ -187,16 +174,12 @@ async def _load_all(sdb: RedisStateStore) -> Dict[str, Dict[str, Any]]:
 
 _EVENT_ORDER = (("t1", "first_target"), ("t2", "target2"), ("stop", "stop"), ("invalidated", "invalidated"))
 
+
 async def update_all(sdb: RedisStateStore, parsed_cache: Dict[str, Tuple[Any, Any, Any]],
                      last_idx: Dict[str, int], log: logging.Logger) -> Dict[str, int]:
     """Advance every tracked structure with the candles that closed since the last
     run. Appends each new event once, and finalises (counters + resolution row)
-    structures whose outcome is decided. Never raises.
-
-    All Redis writes (HSET / HDEL / HINCRBY / EXPIRE) are collected and executed
-    in a single pipeline so cost stays O(1) round-trips regardless of how many
-    structures are open.
-    """
+    structures whose outcome is decided. Never raises."""
     stats = {"tracked": 0, "events": 0, "resolved": 0}
     try:
         recs = await _load_all(sdb)
@@ -205,12 +188,6 @@ async def update_all(sdb: RedisStateStore, parsed_cache: Dict[str, Tuple[Any, An
         return stats
     stats["tracked"] = len(recs)
     max_bars = int(cfg.ELLIOTT_WAVE_TRACK_MAX_BARS)
-
-    # Collect work; write once at the end.
-    to_save: List[Tuple[str, Dict[str, Any]]] = []          # (sid, rec)
-    to_delete: List[str] = []                               # sids
-    to_count: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []  # (rec, prog)
-
     for sid, rec in recs.items():
         pair = str(rec.get("pair"))
         pd_15m = (parsed_cache.get(pair) or (None, None, None))[0]
@@ -221,6 +198,7 @@ async def update_all(sdb: RedisStateStore, parsed_cache: Dict[str, Tuple[Any, An
             prog = evaluate_progress(rec, pd_15m.ts, pd_15m.high, pd_15m.low, pd_15m.close,
                                      pd_15m.volume, int(end), max_bars=max_bars)
             if prog.get("outcome") == "missing_signal_candle":
+                # older than the fetched window: stop following, say so, never guess
                 if int(pd_15m.ts[0]) > rec["signal_ts"]:
                     prog = {"state": "final", "outcome": "unobservable", "bars": 0,
                             "last_ts": int(pd_15m.ts[int(end)]), "first_bars": {},
@@ -249,88 +227,32 @@ async def update_all(sdb: RedisStateStore, parsed_cache: Dict[str, Tuple[Any, An
             stats["events"] += len(rows)
             if not final:
                 if rows:
-                    to_save.append((sid, rec))
+                    await _save(sdb, sid, rec)
                 continue
-            # Defer the HDEL + count so they can be pipelined.
-            to_delete.append(sid)
-            to_count.append((rec, prog))
+            # at-most-once counting: only the caller whose HDEL removed the record counts it
+            removed = await _delete(sdb, sid)
+            if removed:
+                await _count(sdb, rec, prog)
+                stats["resolved"] += 1
         except Exception as exc:
             log.warning(f"[{pair}] Elliott tracker update failed for {sid}: {exc!r}")
-
-    # ── pipelines for all mutations ─────────────────────────────────────
-    # 1) saves + deletes (+ track TTL)
-    # 2) HINCRBYs only for structures whose HDEL actually removed the key
-    #    (preserves the original "count only if we deleted" semantics and
-    #    prevents double-counting under concurrent runs)
-    if not sdb.degraded and sdb._redis and (to_save or to_delete or to_count):
-        try:
-            client = _rc(sdb._redis)
-            track_key = _tk(sdb)
-            stats_key = _sk(sdb)
-
-            async with client.pipeline(transaction=False) as pipe:
-                for sid, rec in to_save:
-                    pipe.hset(track_key, sid, json_dumps(rec))
-                for sid in to_delete:
-                    pipe.hdel(track_key, sid)
-                if to_save or to_delete:
-                    pipe.expire(track_key, _REDIS_TTL_SEC)
-                results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
-
-            n_save = len(to_save)
-            n_del = len(to_delete)
-            del_results = results[n_save:n_save + n_del] if n_del else []
-
-            really_resolved = [
-                (rec, prog)
-                for removed, (rec, prog) in zip(del_results, to_count)
-                if removed
-            ]
-            stats["resolved"] += len(really_resolved)
-
-            if really_resolved:
-                async with client.pipeline(transaction=False) as pipe:
-                    for rec, prog in really_resolved:
-                        base = f"{rec['family']}:{rec['group']}"
-                        outcome = prog.get("outcome")
-                        fields = [f"{base}:n"]
-                        if outcome in ("t2", "stop", "invalidated", "expired"):
-                            fields.append(f"{base}:{outcome}")
-                        if prog.get("t1_before_adverse"):
-                            fields.append(f"{base}:t1_first")
-                        if outcome in ("stop", "invalidated"):
-                            fields.append(f"{base}:adverse")
-                        for f in fields:
-                            pipe.hincrby(stats_key, f, 1)
-                    pipe.expire(stats_key, 90 * 86400)
-                    await asyncio.wait_for(pipe.execute(), timeout=3.0)
-
-        except Exception as exc:
-            log.warning(f"Elliott tracker pipeline failed: {exc!r}")
-            # Fallback: best-effort sequential (still better than silent loss)
-            for sid, rec in to_save:
-                try:
-                    _sid, _rec = sid, rec
-                    await sdb._safe_redis_op(
-                        lambda: _rc(sdb._redis).hset(_tk(sdb), _sid, json_dumps(_rec)),
-                        2.0, "ew_track_save_fb")
-                except Exception:
-                    pass
-            for sid, (rec, prog) in zip(to_delete, to_count):
-                try:
-                    _sid = sid
-                    removed = await sdb._safe_redis_op(
-                        lambda: _rc(sdb._redis).hdel(_tk(sdb), _sid), 2.0, "ew_track_del_fb")
-                    if removed:
-                        await _count_sequential(sdb, rec, prog)
-                        stats["resolved"] += 1
-                except Exception:
-                    pass
-
     return stats
 
-async def _count_sequential(sdb: RedisStateStore, rec: Dict[str, Any], prog: Dict[str, Any]) -> None:
-    """Fallback used only when the pipeline path fails."""
+
+async def _save(sdb: RedisStateStore, sid: str, rec: Dict[str, Any]) -> None:
+    await sdb._safe_redis_op(lambda: _rc(sdb._redis).hset(_tk(sdb), sid, json_dumps(rec)),
+                             2.0, "ew_track_save")
+
+
+async def _delete(sdb: RedisStateStore, sid: str) -> Any:
+    return await sdb._safe_redis_op(lambda: _rc(sdb._redis).hdel(_tk(sdb), sid), 2.0, "ew_track_del")
+
+
+async def _incr(sdb: RedisStateStore, key: str, field: str) -> None:
+    await sdb._safe_redis_op(lambda: _rc(sdb._redis).hincrby(key, field, 1), 2.0, "ew_stats_inc")
+
+
+async def _count(sdb: RedisStateStore, rec: Dict[str, Any], prog: Dict[str, Any]) -> None:
     base = f"{rec['family']}:{rec['group']}"
     key = _sk(sdb)
     outcome = prog.get("outcome")
@@ -342,9 +264,9 @@ async def _count_sequential(sdb: RedisStateStore, rec: Dict[str, Any], prog: Dic
     if outcome in ("stop", "invalidated"):
         fields.append(f"{base}:adverse")
     for f in fields:
-        _f = f
-        await sdb._safe_redis_op(lambda: _rc(sdb._redis).hincrby(key, _f, 1), 2.0, "ew_stats_inc")
+        await _incr(sdb, key, f)
     await sdb._safe_redis_op(lambda: _rc(sdb._redis).expire(key, 90 * 86400), 2.0, "ew_stats_ttl")
+
 
 async def verdict_for(sdb: RedisStateStore, family: str) -> str:
     """One informational line: how this wave family has behaved so far (delivered +
