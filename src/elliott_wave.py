@@ -37,14 +37,15 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 
 __all__ = [
     "ElliottParams", "Pivot", "WaveSetup", "Analysis",
-    "ComponentScore", "ENGINE_VERSION", "replay_events",
+    "ComponentScore", "ENGINE_VERSION", "FEATURE_VERSION", "WaveEvent", "evaluate_progress",
+    "family_rank", "replay_events",
     "analyze", "confirmed_pivots", "normalize_pivots", "htf_bias",
     "check_impulse_rules", "check_abc_rules",
     "FAMILY_PRIORITY", "SCORE_WEIGHTS",
@@ -55,6 +56,13 @@ SELL = "sell"
 
 # Part of every event id: a change to the counting rules must never reuse old ids.
 ENGINE_VERSION = "ew1"
+
+# Version of the Elliott feature set written into an outcome row's `context`
+# (stamped as `feature_version`). Deliberately a separate namespace from the legacy
+# feature store ("fv1"): the legacy version is untouched, so no legacy dataset or
+# cache is invalidated, and the two feature sets can never be mixed by accident.
+# Bump when the meaning or set of `elliott_*` fields changes.
+FEATURE_VERSION = "ewfv1"
 
 # Tie-break when several families qualify on one pair/candle: Wave 3 first.
 FAMILY_PRIORITY: Dict[str, int] = {"wave3": 0, "wave5": 1, "abc": 2}
@@ -86,6 +94,8 @@ class ElliottParams:
     enable_wave3: bool = True
     enable_wave5: bool = True
     enable_abc: bool = True
+    enable_exhaustion: bool = True      # Wave 5 exhaustion EVENTS (never a trade on their own)
+    primary_family: str = "wave3"       # wins ties when several families qualify on one pair/candle
     htf_min_hours: int = 24
     htf_ema_len: int = 21
 
@@ -140,6 +150,29 @@ class WaveSetup:
 
 
 @dataclass
+class WaveEvent:
+    """An informational structural event that is NOT a trade setup. Today: the
+    completion of a five-wave impulse showing exhaustion ("exhaustion"). It is
+    recorded and followed up so its reversal behaviour can be measured, but it
+    never produces an alert on its own."""
+    kind: str                           # "exhaustion"
+    direction: str                      # the direction the event points to (reversal side)
+    signs: Dict[str, bool]              # which exhaustion signs are present
+    score: int                          # number of signs present
+    labels: Dict[str, Tuple[int, int, float]]
+    event_id: str
+    structure_id: str
+    signal_idx: int
+    signal_ts: int
+    entry_price: float                  # close of the candle that confirmed the Wave 5 pivot
+    invalidation: float                 # a close beyond this ends the reversal idea
+    targets: Tuple[float, ...]          # 0.382 / 0.618 retracement of Wave 5
+    atr: float
+    features: Dict[str, Any] = field(default_factory=dict)
+    pair: str = ""
+
+
+@dataclass
 class Analysis:
     setups: List[WaveSetup]
     primary: Optional[WaveSetup]
@@ -147,6 +180,13 @@ class Analysis:
     window_start: int
     window_end: int
     diagnostics: Dict[str, Any]
+    events: List[WaveEvent] = field(default_factory=list)
+
+
+def family_rank(family: str, primary_family: str = "wave3") -> int:
+    """Selection order when several families qualify: the configured primary
+    family first, then the default order wave3 > wave5 > abc."""
+    return 0 if family == primary_family else 1 + FAMILY_PRIORITY.get(family, 9)
 
 
 # ── indicators (causal: value at i uses candles 0..i only) ───────────────
@@ -561,9 +601,15 @@ def _clean_start(ts: np.ndarray, o: np.ndarray, h: np.ndarray, l: np.ndarray,
 
 def analyze(pair: str, ts: np.ndarray, open_: np.ndarray, high: np.ndarray, low: np.ndarray,
             close: np.ndarray, volume: np.ndarray, end: Optional[int] = None,
-            params: Optional[ElliottParams] = None) -> Analysis:
+            params: Optional[ElliottParams] = None,
+            external_gate: Optional[Mapping[str, Optional[str]]] = None) -> Analysis:
     """Find wave candidates as they were knowable at candle `end` (last CLOSED
-    candle). Only candles 0..end are read."""
+    candle). Only candles 0..end are read.
+
+    `external_gate` lets the caller veto a whole direction with a reason, e.g.
+    {"buy": None, "sell": "ichimoku"}: a vetoed direction still produces its
+    setups, but as status "rejected" / reason "legacy_gate:<why>", so the decision
+    and its reason are recorded. None = no external gate (feature shows "n/a")."""
     P = params or ElliottParams()
     n_all = len(ts)
     diag: Dict[str, Any] = {"rejects": {}}
@@ -611,6 +657,7 @@ def analyze(pair: str, ts: np.ndarray, open_: np.ndarray, high: np.ndarray, low:
     bias = htf_bias(ts_all, c_all, end, P.interval_sec, P.htf_min_hours, P.htf_ema_len)
 
     setups: List[WaveSetup] = []
+    events: List[WaveEvent] = []
 
     def reject(key: str, why: str) -> None:
         diag["rejects"][key] = why
@@ -622,9 +669,6 @@ def analyze(pair: str, ts: np.ndarray, open_: np.ndarray, high: np.ndarray, low:
         Ot, Ct = s * o, s * c
         tp = [Pivot(p.idx, s * p.price, s * p.kind, p.confirm_idx) for p in pv]
         ip = [Pivot(p.idx, s * p.price, s * p.kind, p.confirm_idx) for p in raw_in]
-        if not tp or tp[-1].kind != -1:
-            reject(f"{direction}", "last_pivot_not_a_low")
-            continue
         evaluators = []
         if P.enable_wave3:
             evaluators.append(("wave3", _eval_wave3))
@@ -632,9 +676,23 @@ def analyze(pair: str, ts: np.ndarray, open_: np.ndarray, high: np.ndarray, low:
             evaluators.append(("wave5", _eval_wave5))
         if P.enable_abc:
             evaluators.append(("abc", _eval_abc))
+        gate_reason = external_gate.get(direction) if external_gate is not None else None
         ctx = _Ctx(pair=pair, P=P, s=s, direction=direction, off=s0, e=e, ts=t, o=o, h=h, l=l,
                    c=c, v=v, Ht=Ht, Lt=Lt, Ot=Ot, Ct=Ct, atr=atr, atr_e=atr_e, hist=hist,
-                   rsi=rsi, tp=tp, ip=ip, bias=bias)
+                   rsi=rsi, tp=tp, ip=ip, bias=bias, block=gate_reason,
+                   gate_state=("n/a" if external_gate is None else (gate_reason or "pass")))
+        if tp and tp[-1].kind == 1:
+            # the last confirmed pivot is a high: a finished impulse, not a setup start
+            if P.enable_exhaustion:
+                try:
+                    ev = _eval_exhaustion(ctx)
+                except (IndexError, ValueError, ZeroDivisionError, FloatingPointError):
+                    ev = None
+                if ev is not None:
+                    events.append(ev)
+        if not tp or tp[-1].kind != -1:
+            reject(f"{direction}", "last_pivot_not_a_low")
+            continue
         for fam, fn in evaluators:
             try:
                 res = fn(ctx)
@@ -647,7 +705,7 @@ def analyze(pair: str, ts: np.ndarray, open_: np.ndarray, high: np.ndarray, low:
                 setups.append(res)
 
     rank = {"eligible": 0, "watch": 1, "rejected": 2}
-    setups.sort(key=lambda x: (rank[x.status], FAMILY_PRIORITY[x.family], -x.score))
+    setups.sort(key=lambda x: (rank[x.status], family_rank(x.family, P.primary_family), -x.score))
     primary = setups[0] if setups else None
     if primary is not None:
         others = setups[1:]
@@ -657,13 +715,13 @@ def analyze(pair: str, ts: np.ndarray, open_: np.ndarray, high: np.ndarray, low:
                                                               "evaluation_error"))]
         primary.alt_counts = [f"{x.family}_{x.direction}:{x.status}:{x.score:.0f}" for x in others] + pending
         gap = (primary.score - max(x.score for x in others)) if others else None
-        why_primary = (f"status {primary.status}; family order wave3>wave5>abc; "
+        why_primary = (f"status {primary.status}; family order {P.primary_family} first, then wave3>wave5>abc; "
                        f"then score" + (f" (gap {gap:+.1f} to best alternative)" if gap is not None
                                         else " (no competing triggered count)"))
         primary.features["elliott_alt_counts"] = list(primary.alt_counts)
         primary.features["elliott_primary_reason"] = why_primary
         primary.features["elliott_score_gap"] = round(gap, 2) if gap is not None else None
-    return Analysis(setups, primary, len(pv), s0, end, diag)
+    return Analysis(setups, primary, len(pv), s0, end, diag, events)
 
 
 # ── candidate evaluators ─────────────────────────────────────────────────
@@ -693,6 +751,8 @@ class _Ctx:
     tp: List[Pivot]
     ip: List[Pivot]
     bias: Optional[int]
+    block: Optional[str] = None         # external (legacy) gate veto for this direction
+    gate_state: str = "n/a"             # "n/a" | "pass" | <veto reason>
 
 
 def _label(ctx: _Ctx, p: Pivot) -> Tuple[int, int, float]:
@@ -733,7 +793,9 @@ def _finish(ctx: _Ctx, family: str, pts: Sequence[Pivot], names: Sequence[str], 
     score = round(sum(comps.values()), 2)
 
     reason = ""
-    if entry_dist > P.max_entry_distance_atr:
+    if ctx.block:
+        reason = f"legacy_gate:{ctx.block}"
+    elif entry_dist > P.max_entry_distance_atr:
         reason = "late_entry"
     elif not (math.isfinite(rr) and rr >= P.min_rr):
         reason = "reward_risk"
@@ -752,6 +814,8 @@ def _finish(ctx: _Ctx, family: str, pts: Sequence[Pivot], names: Sequence[str], 
     labels = {nm: _label(ctx, p) for nm, p in zip(names, pts)}
     feats: Dict[str, Any] = {
         "elliott_engine_version": ENGINE_VERSION,
+        "elliott_feature_version": FEATURE_VERSION,
+        "elliott_legacy_gate": ctx.gate_state,
         "elliott_wave_family": family,
         "elliott_wave_direction": ctx.direction,
         "elliott_wave_count": extra.pop("count_text", ""),
@@ -787,6 +851,72 @@ def _finish(ctx: _Ctx, family: str, pts: Sequence[Pivot], names: Sequence[str], 
         targets=tuple(float(s * x) for x in targets_t), rr=(round(rr, 2) if math.isfinite(rr) else 0.0),
         atr=ctx.atr_e, age_bars=int(age), htf_bias=htf.values.get("aligned"), detail=detail,
         features=feats, pair=ctx.pair,
+    )
+
+
+def _eval_exhaustion(ctx: _Ctx) -> Optional[WaveEvent]:
+    """A complete, rule-valid five-wave impulse whose Wave 5 high has JUST been
+    confirmed, showing at least one exhaustion sign that matters (momentum
+    divergence against Wave 3, or a truncated fifth). Emitted once, on the candle
+    that confirms the Wave 5 pivot. It is an event to record and follow up, never a
+    reversal trade by itself."""
+    tp, e = ctx.tp, ctx.e
+    if len(tp) < 6 or [p.kind for p in tp[-6:]] != [-1, 1, -1, 1, -1, 1]:
+        return None
+    p0, p1, p2, p3, p4, p5 = tp[-6:]
+    if e != p5.confirm_idx:
+        return None
+    if check_impulse_rules([p.price for p in (p0, p1, p2, p3, p4, p5)], True) is not None:
+        return None
+    w1, w3, w5 = p1.price - p0.price, p3.price - p2.price, p5.price - p4.price
+    truncated = p5.price <= p3.price
+    # indicators live in original price space: multiply by the side so that "lower
+    # in the direction of the impulse" means the same thing for up and down impulses
+    sg = ctx.s
+    hist_div = (not truncated) and bool(sg * ctx.hist[p5.idx] < sg * ctx.hist[p3.idx])
+    rsi_div = (not truncated) and bool(
+        math.isfinite(ctx.rsi[p5.idx]) and math.isfinite(ctx.rsi[p3.idx])
+        and sg * ctx.rsi[p5.idx] < sg * ctx.rsi[p3.idx])
+    weak_w5 = bool(w5 <= w1)
+    v3 = ctx.v[p2.idx:p3.idx + 1]
+    v5 = ctx.v[p4.idx:p5.idx + 1]
+    vol_known = bool(len(v3) and len(v5) and np.all(np.isfinite(v3)) and np.all(np.isfinite(v5))
+                     and float(np.mean(v3)) > 0)
+    vol_fade = bool(vol_known and float(np.mean(v5)) < float(np.mean(v3)))
+    if not (hist_div or rsi_div or truncated):
+        return None
+    signs = {"hist_divergence": hist_div, "rsi_divergence": rsi_div, "truncated_fifth": truncated,
+             "weak_wave5": weak_w5, "volume_fade": vol_fade}
+    score = int(sum(signs.values()))
+    direction = SELL if ctx.s > 0 else BUY       # the impulse's opposite side
+    key_pivots = [(int(ctx.ts[p.idx]), ctx.s * p.price) for p in (p0, p1, p2, p3, p4, p5)]
+    sid, eid = _ids(ctx.pair, direction, "exhaustion", key_pivots, int(ctx.ts[e]))
+    atr_e = ctx.atr_e
+    entry = float(ctx.c[e])
+    feats: Dict[str, Any] = {
+        "elliott_engine_version": ENGINE_VERSION,
+        "elliott_feature_version": FEATURE_VERSION,
+        "elliott_event_kind": "exhaustion",
+        "elliott_wave_family": "exhaustion",
+        "elliott_wave_direction": direction,
+        "elliott_wave_id": eid,
+        "elliott_structure_id": sid,
+        "elliott_exhaustion_signs": dict(signs),
+        "elliott_exhaustion_score": score,
+        "elliott_wave1_length_atr": round(w1 / atr_e, 3),
+        "elliott_wave3_length_atr": round(w3 / atr_e, 3),
+        "elliott_wave5_length_atr": round(w5 / atr_e, 3),
+        "elliott_wave5_vs_wave3": round(w5 / w3, 3) if w3 > 0 else None,
+        "elliott_volume_available": vol_known,
+    }
+    return WaveEvent(
+        kind="exhaustion", direction=direction, signs=signs, score=score,
+        labels={nm: _label(ctx, p) for nm, p in zip(("P0", "P1", "P2", "P3", "P4", "P5"),
+                                                    (p0, p1, p2, p3, p4, p5))},
+        event_id=eid, structure_id=sid, signal_idx=ctx.off + e, signal_ts=int(ctx.ts[e]),
+        entry_price=entry, invalidation=float(ctx.s * p5.price),
+        targets=(float(ctx.s * (p5.price - 0.382 * w5)), float(ctx.s * (p5.price - 0.618 * w5))),
+        atr=atr_e, features=feats, pair=ctx.pair,
     )
 
 
@@ -914,6 +1044,92 @@ def _eval_abc(ctx: _Ctx) -> Any:
                    c.price - P.stop_buffer_atr * ctx.atr_e, c.price, [b.price, s_.price],
                    score_structure("abc", m), score_fibonacci("abc", m), bos,
                    (b.idx, c.idx), (c.idx + 1, e), extra, age, rr_target=1)
+
+
+def evaluate_progress(rec: Mapping[str, Any], ts: np.ndarray, high: np.ndarray, low: np.ndarray,
+                      close: np.ndarray, volume: np.ndarray, end: int,
+                      max_bars: int = 48) -> Dict[str, Any]:
+    """What happened AFTER a stored signal, from the candles that followed it.
+
+    Pure and stateless: the same record and candles always give the same answer,
+    and nothing here can change the original signal (it only describes what came
+    later; callers append the result as a separate event).
+
+    `rec` needs: signal_ts, direction ("buy"/"sell"), entry, atr, invalidation,
+    targets (sequence), and optionally stop and vol_ref (mean volume up to the
+    signal). Within one candle the adverse outcome is assumed to come first
+    (pessimistic), exactly like the bot's stop/target replay.
+
+    Returns state "open" or "final", outcome one of
+      open | t2 | stop | invalidated | expired | missing_signal_candle
+    first-touch bar counts (candles after the signal), excursions in % and ATR
+    until the trade ended, and the later volume relative to `vol_ref`."""
+    ts_a = np.asarray(ts, dtype=np.int64)
+    h_a = np.asarray(high, dtype=np.float64)
+    l_a = np.asarray(low, dtype=np.float64)
+    c_a = np.asarray(close, dtype=np.float64)
+    v_a = np.asarray(volume, dtype=np.float64)
+    end = int(min(end, len(ts_a) - 1))
+    sig = int(rec["signal_ts"])
+    i0 = int(np.searchsorted(ts_a[:end + 1], sig))
+    if end < 0 or i0 > end or int(ts_a[i0]) != sig:
+        return {"state": "open", "outcome": "missing_signal_candle"}
+    buy = rec["direction"] == BUY
+    entry, atr = float(rec["entry"]), float(rec["atr"])
+    inv = float(rec["invalidation"])
+    stop = rec.get("stop")
+    stop = float(stop) if stop is not None else None
+    targets = [float(x) for x in (rec.get("targets") or ())]
+    first: Dict[str, Optional[int]] = {"t1": None, "t2": None, "stop": None, "invalidated": None}
+    mfe = mae = 0.0
+    outcome = "open"
+    j_end = i0
+    last = min(end, i0 + int(max_bars))
+    for j in range(i0 + 1, last + 1):
+        k = j - i0
+        hi, lo, cl = float(h_a[j]), float(l_a[j]), float(c_a[j])
+        fav = (hi - entry) if buy else (entry - lo)
+        adv = (entry - lo) if buy else (hi - entry)
+        inv_hit = (cl < inv) if buy else (cl > inv)
+        stop_hit = stop is not None and ((lo <= stop) if buy else (hi >= stop))
+        mae = max(mae, adv)
+        j_end = j
+        if inv_hit or stop_hit:
+            if stop_hit:
+                first["stop"] = first["stop"] or k
+            if inv_hit:
+                first["invalidated"] = first["invalidated"] or k
+            outcome = "stop" if stop_hit else "invalidated"
+            break
+        mfe = max(mfe, fav)
+        for ti, key in ((0, "t1"), (1, "t2")):
+            if len(targets) > ti and first[key] is None and ((hi >= targets[ti]) if buy else (lo <= targets[ti])):
+                first[key] = k
+        if first["t2"] is not None:
+            outcome = "t2"
+            break
+    else:
+        if last - i0 >= int(max_bars):
+            outcome = "expired"
+    post = v_a[i0 + 1:j_end + 1]
+    vol_ref = rec.get("vol_ref")
+    vol_ratio = None
+    if vol_ref and float(vol_ref) > 0 and len(post) and np.all(np.isfinite(post)):
+        vol_ratio = round(float(np.mean(post)) / float(vol_ref), 3)
+    return {
+        "state": "open" if outcome == "open" else "final",
+        "outcome": outcome,
+        "bars": int(j_end - i0),
+        "last_ts": int(ts_a[j_end]),
+        "first_bars": first,
+        "t1_before_adverse": first["t1"] is not None,
+        "mfe_pct": round(mfe / entry * 100.0, 4) if entry else None,
+        "mae_pct": round(mae / entry * 100.0, 4) if entry else None,
+        "mfe_atr": round(mfe / atr, 3) if atr > 0 else None,
+        "mae_atr": round(mae / atr, 3) if atr > 0 else None,
+        "volume_ratio": vol_ratio,
+        "volume_expanded": (vol_ratio >= 1.2) if vol_ratio is not None else None,
+    }
 
 
 def replay_events(pair: str, ts: np.ndarray, open_: np.ndarray, high: np.ndarray, low: np.ndarray,

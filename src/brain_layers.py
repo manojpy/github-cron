@@ -44,6 +44,8 @@ LAYER_OF: Dict[str, str] = {
     "confluence_tier_report": RESEARCH, "learner": RESEARCH, "autopsy": RESEARCH,
     "brain_recommend_baseline": RESEARCH, "brain_recommend_full": RESEARCH,
     "intelligence": RESEARCH, "autotune": RESEARCH,
+    # Elliott Wave engine: pure computation on candles, proposes nothing live
+    "elliott_wave": RESEARCH,
     # ── validation ──
     "threshold_validation": VALIDATION, "repair_ledger": VALIDATION, "brain_audit": VALIDATION,
     # ── policy ──
@@ -56,13 +58,15 @@ LAYER_OF: Dict[str, str] = {
     "redis_audit": INFRA, "aot_bridge": INFRA, "aot_meta": INFRA,
     "numba_functions_shared": INFRA, "indicators": INFRA, "numeric_selftest": INFRA,
     "pathrecon": INFRA, "feedback": INFRA, "brain_layers": INFRA, "alert_registry": INFRA,
+    # Elliott Wave wiring (Redis, Telegram, outcome rows) and its follow-up tracker
+    "elliott_alerts": INFRA, "elliott_tracker": INFRA,
 }
 
 # Modules that must be pure computation: no Redis, no state store, no files.
 PURE = frozenset({
     "feature_store", "hypothesis_gen", "plan_replay", "rulemine", "autopsy", "threshold_stats",
     "threshold_analysis", "threshold_models", "threshold_quality", "threshold_repair",
-    "threshold_validation", "intelligence", "autotune",
+    "threshold_validation", "intelligence", "autotune", "elliott_wave",
 })
 # State-store methods that change what the bot does.
 POLICY_WRITERS = frozenset({

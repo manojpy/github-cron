@@ -27,13 +27,21 @@ from collections import Counter
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from plan_replay import has_path, replay_plan
+from elliott_wave import FEATURE_VERSION as ELLIOTT_FEATURE_SET_VERSION
 
 Row = Dict[str, Any]
 
 # Bump when the set or meaning of fields written into `context` / `votes`
 # changes. Stamped into every new pending outcome (alerts.py).
 FEATURE_SET_VERSION = "fv1"
+# Elliott Wave rows carry their own feature namespace ("ewfv1", defined next to the
+# fields it describes in elliott_wave.py) in context["feature_version"]. fv1 is NOT
+# bumped: that would relabel every existing legacy row/cache. Anything that selects
+# rows by version therefore keeps seeing only legacy rows as fv1 and sees Elliott
+# rows as their own group; bump ELLIOTT_FEATURE_SET_VERSION when an Elliott feature
+# changes meaning.
 LEGACY_VERSION = "legacy"
+KNOWN_FEATURE_VERSIONS: Tuple[str, ...] = (LEGACY_VERSION, FEATURE_SET_VERSION, ELLIOTT_FEATURE_SET_VERSION)
 
 # 15m candles after the fill. The stored path is 12 candles long, so longer
 # horizons cannot be labelled without extending the outcome path itself.

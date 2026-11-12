@@ -14,14 +14,26 @@ Isolation, by design (do not "fix" any of these):
       - one Telegram alert and one Recorded row per wave structure
         (`structure_id`, claimed in Redis for ELLIOTT_WAVE_EVENT_TTL_HOURS);
       - one Shadowed row per wave structure (separate claim);
-      - ELLIOTT_WAVE_MAX_ALERTS_PER_RUN, separate from MAX_ALERTS_PER_RUN.
+      - ELLIOTT_WAVE_MAX_ALERTS_PER_RUN, separate from MAX_ALERTS_PER_RUN;
+      - ELLIOTT_WAVE_MAX_ALERTS_PER_PAIR inside ELLIOTT_WAVE_PAIR_WINDOW_HOURS.
+  * Elliott setups must pass the SAME common conditions as the MACD alerts, per
+    direction (ELLIOTT_WAVE_RESPECT_LEGACY_GATE): buy_trend_common_relaxed /
+    sell_trend_common_relaxed (trend, trend gate, CPR, Ichimoku cloud when that
+    filter is on) AND the wick-or-reversal-candle test, i.e. exactly
+    buy_common_relaxed_wick / sell_common_relaxed_wick. The relaxed values are read
+    from gates.LEGACY_COMMON_SNAPSHOT, written by the legacy gate evaluation of the
+    same pair and candle (nothing is recomputed, so the two can never disagree).
+    If the legacy gate was not evaluated for that candle the setup is vetoed
+    ("fails closed"). A vetoed setup is still recorded as Shadowed, with the
+    reason, so the value of the gate stays measurable.
   * Elliott never touches the legacy alert registry sets, the dedup of legacy
-    alerts, the heat gate or the confluence score. Its outcome rows carry no
-    confluence score, so the threshold learning of the MACD alerts is not mixed
-    with Elliott scores.
+    alerts, the heat gate or the confluence score. Its outcome rows carry the wave
+    score in the score fields and are skipped by the Brain's legacy readers, so
+    the threshold learning of the MACD alerts is not mixed with Elliott scores.
   * A stored signal is immutable: the decision is taken on the last closed candle
     only, from data that existed at that candle (elliott_wave.analyze never reads
-    beyond it), and nothing is rewritten later.
+    beyond it), and nothing is rewritten later. What happens afterwards is
+    appended as separate events by elliott_tracker.
 """
 from __future__ import annotations
 
@@ -29,16 +41,20 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+
+import elliott_tracker as tracker
 from alert_registry import ELLIOTT_REGISTRY
 from alerts import escape_markdown_v2, queue_failed_alert
-from bot_config import cfg, format_ist_time
+from bot_config import Constants, cfg, format_ist_time
 from elliott_wave import (
-    Analysis, ElliottParams, FAMILY_PRIORITY, WaveSetup, analyze,
+    Analysis, ElliottParams, FEATURE_VERSION, WaveEvent, WaveSetup, analyze, family_rank,
 )
-from fetcher import get_last_closed_index_from_array
+from fetcher import detect_reversal_candle_pattern_with_context, get_last_closed_index_from_array
+from gates import LEGACY_COMMON_SNAPSHOT
 from state import RedisStateStore, _rc
 
-__all__ = ["params_from_cfg", "scan_pair", "run_elliott_scan", "format_elliott_message"]
+__all__ = ["params_from_cfg", "scan_pair", "legacy_gate", "run_elliott_scan", "format_elliott_message"]
 
 INTERVAL_MIN = 15
 _FAMILY_TITLE = {"wave3": "Wave 3", "wave5": "Wave 5", "abc": "ABC reversal"}
@@ -60,6 +76,8 @@ def params_from_cfg() -> ElliottParams:
         enable_wave3=bool(cfg.ELLIOTT_WAVE_ENABLE_WAVE3),
         enable_wave5=bool(cfg.ELLIOTT_WAVE_ENABLE_WAVE5),
         enable_abc=bool(cfg.ELLIOTT_WAVE_ENABLE_ABC),
+        enable_exhaustion=bool(cfg.ELLIOTT_WAVE_ENABLE_EXHAUSTION_EVENTS),
+        primary_family=str(cfg.ELLIOTT_WAVE_PRIMARY_ENTRY),
     )
 
 
@@ -74,19 +92,98 @@ def _deliver_enabled(family: str) -> bool:
     return bool(getattr(cfg, f"ELLIOTT_WAVE_DELIVER_{family.upper()}", True))
 
 
+def _jsonable(x: Any) -> Any:
+    """numpy scalars / tuples / NaN -> plain JSON-safe values."""
+    if isinstance(x, dict):
+        return {str(k): _jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_jsonable(v) for v in x]
+    if isinstance(x, np.generic):
+        x = x.item()
+    if isinstance(x, float) and not np.isfinite(x):
+        return None
+    return x
+
+
+# ── the legacy common-relaxed + wick gate ────────────────────────────────
+
+def _first_failure(snap: Dict[str, Any], side: str) -> str:
+    """Name the first legacy condition that failed, Ichimoku first (the one most
+    often asked about), for the reason string and the Brain."""
+    if not snap.get(f"ichimoku_ok_{side}", False):
+        return "ichimoku"
+    if not snap.get(f"base_{side}_trend", False):
+        return "trend"
+    if not snap.get(f"trend_gate_ok_{side}", False):
+        return "trend_gate"
+    if not snap.get("cpr_ok", False):
+        return "cpr"
+    return "relaxed_common"
+
+
+def legacy_gate(pair: str, pd_15m: Any, i: int) -> Tuple[Optional[Dict[str, Optional[str]]], Dict[str, Dict[str, Any]]]:
+    """Per-direction veto reason (None = passes) plus a detail record per direction.
+
+    pass  <=>  buy_trend_common_relaxed AND (buy_wick_ratio <= MIN_WICK_RATIO OR
+               bullish reversal candle)            -- i.e. buy_common_relaxed_wick
+    (sell mirrored). Returns (None, {}) when the gate is switched off."""
+    if not cfg.ELLIOTT_WAVE_RESPECT_LEGACY_GATE:
+        return None, {}
+    snap = LEGACY_COMMON_SNAPSHOT.get(pair)
+    ts_i = int(pd_15m.ts[i])
+    if not snap or snap.get("i15") != i or snap.get("ts") != ts_i:
+        gone = {"state": "unavailable"}
+        return ({"buy": "gate_unavailable", "sell": "gate_unavailable"},
+                {"buy": dict(gone), "sell": dict(gone)})
+    rev_bull, rev_bear, _name, _leg = detect_reversal_candle_pattern_with_context(pd_15m, i)
+    veto: Dict[str, Optional[str]] = {}
+    detail: Dict[str, Dict[str, Any]] = {}
+    for side, reversal in (("buy", bool(rev_bull)), ("sell", bool(rev_bear))):
+        ratio = float(snap[f"{side}_wick_ratio"])
+        relaxed = bool(snap[f"{side}_relaxed"])
+        wick_ok = bool(ratio <= Constants.MIN_WICK_RATIO or reversal)
+        reason: Optional[str] = None
+        if not relaxed:
+            reason = _first_failure(snap, side)
+        elif not wick_ok:
+            reason = "wick"
+        veto[side] = reason
+        detail[side] = {
+            "state": "pass" if reason is None else "veto",
+            "common_relaxed": relaxed,
+            "ichimoku": bool(snap[f"ichimoku_ok_{side}"]),
+            "trend": bool(snap[f"base_{side}_trend"]),
+            "trend_gate": bool(snap[f"trend_gate_ok_{side}"]),
+            "cpr": bool(snap["cpr_ok"]),
+            "wick_ratio": round(ratio, 4),
+            "reversal_candle": reversal,
+            "wick_ok": wick_ok,
+        }
+    return veto, detail
+
+
 # ── per-pair scan (CPU only, no I/O) ─────────────────────────────────────
 
 def scan_pair(pair: str, pd_15m: Any, reference_time: int,
               params: ElliottParams) -> Tuple[Optional[int], Optional[Analysis]]:
     """Analyse the last CLOSED 15m candle. Returns (index, analysis) or (None, None)
-    when the candle is missing / stale / unstable (same rule as the legacy scan)."""
+    when the candle is missing / stale / unstable (same rule as the legacy scan).
+    The legacy common-relaxed + wick gate is applied inside the analysis as a
+    per-direction veto, and its detail is attached to every setup / event."""
     if pd_15m is None or len(pd_15m) == 0:
         return None, None
     i = get_last_closed_index_from_array(pd_15m.ts, INTERVAL_MIN, reference_time, pair)
     if i is None:
         return None, None
+    veto, detail = legacy_gate(pair, pd_15m, int(i))
     res = analyze(pair, pd_15m.ts, pd_15m.open, pd_15m.high, pd_15m.low,
-                  pd_15m.close, pd_15m.volume, end=int(i), params=params)
+                  pd_15m.close, pd_15m.volume, end=int(i), params=params, external_gate=veto)
+    for s in res.setups:
+        if detail:
+            s.features["elliott_legacy_gate_detail"] = dict(detail.get(s.direction, {}))
+    for ev in res.events:
+        if detail:
+            ev.features["elliott_legacy_gate_detail"] = dict(detail.get(ev.direction, {}))
     return int(i), res
 
 
@@ -101,7 +198,18 @@ def _px(x: float) -> str:
     return f"{x:.6g}"
 
 
-def _setup_block(s: WaveSetup) -> str:
+def _gate_line(s: WaveSetup) -> Optional[str]:
+    d = s.features.get("elliott_legacy_gate_detail") or {}
+    if not d or d.get("state") != "pass":
+        return None
+    parts = ["common relaxed ✓"]
+    if d.get("ichimoku") is not None:
+        parts.append("Ichimoku ✓")
+    parts.append("wick/reversal ✓")
+    return "Legacy gate: " + " · ".join(parts)
+
+
+def _setup_block(s: WaveSetup, verdict: Optional[str] = None) -> str:
     e = escape_markdown_v2
     side = "BUY" if s.direction == "buy" else "SELL"
     icon = "🟢" if s.direction == "buy" else "🔴"
@@ -121,13 +229,19 @@ def _setup_block(s: WaveSetup) -> str:
           f"Invalidation {_px(s.invalidation)}"),
         e(f"Scores: {comp}"),
     ]
+    gl = _gate_line(s)
+    if gl:
+        lines.append(e(gl))
+    if verdict:
+        lines.append(e(verdict))
     return "\n".join(lines)
 
 
-def format_elliott_message(setups: List[WaveSetup]) -> str:
+def format_elliott_message(setups: List[WaveSetup], verdicts: Optional[Dict[str, str]] = None) -> str:
     e = escape_markdown_v2
+    verdicts = verdicts or {}
     head = e(f"🌊 {cfg.BOT_NAME} — Elliott Wave ({len(setups)})")
-    body = "\n\n".join(_setup_block(s) for s in setups)
+    body = "\n\n".join(_setup_block(s, verdicts.get(s.family)) for s in setups)
     ts = max(s.signal_ts for s in setups) + INTERVAL_MIN * 60
     foot = (f"📆  {e(format_ist_time(ts, '%d-%m-%Y'))}  "
             f"⏰ {e(format_ist_time(ts, '%H:%M IST'))}")
@@ -141,6 +255,8 @@ def _context(s: WaveSetup, disposition: str) -> Dict[str, Any]:
     """Everything the Brain may want to slice by, JSON-safe, frozen at signal time."""
     ctx: Dict[str, Any] = dict(s.features)
     ctx.update({
+        # own feature namespace (fv1 is the legacy one and is deliberately not bumped)
+        "feature_version": FEATURE_VERSION,
         "elliott_disposition": disposition,
         "elliott_trigger_level": s.trigger_level,
         "elliott_stop": s.stop,
@@ -151,6 +267,22 @@ def _context(s: WaveSetup, disposition: str) -> Dict[str, Any]:
         "elliott_signal_ts": s.signal_ts,
     })
     return ctx
+
+
+def _snapshot(s: WaveSetup, disposition: str) -> Dict[str, Any]:
+    """The immutable signal snapshot archived by the tracker: the context plus the
+    full per-pillar score breakdown (score / max / reason / values / available)."""
+    snap = _context(s, disposition)
+    snap["elliott_score"] = float(s.score)
+    snap["elliott_status"] = s.status
+    snap["elliott_reason"] = s.reason
+    snap["elliott_rr"] = float(s.rr)
+    snap["elliott_components"] = {
+        k: {"score": v.score, "max": v.max_score, "available": v.available,
+            "reason": v.reason, "values": v.values}
+        for k, v in s.detail.items()
+    }
+    return _jsonable(snap)
 
 
 def _outcome_kwargs(pair: str, s: WaveSetup, disposition: str) -> Dict[str, Any]:
@@ -166,7 +298,7 @@ def _outcome_kwargs(pair: str, s: WaveSetup, disposition: str) -> Dict[str, Any]
         # threshold learning never sees these rows.
         "confluence_score": float(s.score),
         "confluence_total": 100.0,
-        "context": _context(s, disposition),
+        "context": _jsonable(_context(s, disposition)),
     }
 
 
@@ -183,6 +315,24 @@ async def _release(sdb: RedisStateStore, kind: str, structure_id: str) -> None:
         pass
 
 
+async def _claim_pair_slot(sdb: RedisStateStore, pair: str) -> Optional[int]:
+    """Rolling per-pair limit: ELLIOTT_WAVE_MAX_ALERTS_PER_PAIR slots, each held
+    for ELLIOTT_WAVE_PAIR_WINDOW_HOURS. Returns the slot number or None if full."""
+    ttl = int(cfg.ELLIOTT_WAVE_PAIR_WINDOW_HOURS) * 3600
+    for k in range(int(cfg.ELLIOTT_WAVE_MAX_ALERTS_PER_PAIR)):
+        if await sdb.claim_notice(f"ewp:{pair}:{k}", ttl):
+            return k
+    return None
+
+
+async def _release_pair_slot(sdb: RedisStateStore, pair: str, k: int) -> None:
+    key = f"{sdb.meta_prefix}notice:ewp:{pair}:{k}"
+    try:
+        await sdb._safe_redis_op(lambda: _rc(sdb._redis).delete(key), 2.0, "ew_release:pair")
+    except Exception:
+        pass
+
+
 # ── run-level entry point ────────────────────────────────────────────────
 
 async def run_elliott_scan(
@@ -195,9 +345,11 @@ async def run_elliott_scan(
     suppress_delivery: bool = False,
 ) -> Dict[str, int]:
     """Scan every pair on its last closed 15m candle, deliver the best eligible
-    setups (cap + dedup) and record the rest as Shadowed. Never raises."""
+    setups (caps + dedup) and record the rest as Shadowed. Then advance the
+    follow-up of every tracked structure. Never raises."""
     stats = {"pairs": 0, "candidates": 0, "eligible": 0, "delivered": 0,
-             "shadowed": 0, "duplicates": 0, "errors": 0}
+             "shadowed": 0, "duplicates": 0, "gated": 0, "pair_limited": 0,
+             "events": 0, "tracked": 0, "resolved": 0, "errors": 0}
     if not cfg.ENABLE_ELLIOTT_WAVE:
         return stats
     try:
@@ -211,6 +363,22 @@ async def run_elliott_scan(
         return stats
 
 
+def _vol_ref(parsed_cache: Dict[str, Tuple[Any, Any, Any]], pair: str, idx: int) -> Optional[float]:
+    pd_15m = (parsed_cache.get(pair) or (None, None, None))[0]
+    return None if pd_15m is None else tracker.vol_ref_at(pd_15m.volume, idx)
+
+
+def _track_record(pair: str, s: WaveSetup, disposition: str, vol_ref: Optional[float]) -> Dict[str, Any]:
+    return tracker.make_record(
+        kind="setup", pair=pair, alert_key=alert_key_of(s), family=s.family,
+        direction=s.direction, signal_ts=s.signal_ts, entry=s.entry_price, atr=s.atr,
+        invalidation=s.invalidation, stop=s.stop, targets=s.targets,
+        vol_ref=vol_ref,
+        event_id=s.event_id, structure_id=s.structure_id, disposition=disposition,
+        status=s.status, score=s.score,
+        gate_state=str(s.features.get("elliott_legacy_gate", "n/a")), reason=s.reason)
+
+
 async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stats) -> Dict[str, int]:
     if cfg.DRY_RUN_MODE:
         log.info("🌊 Elliott: DRY_RUN_MODE — scan skipped (nothing is claimed or recorded)")
@@ -221,6 +389,7 @@ async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stat
 
     params = params_from_cfg()
     sem = asyncio.Semaphore(max(1, int(cfg.EVAL_CONCURRENCY_LIMIT)))
+    last_idx: Dict[str, int] = {}
 
     async def _one(pair: str):
         async with sem:
@@ -231,23 +400,27 @@ async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stat
                 log.warning(f"[{pair}] Elliott analysis failed: {exc!r}")
                 stats["errors"] += 1
                 return pair, None
+            if i is not None:
+                last_idx[pair] = i
             return pair, res
 
     scanned = await asyncio.gather(*[_one(p) for p in pairs])
 
-    # (pair, setup) for every triggered candidate; primary = best per pair.
+    # (pair, setup, is_primary) for every triggered candidate; primary = best per pair.
     all_c: List[Tuple[str, WaveSetup, bool]] = []
+    events: List[Tuple[str, WaveEvent]] = []
     for pair, res in scanned:
         if res is None:
             continue
         stats["pairs"] += 1
         for s in res.setups:
             all_c.append((pair, s, s is res.primary))
+        for ev in res.events:
+            events.append((pair, ev))
     stats["candidates"] = len(all_c)
     stats["eligible"] = sum(1 for _, s, _p in all_c if s.status == "eligible")
-    if not all_c:
-        log.info(f"🌊 Elliott: {stats['pairs']} pair(s) scanned, no triggered candidate")
-        return stats
+    stats["gated"] = sum(1 for _, s, _p in all_c if str(s.reason).startswith("legacy_gate:"))
+    stats["events"] = len(events)
 
     # ── delivery selection: primary + eligible + family switch, best first ──
     can_send = (bool(cfg.ELLIOTT_WAVE_TELEGRAM_ENABLED) and not suppress)
@@ -264,71 +437,123 @@ async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stat
             why_not[s.event_id] = "delivery_off"
         else:
             deliverable.append((pair, s))
-    deliverable.sort(key=lambda t: (-t[1].score, FAMILY_PRIORITY[t[1].family], t[0]))
+    primary_family = str(cfg.ELLIOTT_WAVE_PRIMARY_ENTRY)
+    deliverable.sort(key=lambda t: (-t[1].score, family_rank(t[1].family, primary_family), t[0]))
 
     cap = int(cfg.ELLIOTT_WAVE_MAX_ALERTS_PER_RUN)
     selected: List[Tuple[str, WaveSetup]] = []
+    slots: Dict[str, Tuple[str, int]] = {}      # event_id -> (pair, slot)
     duplicates: set = set()
     for pair, s in deliverable:
         if len(selected) >= cap:
             why_not[s.event_id] = "over_cap"
             continue
         try:
+            # structure first: a repeat of an already-alerted structure is a duplicate
+            # (never a pair-limit case, never re-recorded as Shadowed)
             owned = await _claim(sdb, "d", s.structure_id)
+            if not owned:
+                duplicates.add(s.event_id)
+                stats["duplicates"] += 1
+                continue
+            slot = await _claim_pair_slot(sdb, pair)
         except Exception as exc:
             log.warning(f"[{pair}] Elliott claim failed: {exc!r}")
             stats["errors"] += 1
             why_not[s.event_id] = "claim_error"
             continue
-        if not owned:
-            duplicates.add(s.event_id)
-            stats["duplicates"] += 1
+        if slot is None:
+            # the structure stays claimed: it is not delivered later, only recorded
+            why_not[s.event_id] = "pair_limit"
+            stats["pair_limited"] += 1
             continue
+        slots[s.event_id] = (pair, slot)
         selected.append((pair, s))
 
     delivered_ids: set = set()
     if selected:
-        delivered_ids = await _deliver(selected, reference_time, sdb, tg, log, stats, why_not)
+        verdicts: Dict[str, str] = {}
+        for fam in {s.family for _, s in selected}:
+            verdicts[fam] = await tracker.verdict_for(sdb, fam)
+        delivered_ids = await _deliver(selected, reference_time, sdb, tg, log, stats, why_not, verdicts)
+        for _, s in selected:
+            if s.event_id not in delivered_ids and s.event_id in slots:
+                await _release_pair_slot(sdb, *slots[s.event_id])
 
     # ── shadow recording of everything not delivered (once per structure) ──
-    if cfg.ELLIOTT_WAVE_SHADOW_MODE:
-        for pair, s, _p in all_c:
-            if s.event_id in delivered_ids or s.event_id in duplicates:
+    recorded_for_tracking: List[Tuple[str, WaveSetup, str]] = []
+    for pair, s, _p in all_c:
+        if s.event_id in delivered_ids:
+            recorded_for_tracking.append((pair, s, why_not.get(s.event_id, "delivered")))
+            continue
+        if s.event_id in duplicates:
+            continue
+        disp = why_not.get(s.event_id, "not_delivered")
+        if not cfg.ELLIOTT_WAVE_SHADOW_MODE:
+            continue
+        if disp.startswith("rejected:") and not cfg.ELLIOTT_WAVE_SHADOW_REJECTED:
+            continue
+        recorded_for_tracking.append((pair, s, disp))
+        try:
+            if not await _claim(sdb, "s", s.structure_id):
                 continue
-            disp = why_not.get(s.event_id, "not_delivered")
-            if disp.startswith("rejected:") and not cfg.ELLIOTT_WAVE_SHADOW_REJECTED:
-                continue
-            try:
-                if not await _claim(sdb, "s", s.structure_id):
-                    continue
-                res_s = await sdb.record_shadow_pending_outcome(
-                    **_outcome_kwargs(pair, s, disp))
-                if res_s == "failed":
-                    await _release(sdb, "s", s.structure_id)
-                    stats["errors"] += 1
-                elif res_s == "created":
-                    stats["shadowed"] += 1
-            except Exception as exc:
-                log.warning(f"[{pair}] Elliott shadow record failed: {exc!r}")
-                stats["errors"] += 1
+            res_s = await sdb.record_shadow_pending_outcome(**_outcome_kwargs(pair, s, disp))
+            if res_s == "failed":
                 await _release(sdb, "s", s.structure_id)
+                stats["errors"] += 1
+            elif res_s == "created":
+                stats["shadowed"] += 1
+        except Exception as exc:
+            log.warning(f"[{pair}] Elliott shadow record failed: {exc!r}")
+            stats["errors"] += 1
+            await _release(sdb, "s", s.structure_id)
+
+    # ── follow-up: register new structures / events, then advance all of them ──
+    for pair, s, disp in recorded_for_tracking:
+        try:
+            rec = _track_record(pair, s, disp, _vol_ref(parsed_cache, pair, s.signal_idx))
+            await tracker.register(sdb, rec, _snapshot(s, disp), log)
+        except Exception as exc:
+            log.warning(f"[{pair}] Elliott tracker register failed: {exc!r}")
+    for pair, ev in events:
+        try:
+            rec = tracker.make_record(
+                kind="event", pair=pair, alert_key=f"elliott_exhaustion_{ev.direction}",
+                family="exhaustion", direction=ev.direction, signal_ts=ev.signal_ts,
+                entry=ev.entry_price, atr=ev.atr, invalidation=ev.invalidation, stop=None,
+                targets=ev.targets, vol_ref=_vol_ref(parsed_cache, pair, ev.signal_idx),
+                event_id=ev.event_id, structure_id=ev.structure_id, disposition="event",
+                status="event", score=float(ev.score),
+                gate_state=str(ev.features.get("elliott_legacy_gate", "n/a")), reason="")
+            snap = _jsonable({**ev.features, "feature_version": FEATURE_VERSION,
+                              "elliott_signs": ev.signs, "elliott_labels":
+                              {k: list(v) for k, v in ev.labels.items()}})
+            await tracker.register(sdb, rec, snap, log)
+        except Exception as exc:
+            log.warning(f"[{pair}] Elliott event register failed: {exc!r}")
+    prog = await tracker.update_all(sdb, parsed_cache, last_idx, log)
+    stats["tracked"], stats["resolved"] = prog["tracked"], prog["resolved"]
 
     log.info(
         f"🌊 Elliott: {stats['pairs']} pair(s), {stats['candidates']} candidate(s), "
-        f"{stats['eligible']} eligible, {stats['delivered']} delivered, "
-        f"{stats['shadowed']} shadowed, {stats['duplicates']} duplicate(s)"
+        f"{stats['eligible']} eligible, {stats['gated']} vetoed by legacy gate, "
+        f"{stats['delivered']} delivered, {stats['shadowed']} shadowed, "
+        f"{stats['duplicates']} duplicate(s), {stats['pair_limited']} pair-limited, "
+        f"{stats['events']} exhaustion event(s), {stats['tracked']} tracked, "
+        f"{stats['resolved']} resolved"
     )
     return stats
 
 
 async def _deliver(selected: List[Tuple[str, WaveSetup]], reference_time: int,
                    sdb: RedisStateStore, tg: Any, log: logging.Logger,
-                   stats: Dict[str, int], why_not: Dict[str, str]) -> set:
+                   stats: Dict[str, int], why_not: Dict[str, str],
+                   verdicts: Optional[Dict[str, str]] = None) -> set:
     """Send ONE Telegram message with the selected setups, then record them as
     Recorded outcomes. A failed send is parked in the dead-letter queue together
     with the outcome rows it owes; if even that fails the claims are released so
     the next run can try again."""
-    message = format_elliott_message([s for _, s in selected])
+    message = format_elliott_message([s for _, s in selected], verdicts)
     outcomes = [_outcome_kwargs(p, s, "delivered") for p, s in selected]
     sent = False
     try:

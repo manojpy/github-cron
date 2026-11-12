@@ -18,6 +18,13 @@ from indicators import (
     _choch_gate_reason, _trendline_events, calculate_ob_equilibrium,
 )
 
+# Per-run, per-pair record of the legacy "relaxed common" gate, written by _eval_gate
+# (read-only for everyone else). The Elliott Wave module reads it so that it respects
+# the same trend / Ichimoku-cloud / CPR / wick conditions as the legacy alerts without
+# re-running the gate. Pure bookkeeping: nothing in the legacy decision path reads it.
+LEGACY_COMMON_SNAPSHOT: Dict[str, Dict[str, Any]] = {}
+
+
 @dataclass(slots=True)
 class IndicatorCache:
     """Typed replacement for the merged gate_indicators/alert_indicators dict."""
@@ -1186,6 +1193,16 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             and trend_gate_ok_sell
             and bool(ichimoku_filter_ok_sell)
         )
+        LEGACY_COMMON_SNAPSHOT[pair_name] = {
+            "i15": int(i15), "ts": int(ts_curr),
+            "buy_relaxed": bool(buy_trend_common_relaxed),
+            "sell_relaxed": bool(sell_trend_common_relaxed),
+            "buy_wick_ratio": float(buy_wick_ratio), "sell_wick_ratio": float(sell_wick_ratio),
+            "base_buy_trend": bool(base_buy_trend), "base_sell_trend": bool(base_sell_trend),
+            "trend_gate_ok_buy": bool(trend_gate_ok_buy), "trend_gate_ok_sell": bool(trend_gate_ok_sell),
+            "ichimoku_ok_buy": bool(ichimoku_filter_ok_buy), "ichimoku_ok_sell": bool(ichimoku_filter_ok_sell),
+            "cpr_ok": bool(effective_cpr_ok),
+        }
         reversal_candidate = (
             (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT
              or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT
