@@ -50,7 +50,7 @@ from alerts import (
     DEDUP_STATS, reset_dedup_stats, DLQ_STATS, reset_dlq_stats, replay_telegram_dlq, format_dedup_summary,
     send_trade_close_notices, _record_counterfactual_block, send_pullback_watch, flush_pullback_watch,
 )
-from alert_registry import ALERT_KEYS, BUY_ALERT_KEYS, keys_for
+from alert_registry import ALERT_KEYS, BUY_ALERT_KEYS, keys_for, is_elliott_key
 from elliott_alerts import run_elliott_scan
 
 _pair_eval_counter = 0
@@ -1368,6 +1368,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             recent = await asyncio.to_thread(
                 load_recent_outcomes, hours=cfg.KILL_SWITCH_LOOKBACK_HOURS
             )
+            # Elliott runs on its own switch and is quarantined from the legacy
+            # kill switch, so its losses can never pause the MACD alerts.
+            recent = [r for r in recent if not is_elliott_key(str(r.get("alert_key") or ""))]
             ks_state = engine.KillSwitch(
                 max_consecutive_losses=cfg.KILL_SWITCH_MAX_CONSECUTIVE_LOSSES,
                 max_drawdown_pct=cfg.KILL_SWITCH_MAX_DRAWDOWN_PCT,
@@ -1537,12 +1540,10 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     # even when no trade resolved this cycle.
     try:
         cum = await state_db.get_cumulative_outcome_stats(reuse_prescan=True)
-        for source in ("Recorded", "Shadowed"):
-            icon = "📝" if source == "Recorded" else "👁"
+        for source, icon in (("Recorded", "📝"), ("Shadowed", "👁"), ("Elliott", "🌊")):
             logger_main.info(format_outcome_totals(source, cum.get(source), icon))
     except Exception as exc:
         logger_main.warning(f"Cumulative outcome stats log failed: {exc}")
-
     logger_main.debug(
         f"Results: {len(valid_results)} successful, {len(results) - len(valid_results)} failed"
     )

@@ -186,11 +186,13 @@ async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger
         if clear_alert_stats:
             alert_stats_keys = await _scan_keys_with_timeout(f"{RedisKeyPrefix.ALERT_STATS}*", count=100)
             deleted_alert_stats = await _batch_unlink(alert_stats_keys)
-            await _batch_unlink([f"{RedisKeyPrefix.OUTCOME_TOTALS}Recorded"])
+            await _batch_unlink([f"{RedisKeyPrefix.OUTCOME_TOTALS}Recorded",
+                                 f"{RedisKeyPrefix.OUTCOME_TOTALS}Elliott"])
         if clear_shadow_stats:
             shadow_stats_keys = await _scan_keys_with_timeout(f"{RedisKeyPrefix.SHADOW_STATS}*", count=100)
             deleted_shadow_stats = await _batch_unlink(shadow_stats_keys)
-            await _batch_unlink([f"{RedisKeyPrefix.OUTCOME_TOTALS}Shadowed"])
+            await _batch_unlink([f"{RedisKeyPrefix.OUTCOME_TOTALS}Shadowed",
+                                 f"{RedisKeyPrefix.OUTCOME_TOTALS}Elliott"])
             hiconf_keys = await _scan_keys_with_timeout(f"{RedisKeyPrefix.SHADOW_HICONF_STATS}*", count=100)
             deleted_shadow_hiconf = await _batch_unlink(hiconf_keys)
 
@@ -2699,7 +2701,12 @@ class RedisStateStore:
                         if result.get("outcome_class") == "timeout":
                             write_pipe.hincrby(stats_key, "timeout_wins" if win else "timeouts", 1)
                         write_pipe.expire(stats_key, stats_ttl)
-                        totals_key = f"{RedisKeyPrefix.OUTCOME_TOTALS}Recorded"
+                        # Elliott rows keep their own running total so the legacy
+                        # Recorded / Shadowed win rates stay pure MACD.
+                        totals_key = (
+                            f"{RedisKeyPrefix.OUTCOME_TOTALS}"
+                            f"{'Elliott' if is_elliott_key(str(alert_key)) else 'Recorded'}"
+                        )
                         write_pipe.hincrby(totals_key, "wins" if win else "losses", 1)
                         if result.get("outcome_class") == "timeout":
                             write_pipe.hincrby(totals_key, "timeout_wins" if win else "timeouts", 1)
@@ -2981,7 +2988,10 @@ class RedisStateStore:
                         if result.get("outcome_class") == "timeout":
                             write_pipe.hincrby(stats_key, "timeout_wins" if win else "timeouts", 1)
                         write_pipe.expire(stats_key, stats_ttl)
-                        totals_key = f"{RedisKeyPrefix.OUTCOME_TOTALS}Shadowed"
+                        totals_key = (
+                            f"{RedisKeyPrefix.OUTCOME_TOTALS}"
+                            f"{'Elliott' if is_elliott_key(str(alert_key)) else 'Shadowed'}"
+                        )
                         write_pipe.hincrby(totals_key, "wins" if win else "losses", 1)
                         if result.get("outcome_class") == "timeout":
                             write_pipe.hincrby(totals_key, "timeout_wins" if win else "timeouts", 1)
@@ -3215,12 +3225,14 @@ class RedisStateStore:
         so the totals are the same. Falls back to SCAN when no pre-scan was stored.
         """
         empty = {"wins": 0, "losses": 0, "timeouts": 0, "timeout_wins": 0, "total": 0}
-        out: Dict[str, Dict[str, int]] = {"Recorded": dict(empty), "Shadowed": dict(empty)}
+        out: Dict[str, Dict[str, int]] = {
+            "Recorded": dict(empty), "Shadowed": dict(empty), "Elliott": dict(empty),
+        }
 
         if self.degraded or not self._redis:
             return out
 
-        labels = ("Recorded", "Shadowed")
+        labels = ("Recorded", "Shadowed", "Elliott")
         try:
             rows: Dict[str, Dict[str, Any]] = {}
             if not force:
@@ -3262,10 +3274,12 @@ class RedisStateStore:
         partial result is returned for display but NOT stored."""
         prefix_map = {"Recorded": RedisKeyPrefix.ALERT_STATS, "Shadowed": RedisKeyPrefix.SHADOW_STATS}
         result: Dict[str, Dict[str, Any]] = {}
+        # Elliott outcomes (Recorded and Shadowed alike) are summed into their own
+        # bucket and kept out of the two legacy ones.
+        elliott_totals: Dict[str, Any] = {f: 0 for f in self.OUTCOME_TOTALS_FIELDS}
 
         for label, prefix in prefix_map.items():
             totals: Dict[str, Any] = {f: 0 for f in self.OUTCOME_TOTALS_FIELDS}
-
             async def _consume(p: str = prefix) -> List[str]:
                 return [k async for k in self._redis.scan_iter(match=f"{p}*", count=2000)]  # type: ignore[union-attr]
 
@@ -3274,9 +3288,9 @@ class RedisStateStore:
             except Exception as e:
                 logger.warning(f"get_cumulative_outcome_stats: scan of '{prefix}*' failed ({e}) — totals are PARTIAL")
                 totals["partial"] = 1
+                elliott_totals["partial"] = 1
                 result[label] = totals
                 continue
-
             # Base key = exactly one ":" after the statistics prefix.
             # Session-scoped keys contain an additional ":" and must not be counted.
             base_keys = [k for k in collected if str(k)[len(prefix):].count(":") == 1]
@@ -3285,12 +3299,14 @@ class RedisStateStore:
                     for k in base_keys:
                         pipe.hgetall(k)
                     stat_rows = await asyncio.wait_for(_execute_pipeline(pipe), timeout=5.0)
-                for data in stat_rows:
+                for k, data in zip(base_keys, stat_rows):
                     if not data:
                         continue
+                    bucket = elliott_totals if is_elliott_key(str(k).rsplit(":", 1)[-1]) else totals
                     for field in self.OUTCOME_TOTALS_FIELDS:
-                        totals[field] += int(data.get(field, 0) or 0)
+                        bucket[field] += int(data.get(field, 0) or 0)
             result[label] = totals
+        result["Elliott"] = elliott_totals
 
         if not any(v.get("partial") for v in result.values()):
             stats_ttl = max(cfg.STATE_EXPIRY_DAYS * 86400, 7 * 86400)
@@ -3331,9 +3347,11 @@ class RedisStateStore:
                 continue
 
             pending_rows = await asyncio.wait_for(_rc(self._redis).mget(pending_keys), timeout=5.0)
-            for raw in pending_rows:
+            for pkey, raw in zip(pending_keys, pending_rows):
                 if not raw:
                     continue
+                # pending key = <prefix><pair>:<alert_key>:<entry_ts>
+                bucket_label = "Elliott" if is_elliott_key(str(pkey).rsplit(":", 2)[-2]) else label
 
                 try:
                     data = json_loads(raw)
@@ -3342,15 +3360,14 @@ class RedisStateStore:
 
                 # Only count trades whose TP/SL has actually been hit.
                 closed_reason = str(data.get("closed_reason") or "").lower()
-
                 if not closed_reason:
                     continue
 
                 if closed_reason == "target":
-                    out[label]["wins"] += 1
+                    out[bucket_label]["wins"] += 1
                 elif closed_reason in ("stop", "both"):
                     # "both" means TP and SL were touched inside the same candle.
-                    out[label]["losses"] += 1
+                    out[bucket_label]["losses"] += 1
     
     async def batch_get_all_alert_states(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, bool]:
         if not self._redis or self.degraded or not alert_keys:

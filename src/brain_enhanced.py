@@ -18,6 +18,7 @@ from archive_reader import load_archived_outcomes
 from bot_config import cfg, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS, format_ist_time, json_dumps, json_loads
 from state import RedisKeyPrefix, RedisStateStore, outcome_totals_from_rows
 from brain import BrainCore, _extract_p_value_for_fdr
+from alert_registry import is_elliott_key
 from pathrecon import KEY_RECON, apply_cached, needs_recon
 import threshold_engine as engine
 from threshold_engine import (
@@ -1514,7 +1515,12 @@ class BrainEngineV2(BrainCore):
                 # agree with the trade count printed above them.
                 try:
                     _real, _shadow = await self._get_rows()
-                    for _label, _rows in (("Recorded", _real), ("Shadowed", _shadow)):
+                    # Elliott rows are split out so the legacy totals stay pure MACD.
+                    _all = list(_real or []) + list(_shadow or [])
+                    _ew_rows = [r for r in _all if is_elliott_key(str(r.get("alert_key") or ""))]
+                    _legacy_real = [r for r in (_real or []) if not is_elliott_key(str(r.get("alert_key") or ""))]
+                    _legacy_shadow = [r for r in (_shadow or []) if not is_elliott_key(str(r.get("alert_key") or ""))]
+                    for _label, _rows in (("Recorded", _legacy_real), ("Shadowed", _legacy_shadow), ("Elliott", _ew_rows)):
                         _arch = outcome_totals_from_rows(_rows)
                         if _arch["total"] > int((_cum.get(_label) or {}).get("total", 0)):
                             _cum[_label] = _arch
