@@ -8,7 +8,7 @@ import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Sequence
 from alert_registry import resolve_alert_config_path, alert_family_of, is_elliott_key
-from bot_config import cfg
+from bot_config import cfg, format_ist_time
 import threshold_engine as engine
 
 _OVERRIDE_COOLDOWN_PREFIX = "brain_override_cooldown:"
@@ -517,7 +517,9 @@ def build_evidence_cards(rows: Sequence[Dict[str, Any]], *, stop_pct: float, tar
 
 def evidence_card_lookup(blob: Optional[Dict[str, Any]], alert_key: str, direction: str,
                          max_age_sec: float, now_ts: Optional[float] = None) -> Optional[Dict[str, Any]]:
-    """The card for this alert's family+direction, or None (no blob, stale, or family unseen)."""
+    """The card for this alert's family+direction, or None when there is no usable blob (missing or
+    stale). A fresh blob with no card for this family is a real answer, "no resolved trades yet",
+    so it returns an empty n=0 card that the block words differently from a missing blob."""
     if not isinstance(blob, dict):
         return None
     now = now_ts if now_ts is not None else time.time()
@@ -525,10 +527,11 @@ def evidence_card_lookup(blob: Optional[Dict[str, Any]], alert_key: str, directi
         return None
     card = (blob.get("cards") or {}).get(f"{evidence_group_of(alert_key)}|{str(direction).lower()}")
     if not isinstance(card, dict):
-        return None
+        card = {"state": "INSUFFICIENT", "recent": {"n": 0, "decided": 0}, "trend": "n/a"}
     out = dict(card)
     out["window"] = blob.get("window")
     out["min_n"] = blob.get("min_n")
+    out["asof"] = blob.get("ts")
     return out
 
 def evidence_block_lines(card: Optional[Dict[str, Any]], alert_key: str, direction: str) -> List[str]:
@@ -545,11 +548,19 @@ def evidence_block_lines(card: Optional[Dict[str, Any]], alert_key: str, directi
     be = float(be) if isinstance(be, (int, float)) else evidence_breakeven_pct(stop, target, cost)
     n, decided = int(rec.get("n") or 0), int(rec.get("decided") or 0)
     min_n = int((card or {}).get("min_n") or int(getattr(cfg, "ALERT_EVIDENCE_MIN_TRADES", 30)))
+    if card is None:
+        # No card at all (blob missing, expired or Redis unreachable): says nothing about the trade count.
+        insufficient = "INSUFFICIENT DATA ⏳ (statistics not loaded yet)"
+    elif n == 0:
+        insufficient = "INSUFFICIENT DATA ⏳ (no resolved trades for this family yet)"
+    elif n < min_n:
+        insufficient = f"INSUFFICIENT DATA ⏳ ({n} of {min_n} trades needed)"
+    else:
+        insufficient = "INSUFFICIENT DATA ⏳ (waiting for confirmation)"
     label = {
         "VALIDATED": "VALIDATED ✅",
         "NOT_VALIDATED": "NOT VALIDATED ❌ (no proven edge)",
-        "INSUFFICIENT": f"INSUFFICIENT DATA ⏳ ({n} of {min_n} trades needed)" if n < min_n
-                        else "INSUFFICIENT DATA ⏳ (waiting for confirmation)",
+        "INSUFFICIENT": insufficient,
     }[state]
     wr, ev = rec.get("wr"), rec.get("ev")
     fam = evidence_family_label(alert_key)
@@ -562,6 +573,9 @@ def evidence_block_lines(card: Optional[Dict[str, Any]], alert_key: str, directi
         f"Performance trend: {(card or {}).get('trend') or 'n/a'}",
         "Historical statistics only. Not a guarantee of future performance.",
     ]
+    asof = (card or {}).get("asof")
+    if isinstance(asof, (int, float)) and asof > 0:
+        lines[-1] = f"Historical statistics as of {format_ist_time(asof, '%d %b %H:%M IST')}. Not a guarantee of future performance."
     if is_elliott_key(str(alert_key).lower()):
         # Elliott alerts show their own structural stop and targets, but their recorded outcomes
         # are scored on the bot's fixed bracket. Say so, so the numbers are not read as that plan's.

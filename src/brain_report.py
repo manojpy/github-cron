@@ -272,6 +272,7 @@ def _collect_facts(recs: Dict[str, Any], cfg) -> Dict[str, Any]:
             rows, sl_pct=_sl, tp_pct=_sl * float(getattr(cfg, "OUTCOME_RR_TARGET", 2.0)),
             horizon=int(getattr(cfg, "OUTCOME_LOOKAHEAD_CANDLES", 12)),
             cost_pct=(_fee * 2 + _slip * 2) * 100.0, name_fn=_pretty_alert,
+            entry_saving_pct=(_slip + max(0.0, _fee - float(getattr(cfg, "BRAIN_MAKER_FEE_PCT", _fee)))) * 100.0,
         )
     except Exception as e:
         logging.getLogger("macd_bot").warning(f"Brain report: trade-plan lab failed: {type(e).__name__}: {e}")
@@ -2014,6 +2015,24 @@ _BRIEF_PLANS: Tuple[Tuple[float, float], ...] = ((1.0, 2.0), (1.0, 1.5), (0.75, 
 _BRIEF_MIN_ALERT_N = 30          # an alert needs this many trades before it is named good or bad
 _BRIEF_SKIP_EV = -0.15           # ...and this average loss (%/trade) before the brief says skip it
 
+def _brief_replay_sentences(lab: Dict[str, Any]) -> List[str]:
+    """Plain-language summary of the partial-exit and limit-entry replays (fixed, unfitted tests
+    on every stored trade). Empty when the lab has no such result yet."""
+    out: List[str] = []
+    so = (lab.get("scaleout") or {}).get("reference")
+    if so:
+        s = (f"Taking half the profit at +{so['t1']:g}% and moving the stop to breakeven would have made "
+             f"{so['green_new']:.0%} of past trades end in profit instead of {so['green_base']:.0%}; "
+             f"average per trade {so['ev_new']:+.2f}% instead of {so['ev_base']:+.2f}%.")
+        if so["green_new"] > so["green_base"] and so["ev_new"] < so["ev_base"]:
+            s += " More green trades, but a lower average, so it would not have paid more."
+        out.append(s)
+    lim = (lab.get("limit") or {}).get("reference")
+    if lim:
+        out.append(f"A limit entry {lim['offset']:g}% better, left working {lim['wait']} candles, would have filled "
+                   f"{lim['fill_rate']:.0%} of signals; average per signal {lim['ev_new']:+.2f}% instead of {lim['ev_base']:+.2f}%.")
+    return out
+
 def _breakeven_hit_rate(stop_pct: float, target_pct: float, cost_pct: float) -> float:
     """Share of trades that must reach the target BEFORE the stop to break even after
     round-trip costs (timeouts ignored): a win pays target - cost, a loss costs stop + cost."""
@@ -2099,6 +2118,9 @@ def _brief_pieces(F: Dict[str, Any], cfg, stamp: str, elliott_rows: Optional[Seq
     else:
         out.append(_p("A smaller target is not automatically easier: costs take a bigger bite. A different plan is only worth "
                       "using when its replay on past trades is profitable. The Brain tests this for every alert; none has passed yet."))
+    _replays = _brief_replay_sentences(F.get("plan_lab") or {})
+    if _replays:
+        out.append(_p("🧩 TAKING PROFIT EARLY AND LIMIT ENTRIES (replayed on past trades, nothing applied)\n" + "\n".join(_replays)))
 
     # 3) leaks and what is working
     weak = [a for a in F["weak"] if a["n"] >= _BRIEF_MIN_ALERT_N][:4]

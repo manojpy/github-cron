@@ -207,7 +207,7 @@ def scan_pair(pair: str, pd_15m: Any, reference_time: int,
     return int(i), res
 
 
-# ── message ─────────────────────────────────────────────────────────────
+# ── message ─────────────────────────────────────────────────���───────────
 def _px(x: float) -> str:
     ax = abs(x)
     if ax >= 1000:
@@ -828,7 +828,7 @@ async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stat
         if getattr(cfg, "ALERT_EVIDENCE_BLOCK", True):
             try:
                 _blob = await evidence_task
-                _max_age = float(getattr(cfg, "ALERT_EVIDENCE_MAX_AGE_HOURS", 12.0)) * 3600.0
+                _max_age = float(getattr(cfg, "ALERT_EVIDENCE_MAX_AGE_HOURS", 36.0)) * 3600.0
                 evidence_cards = {
                     alert_key_of(s): evidence_card_lookup(_blob, alert_key_of(s), s.direction, _max_age)
                     for _, s in selected

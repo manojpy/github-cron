@@ -767,7 +767,7 @@ class BrainCore:
             blob = await self._load_evidence_cards()
             return evidence_card_lookup(
                 blob, alert_key, direction,
-                float(getattr(cfg, "ALERT_EVIDENCE_MAX_AGE_HOURS", 12.0)) * 3600.0,
+                float(getattr(cfg, "ALERT_EVIDENCE_MAX_AGE_HOURS", 36.0)) * 3600.0,
             )
         except Exception as e:
             logging.getLogger("macd_bot").debug(f"evidence card lookup failed: {e}")

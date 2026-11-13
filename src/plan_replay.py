@@ -460,13 +460,308 @@ def volatility_plan_study(rows: Sequence[Row], default_cost_pct: float, fixed_sl
         "overall_lo": None if lo is None else round(lo, 4), "n_blocks": nb,
         "fixed_plan": {"sl": fixed_sl, "tp": fixed_tp, "h": fixed_h},
         "status": "insufficient" if lo is None else "supported" if lo > 0 else "worse" if (hi is not None and hi < 0) else "not_distinguishable",
+
     })
+    return out
+
+# ── Partial exits and limit entries (descriptive replays; nothing here is applied) ─────────
+SCALE_T1_GRID: Tuple[float, ...] = (0.5, 0.75, 1.0)    # first slice is taken at +x%
+SCALE_FRAC_GRID: Tuple[float, ...] = (0.33, 0.5, 0.67) # share of the position taken at that first level
+LIMIT_OFFSET_GRID: Tuple[float, ...] = (0.1, 0.2, 0.3, 0.5)  # limit order sits x% better than the market fill
+LIMIT_WAIT_GRID: Tuple[int, ...] = (1, 2, 4)           # candles the limit order is left working
+LIMIT_THROUGH_PCT = 0.02                               # price must trade this far THROUGH the limit to count as filled
+
+
+def replay_scaleout(fav: Sequence[float], adv: Sequence[float], cls: Sequence[float], sl: float, tp: float, horizon: int, t1: float, frac: float, rest_be: bool = True) -> Optional[Tuple[str, float]]:
+    """Exact replay of a bracket that sells `frac` of the position at +t1% and lets the rest run.
+
+    The rest keeps the target `tp`; its stop is the original stop, or breakeven when
+    rest_be.  The stop move takes effect from the NEXT candle (order inside a candle is
+    unknown).  A candle touching the stop counts as the stop for everything still open,
+    even when it also touched a target.  A candle that reaches `tp` without touching the
+    stop has passed through t1 as well, so both slices fill.  Costs are one round trip on
+    the whole position, so the caller subtracts the usual single cost.
+    Returns (class, gross P&L %): tp | sl | timeout | partial (first slice taken, rest
+    stopped, breakeven or timed out), or None when the path is shorter than the horizon."""
+    if len(fav) <= horizon or not (0.0 < frac < 1.0) or not (0.0 < t1 < tp):
+        return None
+    got = False
+    stop = -sl
+    for i in range(horizon + 1):
+        if -adv[i] <= stop:
+            return ("partial", frac * t1 + (1.0 - frac) * stop) if got else ("sl", stop)
+        if fav[i] >= tp:
+            return "tp", frac * t1 + (1.0 - frac) * tp
+        if not got and fav[i] >= t1:
+            got = True
+            if rest_be:
+                stop = 0.0
+    last = float(cls[horizon])
+    return ("partial", frac * t1 + (1.0 - frac) * last) if got else ("timeout", last)
+
+
+def replay_limit(fav: Sequence[float], adv: Sequence[float], cls: Sequence[float], sl: float, tp: float, horizon: int, offset: float, wait: int, through: float = LIMIT_THROUGH_PCT) -> Optional[Tuple[str, float]]:
+    """Exact replay of entering with a limit order `offset`% better than the market fill.
+
+    The order works for `wait` candles and fills when the adverse move reaches
+    offset + through (price must trade through the limit, not just touch it).  Stop and
+    target are then measured from the limit price.  Pessimistic by construction: in the
+    fill candle only the stop can fire (the target cannot be credited, the order of events
+    inside the candle is unknown); the stop is checked there because price had to cross the
+    limit on its way down to it.  Fills at the limit price, never better.  The path after
+    the fill is the real one, so the adverse selection of limit orders (they fill most
+    often just before price keeps moving against you) is already in the result.
+    Returns ("nofill", 0.0) when the order never filled, else (class, gross P&L % on the
+    limit price); the exit candle stays the market plan's, so a late fill has less time."""
+    if len(fav) <= horizon or offset <= 0.0 or offset >= tp or wait < 1:
+        return None
+    need = offset + through
+    fill = -1
+    for i in range(min(wait, horizon + 1)):
+        if adv[i] >= need:
+            fill = i
+            break
+    if fill < 0:
+        return "nofill", 0.0
+    stop_lvl = offset + sl
+    tp_lvl = tp - offset
+    if adv[fill] >= stop_lvl:
+        return "sl", -sl
+    for j in range(fill + 1, horizon + 1):
+        if adv[j] >= stop_lvl:
+            return "sl", -sl
+        if fav[j] >= tp_lvl:
+            return "tp", tp
+    return "timeout", float(cls[horizon]) + offset
+
+
+def _row_cost(row: Mapping[str, Any], default_cost_pct: float) -> float:
+    c = row.get("realized_cost_pct")
+    return float(c) if c is not None else float(default_cost_pct)
+
+
+def _full_path_rows(rows: Sequence[Row], horizon: int) -> List[Row]:
+    return sorted((r for r in rows if has_path(r) and r.get("entry_ts") is not None and len(r["path_fav"]) > horizon),
+                  key=lambda r: r["entry_ts"])
+
+
+def _paired_summary(base: Sequence[float], new: Sequence[float], stamps: Sequence[float], z: float) -> Dict[str, Any]:
+    """Per-trade paired comparison of two P&L series (same trades, same order)."""
+    n = len(base)
+    delta = [b - a for a, b in zip(base, new)]
+    d_mean = sum(delta) / n
+    se, nb = cluster_se(delta, stamps)
+    ok = se != float("inf")
+    lo = d_mean - z * se if ok else None
+    hi = d_mean + z * se if ok else None
+    return {
+        "n": n, "n_blocks": nb, "ev_base": sum(base) / n, "ev_new": sum(new) / n,
+        "delta": d_mean, "lo": lo, "hi": hi,
+        "green_base": sum(1 for p in base if p > 0) / n, "green_new": sum(1 for p in new if p > 0) / n,
+        "dd_base": max_drawdown(base), "dd_new": max_drawdown(new),
+        "status": "insufficient" if lo is None else "supported" if lo > 0 else "worse" if (hi is not None and hi < 0) else "not_distinguishable",
+    }
+
+
+def _split_for_study(usable: Sequence[Row], train_frac: float) -> Tuple[List[Row], List[Row]]:
+    cut = int(len(usable) * train_frac)
+    hold = list(usable[cut:])
+    if not hold:
+        return [], []
+    split_ts = hold[0]["entry_ts"]
+    embargo = (max(DEFAULT_HORIZONS) + 2) * _CANDLE_SEC
+    return [r for r in usable[:cut] if r["entry_ts"] <= split_ts - embargo], hold
+
+
+def _scale_net(r: Row, sl: float, tp: float, h: int, t1: float, frac: float, be: bool, cost: float) -> Optional[Tuple[str, float]]:
+    res = replay_scaleout(r["path_fav"], r["path_adv"], r["path_close"], sl, tp, h, t1, frac, be)
+    return None if res is None else (res[0], res[1] - cost)
+
+
+def scaleout_study(rows: Sequence[Row], default_cost_pct: float, fixed_sl: float, fixed_tp: float, fixed_h: int, *, min_n: int = 80, min_hold: int = 25, train_frac: float = 0.6, z: float = 1.645) -> Dict[str, Any]:
+    """Would taking part of the profit early (and protecting the rest) beat the plain bracket?
+
+    Two views, both paired per trade against the plain fixed plan on the SAME trades:
+      reference  one fixed, pre-stated variant (half off at +1%, breakeven for the rest)
+                 on every trade; nothing was fitted, so every trade is out of sample.
+      tuned      the best (first level, share, breakeven yes/no) on older trades only, then
+                 judged on the newer, untouched ones with a time-blocked lower bound.
+    Descriptive only: nothing is applied, and the recorded outcome label is unchanged."""
+    usable = _full_path_rows(rows, fixed_h)
+    out: Dict[str, Any] = {"status": "insufficient", "n": len(usable), "fixed_plan": {"sl": fixed_sl, "tp": fixed_tp, "h": fixed_h}}
+    if len(usable) < min_n:
+        return out
+    stamps = [float(r["entry_ts"]) for r in usable]
+    base = [replay_plan(r, fixed_sl, fixed_tp, fixed_h, default_cost_pct) for r in usable]
+    ref_t1 = min(SCALE_T1_GRID[-1], fixed_tp * 0.5)
+    ref = [_scale_net(r, fixed_sl, fixed_tp, fixed_h, ref_t1, 0.5, True, _row_cost(r, default_cost_pct)) for r in usable]
+    pairs = [(b[1], x[1], t) for b, x, t in zip(base, ref, stamps) if b is not None and x is not None]
+    if pairs:
+        out["reference"] = _paired_summary([p[0] for p in pairs], [p[1] for p in pairs], [p[2] for p in pairs], z)
+        out["reference"].update({"t1": ref_t1, "frac": 0.5, "be": True})
+    train, hold = _split_for_study(usable, train_frac)
+    if len(train) < max(20, min_n // 2) or len(hold) < min_hold:
+        return out
+    cands = [(t1, f, be) for t1 in SCALE_T1_GRID if t1 < fixed_tp for f in SCALE_FRAC_GRID for be in (True, False)]
+    out["n_candidates"] = len(cands)
+    best: Optional[Tuple[float, Tuple[float, float, bool]]] = None
+    for c in cands:
+        d = []
+        for r in train:
+            b = replay_plan(r, fixed_sl, fixed_tp, fixed_h, default_cost_pct)
+            x = _scale_net(r, fixed_sl, fixed_tp, fixed_h, c[0], c[1], c[2], _row_cost(r, default_cost_pct))
+            if b is not None and x is not None:
+                d.append(x[1] - b[1])
+        if len(d) >= max(20, min_n // 2):
+            m = sum(d) / len(d)
+            if best is None or m > best[0]:
+                best = (m, c)
+    if best is None:
+        return out
+    t1, f, be = best[1]
+    hp: List[Tuple[float, float, float]] = []
+    for r in hold:
+        b = replay_plan(r, fixed_sl, fixed_tp, fixed_h, default_cost_pct)
+        x = _scale_net(r, fixed_sl, fixed_tp, fixed_h, t1, f, be, _row_cost(r, default_cost_pct))
+        if b is not None and x is not None:
+            hp.append((b[1], x[1], float(r["entry_ts"])))
+    if len(hp) < min_hold:
+        return out
+    hs = _paired_summary([p[0] for p in hp], [p[1] for p in hp], [p[2] for p in hp], z)
+    out.update({"best": {"t1": t1, "frac": f, "be": be, "train_delta": round(best[0], 4)}, "hold": hs,
+                "n_train": len(train), "status": hs["status"]})
+    return out
+
+
+def limit_entry_study(rows: Sequence[Row], default_cost_pct: float, fixed_sl: float, fixed_tp: float, fixed_h: int, *, entry_saving_pct: float = 0.0, min_n: int = 80, min_hold: int = 25, min_train_fills: int = 15, train_frac: float = 0.6, z: float = 1.645) -> Dict[str, Any]:
+    """Would a limit-order entry beat entering at market, signal for signal?
+
+    Every comparison is PER SIGNAL: a limit order that never fills earns 0 on that
+    signal, so missed winners are charged.  entry_saving_pct is the cost a limit entry
+    saves (entry slippage, plus any maker-fee discount); the exit is still costed in full.
+    Skipping a signal is NOT counted as an improvement: in a market where the plain plan
+    loses after costs, trading less looks better by itself, which says nothing about the
+    entry.  So a signal that never fills is charged the round-trip cost the market trade
+    would have paid (its gross P&L is lost, its cost is not saved); ev_literal reports the
+    other accounting (unfilled earns 0) and skip_saving the difference.
+    Same two views as scaleout_study: a fixed reference (limit 0.2% better, left working
+    2 candles) on every trade, and a (offset, wait) tuned on older trades then judged on
+    newer ones.  Descriptive only."""
+    usable = _full_path_rows(rows, fixed_h)
+    out: Dict[str, Any] = {"status": "insufficient", "n": len(usable), "entry_saving_pct": entry_saving_pct,
+                           "fixed_plan": {"sl": fixed_sl, "tp": fixed_tp, "h": fixed_h}}
+    if len(usable) < min_n:
+        return out
+
+    def one(r: Row, off: float, wait: int) -> Optional[Tuple[str, float]]:
+        res = replay_limit(r["path_fav"], r["path_adv"], r["path_close"], fixed_sl, fixed_tp, fixed_h, off, wait)
+        if res is None:
+            return None
+        if res[0] == "nofill":
+            return "nofill", -_row_cost(r, default_cost_pct)
+        return res[0], res[1] - max(0.0, _row_cost(r, default_cost_pct) - entry_saving_pct)
+
+    def summarise(rs: Sequence[Row], off: float, wait: int) -> Optional[Dict[str, Any]]:
+        trip: List[Tuple[float, float, float, bool, bool]] = []
+        for r in rs:
+            b = replay_plan(r, fixed_sl, fixed_tp, fixed_h, default_cost_pct)
+            x = one(r, off, wait)
+            if b is not None and x is not None:
+                trip.append((b[1], x[1], float(r["entry_ts"]), x[0] != "nofill", b[0] == "tp"))
+        if len(trip) < 2:
+            return None
+        s = _paired_summary([t[0] for t in trip], [t[1] for t in trip], [t[2] for t in trip], z)
+        filled = [t for t in trip if t[3]]
+        missed = [t for t in trip if not t[3]]
+        s.update({
+            "offset": off, "wait": wait, "fill_rate": len(filled) / len(trip), "n_filled": len(filled),
+            "skip_saving": sum(-t[1] for t in missed) / len(trip) if missed else 0.0,
+            "ev_filled": (sum(t[1] for t in filled) / len(filled)) if filled else None,
+            "ev_base_same": (sum(t[0] for t in filled) / len(filled)) if filled else None,
+            "missed_target_share": (sum(1 for t in missed if t[4]) / len(missed)) if missed else None,
+        })
+        return s
+
+    ref = summarise(usable, 0.2, 2)
+    if ref:
+        out["reference"] = ref
+    train, hold = _split_for_study(usable, train_frac)
+    if len(train) < max(20, min_n // 2) or len(hold) < min_hold:
+        return out
+    cands = [(o, w) for o in LIMIT_OFFSET_GRID if o < fixed_tp for w in LIMIT_WAIT_GRID]
+    out["n_candidates"] = len(cands)
+    best: Optional[Tuple[float, Tuple[float, int]]] = None
+    for c in cands:
+        s = summarise(train, c[0], c[1])
+        if s and s["n_filled"] >= min_train_fills and (best is None or s["delta"] > best[0]):
+            best = (s["delta"], c)
+    if best is None:
+        return out
+    hs = summarise(hold, best[1][0], best[1][1])
+    if hs is None or hs["n"] < min_hold:
+        return out
+    out.update({"best": {"offset": best[1][0], "wait": best[1][1], "train_delta": round(best[0], 4)}, "hold": hs,
+                "n_train": len(train), "status": hs["status"]})
+    return out
+
+
+def _study_verdict(st: str, what: str) -> str:
+    return {
+        "supported": f"Verdict: {what} beat the plain plan on unseen trades, with the lower bound above zero.",
+        "worse": f"Verdict: {what} did worse than the plain plan on unseen trades.",
+        "not_distinguishable": f"Verdict: no proven difference in average result versus the plain plan ({what}).",
+    }.get(st, "Verdict: not enough trades yet.")
+
+
+def scaleout_lines(st: Mapping[str, Any]) -> List[str]:
+    if not st or not st.get("n"):
+        return []
+    fp = st["fixed_plan"]
+    out = [f"PARTIAL EXIT: take part of the profit early (n={st['n']} trades with full price paths; plain plan = stop {fp['sl']:g}% / target {fp['tp']:g}% / {fp['h']} candles)"]
+    r = st.get("reference")
+    if r:
+        out.append(f"  Fixed test, no fitting: sell half at +{r['t1']:g}%, then breakeven stop for the rest, target stays {fp['tp']:g}%.")
+        out.append(f"  Trades ending in profit after costs {r['green_base']:.0%} → {r['green_new']:.0%} | average per trade {r['ev_base']:+.2f}% → {r['ev_new']:+.2f}%"
+                   f" | worst cumulative fall {r['dd_base']:.1f}% → {r['dd_new']:.1f}%")
+    b, h = st.get("best"), st.get("hold")
+    if b and h:
+        be_txt = "breakeven stop for the rest" if b["be"] else "original stop for the rest"
+        out.append(f"  Best variant on older trades: sell {b['frac']:.0%} at +{b['t1']:g}%, {be_txt}. On newer unseen trades (n={h['n']}):")
+        lo = "n/a" if h["lo"] is None else f"{h['lo']:+.2f}%"
+        out.append(f"  profit {h['green_base']:.0%} → {h['green_new']:.0%} | average {h['ev_base']:+.2f}% → {h['ev_new']:+.2f}% (gain {h['delta']:+.2f}%, lower bound {lo})")
+        out.append("  " + _study_verdict(st["status"], "the tuned partial exit"))
+    elif r:
+        out.append("  Tuned test: not enough trades yet.")
+    return out
+
+
+def limit_lines(st: Mapping[str, Any]) -> List[str]:
+    if not st or not st.get("n"):
+        return []
+    out = [f"LIMIT-ORDER ENTRY instead of market (n={st['n']} trades with full price paths; per signal; limit entry credited {st['entry_saving_pct']:.2f}% lower cost)"]
+    r = st.get("reference")
+    if r:
+        miss = "" if r["missed_target_share"] is None else f", {r['missed_target_share']:.0%} of the unfilled signals would have reached the target"
+        out.append(f"  Fixed test, no fitting: limit {r['offset']:g}% better, left working {r['wait']} candles. Filled {r['fill_rate']:.0%}{miss}.")
+        out.append(f"  Average per signal {r['ev_base']:+.2f}% → {r['ev_new']:+.2f}% | trades ending in profit after costs (per signal) {r['green_base']:.0%} → {r['green_new']:.0%}")
+        out.append(f"  Signals that never fill are charged the cost they would have paid, so skipping a signal is not mistaken for a better entry "
+                   f"(counting them as simply not taken would add {r['skip_saving']:+.2f}%).")
+        if r["ev_filled"] is not None:
+            out.append(f"  On the filled trades alone: market {r['ev_base_same']:+.2f}% → limit {r['ev_filled']:+.2f}% "
+                       f"(flatters limit orders: the trades that dip first are the ones a market entry does worst on).")
+    b, h = st.get("best"), st.get("hold")
+    if b and h:
+        out.append(f"  Best on older trades: limit {b['offset']:g}% better, {b['wait']} candles. On newer unseen signals (n={h['n']}): filled {h['fill_rate']:.0%}")
+        lo = "n/a" if h["lo"] is None else f"{h['lo']:+.2f}%"
+        out.append(f"  average per signal {h['ev_base']:+.2f}% → {h['ev_new']:+.2f}% (gain {h['delta']:+.2f}%, lower bound {lo})")
+        out.append("  " + _study_verdict(st["status"], "the tuned limit entry"))
+    elif r:
+        out.append("  Tuned test: not enough trades yet.")
     return out
 
 # ── Works on legacy rows too (MAE/MFE only) ───────────────────────────────
 def row_excursions(row: Mapping[str, Any], min_len: int = 0) -> Optional[Tuple[float, float]]:
     """(best move, worst move against) in %, over the FULL outcome window, or None.
-
     A trade that hit its stop (or target) early is graded on the path up to that
     candle only, so its stored mfe / mae stop at the exit: the worst move can never
     show much beyond the stop and the best move misses any later rally. Those rows
@@ -545,9 +840,8 @@ def plan_exit_suffix(p: Mapping[str, Any]) -> str:
         bits.append(f"trail {float(p['trail']):g}%")
     return (" | " + " | ".join(bits)) if bits else ""
 
-
 # ── Report text ───────────────────────────────────────────────────────────
-def build_plan_lab(rows: Sequence[Row], *, sl_pct: float, tp_pct: float, horizon: int, cost_pct: float, name_fn: Callable[[str], str] = str, min_n: int = 40, max_groups: int = 6) -> Tuple[Optional[str], Dict[str, Any]]:
+def build_plan_lab(rows: Sequence[Row], *, sl_pct: float, tp_pct: float, horizon: int, cost_pct: float, name_fn: Callable[[str], str] = str, min_n: int = 40, max_groups: int = 6, entry_saving_pct: float = 0.0) -> Tuple[Optional[str], Dict[str, Any]]:
     """Plain-text 'Trade-plan lab' block for the Brain report + machine facts."""
     if not rows:
         return None, {}
@@ -612,6 +906,19 @@ def build_plan_lab(rows: Sequence[Row], *, sl_pct: float, tp_pct: float, horizon
         best_have = max((len(v) for v in groups.values()), default=0)
         lines.append(f"  Collecting: need ≥{need} path rows per alert; best alert has {best_have}. "
                      f"Path capture started with the new resolver, so this fills in as alerts resolve.")
+    for key, study, fmt in (
+        ("scaleout", lambda: scaleout_study(rows, cost_pct, sl_pct, tp_pct, horizon), scaleout_lines),
+        ("limit", lambda: limit_entry_study(rows, cost_pct, sl_pct, tp_pct, horizon, entry_saving_pct=entry_saving_pct), limit_lines),
+    ):
+        try:                                   # a failing study must not take the rest of the lab down
+            st = study()
+            facts[key] = st
+            extra = fmt(st)
+        except Exception:
+            extra = []
+        if extra:
+            lines.append("")
+            lines.extend(extra)
     lines.append("")
     lines.append("Read: VALIDATED = profitable on unseen later trades with a positive lower bound. "
                  "Nothing here is auto-applied.")
