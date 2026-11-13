@@ -273,9 +273,15 @@ def test_archive_failure_is_not_fatal_and_sends_once(monkeypatch):
     monkeypatch.setattr(outcome_storage, "save_report", boom)
     eng, q = _engine__brain_report_v2(monkeypatch, sent)
     assert asyncio.run(eng.generate_report([], q, logging.getLogger("t"))) is True
-    assert "END OF BRAIN REPORT" in _plain(sent[-1:])
+    assert "TRUST:" in _plain(sent[-1:])                       # short brief is the default Telegram report
     assert not any("classic" in m for m in sent)               # no fallback report was sent
 
+    # BRAIN_REPORT_BRIEF=false restores the full 16-section report on Telegram
+    sent_full = []
+    monkeypatch.setattr(be.cfg, "BRAIN_REPORT_BRIEF", False)
+    eng, q = _engine__brain_report_v2(monkeypatch, sent_full)
+    assert asyncio.run(eng.generate_report([], q, logging.getLogger("t"))) is True
+    assert "END OF BRAIN REPORT" in _plain(sent_full[-1:])
 
 def test_generate_report_falls_back_to_base_report(monkeypatch):
     import logging
