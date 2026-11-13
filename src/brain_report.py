@@ -2048,7 +2048,7 @@ def _brief_pieces(F: Dict[str, Any], cfg, stamp: str, elliott_rows: Optional[Seq
     n, ev, days = F["n"], F["net_ev"], F["days"]
     an = F.get("anatomy") or {}
     cnt, known = an.get("counts") or {}, an.get("known") or 0
-    stop_pct = float(an.get("risk") or getattr(cfg, "OUTCOME_MAE_LOSS_PCT", 1.0))
+    stop_pct = float(an.get("risk") or float(getattr(cfg, "OUTCOME_MAE_LOSS_PCT", 1.0) or 1.0))
     tgt_pct = float(an.get("target") or stop_pct * float(getattr(cfg, "OUTCOME_RR_TARGET", 2.0)))
     hours = float(an.get("hours") or 3.0)
     cost = (float(getattr(cfg, "BRAIN_FEE_PCT", 0.0006)) * 2 + float(getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003)) * 2) * 100.0
