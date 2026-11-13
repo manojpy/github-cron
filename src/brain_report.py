@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from datetime import datetime, timedelta, timezone
 from brain_audit import DataCoverage, HealthStatus, get_audit
 import threshold_engine as engine
-from plan_replay import build_plan_lab
+from plan_replay import build_plan_lab, row_excursions
 from alerts import escape_markdown_v2
 from state import format_outcome_totals
 from alert_registry import ALERT_KEYS, alert_family_of as _registry_family_of, pretty_alert as _pretty_alert
@@ -181,7 +181,9 @@ def _collect_facts(recs: Dict[str, Any], cfg) -> Dict[str, Any]:
     span = audit.history_span()
     F["days"] = span[0] if span else None
     F["req_days"] = span[1] if span else int(getattr(cfg, "BRAIN_LONG_WINDOW_DAYS", 180))
-    F["low_trust"] = F["conf"] in ("VERY LOW", "LOW")
+    F["low_trust"] = F["conf"] in ("VERY LOW", "LOW") or (
+        F["days"] is not None and F["days"] < float(getattr(cfg, "BRAIN_TRUST_MIN_DAYS", 30))
+    )
 
     # Portfolio-level EV object (drawdown, P(EV>0)) — cached by the engine.
     ev_obj = None
@@ -305,8 +307,10 @@ def _outcome_anatomy(rows: List[Dict[str, Any]], cfg) -> Tuple[Optional[str], Di
         m = len(v) // 2
         return v[m] if len(v) % 2 else (v[m - 1] + v[m]) / 2.0
 
-    med_mfe = _med([r["mfe"] * 100.0 for r in rows if r.get("mfe") is not None])
-    med_mae = _med([r["mae"] * 100.0 for r in rows if r.get("mae") is not None])
+    _full_len = int(getattr(cfg, "OUTCOME_LOOKAHEAD_CANDLES", 12) or 12) + 1
+    _ex = [e for e in (row_excursions(r, _full_len) for r in rows) if e is not None]
+    med_mfe = _med([e[0] for e in _ex])
+    med_mae = _med([e[1] for e in _ex])
     lines = [
         f"A TARGET WIN is price moving +{target:.1f}% your way "
         f"before it moves -{risk:.1f}% against you, within {hours:g} hours.",
@@ -814,7 +818,7 @@ def _sec_profit(F: Dict[str, Any], cfg) -> List[_Piece]:
          "🟢 Long enough" if (days or 0) >= 30 else "🟡 Short" if (days or 0) >= 14 else "🔴 Too short"),
         ("After costs?", "YES" if F["gate"].get("execution", True) else "NO",
          "🟢 Costs accounted" if F["gate"].get("execution", True) else "🔴 Missing"),
-        (f"Drawdown ({dd_win}h)", "n/a" if dd is None else f"{dd:.1f}%",
+        (f"24h loss, all alerts ({dd_win}h)", "n/a" if dd is None else f"{dd:.1f}%",
          "⚪ unknown" if dd is None else f"{'🟢 Within' if dd <= bud else '🔴 Over'} {bud:.1f}% budget"),
         ("CUSUM drift", "ACTIVE" if F["gate"].get("stability") is False else "NONE",
          "🔴 Drifting" if F["gate"].get("stability") is False else "🟢 Stable"),
@@ -1062,9 +1066,9 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
     _dd_win = g.get("risk_window_hours", 24)
     _dd_bud = g.get("risk_budget_pct", 3.0)
     if _dd_pct is None:
-        _risk_label = f"Drawdown ({_dd_win}h: n/a)"
+        _risk_label = f"24h loss ({_dd_win}h: n/a)"
     else:
-        _risk_label = f"Drawdown ({_dd_win}h: {_dd_pct:.1f}% / {_dd_bud:.1f}%)"
+        _risk_label = f"24h loss ({_dd_win}h: {_dd_pct:.1f}% / {_dd_bud:.1f}%)"
 
     labels = [("data_quality", "Minimum trades"), ("oos_prediction", "OOS EV"),
               ("profitability", "Net EV confidence"), ("stability", "CUSUM drift"),
@@ -1440,7 +1444,20 @@ def _hypothesis_gen_lines(sm: Optional[Dict[str, Any]]) -> List[str]:
         if e.get("status") in ("rejected", "revoked", "expired"):
             lines.append(f"{e['status'].capitalize()}: {e['text']}")
     if lines:
-        lines.append("Nothing here is applied. A confirmed rule is a candidate to review before adding it to the 'when not to take it' list.")
+        try:
+            from bot_config import cfg as _hcfg
+            _hmode = str(getattr(_hcfg, "ALERT_HYPOTHESIS_VETO_MODE", "off"))
+            _hmax = int(getattr(_hcfg, "ALERT_HYPOTHESIS_MAX_RULES", 5))
+        except Exception:
+            _hmode, _hmax = "off", 5
+        if _hmode == "live":
+            lines.append(
+                f"LIVE: confirmed rules that also beat the rest of the delivered book (up to {_hmax}; "
+                "see the Intelligence report for which) are ACTIVE and block matching alerts. "
+                "All other rules listed here are not applied."
+            )
+        else:
+            lines.append("Nothing here is applied. A confirmed rule is a candidate to review before adding it to the 'when not to take it' list.")
     return lines
 
 def _layer_lines(a: Optional[Dict[str, Any]], mode: str) -> List[str]:
@@ -1639,6 +1656,8 @@ def _sec_reasoning_chain(F: Dict[str, Any], cfg) -> List[_Piece]:
             decision = "MONITOR — gate open but edge not strong enough to change live rules"
         elif n < int(getattr(cfg, "BRAIN_AUDIT_MIN_ROWS_FOR_RECOMMENDATION", 100)):
             decision = "BLOCKED — insufficient sample for any live change"
+        elif gate.get("profitability") is False:
+            decision = "BLOCKED — net EV is not confidently positive; no live changes"
         elif not gate.get("stability"):
             decision = "BLOCKED — drift detected; freeze parameter changes"
         else:
@@ -1892,12 +1911,12 @@ _REPORT_SECTIONS = (
     ("BRAIN HEALTH", _sec_health),
 )
 
-def build_brain_report_sections(recs: Dict[str, Any], cfg) -> Tuple[List[List["_Piece"]], str]:
+def build_brain_report_sections(recs: Dict[str, Any], cfg, facts: Optional[Dict[str, Any]] = None) -> Tuple[List[List["_Piece"]], str]:
     """Compute the 16 report sections once. Returns (sections, stamp); each
     section is a list of rendered pieces. An individual failing section is
     replaced by a notice; the call raises only if the shared facts cannot
-    be computed."""
-    F = _collect_facts(recs, cfg)
+    be computed. `facts` = _collect_facts() output when the caller already has it."""
+    F = facts if facts is not None else _collect_facts(recs, cfg)
     stamp = datetime.now(_IST).strftime("%d %b %Y | %H:%M IST").upper()
     sections: List[List[_Piece]] = []
     failed: List[str] = []
@@ -1989,3 +2008,215 @@ def build_brain_report(recs: Dict[str, Any], cfg) -> List[str]:
     """Convenience wrapper: sections -> Telegram messages."""
     sections, stamp = build_brain_report_sections(recs, cfg)
     return render_report_messages(sections, stamp)
+
+# ── Short plain-language brief (Telegram); the 16-section report stays in the archive ──
+_BRIEF_PLANS: Tuple[Tuple[float, float], ...] = ((1.0, 2.0), (1.0, 1.5), (0.75, 1.5), (0.5, 1.0))   # (stop %, target %)
+_BRIEF_MIN_ALERT_N = 30          # an alert needs this many trades before it is named good or bad
+_BRIEF_SKIP_EV = -0.15           # ...and this average loss (%/trade) before the brief says skip it
+
+def _breakeven_hit_rate(stop_pct: float, target_pct: float, cost_pct: float) -> float:
+    """Share of trades that must reach the target BEFORE the stop to break even after
+    round-trip costs (timeouts ignored): a win pays target - cost, a loss costs stop + cost."""
+    return (stop_pct + cost_pct) / (stop_pct + target_pct)
+
+def _ending_counts(rows: Sequence[Dict[str, Any]]) -> Tuple[int, int, int]:
+    """(reached target, hit stop, neither) by the bracket tag on each outcome row."""
+    tp = sl = other = 0
+    for r in rows:
+        x = engine.bracket_exit_pct(r)
+        if x is None:
+            other += 1
+        elif x > 0:
+            tp += 1
+        else:
+            sl += 1
+    return tp, sl, other
+
+def _brief_verdict(F: Dict[str, Any]) -> Tuple[str, str]:
+    n, ev = F["n"], F["net_ev"]
+    if not F["net_ev_known"] or n < 30:
+        return "⚪ TOO EARLY", "Not enough finished trades to judge the system yet."
+    if ev <= -0.05:
+        return "🔴 LOSING AFTER COSTS", "On average each alert loses money. Treat alerts as a watch-list, not as trades to take, and do not size up."
+    if ev < 0.05:
+        return "🟡 BREAK-EVEN", "Alerts roughly cover their costs but do not make money yet."
+    if F["gate_ok"] and (F.get("p_ev") or 0) >= 0.85 and not F["low_trust"]:
+        return "🟢 PROFITABLE", "Positive after costs with solid evidence. Keep position sizes modest."
+    return "🟡 POSITIVE BUT UNPROVEN", "Positive so far, but the evidence is still thin. Do not size up yet."
+
+def _brief_pieces(F: Dict[str, Any], cfg, stamp: str, elliott_rows: Optional[Sequence[Dict[str, Any]]] = None) -> List["_Piece"]:
+    n, ev, days = F["n"], F["net_ev"], F["days"]
+    an = F.get("anatomy") or {}
+    cnt, known = an.get("counts") or {}, an.get("known") or 0
+    stop_pct = float(an.get("risk") or getattr(cfg, "OUTCOME_MAE_LOSS_PCT", 1.0))
+    tgt_pct = float(an.get("target") or stop_pct * float(getattr(cfg, "OUTCOME_RR_TARGET", 2.0)))
+    hours = float(an.get("hours") or 3.0)
+    cost = (float(getattr(cfg, "BRAIN_FEE_PCT", 0.0006)) * 2 + float(getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003)) * 2) * 100.0
+    label, why = _brief_verdict(F)
+    out: List[_Piece] = [_p(f"🧠 CONVERGEX BRIEF · {stamp}\n\nSTATUS: {label}\n{why}")]
+
+    # 1) the numbers that matter
+    rows: List[Tuple[str, str]] = [("Trades finished", f"{n:,} in {_fmt_days(days)}")]
+    if F["net_ev_known"]:
+        rows.append(("Avg result / trade", f"{ev:+.2f}%"))
+        rows.append(("  costs per trade", f"-{cost:.2f}%"))
+        rows.append(("  before costs", f"{ev + cost:+.2f}%"))
+    tp_share = (cnt.get("target", 0) / known) if known else None
+    be_now = _breakeven_hit_rate(stop_pct, tgt_pct, cost)
+    if tp_share is not None:
+        rows.append((f"Reached +{tgt_pct:g}%", f"{tp_share:.0%}  (need {be_now:.0%})"))
+        rows.append((f"Stopped at -{stop_pct:g}%", f"{cnt.get('stop', 0) / known:.0%}"))
+        rows.append((f"Neither in {hours:g}h", f"{cnt.get('neither', 0) / known:.0%}"))
+    if F.get("dd") is not None:
+        rows.append(("Last 24h, all alerts", f"-{F['dd']:.1f}%" if F["dd"] > 0 else "no loss"))
+    out.append(_c("\n".join(_table(rows, "ll"))))
+
+    expl: List[str] = []
+    if known:
+        decided = cnt.get("target", 0) + cnt.get("stop", 0)
+        if decided:
+            expl.append(f"The {F['wr']:.0%} 'win rate' counts trades that merely ended in profit after {hours:g}h. "
+                        f"Of trades that reached the target or the stop, {cnt.get('target', 0) / decided:.0%} won.")
+    if F["net_ev_known"] and abs(ev + cost) <= 0.08 and ev < 0:
+        expl.append("Before costs the signals are roughly flat, so the loss is mostly fees and slippage. "
+                    "Cheaper execution (limit orders where possible) helps as much as better signals.")
+    if expl:
+        out.append(_p("\n\n".join(expl)))
+
+    # 2) is a smaller reward easier? (break-even hit rate after costs)
+    plan_rows = []
+    for sp, tp in _BRIEF_PLANS:
+        mark = "  <- now" if abs(sp - stop_pct) < 1e-9 and abs(tp - tgt_pct) < 1e-9 else ""
+        plan_rows.append((f"stop {sp:g}% / target {tp:g}%", f"needs {_breakeven_hit_rate(sp, tp, cost):.0%}{mark}"))
+    out.append(_p("🎯 HOW OFTEN MUST A PLAN WIN TO BREAK EVEN?"))
+    out.append(_c("\n".join(_table(plan_rows, "ll"))))
+    _valid = [(k, v) for k, v in ((F.get("plan_lab") or {}).get("plans") or {}).items() if v.get("status") == "VALIDATED"]
+    if _valid:
+        _names = "; ".join(
+            f"{_pretty_alert(k.split('|', 1)[0])} {k.split('|', 1)[-1]}: stop {v['best']['sl']:g}% / target {v['best']['tp']:g}% / {v['best']['h']} candles"
+            for k, v in _valid[:3])
+        out.append(_p(f"Plans that passed the Brain's test on unseen trades: {_names}."))
+    else:
+        out.append(_p("A smaller target is not automatically easier: costs take a bigger bite. A different plan is only worth "
+                      "using when its replay on past trades is profitable. The Brain tests this for every alert; none has passed yet."))
+
+    # 3) leaks and what is working
+    weak = [a for a in F["weak"] if a["n"] >= _BRIEF_MIN_ALERT_N][:4]
+    if weak:
+        out.append(_p("🔴 BIGGEST LEAKS (30+ trades each)"))
+        out.append(_c("\n".join(_table([("Alert", "Avg", "Win", "N")] + [
+            (a["name"], f"{a['ev']:+.2f}%", f"{a['wr']:.0%}", str(a["n"])) for a in weak], "lrrr"))))
+    good = [a for a in F["good"] if a["n"] >= _BRIEF_MIN_ALERT_N][:3]
+    few = [a for a in F["good"] if a["n"] < _BRIEF_MIN_ALERT_N][:4]
+    tested = sum(1 for a in F["alerts"] if a["ev"] is not None)
+    if good or few:
+        lines = []
+        for a in good:
+            lines.append(f"• {a['name']}: {a['ev']:+.2f}% per trade over {a['n']} trades "
+                         f"(chance the edge is real ≈ {int(round((a['p'] or 0) * 100))}%)")
+        if few:
+            lines.append("• Too few trades to judge: " + ", ".join(f"{a['name']} ({a['n']})" for a in few))
+        out.append(_p("🟢 LOOKS BETTER, NOT PROVEN\n" + "\n".join(lines)
+                      + f"\nWith {tested} alert types tested, a few will look good by luck alone."))
+
+    ew = list(elliott_rows or [])
+    if len(ew) >= 10:
+        try:
+            e = engine.ev_first_objective(ew, min_sample=10)
+            etp, esl, eot = _ending_counts(ew)
+            if e.get("valid"):
+                _unproven = len(ew) < 60 or e["p_ev_positive"] < 0.85 or F["low_trust"]
+                _verdict = ("No edge shown so far." if e["net_ev"] <= 0 else
+                            "Best-looking family so far, but still unproven." if _unproven else
+                            "Holding up well.")
+                out.append(_p(f"🌊 ELLIOTT: {len(ew)} trades, {e['net_ev']:+.2f}% per trade after costs, "
+                              f"{etp / len(ew):.0%} reached the target, {esl / len(ew):.0%} hit the stop "
+                              f"(chance the edge is real ≈ {int(round(e['p_ev_positive'] * 100))}%). "
+                              f"Same 1%/2% yardstick as the rest. {_verdict}"))
+        except Exception as ex:
+            logging.getLogger("macd_bot").debug(f"brief: Elliott line skipped: {ex}")
+
+    # 4) are the filters picking winners?
+    sh = F.get("shadow_rows") or []
+    if len(sh) >= 30 and known:
+        stp, ssl, sot = _ending_counts(sh)
+        s_stop, s_tp = ssl / len(sh), stp / len(sh)
+        r_stop = cnt.get("stop", 0) / known
+        r_tp = cnt.get("target", 0) / known
+        out.append(_p(
+            f"🔍 ARE THE FILTERS HELPING?\nSent: {r_tp:.0%} reached target, {r_stop:.0%} stopped. "
+            f"Rejected: {s_tp:.0%} reached target, {s_stop:.0%} stopped.\n"
+            + ("Rejected alerts did no worse than the ones sent, so the filters are not yet picking winners."
+               if s_stop <= r_stop + 0.02 and s_tp >= r_tp - 0.02 else
+               "Rejected alerts did worse than the ones sent, so the filters are doing their job.")))
+
+    # 5) session noise check
+    sess = F.get("sessions") or []
+    if len(sess) >= 2:
+        (wn, wwr, wnn), (bn, bwr, bnn) = sess[0], sess[-1]
+        se = ((wwr * (1 - wwr)) / max(wnn, 1) + (bwr * (1 - bwr)) / max(bnn, 1)) ** 0.5
+        z = (bwr - wwr) / se if se > 0 else 0.0
+        _sn = {"ny": "NY", "asian": "Asian", "london": "London", "dead": "Dead-hours"}
+        out.append(_p(f"⏰ SESSIONS: {_sn.get(bn, bn.title())} best {bwr:.0%} ({bnn}), {_sn.get(wn, wn.title())} worst {wwr:.0%} ({wnn}). "
+                      + ("The gap is within normal luck, so do not filter by session yet." if z < 2.0
+                         else "The gap is larger than luck alone would usually give.")))
+
+    # 5b) tweaks the Brain has already replayed on past trades
+    _scen = sorted(((x for x in ((F.get("ai") or {}).get("counterfactual_scenarios") or []) if x.get("delta_ev", 0.0) > 0)),
+                   key=lambda x: x.get("ev", float("-inf")), reverse=True)[:2]
+    if _scen:
+        lines = []
+        for x in _scen:
+            rp = x.get("replay") or {}
+            dl = rp.get("delta") or {}
+            extra = (f"; replayed on past trades: {dl['total_pnl_pct']:+.0f} points, "
+                     f"{rp.get('trades_removed', 0)} fewer trades") if rp.get("valid") and dl else ""
+            lines.append(f"• {x.get('label', '?')}: {_ev_text(F)} → {x.get('ev', 0.0):+.2f}% per trade "
+                         f"({x.get('n', 0)} trades kept){extra}")
+        _still_neg = max(x.get("ev", 0.0) for x in _scen) <= 0
+        out.append(_p("💡 TWEAKS THAT HELPED IN REPLAY\n" + "\n".join(lines) + "\n"
+                      + ("Still negative per trade: these cut losses but do not create an edge, so they are not applied."
+                         if _still_neg else "Positive after the change, but only worth applying once the Brain's checks agree.")))
+
+    # 6) what to do
+    todo: List[str] = []
+    skip = [a for a in F["weak"] if a["n"] >= _BRIEF_MIN_ALERT_N and a["ev"] <= _BRIEF_SKIP_EV][:4]
+    if skip:
+        todo.append("Skip: " + ", ".join(a["name"] for a in skip) + ".")
+    if label.startswith("🔴"):
+        todo.append("Paper-trade or use very small size until the status turns green.")
+    elif label.startswith("🟡 POSITIVE"):
+        todo.append("Keep size modest until the status turns green.")
+    if F["net_ev_known"] and ev < 0 and abs(ev + cost) <= 0.08:
+        todo.append(f"Enter with limit orders where you can: costs are {cost:.2f}% on every trade.")
+    todo.append("Keep Shadow Mode on so every rejected alert keeps being judged.")
+    blockers = [b for b in _active_blockers(F)][:3]
+    out.append(_p("✅ WHAT TO DO\n" + "\n".join(f"• {t}" for t in todo)))
+
+    # 7) when can a TAKE be trusted
+    validated = [a for a in F["alerts"] if a["rank"] == 4]
+    out.append(_p(
+        f"🛡️ TRUST: {len(validated)} of {tested} alert types validated. An alert earns trust with 60+ trades, "
+        f"30+ days of history, positive average after costs and a ≥85% chance the edge is real."
+        + (f"\nBrain is blocked from changing live rules: {'; '.join(blockers)}." if blockers and not F["gate_ok"] else "")))
+    return out
+
+def render_brief_messages(pieces: Sequence["_Piece"]) -> List[str]:
+    """Pack brief pieces into Telegram messages of at most _MSG_LIMIT rendered chars."""
+    msgs: List[str] = []
+    cur = ""
+    for piece in pieces:
+        if cur and len(cur) + len(piece) + 2 > _MSG_LIMIT:
+            msgs.append(cur)
+            cur = ""
+        cur = f"{cur}\n\n{piece}" if cur else str(piece)
+    if cur:
+        msgs.append(cur)
+    return msgs
+
+def build_brain_brief(recs: Dict[str, Any], cfg, facts: Optional[Dict[str, Any]] = None) -> List[str]:
+    """The short Telegram report: plain language, one or two messages. Raises only if the
+    shared facts cannot be computed (the caller then falls back to the full report)."""
+    F = facts if facts is not None else _collect_facts(recs, cfg)
+    stamp = datetime.now(_IST).strftime("%d %b %Y | %H:%M IST").upper()
+    return render_brief_messages(_brief_pieces(F, cfg, stamp, recs.get("_elliott_rows")))

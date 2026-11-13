@@ -57,6 +57,7 @@ _pair_eval_counter = 0
 STALE_NOTICE_COOLDOWN_SEC = 7200   # repeat a stale-candle Telegram notice at most every 2h
 _CLUSTER_CACHE_MISS = object()
 LAST_CANDLE_OK_THIS_RUN: Dict[str, int] = {}
+ELLIOTT_RUN_STATS: Dict[str, int] = {}   # last run_elliott_scan() stats, read by run_once() for the RUN COMPLETE line
 
 def build_candle_freshness(pairs: Sequence[str], merged: Dict[str, int], this_run: Dict[str, int], now: int, stale_after_sec: int) -> Dict[str, Any]:
     """Per-pair last-successful-candle block for the structured run summary."""
@@ -1529,11 +1530,13 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     # but keeps its own dedup (one claim per wave structure) and per-run cap.
     # Switch off with ENABLE_ELLIOTT_WAVE=false: nothing above changes either way.
     if cfg.ENABLE_ELLIOTT_WAVE:
-        await run_elliott_scan(
+        _ew_stats = await run_elliott_scan(
             parsed_cache, [t[0] for t in prepared_tasks], reference_time,
             state_db, telegram_queue, logger_main,
             suppress_delivery=bool(kill_switch_active_run or kill_switch_tripped_this_run),
         )
+        ELLIOTT_RUN_STATS.clear()
+        ELLIOTT_RUN_STATS.update(_ew_stats or {})
 
     # All-time Recorded / Shadowed totals (from beginning of data collection).
     # Always log on every run so operators see the current win-rate snapshot
@@ -2012,7 +2015,7 @@ async def run_once() -> Optional[bool]:
             f"Duration: {run_duration:.1f}s | "
             f"Pairs: {len(all_results)}/{len(pairs_to_process)} | "
             f"Deferred: {deferred_n} | "
-            f"Alerts: {alerts_sent_ref[0]} | "
+            f"Alerts: {alerts_sent_ref[0]} (+{int(ELLIOTT_RUN_STATS.get('delivered', 0))} Elliott) | "
             f"OI/Funding blocks: {fetcher_stats.get('oi_funding_blocks', 0)} | "
             f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
             f"Redis: {redis_status}{redis_mem_field}"
@@ -2105,6 +2108,7 @@ async def run_once() -> Optional[bool]:
                 "pairs_deferred": deferred_n,
                 "deferred_pairs": deferred_pairs[:50],
                 "alerts_sent": alerts_sent_ref[0],
+                "elliott_alerts_sent": int(ELLIOTT_RUN_STATS.get("delivered", 0)),
                 "oi_funding_blocks": fetcher_stats.get("oi_funding_blocks", 0),
                 "memory_mb_start": round(container_memory_mb, 1),
                 "memory_mb_end": round(final_memory_mb, 1),

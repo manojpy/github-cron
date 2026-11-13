@@ -464,11 +464,28 @@ def volatility_plan_study(rows: Sequence[Row], default_cost_pct: float, fixed_sl
     return out
 
 # ── Works on legacy rows too (MAE/MFE only) ───────────────────────────────
-def reach_table(rows: Sequence[Row], levels: Sequence[float] = REACH_LEVELS) -> Dict[str, Any]:
+def row_excursions(row: Mapping[str, Any], min_len: int = 0) -> Optional[Tuple[float, float]]:
+    """(best move, worst move against) in %, over the FULL outcome window, or None.
+
+    A trade that hit its stop (or target) early is graded on the path up to that
+    candle only, so its stored mfe / mae stop at the exit: the worst move can never
+    show much beyond the stop and the best move misses any later rally. Those rows
+    are only used when a full-length path is stored (min_len candles, rebuilt from
+    exchange history by pathrecon); otherwise they are skipped, not guessed."""
+    if has_path(row) and len(row["path_fav"]) >= max(1, min_len):
+        return (max(0.0, max(float(x) for x in row["path_fav"])),
+                max(0.0, max(float(x) for x in row["path_adv"])))
+    if row.get("early_close") or row.get("mfe") is None or row.get("mae") is None:
+        return None
+    return abs(float(row["mfe"])) * 100.0, abs(float(row["mae"])) * 100.0
+
+
+def reach_table(rows: Sequence[Row], levels: Sequence[float] = REACH_LEVELS, min_len: int = 0) -> Dict[str, Any]:
     """Share of trades whose best / worst excursion reached each level.
-    mfe / mae are stored as fractions (0.01 = 1%)."""
-    mfes = [abs(float(r["mfe"])) * 100.0 for r in rows if r.get("mfe") is not None]
-    maes = [abs(float(r["mae"])) * 100.0 for r in rows if r.get("mae") is not None]
+    Excursions come from row_excursions (full window only; min_len = full path length)."""
+    ex = [e for e in (row_excursions(r, min_len) for r in rows) if e is not None]
+    mfes = [e[0] for e in ex]
+    maes = [e[1] for e in ex]
     if not mfes or not maes:
         return {}
     return {
@@ -537,7 +554,7 @@ def build_plan_lab(rows: Sequence[Row], *, sl_pct: float, tp_pct: float, horizon
     facts: Dict[str, Any] = {}
     lines: List[str] = []
 
-    rt = reach_table(rows)
+    rt = reach_table(rows, min_len=horizon + 1)
     if rt:
         facts["reach"] = rt
         lv = list(rt["mfe"].keys())

@@ -52,6 +52,8 @@ from brain_report import (
     plan_transition_allowed,
     _PHASE_MIN_SAMPLES,
     _Piece,
+    _collect_facts as _collect_report_facts,
+    build_brain_brief,
     build_brain_report_sections,
     render_report_markdown,
     render_report_messages,
@@ -1518,6 +1520,7 @@ class BrainEngineV2(BrainCore):
                     # Elliott rows are split out so the legacy totals stay pure MACD.
                     _all = list(_real or []) + list(_shadow or [])
                     _ew_rows = [r for r in _all if is_elliott_key(str(r.get("alert_key") or ""))]
+                    recs["_elliott_rows"] = [r for r in (_real or []) if is_elliott_key(str(r.get("alert_key") or ""))]   # delivered Elliott alerts only (for the brief)
                     _legacy_real = [r for r in (_real or []) if not is_elliott_key(str(r.get("alert_key") or ""))]
                     _legacy_shadow = [r for r in (_shadow or []) if not is_elliott_key(str(r.get("alert_key") or ""))]
                     for _label, _rows in (("Recorded", _legacy_real), ("Shadowed", _legacy_shadow), ("Elliott", _ew_rows)):
@@ -1529,9 +1532,17 @@ class BrainEngineV2(BrainCore):
                 recs["_outcome_totals"] = _cum
             except Exception as e:
                 logger_run.debug(f"Outcome totals unavailable for Brain report: {e}")
-            sections, stamp = build_brain_report_sections(recs, cfg)
-            plan_messages = render_report_messages(sections, stamp)   # already MarkdownV2-escaped
-            self._archive_report(sections, stamp, logger_run)
+            _facts = _collect_report_facts(recs, cfg)                 # computed once, shared by both reports
+            sections, stamp = build_brain_report_sections(recs, cfg, _facts)
+            self._archive_report(sections, stamp, logger_run)         # the full report is always archived
+            plan_messages: List[str] = []
+            if getattr(cfg, "BRAIN_REPORT_BRIEF", True):
+                try:
+                    plan_messages = build_brain_brief(recs, cfg, _facts)   # already MarkdownV2-escaped
+                except Exception as brief_err:
+                    logger_run.warning(f"Brain brief failed, sending the full report instead: {brief_err}")
+            if not plan_messages:
+                plan_messages = render_report_messages(sections, stamp)   # already MarkdownV2-escaped
             sent_ok = True
             for msg in plan_messages:
                 if not await telegram_queue.send(msg):

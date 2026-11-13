@@ -1175,16 +1175,25 @@ class BrainCore:
             return f"{r.get('pair', '')}|{int(r.get('entry_ts', 0) or 0)}"
 
         to_save: List[Tuple[str, Dict[str, Any], int]] = []
+        _cusum_ref = float(getattr(cfg, "BRAIN_CUSUM_TARGET_WR", 0.40))
+        _cusum_delta = float(getattr(cfg, "BRAIN_CUSUM_DRIFT_DELTA", 0.15))
+        _cusum_h = float(getattr(cfg, "BRAIN_CUSUM_THRESHOLD", 8.0))
         for alert_key, rows in by_alert.items():
             watermark, saved = bulk[alert_key]
             if alert_key not in self._cusum_detectors:
-                self._cusum_detectors[alert_key] = (
+                _det = (
                     CUSUMDetector.from_dict(saved) if saved else CUSUMDetector(
-                        target_wr=cfg.MIN_WIN_RATE,
-                        drift_delta=getattr(cfg, "BRAIN_CUSUM_DRIFT_DELTA", 0.10),
-                        threshold=getattr(cfg, "BRAIN_CUSUM_THRESHOLD", 2.0),
+                        target_wr=_cusum_ref, drift_delta=_cusum_delta, threshold=_cusum_h,
                     )
                 )
+                if (abs(_det.mu - _cusum_ref) > 1e-9 or abs(_det.delta - _cusum_delta) > 1e-9
+                        or abs(_det.h - _cusum_h) > 1e-9):
+                    # Persisted state was built with the old settings (55% reference,
+                    # h=2): re-base once and clear the accumulated alarm.
+                    _det.mu, _det.delta, _det.h = _cusum_ref, _cusum_delta, _cusum_h
+                    _det.s_pos = 0.0
+                    _det.s_neg = 0.0
+                self._cusum_detectors[alert_key] = _det
             det = self._cusum_detectors[alert_key]
             in_window = {_rid(r) for r in rows if r.get("entry_ts", 0)}
             seen_saved = (saved or {}).get("seen")
