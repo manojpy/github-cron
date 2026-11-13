@@ -62,7 +62,7 @@ from fetcher import (
 )
 
 from state import RedisStateStore, TokenBucket, _rc
-from brain_helpers import KILL_SWITCH_KEY, kill_switch_mode
+from brain_helpers import KILL_SWITCH_KEY, kill_switch_mode, evidence_block_lines
 from gates import GateResult, IndicatorCache
 import threshold_engine as engine
 
@@ -581,7 +581,7 @@ async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, a
         except Exception as e:
             logger_pair.debug(f"Why-rejected log failed ({block_reason}): {e}")
 
-def build_rich_pair_msg(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], setup_line: str, advice: PairAdvice, primary_emoji: Optional[str] = None, record_line: Optional[str] = None, pullback_line: Optional[str] = None, short: bool = False) -> str:
+def build_rich_pair_msg(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], setup_line: str, advice: PairAdvice, primary_emoji: Optional[str] = None, record_line: Optional[str] = None, pullback_line: Optional[str] = None, short: bool = False, evidence_lines: Optional[List[str]] = None) -> str:
     """Structured Telegram body (MarkdownV2-escaped) WITHOUT bias/datetime footer.
     short=True (alert ignored because a trade is already open) keeps only the header,
     the setup line and the status line."""
@@ -609,6 +609,8 @@ def build_rich_pair_msg(*, pair: str, direction: str, price: Any, ts: int, score
     ]
     if advice.size_line:
         lines.append(advice.size_line)
+    if evidence_lines:
+        lines.extend(evidence_lines)
     if record_line:
         lines.append(record_line)
     return "\n".join(escape_markdown_v2(x) for x in lines)
@@ -660,7 +662,7 @@ def _record_status_line(status: str, active: Optional[Dict[str, Any]]) -> str:
         return f"⏸ Cooldown — same-direction trade recently closed, not recorded until the {resume} candle"
     return "📝 Recorded as trade"
 
-def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], items: List[Tuple[str, str]], keys: List[str], tq_by_key: Dict[str, Optional[Dict[str, Any]]], votes: Optional[Dict[str, bool]], required: Optional[float], bias_context: Optional[BiasContext], logger_pair: logging.Logger, pb_by_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None, adx_val: Optional[float] = None, record_line: Optional[str] = None, pullback_line: Optional[str] = None, decision_sink: Optional[Dict[str, Any]] = None, exhaustion: Optional[Dict[str, Any]] = None, short: bool = False) -> Tuple[str, Optional[str]]:
+def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int, score: Optional[float], total: Optional[float], items: List[Tuple[str, str]], keys: List[str], tq_by_key: Dict[str, Optional[Dict[str, Any]]], votes: Optional[Dict[str, bool]], required: Optional[float], bias_context: Optional[BiasContext], logger_pair: logging.Logger, pb_by_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None, adx_val: Optional[float] = None, record_line: Optional[str] = None, pullback_line: Optional[str] = None, decision_sink: Optional[Dict[str, Any]] = None, exhaustion: Optional[Dict[str, Any]] = None, short: bool = False, evidence_by_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None) -> Tuple[str, Optional[str]]:
     """Build the rich body for one pair/direction and return (body, verdict).
     Never raises: any failure degrades to a plain header + setup line (verdict
     None) so an alert is never lost to a formatting bug."""
@@ -718,6 +720,16 @@ def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int
                 "exhaustion_adj": advice.exh_adj,
                 "keys": list(s_keys),
             })
+
+        # Informational evidence block. Own try/except: a failure here must never
+        # degrade the rest of the alert, and nothing below depends on it.
+        evidence_lines: List[str] = []
+        if not short and getattr(cfg, "ALERT_EVIDENCE_BLOCK", True):
+            try:
+                evidence_lines = evidence_block_lines(
+                    (evidence_by_key or {}).get(s_keys[0]), s_keys[0], direction)
+            except Exception as e:
+                logger_pair.debug(f"[{pair}] evidence block skipped: {e}")
         body = build_rich_pair_msg(
             pair=pair, direction=direction, price=price, ts=ts, score=score, total=total,
             setup_line=_combined_setup_line(s_items), advice=advice,
@@ -725,6 +737,7 @@ def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int
             record_line=record_line,
             pullback_line=pullback_line,
             short=short,
+            evidence_lines=evidence_lines,
         )
         return body, advice.verdict
     except Exception as e:
@@ -734,6 +747,19 @@ def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int
             f"{pair} — {side} | {_format_price(price)}{_fmt_score(score, total)}\n"
             f"{_combined_setup_line(items)}"
         ), None
+
+async def _evidence_cards_for(brain_engine: Optional[Any], keys: List[str], direction: str) -> Dict[str, Optional[Dict[str, Any]]]:
+    """Evidence cards for the alert keys of one message. Read-only, cached, never raises;
+    an empty result just makes the block read INSUFFICIENT DATA."""
+    out: Dict[str, Optional[Dict[str, Any]]] = {}
+    if brain_engine is None or not getattr(cfg, "ALERT_EVIDENCE_BLOCK", True):
+        return out
+    for k in dict.fromkeys(keys):
+        try:
+            out[k] = await brain_engine.get_evidence_card(k, direction)
+        except Exception:
+            out[k] = None
+    return out
 
 def build_pair_msg_safe(**kwargs: Any) -> str:
     """Body-only convenience wrapper around build_pair_msg_and_verdict()."""
@@ -3981,6 +4007,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 )
             except NameError:
                 _req_msg = None
+            _evidence_cards = await _evidence_cards_for(brain_engine, keys, direction)
             msg, pair_verdict = build_pair_msg_and_verdict(
                 pair=pair_name,
                 direction=direction,
@@ -4005,6 +4032,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 ),
                 decision_sink=advisor_seen,
                 exhaustion=exhaustion_info_for_verdict(context, direction, keys),
+                evidence_by_key=_evidence_cards,
                 short=(record_status == "IGNORED"),
             )
             msg_body = msg
@@ -4244,6 +4272,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 )
             except NameError:
                 _req_msg = None
+            _evidence_cards = await _evidence_cards_for(brain_engine, keys, direction)
             msg, _ = build_pair_msg_and_verdict(
                 pair=pair_name,
                 direction=direction,
@@ -4268,6 +4297,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 ),
                 decision_sink=advisor_seen,
                 exhaustion=exhaustion_info_for_verdict(context, direction, keys),
+                evidence_by_key=_evidence_cards,
             )
             # Footer: candle OPEN time (e.g. 16:00 for the 16:00-16:15 candle,
             # delivered ~16:16). The timestamp is always present; the bias

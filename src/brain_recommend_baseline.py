@@ -18,6 +18,7 @@ from brain_helpers import (
     KILL_SWITCH_KEY, _resolve_config_path,
     kill_switch_mode, record_kill_switch_shadow, load_kill_switch_shadow_log,
     EXPERIMENT_LEDGER_KEY, HYPOTHESIS_POOL_KEY, count_brain_trials, update_experiment_ledger,
+    build_evidence_cards,
 )
 
 async def build_baseline_recommendations(self) -> Dict[str, Any]:
@@ -1361,7 +1362,23 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             "ts": int(time.time()),
         })
 
-    # ── Market-state model: report-only refresh each cycle. Discarded
+    # ── Alert evidence cards: informational Telegram block, computed from the same outcome
+    # rows on the scored bracket. Own try/except and own key: nothing else depends on it. ──
+    try:
+        _stop = float(getattr(cfg, "OUTCOME_MAE_LOSS_PCT", 1.0) or 1.0)
+        await self._persist_evidence_cards(build_evidence_cards(
+            real_rows, stop_pct=_stop,
+            target_pct=_stop * float(getattr(cfg, "OUTCOME_RR_TARGET", 2.0) or 2.0),
+            cost_pct=(float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100.0,
+            window=int(getattr(cfg, "ALERT_EVIDENCE_WINDOW", 50)),
+            min_n=int(getattr(cfg, "ALERT_EVIDENCE_MIN_TRADES", 30)),
+            min_blocks=int(getattr(cfg, "ALERT_EVIDENCE_MIN_BLOCKS", 8)),
+            z=float(getattr(cfg, "ALERT_EVIDENCE_Z", 1.96)),
+        ))
+    except Exception as e:
+        audit.record_analysis_exception("evidence_cards", e)
+
+    # ── Market-state model: report-only refresh each cycle.
     # (previous persisted model kept as-is) unless it clears OOS EV
     if getattr(cfg, "ENABLE_MARKET_STATE_MODEL", True):
         ms_model = engine.train_market_state_model(

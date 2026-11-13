@@ -35,6 +35,8 @@ from brain_helpers import (
     FEATURE_DATASET_KEY,
     ML_CALIBRATION_KEY,
     QUALITY_INPUTS_KEY,
+    EVIDENCE_CARDS_KEY,
+    evidence_card_lookup,
     _OVERRIDE_COOLDOWN_PREFIX,
     _hget_int,
     _resolve_config_path,
@@ -467,6 +469,7 @@ class BrainCore:
                 self._load_batch_market_state_model(),
                 self._load_ml_calibration_curve(),
                 self._load_quality_inputs(),
+                self._load_evidence_cards(),
                 *([self._load_playbook_blob()] if getattr(cfg, "PLAYBOOK_MODE", "off") != "off" else []),
                 return_exceptions=True,
             )
@@ -735,6 +738,40 @@ class BrainCore:
             "_quality_cache", "_quality_cache_ts", QUALITY_INPUTS_KEY,
             "quality_inputs_load",
         )
+
+    # ── Alert evidence cards (informational only; no gate reads these) ──
+    async def _persist_evidence_cards(self, blob: Dict[str, Any]) -> None:
+        if self.sdb.degraded or not self.sdb._redis:
+            return
+        try:
+            await self.sdb._safe_redis_op(
+                lambda: _rc(self.sdb._redis).set(
+                    EVIDENCE_CARDS_KEY, json_dumps(blob),
+                    ex=int(getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30) * 86400),
+                ),
+                2.0, "evidence_cards_persist",
+            )
+        except Exception as e:
+            logging.getLogger("macd_bot").warning(f"Evidence-cards persistence failed: {e}")
+
+    async def _load_evidence_cards(self) -> Optional[Dict[str, Any]]:
+        return await self._load_json_cached(
+            "_evidence_cache", "_evidence_cache_ts", EVIDENCE_CARDS_KEY,
+            "evidence_cards_load",
+        )
+
+    async def get_evidence_card(self, alert_key: str, direction: str) -> Optional[Dict[str, Any]]:
+        """Evidence card for an alert's family+direction, or None (missing, stale, Redis down).
+        Never raises and never blocks dispatch."""
+        try:
+            blob = await self._load_evidence_cards()
+            return evidence_card_lookup(
+                blob, alert_key, direction,
+                float(getattr(cfg, "ALERT_EVIDENCE_MAX_AGE_HOURS", 12.0)) * 3600.0,
+            )
+        except Exception as e:
+            logging.getLogger("macd_bot").debug(f"evidence card lookup failed: {e}")
+            return None
 
     async def _load_playbook_blob(self) -> Optional[Dict[str, Any]]:
         """The learner playbook blob, cached for 5 minutes. Single-flight: pairs are

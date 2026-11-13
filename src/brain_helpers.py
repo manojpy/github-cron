@@ -3,7 +3,10 @@
 Split out of the original module without logic changes; the original
 module remains as a facade re-exporting every name."""
 from __future__ import annotations
-from typing import Any, Dict, List, Optional
+import math
+import time
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Sequence
 from alert_registry import resolve_alert_config_path, alert_family_of
 from bot_config import cfg
 import threshold_engine as engine
@@ -11,6 +14,7 @@ import threshold_engine as engine
 _OVERRIDE_COOLDOWN_PREFIX = "brain_override_cooldown:"
 CALIBRATION_CURVES_KEY = "brain:calibration_curves"
 QUALITY_INPUTS_KEY = "brain:quality_inputs"
+EVIDENCE_CARDS_KEY = "brain:evidence_cards"
 KILL_SWITCH_KEY = "brain:kill_switch_active"
 KILL_SWITCH_SHADOW_KEY = "brain:kill_switch_shadow_active"
 KILL_SWITCH_SHADOW_LOG_KEY = "brain:kill_switch_shadow_log"
@@ -397,3 +401,151 @@ def _extract_p_value_for_fdr(rec: Dict[str, Any]) -> Optional[float]:
 
     # ── Fallthrough: no clean single-hypothesis claim ──
     return None
+
+# ── Alert evidence cards (informational Telegram block) ──────────────────
+# One card per alert family and direction, built from REALISED outcome rows on
+# the SAME bracket the trades are scored on (stop OUTCOME_MAE_LOSS_PCT, target
+# stop x OUTCOME_RR_TARGET, 12 candles). It only describes history: nothing here
+# is read by any gate, filter or veto, so it can never change whether an alert is sent.
+_EVIDENCE_STATES = ("VALIDATED", "NOT_VALIDATED", "INSUFFICIENT")
+
+def evidence_breakeven_pct(stop_pct: float, target_pct: float, cost_pct: float) -> float:
+    """Share (0-1) of DECIDED trades (target or stop reached) that must reach the
+    target first to break even after round-trip costs: a win pays target - cost,
+    a loss costs stop + cost."""
+    return (stop_pct + cost_pct) / (stop_pct + target_pct)
+
+def _evidence_window(rows: Sequence[Dict[str, Any]], stop_pct: float, target_pct: float,
+                     cost_pct: float) -> Dict[str, Any]:
+    """Statistics of one window of resolved rows. Win rate is target-before-stop among
+    DECIDED trades only (timeouts excluded), the figure the break-even compares to;
+    EV covers every trade, timeouts included, after costs."""
+    from plan_replay import cluster_se
+    n = len(rows)
+    pn = [engine.row_net_pnl_pct(r, cost_pct) for r in rows]
+    tp = sl = 0
+    costs: List[float] = []
+    for r in rows:
+        x = engine.bracket_exit_pct(r)
+        if x is not None:
+            if x > 0:
+                tp += 1
+            else:
+                sl += 1
+        c = r.get("realized_cost_pct")
+        costs.append(float(c) if c is not None else cost_pct)
+    decided = tp + sl
+    ev = (sum(pn) / n) if n else None
+    se, blocks = cluster_se(pn, [r.get("entry_ts") or None for r in rows]) if n >= 2 else (float("inf"), n)
+    se_ok = se != float("inf") and not math.isnan(se)
+    mean_cost = (sum(costs) / n) if n else cost_pct
+    return {
+        "n": n, "decided": decided,
+        "wr": (tp / decided) if decided else None,
+        "ev": ev, "se": se if se_ok else None, "blocks": blocks,
+        "be": evidence_breakeven_pct(stop_pct, target_pct, mean_cost),
+    }
+
+def _evidence_card(recent: Dict[str, Any], prior: Dict[str, Any], *, min_n: int, min_blocks: int,
+                   prior_min: int, z: float, trend_z: float) -> Dict[str, Any]:
+    ev, se = recent["ev"], recent["se"]
+    lcb = (ev - z * se) if (ev is not None and se is not None) else None
+    if recent["n"] < min_n or recent["blocks"] < min_blocks or ev is None or se is None:
+        state = "INSUFFICIENT"
+    elif ev <= 0 or lcb is None or lcb <= 0:
+        state = "NOT_VALIDATED"
+    elif prior["n"] < prior_min:
+        state = "INSUFFICIENT"            # recent window passes; the earlier window cannot confirm it yet
+    elif prior["ev"] is not None and prior["ev"] > 0:
+        state = "VALIDATED"
+    else:
+        state = "NOT_VALIDATED"
+    trend = "n/a"
+    if (prior["n"] >= prior_min and recent["n"] >= prior_min and ev is not None and se is not None
+            and prior["ev"] is not None and prior["se"] is not None):
+        diff = ev - prior["ev"]
+        sed = math.sqrt(se * se + prior["se"] * prior["se"])
+        trend = "Improving" if diff > trend_z * sed else "Deteriorating" if diff < -trend_z * sed else "Stable"
+    return {
+        "state": state, "trend": trend, "lcb": lcb,
+        "recent": {k: recent[k] for k in ("n", "decided", "wr", "ev", "blocks", "be")},
+        "prior": {k: prior[k] for k in ("n", "ev")},
+    }
+
+def build_evidence_cards(rows: Sequence[Dict[str, Any]], *, stop_pct: float, target_pct: float,
+                         cost_pct: float, window: int = 50, min_n: int = 30, min_blocks: int = 8,
+                         z: float = 1.96, trend_z: float = 1.645,
+                         now_ts: Optional[float] = None) -> Dict[str, Any]:
+    """{"ts", "cards": {"<family>|<direction>": card}} for every family seen in `rows`.
+    recent = newest `window` trades of that family+direction; prior = the `window` before it.
+    VALIDATED needs the recent window's cluster-robust EV lower bound > 0 AND a positive earlier
+    window; too few trades is INSUFFICIENT, never NOT_VALIDATED."""
+    groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        d = str(r.get("direction") or "").lower()
+        if d in ("buy", "sell"):
+            groups[f"{alert_family_of(str(r.get('alert_key') or ''))}|{d}"].append(r)
+    prior_min = max(10, min_n // 2)
+    cards: Dict[str, Any] = {}
+    for key, rs in groups.items():
+        rs.sort(key=lambda r: r.get("entry_ts") or 0)
+        rec = rs[-window:]
+        pri = rs[-2 * window:-window] if len(rs) > window else []
+        cards[key] = _evidence_card(
+            _evidence_window(rec, stop_pct, target_pct, cost_pct),
+            _evidence_window(pri, stop_pct, target_pct, cost_pct),
+            min_n=min_n, min_blocks=min_blocks, prior_min=prior_min, z=z, trend_z=trend_z,
+        )
+    return {
+        "ts": int(now_ts if now_ts is not None else time.time()),
+        "window": window, "min_n": min_n, "cards": cards,
+    }
+
+def evidence_card_lookup(blob: Optional[Dict[str, Any]], alert_key: str, direction: str,
+                         max_age_sec: float, now_ts: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """The card for this alert's family+direction, or None (no blob, stale, or family unseen)."""
+    if not isinstance(blob, dict):
+        return None
+    now = now_ts if now_ts is not None else time.time()
+    if now - float(blob.get("ts") or 0) > max_age_sec:
+        return None
+    card = (blob.get("cards") or {}).get(f"{alert_family_of(alert_key)}|{str(direction).lower()}")
+    if not isinstance(card, dict):
+        return None
+    out = dict(card)
+    out["window"] = blob.get("window")
+    out["min_n"] = blob.get("min_n")
+    return out
+
+def evidence_block_lines(card: Optional[Dict[str, Any]], alert_key: str, direction: str) -> List[str]:
+    """Plain-text lines of the compact Telegram evidence block. Never raises on a missing or
+    partial card: that case reads INSUFFICIENT DATA, with the break-even taken from the config plan."""
+    stop = float(getattr(cfg, "OUTCOME_MAE_LOSS_PCT", 1.0) or 1.0)
+    target = stop * float(getattr(cfg, "OUTCOME_RR_TARGET", 2.0) or 2.0)
+    cost = (float(getattr(cfg, "BRAIN_FEE_PCT", 0.0006)) + float(getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003))) * 2 * 100.0
+    rec = (card or {}).get("recent") or {}
+    state = str((card or {}).get("state") or "INSUFFICIENT")
+    if state not in _EVIDENCE_STATES:
+        state = "INSUFFICIENT"
+    be = rec.get("be")
+    be = float(be) if isinstance(be, (int, float)) else evidence_breakeven_pct(stop, target, cost)
+    n, decided = int(rec.get("n") or 0), int(rec.get("decided") or 0)
+    min_n = int((card or {}).get("min_n") or int(getattr(cfg, "ALERT_EVIDENCE_MIN_TRADES", 30)))
+    label = {
+        "VALIDATED": "VALIDATED ✅",
+        "NOT_VALIDATED": "NOT VALIDATED ❌ (no proven edge)",
+        "INSUFFICIENT": f"INSUFFICIENT DATA ⏳ ({n} of {min_n} trades needed)" if n < min_n
+                        else "INSUFFICIENT DATA ⏳ (waiting for confirmation)",
+    }[state]
+    wr, ev = rec.get("wr"), rec.get("ev")
+    fam = alert_family_of(alert_key)
+    lines = [
+        f"🧠 TRADE EVIDENCE · {fam} {str(direction).upper()}",
+        f"Family status: {label}",
+        f"Break-even target WR: {be:.0%}",
+        ("Recent target WR: " + (f"{wr:.0%} (n={decided} decided)" if isinstance(wr, (int, float)) and decided else "n/a")),
+        ("Historical net EV: " + (f"{ev:+.2f}% (last {n} trades)" if isinstance(ev, (int, float)) and n else "n/a")),
+        f"Performance trend: {(card or {}).get('trend') or 'n/a'}",
+        "Historical statistics only. Not a guarantee of future performance.",
+    ]
+    return lines
