@@ -7,7 +7,7 @@ import math
 import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Sequence
-from alert_registry import resolve_alert_config_path, alert_family_of
+from alert_registry import resolve_alert_config_path, alert_family_of, is_elliott_key
 from bot_config import cfg
 import threshold_engine as engine
 
@@ -409,6 +409,20 @@ def _extract_p_value_for_fdr(rec: Dict[str, Any]) -> Optional[float]:
 # is read by any gate, filter or veto, so it can never change whether an alert is sent.
 _EVIDENCE_STATES = ("VALIDATED", "NOT_VALIDATED", "INSUFFICIENT")
 
+def evidence_group_of(alert_key: str) -> str:
+    """The unit a card describes. Legacy alerts: their learning family. Elliott alerts: the
+    alert key itself (wave3 / wave5 / abc, per direction), because those are the families
+    Elliott reports use and they behave very differently from each other."""
+    key = str(alert_key or "").lower()
+    return key if is_elliott_key(key) else alert_family_of(key)
+
+def evidence_family_label(alert_key: str) -> str:
+    key = str(alert_key or "").lower()
+    if is_elliott_key(key):
+        kind = key.replace("elliott_", "", 1).rsplit("_", 1)[0]
+        return {"wave3": "Elliott Wave 3", "wave5": "Elliott Wave 5", "abc": "Elliott ABC"}.get(kind, "Elliott Wave")
+    return alert_family_of(key)
+
 def evidence_breakeven_pct(stop_pct: float, target_pct: float, cost_pct: float) -> float:
     """Share (0-1) of DECIDED trades (target or stop reached) that must reach the
     target first to break even after round-trip costs: a win pays target - cost,
@@ -484,7 +498,7 @@ def build_evidence_cards(rows: Sequence[Dict[str, Any]], *, stop_pct: float, tar
     for r in rows:
         d = str(r.get("direction") or "").lower()
         if d in ("buy", "sell"):
-            groups[f"{alert_family_of(str(r.get('alert_key') or ''))}|{d}"].append(r)
+            groups[f"{evidence_group_of(str(r.get('alert_key') or ''))}|{d}"].append(r)
     prior_min = max(10, min_n // 2)
     cards: Dict[str, Any] = {}
     for key, rs in groups.items():
@@ -509,7 +523,7 @@ def evidence_card_lookup(blob: Optional[Dict[str, Any]], alert_key: str, directi
     now = now_ts if now_ts is not None else time.time()
     if now - float(blob.get("ts") or 0) > max_age_sec:
         return None
-    card = (blob.get("cards") or {}).get(f"{alert_family_of(alert_key)}|{str(direction).lower()}")
+    card = (blob.get("cards") or {}).get(f"{evidence_group_of(alert_key)}|{str(direction).lower()}")
     if not isinstance(card, dict):
         return None
     out = dict(card)
@@ -538,7 +552,7 @@ def evidence_block_lines(card: Optional[Dict[str, Any]], alert_key: str, directi
                         else "INSUFFICIENT DATA ⏳ (waiting for confirmation)",
     }[state]
     wr, ev = rec.get("wr"), rec.get("ev")
-    fam = alert_family_of(alert_key)
+    fam = evidence_family_label(alert_key)
     lines = [
         f"🧠 TRADE EVIDENCE · {fam} {str(direction).upper()}",
         f"Family status: {label}",
@@ -548,4 +562,9 @@ def evidence_block_lines(card: Optional[Dict[str, Any]], alert_key: str, directi
         f"Performance trend: {(card or {}).get('trend') or 'n/a'}",
         "Historical statistics only. Not a guarantee of future performance.",
     ]
+    if is_elliott_key(str(alert_key).lower()):
+        # Elliott alerts show their own structural stop and targets, but their recorded outcomes
+        # are scored on the bot's fixed bracket. Say so, so the numbers are not read as that plan's.
+        hours = float(getattr(cfg, "OUTCOME_LOOKAHEAD_CANDLES", 12)) * 0.25
+        lines.insert(-1, f"Scored on the fixed {stop:g}% stop / {target:g}% target / {hours:g}h plan, not this setup's own stop and targets.")
     return lines

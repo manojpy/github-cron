@@ -1367,7 +1367,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
     try:
         _stop = float(getattr(cfg, "OUTCOME_MAE_LOSS_PCT", 1.0) or 1.0)
         await self._persist_evidence_cards(build_evidence_cards(
-            real_rows, stop_pct=_stop,
+            list(real_rows) + list(await self._load_elliott_rows()), stop_pct=_stop,
             target_pct=_stop * float(getattr(cfg, "OUTCOME_RR_TARGET", 2.0) or 2.0),
             cost_pct=(float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100.0,
             window=int(getattr(cfg, "ALERT_EVIDENCE_WINDOW", 50)),
@@ -1375,10 +1375,11 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             min_blocks=int(getattr(cfg, "ALERT_EVIDENCE_MIN_BLOCKS", 8)),
             z=float(getattr(cfg, "ALERT_EVIDENCE_Z", 1.96)),
         ))
+
     except Exception as e:
         audit.record_analysis_exception("evidence_cards", e)
 
-    # ── Market-state model: report-only refresh each cycle.
+    # ── Market-state model: report-only refresh each cycle. Discarded
     # (previous persisted model kept as-is) unless it clears OOS EV
     if getattr(cfg, "ENABLE_MARKET_STATE_MODEL", True):
         ms_model = engine.train_market_state_model(

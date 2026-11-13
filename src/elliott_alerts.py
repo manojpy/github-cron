@@ -58,11 +58,11 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-
 import elliott_tracker as tracker
 from alert_registry import ELLIOTT_REGISTRY, is_elliott_key
 from alerts import escape_markdown_v2, queue_failed_alert
-from bot_config import Constants, cfg, format_ist_time, json_dumps, logger
+from bot_config import Constants, cfg, format_ist_time, json_dumps, json_loads, logger
+from brain_helpers import EVIDENCE_CARDS_KEY, evidence_block_lines, evidence_card_lookup
 from elliott_wave import (
     Analysis, ElliottParams, FEATURE_VERSION, WaveEvent, WaveSetup, analyze, family_rank,
 )
@@ -207,7 +207,7 @@ def scan_pair(pair: str, pd_15m: Any, reference_time: int,
     return int(i), res
 
 
-# ── message ──────────────────────────────────────────────────────────────
+# ── message ─────────────────────────────────────────────────�������������────────────
 def _px(x: float) -> str:
     ax = abs(x)
     if ax >= 1000:
@@ -228,7 +228,8 @@ def _gate_line(s: WaveSetup) -> Optional[str]:
     return "Legacy gate: " + " · ".join(parts)
 
 
-def _setup_block(s: WaveSetup, verdict: Optional[str] = None) -> str:
+def _setup_block(s: WaveSetup, verdict: Optional[str] = None,
+                 evidence_lines: Optional[List[str]] = None) -> str:
     e = escape_markdown_v2
     side = "BUY" if s.direction == "buy" else "SELL"
     icon = "🟢" if s.direction == "buy" else "🔴"
@@ -254,15 +255,31 @@ def _setup_block(s: WaveSetup, verdict: Optional[str] = None) -> str:
         lines.append(e(gl))
     if verdict:
         lines.append(e(verdict))
+    if evidence_lines:
+        lines.extend(e(x) for x in evidence_lines)
     return "\n".join(lines)
 
 
+def _evidence_lines_for(s: WaveSetup, cards: Optional[Dict[str, Optional[Dict[str, Any]]]]) -> List[str]:
+    """Informational evidence block for one setup. cards=None means 'not requested'. Never raises:
+    a failure here only drops the block, never the alert."""
+    if cards is None:
+        return []
+    try:
+        return evidence_block_lines(cards.get(alert_key_of(s)), alert_key_of(s), s.direction)
+    except Exception as exc:
+        logger.debug(f"Elliott evidence block skipped: {exc!r}")
+        return []
+
+
 def format_elliott_message(setups: List[WaveSetup],
-                           verdicts: Optional[Dict[str, str]] = None) -> str:
+                           verdicts: Optional[Dict[str, str]] = None,
+                           evidence_cards: Optional[Dict[str, Optional[Dict[str, Any]]]] = None) -> str:
     e = escape_markdown_v2
     verdicts = verdicts or {}
     head = e(f"🌊 {cfg.BOT_NAME} — Elliott Wave ({len(setups)})")
-    body = "\n\n".join(_setup_block(s, verdicts.get(s.family)) for s in setups)
+    body = "\n\n".join(
+        _setup_block(s, verdicts.get(s.family), _evidence_lines_for(s, evidence_cards)) for s in setups)
     ts = max(s.signal_ts for s in setups) + INTERVAL_MIN * 60
     foot = (f"📆 {e(format_ist_time(ts, '%d-%m-%Y'))} "
             f"⏰ {e(format_ist_time(ts, '%H:%M IST'))}")
@@ -665,6 +682,20 @@ def _track_record(pair: str, s: WaveSetup, disposition: str,
         gate_state=str(s.features.get("elliott_legacy_gate", "n/a")), reason=s.reason)
 
 
+async def _prefetch_evidence(sdb: RedisStateStore) -> Optional[Dict[str, Any]]:
+    """The Brain's evidence-cards blob for the informational Telegram block. One GET, started
+    before the CPU scan so its round trip is hidden. None on any failure; never raises."""
+    if not getattr(cfg, "ALERT_EVIDENCE_BLOCK", True):
+        return None
+    try:
+        raw = await sdb._safe_redis_op(lambda: _rc(sdb._redis).get(EVIDENCE_CARDS_KEY), 2.0, "evidence_cards_load")
+        return json_loads(raw) if raw else None
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return None
+
+
 async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stats
                ) -> Dict[str, int]:
     if cfg.DRY_RUN_MODE:
@@ -679,10 +710,10 @@ async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stat
     # One pipeline for both tracker hashes, started BEFORE the CPU scan so its
     # ~250 ms round-trip is paid by the analysis, not added to it.
     prefetch_task = asyncio.create_task(tracker.prefetch(sdb))
+    evidence_task = asyncio.create_task(_prefetch_evidence(sdb))
     try:
         sem = asyncio.Semaphore(max(1, int(cfg.EVAL_CONCURRENCY_LIMIT)))
         last_idx: Dict[str, int] = {}
-
         async def _one(pair: str):
             async with sem:
                 pd_15m = (parsed_cache.get(pair) or (None, None, None))[0]
@@ -701,9 +732,11 @@ async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stat
         track_pre, stats_pre = await prefetch_task
     except BaseException:
         prefetch_task.cancel()
+        evidence_task.cancel()
         raise
 
     # (pair, setup, is_primary) for every triggered candidate; primary = best per pair.
+
     all_c: List[Tuple[str, WaveSetup, bool]] = []
     events: List[Tuple[str, WaveEvent]] = []
     for pair, res in scanned:
@@ -791,8 +824,23 @@ async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stat
     if selected:
         verdicts = await tracker.verdicts_for(
             sdb, [s.family for _, s in selected], preloaded_stats=stats_pre)
+        evidence_cards: Optional[Dict[str, Optional[Dict[str, Any]]]] = None
+        if getattr(cfg, "ALERT_EVIDENCE_BLOCK", True):
+            try:
+                _blob = await evidence_task
+                _max_age = float(getattr(cfg, "ALERT_EVIDENCE_MAX_AGE_HOURS", 12.0)) * 3600.0
+                evidence_cards = {
+                    alert_key_of(s): evidence_card_lookup(_blob, alert_key_of(s), s.direction, _max_age)
+                    for _, s in selected
+                }
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.debug(f"Elliott evidence cards unavailable: {exc!r}")
+                evidence_cards = {}
         delivered_ids = await _deliver(selected, reference_time, sdb, tg, log,
-                                       stats, why_not, verdicts, releases)
+                                       stats, why_not, verdicts, releases,
+                                       evidence_cards=evidence_cards)
         for _, s in selected:
             if s.event_id not in delivered_ids and s.event_id in slots:
                 p, k = slots[s.event_id]
@@ -895,13 +943,14 @@ async def _deliver(selected: List[Tuple[str, WaveSetup]], reference_time: int,
                    sdb: RedisStateStore, tg: Any, log: logging.Logger,
                    stats: Dict[str, int], why_not: Dict[str, str],
                    verdicts: Optional[Dict[str, str]] = None,
-                   releases: Optional[List[str]] = None) -> set:
+                   releases: Optional[List[str]] = None,
+                   evidence_cards: Optional[Dict[str, Optional[Dict[str, Any]]]] = None) -> set:
     """Send ONE Telegram message with the selected setups, then record them as
     Recorded outcomes. A failed send is parked in the dead-letter queue together
     with the outcome rows it owes; if even that fails the claims are released so
     the next run can try again."""
     releases = releases if releases is not None else []
-    message = format_elliott_message([s for _, s in selected], verdicts)
+    message = format_elliott_message([s for _, s in selected], verdicts, evidence_cards)
     outcomes = [_outcome_kwargs(p, s, "delivered") for p, s in selected]
     sent = False
     try:

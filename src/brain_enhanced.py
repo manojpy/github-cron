@@ -93,6 +93,7 @@ class BrainEngineV2(BrainCore):
         self._repair_help_preds: Dict[str, float] = {}
         self._rows_cache: Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]] = None
         self._recent_rows_cache: Optional[List[Dict[str, Any]]] = None
+        self._elliott_rows_cache: Optional[List[Dict[str, Any]]] = None
         self._layered_rows_cache: Optional[Tuple[
             List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]
         ]] = None
@@ -331,6 +332,27 @@ class BrainEngineV2(BrainCore):
             logging.getLogger("macd_bot").debug(f"Brain: cached path lookup skipped: {e!r}")
             return rows
 
+    async def _load_elliott_rows(self) -> List[Dict[str, Any]]:
+        """Delivered Elliott outcome rows from the file archive (memoised per cycle). The legacy
+        loaders skip them on purpose, so they are read separately, never mixed into legacy analysis."""
+        cached = getattr(self, "_elliott_rows_cache", None)
+        if cached is not None:
+            return cached
+        rows: List[Dict[str, Any]] = []
+        data_dir = getattr(cfg, "OUTCOME_DATA_DIR", None) or os.environ.get("OUTCOME_DATA_DIR")
+        if data_dir and Path(data_dir).exists():
+            try:
+                got = await asyncio.to_thread(
+                    load_archived_outcomes, data_dir,
+                    window_days=getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30),
+                    shadow=False, include_elliott=True,
+                )
+                rows = [r for r in (got or []) if is_elliott_key(str(r.get("alert_key") or ""))]
+            except Exception as e:
+                logging.getLogger("macd_bot").debug(f"Brain: Elliott rows unavailable: {e!r}")
+        self._elliott_rows_cache = rows
+        return rows
+
     async def _load_rows(self) -> tuple:
         """Shared row loader — reads from archived files if available,
         otherwise falls back to Redis streams. Memoized per report cycle."""
@@ -422,9 +444,10 @@ class BrainEngineV2(BrainCore):
         self._rows_cache = None
         self._recent_rows_cache = None
         self._layered_rows_cache = None
+        self._elliott_rows_cache = None
         result = await self._generate_recommendations_full()
-
         self._recs_cache = result
+
         # Stamp the cache when the compute FINISHES: the pipeline can run longer
         # than the 120 s window, and a start-time stamp made the entry expire
         # before the second caller (e.g. the fallback report) could reuse it.
@@ -1518,9 +1541,8 @@ class BrainEngineV2(BrainCore):
                 try:
                     _real, _shadow = await self._get_rows()
                     # Elliott rows are split out so the legacy totals stay pure MACD.
-                    _all = list(_real or []) + list(_shadow or [])
-                    _ew_rows = [r for r in _all if is_elliott_key(str(r.get("alert_key") or ""))]
-                    recs["_elliott_rows"] = [r for r in (_real or []) if is_elliott_key(str(r.get("alert_key") or ""))]   # delivered Elliott alerts only (for the brief)
+                    _ew_rows = list(await self._load_elliott_rows())   # the legacy loaders skip Elliott rows on purpose
+                    recs["_elliott_rows"] = _ew_rows   # delivered Elliott alerts only (for the brief)
                     _legacy_real = [r for r in (_real or []) if not is_elliott_key(str(r.get("alert_key") or ""))]
                     _legacy_shadow = [r for r in (_shadow or []) if not is_elliott_key(str(r.get("alert_key") or ""))]
                     for _label, _rows in (("Recorded", _legacy_real), ("Shadowed", _legacy_shadow), ("Elliott", _ew_rows)):

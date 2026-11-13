@@ -783,13 +783,30 @@ class BrainCore:
             return self._playbook_cache
         if self.sdb.degraded or not self.sdb._redis:
             return None
+        if self.__dict__.get("_playbook_failures", 0) >= 2:
+            return None   # two failed reads this run: stop retrying, fail open
         async with self.__dict__.setdefault("_playbook_lock", asyncio.Lock()):
             now = time.time()
             if self._playbook_cache is not None and now - self._playbook_cache_ts <= 300:
                 return self._playbook_cache
-            raw = await self.sdb.get_metadata(PLAYBOOK_KEY)
+            if self.__dict__.get("_playbook_failures", 0) >= 2:
+                return None
+            async def _get_or_absent():
+                v = await _rc(self.sdb._redis).get(f"{self.sdb.meta_prefix}{PLAYBOOK_KEY}")
+                return v if v else _BLOB_ABSENT
+            t0 = time.time()
+            raw = await self.sdb._safe_redis_op(_get_or_absent, 5.0, f"get_metadata {PLAYBOOK_KEY}")
+            if raw is None:
+                # Timeout or Redis error, NOT "no playbook". Do not cache an empty playbook
+                # for it; the next caller retries once, then this run fails open.
+                self._playbook_failures = self.__dict__.get("_playbook_failures", 0) + 1
+                return None
+            self._playbook_failures = 0
+            if time.time() - t0 > 1.0 and raw != _BLOB_ABSENT:
+                logging.getLogger("macd_bot").warning(
+                    f"Playbook read was slow: {time.time() - t0:.1f}s for {len(raw) / 1024:.0f} KB")
             try:
-                blob = json.loads(raw) if raw else {}
+                blob = {} if raw == _BLOB_ABSENT else json.loads(raw)
             except (TypeError, ValueError):
                 blob = {}
             self._playbook_cache_ts = time.time()
@@ -1152,6 +1169,11 @@ class BrainCore:
         shadow_rows = self._parse_rows(shadow_raw, window_days=window_days)
 
         return real_rows, shadow_rows
+
+    async def _load_elliott_rows(self) -> List[Dict[str, Any]]:
+        """Delivered Elliott outcome rows. The Redis-stream path keeps none (legacy analysis
+        skips them); BrainEnhanced reads them from the file archive."""
+        return []
 
     async def _get_layered_window_rows(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Real-outcome rows for the recent/medium/long-history comparison
