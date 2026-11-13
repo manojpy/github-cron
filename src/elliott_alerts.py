@@ -207,7 +207,7 @@ def scan_pair(pair: str, pd_15m: Any, reference_time: int,
     return int(i), res
 
 
-# ── message ─────────────────────────────────────────────────���───────────
+# ── message ────────────────────────────────────────────────────────────
 def _px(x: float) -> str:
     ax = abs(x)
     if ax >= 1000:
