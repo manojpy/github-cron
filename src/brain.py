@@ -420,6 +420,33 @@ class BrainCore:
     # created lazily so engines built via cls.__new__ keep working.
     _BLOB_MISS_TTL_SEC = 30.0   # applies only to a CONFIRMED-absent key (see _load_json_cached)
     _BLOB_MAX_FAILURES = 2      # failed reads of one Brain blob per run before it is skipped (fail open)
+    _BLOB_READ_TIMEOUT_SEC = 4.0   # a new Valkey connection alone can take ~1.5 s; these reads overlap the candle fetch
+
+    async def _prefetch_blobs(self, keys: List[str]) -> None:
+        """One MGET for every Brain blob the alert path needs: one connection and one round trip
+        instead of one new connection per blob. The result is handed to the individual loaders
+        (they still own parsing, caching and failure bookkeeping) and used once. If the MGET fails,
+        nothing is prefetched and each loader reads for itself. Never raises."""
+        try:
+            ks = list(dict.fromkeys(keys))
+            if not ks or self.sdb.degraded or not self.sdb._redis:
+                return
+            t0 = time.monotonic()
+            res = await self.sdb._safe_redis_op(
+                lambda: _rc(self.sdb._redis).mget(ks), self._BLOB_READ_TIMEOUT_SEC, "brain_blob_prefetch")
+            took = time.monotonic() - t0
+            if not isinstance(res, (list, tuple)) or len(res) != len(ks):
+                return
+            store = self.__dict__.setdefault("_blob_prefetch", {})
+            total = 0
+            for k, v in zip(ks, res):
+                store[k] = v if v else _BLOB_ABSENT
+                total += len(v) if v else 0
+            if took > 1.0:
+                logging.getLogger("macd_bot").warning(
+                    f"Redis Brain blob prefetch was slow: {took:.1f}s for {len(ks)} keys, {total / 1024:.0f} KB")
+        except Exception as e:
+            logging.getLogger("macd_bot").debug(f"brain blob prefetch failed (non-fatal): {e!r}")
 
     def _spawn_blob_size_probe(self, key: str, label: str) -> None:
         """After a blob read fails, ask Redis for its size (STRLEN, 1 s) in the background and log it,
@@ -469,7 +496,11 @@ class BrainCore:
                 v = await _rc(self.sdb._redis).get(key)
                 return v if v else _BLOB_ABSENT
             t0 = time.monotonic()
-            raw = await self.sdb._safe_redis_op(_get_or_absent, 2.0, label)
+            prefetched = self.__dict__.get("_blob_prefetch", {})
+            if key in prefetched:
+                raw = prefetched.pop(key)   # from the one MGET in warm_dispatch_caches; used once
+            else:
+                raw = await self.sdb._safe_redis_op(_get_or_absent, self._BLOB_READ_TIMEOUT_SEC, label)
             took = time.monotonic() - t0
             if raw is None:
                 # timeout / Redis error: _safe_redis_op cannot tell us the key is missing, so do NOT
@@ -501,6 +532,11 @@ class BrainCore:
         series). Called while candles are still being fetched so the alert
         path finds warm caches. Never raises."""
         try:
+            await self._prefetch_blobs([
+                CALIBRATION_CURVES_KEY, MARKET_STATE_MODEL_KEY, ML_CALIBRATION_KEY,
+                QUALITY_INPUTS_KEY, EVIDENCE_CARDS_KEY,
+                *([f"{self.sdb.meta_prefix}{PLAYBOOK_KEY}"] if getattr(cfg, "PLAYBOOK_MODE", "off") != "off" else []),
+            ])
             await asyncio.gather(
                 self._load_calibration_curve("__warm__"),
                 self._load_batch_market_state_model(),
@@ -828,11 +864,16 @@ class BrainCore:
                 return self._playbook_cache
             if self.__dict__.get("_playbook_failures", 0) >= 2:
                 return None
+            pb_key = f"{self.sdb.meta_prefix}{PLAYBOOK_KEY}"
             async def _get_or_absent():
-                v = await _rc(self.sdb._redis).get(f"{self.sdb.meta_prefix}{PLAYBOOK_KEY}")
+                v = await _rc(self.sdb._redis).get(pb_key)
                 return v if v else _BLOB_ABSENT
             t0 = time.time()
-            raw = await self.sdb._safe_redis_op(_get_or_absent, 5.0, f"get_metadata {PLAYBOOK_KEY}")
+            prefetched = self.__dict__.get("_blob_prefetch", {})
+            if pb_key in prefetched:
+                raw = prefetched.pop(pb_key)   # from the one MGET in warm_dispatch_caches; used once
+            else:
+                raw = await self.sdb._safe_redis_op(_get_or_absent, 5.0, f"get_metadata {PLAYBOOK_KEY}")
             if raw is None:
                 # Timeout or Redis error, NOT "no playbook". Do not cache an empty playbook
                 # for it; the next caller retries once, then this run fails open.
