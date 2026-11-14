@@ -124,8 +124,8 @@ class Constants:
     PPO_RSI_GUARD_SELL = -0.50
     PPO_SIGNAL_CROSS_MAX_BUY = 0.30
     PPO_SIGNAL_CROSS_MIN_SELL = -0.30
-    RSI_SIGNAL_CROSS_MAX_BUY = 65
-    RSI_SIGNAL_CROSS_MIN_SELL = 35
+    RSI_SIGNAL_CROSS_MAX_BUY = 60
+    RSI_SIGNAL_CROSS_MIN_SELL = 40
     PPO_CROSS_STATIC = 0.18             # PPO crosses above +0.18 / below -0.18 (fixed, no volatility scaling)
     RSI_CROSS_STATIC_BUY = 55           # RSI crosses above this level
     RSI_CROSS_STATIC_SELL = 45          # RSI crosses below this level
