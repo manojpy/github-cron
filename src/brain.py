@@ -91,10 +91,11 @@ class BrainCore:
         conf_pct = (confluence_score / confluence_total) * 100.0
         if conf_pct < cfg.BRAIN_REWARDABLE_MIN_CONFLUENCE_PCT:
             return None
-
         if self.sdb.degraded or not self.sdb._redis:
             return None
 
+        if self.__dict__.get("_hiconf_failures", 0) >= self._BLOB_MAX_FAILURES:
+            return None   # two failed reads this run: stop paying the timeout per alert, fail open
         hiconf_key = f"{RedisKeyPrefix.SHADOW_HICONF_STATS}{alert_key}"
         try:
             data = await self.sdb._safe_redis_op(
@@ -102,9 +103,11 @@ class BrainCore:
             )
         except Exception:
             return None
+        if data is None:   # timeout / Redis error (a missing hash answers {})
+            self._hiconf_failures = self.__dict__.get("_hiconf_failures", 0) + 1
+            return None
         if not data:
             return None
-
         wins = _hget_int(data, "wins")
         losses = _hget_int(data, "losses")
         total = wins + losses
@@ -416,6 +419,27 @@ class BrainCore:
     # other modules set `_calib_cache` etc. directly) and the extra state is
     # created lazily so engines built via cls.__new__ keep working.
     _BLOB_MISS_TTL_SEC = 30.0   # applies only to a CONFIRMED-absent key (see _load_json_cached)
+    _BLOB_MAX_FAILURES = 2      # failed reads of one Brain blob per run before it is skipped (fail open)
+
+    def _spawn_blob_size_probe(self, key: str, label: str) -> None:
+        """After a blob read fails, ask Redis for its size (STRLEN, 1 s) in the background and log it,
+        so the log shows whether the blob is simply large. Never raises, never delays the caller."""
+        async def _probe() -> None:
+            n: Optional[int] = None
+            try:
+                n = int(await asyncio.wait_for(_rc(self.sdb._redis).strlen(key), timeout=1.0))
+            except Exception:
+                n = None
+            msg = (f"Brain blob {label} read failed; stored size is {n} bytes ({n / 1024:.0f} KB)"
+                   if n is not None else f"Brain blob {label} read failed; size unavailable (Redis did not answer in 1 s)")
+            logging.getLogger("macd_bot").warning(msg)
+        try:
+            tasks = self.__dict__.setdefault("_probe_tasks", set())
+            t = asyncio.ensure_future(_probe())
+            tasks.add(t)
+            t.add_done_callback(tasks.discard)
+        except Exception:
+            pass
 
     async def _load_json_cached(self, attr: str, ts_attr: str, key: str, label: str, post=None):
         now = time.time()
@@ -423,8 +447,11 @@ class BrainCore:
         if cached is not None and now - getattr(self, ts_attr, 0.0) <= 300:
             return cached
         misses = self.__dict__.setdefault("_blob_miss_ts", {})
+        failures = self.__dict__.setdefault("_blob_failures", {})
         if now - misses.get(key, 0.0) < self._BLOB_MISS_TTL_SEC:
             return None
+        if failures.get(key, 0) >= self._BLOB_MAX_FAILURES:
+            return None   # this blob already failed twice this run: stop paying the timeout, fail open
         if self.sdb.degraded or not self.sdb._redis:
             return None
         lock = self.__dict__.setdefault("_blob_locks", {}).setdefault(key, asyncio.Lock())
@@ -436,15 +463,25 @@ class BrainCore:
                 return cached
             if now - misses.get(key, 0.0) < self._BLOB_MISS_TTL_SEC:
                 return None
+            if failures.get(key, 0) >= self._BLOB_MAX_FAILURES:
+                return None   # a task ahead of us in the lock just failed it for the second time
             async def _get_or_absent():
                 v = await _rc(self.sdb._redis).get(key)
                 return v if v else _BLOB_ABSENT
+            t0 = time.monotonic()
             raw = await self.sdb._safe_redis_op(_get_or_absent, 2.0, label)
+            took = time.monotonic() - t0
             if raw is None:
-                # timeout / Redis error: _safe_redis_op cannot tell us the key is missing,
-                # so do NOT negative-cache (the next caller retries; the lock above still
-                # stops concurrent callers from each paying the timeout).
+                # timeout / Redis error: _safe_redis_op cannot tell us the key is missing, so do NOT
+                # negative-cache. Count the failure instead: after _BLOB_MAX_FAILURES this blob is
+                # skipped for the rest of the run (fail open) so a slow Valkey cannot stall every alert.
+                failures[key] = failures.get(key, 0) + 1
+                if failures[key] == 1:
+                    self._spawn_blob_size_probe(key, label)
                 return None
+            if raw != _BLOB_ABSENT and took > 1.0:
+                logging.getLogger("macd_bot").warning(
+                    f"Redis {label} read was slow: {took:.1f}s for {len(raw) / 1024:.0f} KB")
             if raw == _BLOB_ABSENT:
                 misses[key] = time.time()
                 return None
