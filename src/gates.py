@@ -485,7 +485,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
   
         logger_pair.debug(
             f"[{pair_name}] 🕯️ Candle | O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} | "
-            f"{'���� GREEN' if is_green else '🔴 RED'} | "
+            f"{'🟢 GREEN' if is_green else '🔴 RED'} | "
             f"ValidBuy={is_valid_for_buy} ValidSell={is_valid_for_sell}"
         )
         open_curr = o

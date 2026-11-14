@@ -851,7 +851,7 @@ def repair_shop_diagnosis(rows: List[Row], drift_alerts: List[Dict[str, Any]], c
             "scope": {"kind": "global"},
         })
 
-    # ── 7. Sample size warning ─��
+    # ── 7. Sample size warning ─
     if n < 200:
         repairs.append({
             "severity": "medium",

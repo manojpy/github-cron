@@ -1013,7 +1013,7 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
         if rk and conditional_states.get(rk, False) and cond:
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
-    # ── Order Block reversal ─��
+    # ── Order Block reversal ─
     for k, ok_key in ((AlertKey.OB_REVERSAL_BUY, "ob_gate_ok_buy"), (AlertKey.OB_REVERSAL_SELL, "ob_gate_ok_sell")):
         rk = ALERT_KEYS.get(k)
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
