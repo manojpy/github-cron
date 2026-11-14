@@ -408,8 +408,6 @@ class BotConfig(BaseModel):
     ELLIOTT_WAVE_ENABLE_EXHAUSTION_EVENTS: bool = Field(default=True, description="Detect and record Wave 5 exhaustion events (finished impulse with divergence or a truncated fifth). Never delivered to Telegram and never an outcome row: tracked and archived only, to measure reversal behaviour")
     ELLIOTT_WAVE_TRACK_MAX_BARS: int = Field(default=48, ge=8, le=288, description="How many closed 15m candles a structure is followed after its signal (structural stop / invalidation / targets, MFE / MAE, volume) before it is recorded as expired")
     ELLIOTT_WAVE_VERDICT_MIN_SAMPLES: int = Field(default=30, ge=5, le=500, description="Decided structures (first target before invalidation, or the reverse) a wave family needs before the Telegram alert shows TAKE / WATCH / AVOID instead of LEARNING")
-    ELLIOTT_WAVE_VERDICT_TAKE_RATE: float = Field(default=0.55, ge=0.1, le=0.95, description="Share of decided structures reaching the first target before invalidation at or above which the verdict is TAKE. Informational only: the verdict never gates or ranks an alert")
-    ELLIOTT_WAVE_VERDICT_AVOID_RATE: float = Field(default=0.40, ge=0.05, le=0.9, description="Share below which the verdict is AVOID (between the two rates = WATCH). Informational only")
     EXHAUSTION_MODE: str = Field(default="shadow", pattern="^(off|shadow|live)$", description="Late-trend exhaustion filter for the host alerts (same list as the pullback layer). off = not computed; shadow = score computed, stored with every Recorded/Shadowed trade and shown on the alert, nothing blocked; live = a host alert whose exhaustion score reaches EXHAUSTION_VETO_SCORE (in at least EXHAUSTION_MIN_CATEGORIES categories) is not sent and is shadow-tracked as 'exhaustion_veto'. Existing alert conditions are never changed. Keep shadow until the Brain's exhaustion study shows the veto catches early stops without losing winners")
     EXHAUSTION_SCOPE: str = Field(default="all", pattern="^(all|hosts)$", description="Which alerts the exhaustion filter covers. all = every alert (pivot, cross, reversal, trendline...), measured in the alert's own direction; hosts = only the pullback-layer host alerts")
     EXHAUSTION_EXCLUDE_KEYS: List[str] = Field(default_factory=list, description="Alert keys the exhaustion filter never touches, e.g. [\"tl_break_buy\"]. Empty = none excluded")
@@ -458,12 +456,6 @@ class BotConfig(BaseModel):
     VOLUME_PCTL_MIN_HISTORY: int = Field(default=50, ge=10, le=400, description="Min warm-up samples before volume percentile activates; fails open (vote excluded) until then")
     ADX_ADAPTIVE_BAND_WIDTH: float = Field(default=0.0, ge=0.0, le=40.0)
     ADX_ADAPTIVE_FALLBACK: float = Field(default=18.0, ge=5.0, le=50.0, description="ADX threshold used during warm-up or when ATR_ADAPTIVE_ENABLED=False")
-    PPO_ADAPTIVE_CALM: float = Field(default=0.08, ge=0.01, le=1.0, description="PPO cross threshold in calm regime")
-    PPO_ADAPTIVE_VOLATILE: float = Field(default=0.20, ge=0.01, le=1.0, description="PPO cross threshold in volatile regime")
-    RSI_ADAPTIVE_BUY_CALM: float = Field(default=55.0, ge=45.0, le=90.0, description="RSI buy level in calm regime")
-    RSI_ADAPTIVE_BUY_VOLATILE: float = Field(default=70.0, ge=45.0, le=90.0, description="RSI buy level in volatile regime")
-    RSI_ADAPTIVE_SELL_CALM: float = Field(default=45.0, ge=10.0, le=55.0, description="RSI sell level in calm regime")
-    RSI_ADAPTIVE_SELL_VOLATILE: float = Field(default=30.0, ge=10.0, le=55.0, description="RSI sell level in volatile regime")
     MAX_CANDLE_STALENESS_SEC: int = Field(default=1200, ge=600, le=3600)  # Max candle age in seconds (10-60 min)
     LAST_CANDLE_STALE_AFTER_SEC: int = Field(default=2700, ge=900, le=86400, description="Run summary flags a pair as STALE when its last successfully evaluated 15m candle opened more than this many seconds ago (default 2700 = 3 candles).")
     RATE_LIMIT_PER_MINUTE: int = Field(default=400, ge=90, le=600)
@@ -703,22 +695,6 @@ class BotConfig(BaseModel):
             raise ValueError(
                 f'ADAPTIVE_MULT_CALM ({self.ADAPTIVE_MULT_CALM}) must be < '
                 f'ADAPTIVE_MULT_VOLATILE ({self.ADAPTIVE_MULT_VOLATILE})'
-            )
-        if self.PPO_ADAPTIVE_CALM >= self.PPO_ADAPTIVE_VOLATILE:
-            raise ValueError(
-                f'PPO_ADAPTIVE_CALM ({self.PPO_ADAPTIVE_CALM}) must be < '
-                f'PPO_ADAPTIVE_VOLATILE ({self.PPO_ADAPTIVE_VOLATILE})'
-            )
-        if self.RSI_ADAPTIVE_BUY_CALM >= self.RSI_ADAPTIVE_BUY_VOLATILE:
-            raise ValueError(
-                f'RSI_ADAPTIVE_BUY_CALM ({self.RSI_ADAPTIVE_BUY_CALM}) must be < '
-                f'RSI_ADAPTIVE_BUY_VOLATILE ({self.RSI_ADAPTIVE_BUY_VOLATILE})'
-            )
-        if self.RSI_ADAPTIVE_SELL_CALM <= self.RSI_ADAPTIVE_SELL_VOLATILE:
-            raise ValueError(
-                f'RSI_ADAPTIVE_SELL_CALM ({self.RSI_ADAPTIVE_SELL_CALM}) must be > '
-                f'RSI_ADAPTIVE_SELL_VOLATILE ({self.RSI_ADAPTIVE_SELL_VOLATILE}) '
-                f'— sell threshold drops as volatility rises'
             )
         if self.CPR_ADAPTIVE_CALM >= self.CPR_ADAPTIVE_VOLATILE:
             raise ValueError(

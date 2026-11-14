@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 from brain_audit import DataCoverage, HealthStatus, get_audit
-from bot_config import cfg, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS, json_dumps, json_loads
+from bot_config import cfg, Constants, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS, json_dumps, json_loads
 from brain_helpers import _extract_p_value_for_fdr, HYPOTHESIS_LEDGER_KEY, collect_conclusions, update_hypothesis_ledger
 import threshold_engine as engine
 from threshold_engine import (
@@ -568,16 +568,10 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
     # ── Phase 2: Parameter Autopsy ─────────────────────────────────
     if real_rows and any("context" in r for r in real_rows):
         PARAM_ALERT_MAP = {
-            "ppo_adaptive_threshold": ["ppo_adaptive_up", "ppo_adaptive_down"],
-            "rsi_adaptive_buy": ["rsi_ema5_up", "rsi_cross_adaptive_up"],
-            "rsi_adaptive_sell": ["rsi_ema5_down", "rsi_cross_adaptive_down"],
             "buy_wick_ratio": ["strong_reversal_buy", "hist_rma_buy", "ppohist_buy", "tk_conversion_up", "kijun_cross_up"],
             "sell_wick_ratio": ["strong_reversal_sell", "hist_rma_sell", "ppohist_sell", "tk_conversion_down", "kijun_cross_down"],
         }
         params_higher_worse = {
-            "rsi_adaptive_buy": True,
-            "rsi_adaptive_sell": False,
-            "ppo_adaptive_threshold": True,
             "buy_wick_ratio": True,
             "sell_wick_ratio": True,
         }
@@ -611,20 +605,6 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
                     "n": last_bucket["n"],
                     "wr": last_bucket["wr"],
                 })
-                config_path = None
-                if param == "ppo_adaptive_threshold":
-                    config_path = "PPO_ADAPTIVE_VOLATILE" if higher_is_worse else "PPO_ADAPTIVE_CALM"
-                elif param == "rsi_adaptive_buy":
-                    config_path = "RSI_ADAPTIVE_BUY_VOLATILE"
-                elif param == "rsi_adaptive_sell":
-                    config_path = "RSI_ADAPTIVE_SELL_VOLATILE"
-                if config_path and config_path not in {p["path"] for p in config_patch}:
-                    config_patch.append({
-                        "path": config_path,
-                        "current": getattr(cfg, config_path, None),
-                        "suggested": round(autopsy["optimal_cutoff"], 3),
-                        "reason": f"Parameter autopsy: WR drops above {autopsy['optimal_cutoff']:.2f}",
-                    })
 
     _phase_mark("parameter_autopsy")
 
@@ -713,9 +693,9 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
             shadow_baseline_ev, _hk, _swr = engine.ev_and_kelly_for(shadow_rows)
 
         rsi_cap_ok = any(
-            "context" in r and r["context"].get("rsi_adaptive_buy") for r in real_rows
+            "context" in r and r["context"].get("rsi_curr") is not None for r in real_rows
         )
-        rsi_cap = getattr(cfg, "RSI_ADAPTIVE_BUY_VOLATILE", 70.0) - 3
+        rsi_cap = Constants.RSI_SIGNAL_CROSS_MAX_BUY - 3
         specs: List[Dict[str, Any]] = [
             {"label": f"Threshold +1 ({cfg.CONFLUENCE_MIN_ABS_SCORE + 1.0})",
              "new_threshold": cfg.CONFLUENCE_MIN_ABS_SCORE + 1.0, "new_params": None},

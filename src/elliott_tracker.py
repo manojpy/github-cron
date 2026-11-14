@@ -38,11 +38,11 @@ the number of SEQUENTIAL commands, not their size, is what costs runtime.
 Semantics are unchanged: a structure is registered once per claim TTL and then left exactly as it was, and counters are still incremented ONLY by the caller whose HDEL
 actually removed the record (at-most-once counting under concurrent runs).
 
-The verdict line shown in the Telegram alert is informational only: it never
-gates or ranks anything.
+The record line shown in the Telegram alert is informational only: it never
+gates or ranks anything, and it carries no TAKE / WATCH / AVOID label (the cost-aware
+TRADE EVIDENCE block does the judging).
 """
 from __future__ import annotations
-
 import asyncio
 import logging
 import time
@@ -530,26 +530,23 @@ def _verdict_from(st: Dict[str, int], family: str) -> str:
     adv = sum(g(gr, "adverse") for gr in ("delivered", "shadow"))
     n_dec = succ + adv
     need = int(cfg.ELLIOTT_WAVE_VERDICT_MIN_SAMPLES)
+    # A plain record, not a verdict: it counts first-target-before-invalidation on each setup's own
+    # structure and ignores costs, so it must not read as TAKE / WATCH / AVOID next to the
+    # cost-aware TRADE EVIDENCE block, which carries the verdict.
     if n_dec < need:
-        return (f"Brain: LEARNING — {family} first target before invalidation "
-                f"{succ}/{n_dec} (need {need})")
+        return (f"Elliott record: {family} reached its first target before invalidation "
+                f"{succ}/{n_dec} (need {need} decided). Not cost-adjusted.")
     rate = succ / n_dec
-    if rate >= float(cfg.ELLIOTT_WAVE_VERDICT_TAKE_RATE):
-        v = "TAKE"
-    elif rate < float(cfg.ELLIOTT_WAVE_VERDICT_AVOID_RATE):
-        v = "AVOID"
-    else:
-        v = "WATCH"
-    return (f"Brain: {v} — {family} first target before invalidation "
-            f"{succ}/{n_dec} ({rate:.0%})")
+    return (f"Elliott record: {family} reached its first target before invalidation "
+            f"{succ}/{n_dec} ({rate:.0%}). Not cost-adjusted.")
 
 
 async def verdicts_for(sdb: RedisStateStore, families: Sequence[str],
                        *, preloaded_stats: Optional[Dict[str, int]] = None
                        ) -> Dict[str, str]:
-    """One informational line per family, from ONE HGETALL (or the prefetch).
-    TAKE / WATCH / AVOID only once the sample is large enough; before that it
-    says it is learning. Never gates or ranks anything."""
+    """One informational line per family, from ONE HGETALL (or the prefetch): the plain
+    first-target-before-invalidation record, with no TAKE / WATCH / AVOID label.
+    Never gates or ranks anything."""
     fams = sorted(set(families))
     if not fams:
         return {}

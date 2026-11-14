@@ -51,9 +51,6 @@ except ImportError:
     ALLOWED_FIELDS = {
         "CONFLUENCE_MIN_ABS_SCORE",
         "CONFLUENCE_MIN_PCT",
-        "RSI_ADAPTIVE_BUY_VOLATILE",
-        "RSI_ADAPTIVE_SELL_VOLATILE",
-        "PPO_ADAPTIVE_VOLATILE",
     }
 
 METADATA_PREFIX = "metadata:"

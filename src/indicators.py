@@ -2111,16 +2111,6 @@ def get_adaptive_threshold(atr_long_arr, i15, cfg, calm_attr: str, volatile_attr
         pctl = _get_smoothed_pctl(atr_long_arr, i15, cfg)
     return _scale_by_pctl(pctl, getattr(cfg, calm_attr), getattr(cfg, volatile_attr))
 
-def get_adaptive_ppo_threshold(atr_long_arr, i15, cfg, pctl: Optional[float] = None) -> float:
-    return get_adaptive_threshold(atr_long_arr, i15, cfg, "PPO_ADAPTIVE_CALM", "PPO_ADAPTIVE_VOLATILE", pctl=pctl)
-
-def get_adaptive_rsi_thresholds(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig, pctl: Optional[float] = None) -> Tuple[float, float]:
-    if pctl is None:
-        pctl = _get_smoothed_pctl(atr_long_arr, i15, cfg)
-    buy = _scale_by_pctl(pctl, cfg.RSI_ADAPTIVE_BUY_CALM, cfg.RSI_ADAPTIVE_BUY_VOLATILE)
-    sell = _scale_by_pctl(pctl, cfg.RSI_ADAPTIVE_SELL_CALM, cfg.RSI_ADAPTIVE_SELL_VOLATILE)
-    return buy, sell
-
 def get_adaptive_cpr_threshold(atr_long_arr, i15, cfg, pctl: Optional[float] = None) -> float:
     return get_adaptive_threshold(atr_long_arr, i15, cfg, "CPR_ADAPTIVE_CALM", "CPR_ADAPTIVE_VOLATILE", pctl=pctl)
 

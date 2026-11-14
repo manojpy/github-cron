@@ -12,8 +12,8 @@ from fetcher import PriceData, get_last_closed_index_from_array, validate_candle
 from state import RedisStateStore, _blanket_reset_pair
 from indicators import (
     calculate_gate_indicators_numpy, get_atr_percentile, get_adx_percentile,
-    get_volume_percentile, get_adaptive_rvol_threshold, get_adaptive_ppo_threshold,
-    get_adaptive_rsi_thresholds, get_adaptive_cpr_threshold, _order_block_gate_reason,
+    get_volume_percentile, get_adaptive_rvol_threshold,
+    get_adaptive_cpr_threshold, _order_block_gate_reason,
     _oi_funding_gate_reason, get_adaptive_adx_threshold_smoothed, _get_smoothed_pctl,
     _choch_gate_reason, _trendline_events, calculate_ob_equilibrium,
 )
@@ -146,10 +146,6 @@ class GateResult:
     effective_cpr_ok: bool
     cpr_adaptive_min_pct_move: float
     move_from_prev_close_ok: bool
-
-    # -- adaptive thresholds carried into Phase 2 --
-    ppo_adaptive_threshold: float
-    rsi_adaptive_buy: float; rsi_adaptive_sell: float
 
     # -- final gate decision --
     buy_common: bool
@@ -489,7 +485,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
   
         logger_pair.debug(
             f"[{pair_name}] 🕯️ Candle | O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} | "
-            f"{'🟢 GREEN' if is_green else '🔴 RED'} | "
+            f"{'���� GREEN' if is_green else '🔴 RED'} | "
             f"ValidBuy={is_valid_for_buy} ValidSell={is_valid_for_sell}"
         )
         open_curr = o
@@ -711,8 +707,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         atr_ratio = (atr_short_val / atr_long_val) if atr_ratio_valid else float('nan')
         shared_smoothed_pctl = _get_smoothed_pctl(atr_long_arr, i15, cfg)
         adaptive_threshold = get_adaptive_rvol_threshold(atr_long_arr, i15, cfg, pctl=shared_smoothed_pctl)
-        ppo_adaptive_threshold = get_adaptive_ppo_threshold(atr_long_arr, i15, cfg, pctl=shared_smoothed_pctl)
-        rsi_adaptive_buy, rsi_adaptive_sell = get_adaptive_rsi_thresholds(atr_long_arr, i15, cfg, pctl=shared_smoothed_pctl)
         cpr_adaptive_min_pct_move = get_adaptive_cpr_threshold(atr_long_arr, i15, cfg, pctl=shared_smoothed_pctl)
 
         volume_curr = data_15m.volume[i15]
@@ -1371,8 +1365,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             volume_pctl=volume_pctl, volume_pctl_ok=volume_pctl_ok,
             cpr_ok=cpr_ok, nr_cpr=nr_cpr, effective_cpr_ok=effective_cpr_ok,
             cpr_adaptive_min_pct_move=cpr_adaptive_min_pct_move, move_from_prev_close_ok=move_from_prev_close_ok,
-            ppo_adaptive_threshold=ppo_adaptive_threshold,
-            rsi_adaptive_buy=rsi_adaptive_buy, rsi_adaptive_sell=rsi_adaptive_sell,
             buy_common=buy_common, sell_common=sell_common,
             buy_trend_common=buy_trend_common, sell_trend_common=sell_trend_common,
             buy_trend_common_relaxed=buy_trend_common_relaxed, sell_trend_common_relaxed=sell_trend_common_relaxed,

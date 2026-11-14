@@ -502,10 +502,7 @@ async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, a
         if gr is not None:
             rich_fields.update({
                 "rsi_curr": (context or {}).get("rsi_curr"),
-                "rsi_adaptive_buy": gr.rsi_adaptive_buy,
-                "rsi_adaptive_sell": gr.rsi_adaptive_sell,
                 "ppo_curr": (context or {}).get("ppo_curr"),
-                "ppo_adaptive_threshold": gr.ppo_adaptive_threshold,
                 "buy_wick_ratio": gr.buy_wick_ratio,
                 "sell_wick_ratio": gr.sell_wick_ratio,
                 "adx_val": gr.adx_val,
@@ -845,8 +842,8 @@ class AlertRule:
 _ALERT_DEFINITIONS_RAW: List[Dict[str, Any]] = [
     {"key":"ppo_signal_up","title":"🟢 PPO cross▲signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and (ppo.get("prev",np.nan)<=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)>ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal","ppo_alerts"]},
     {"key":"ppo_signal_down","title":"🔴 PPO cross▼signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and (ppo.get("prev",np.nan)>=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)<ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal","ppo_alerts"]},
-    {"key":"rsi_ema5_up","title":"🟢 RSI▲EMA5","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and (rsi.get("prev",50)<=rsi.get("ema_prev",50)) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("curr",50)<ctx.get("rsi_adaptive_buy",60)) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",50)<Constants.RSI_SIGNAL_CROSS_MAX_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▲EMA5 {rsi.get('ema_curr',50):.2f} | cap {ctx.get('rsi_adaptive_buy',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["rsi","rsi_alerts"]},
-    {"key":"rsi_ema5_down","title":"🔴 RSI▼EMA5","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and (rsi.get("prev",50)>=rsi.get("ema_prev",50)) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("curr",50)>ctx.get("rsi_adaptive_sell",40)) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",50)>Constants.RSI_SIGNAL_CROSS_MIN_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼EMA5 {rsi.get('ema_curr',50):.2f} | cap {ctx.get('rsi_adaptive_sell',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["rsi","rsi_alerts"]},
+    {"key":"rsi_ema5_up","title":"🟢 RSI▲EMA5","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and (rsi.get("prev",50)<=rsi.get("ema_prev",50)) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("curr",50)<Constants.RSI_SIGNAL_CROSS_MAX_BUY) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",50)<Constants.RSI_SIGNAL_CROSS_MAX_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▲EMA5 {rsi.get('ema_curr',50):.2f} | cap {Constants.RSI_SIGNAL_CROSS_MAX_BUY:g} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["rsi","rsi_alerts"]},
+    {"key":"rsi_ema5_down","title":"🔴 RSI▼EMA5","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and (rsi.get("prev",50)>=rsi.get("ema_prev",50)) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("curr",50)>Constants.RSI_SIGNAL_CROSS_MIN_SELL) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",50)>Constants.RSI_SIGNAL_CROSS_MIN_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼EMA5 {rsi.get('ema_curr',50):.2f} | cap {Constants.RSI_SIGNAL_CROSS_MIN_SELL:g} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["rsi","rsi_alerts"]},   
     {"key":"vwap_up","title":"🔵▲ VWAP Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_wick",False) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
     {"key":"vwap_down","title":"🟣▼ VWAP Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_wick",False) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
     {"key":"cloud_cross_up","title":"☁️🟢 Ichimoku Cloud Up Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Upper {ctx.get('cloud_upper_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
@@ -855,10 +852,10 @@ _ALERT_DEFINITIONS_RAW: List[Dict[str, Any]] = [
     {"key":"ob_reversal_sell","title":"🔴🏛 Order Block Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and ctx.get("ob_gate_ok_sell",False) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}","requires":[]},
     {"key":"ppo_zero_up","title":"🟢 PPO cross▲0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_wick",False) and (ppo.get("prev",np.nan)<=0.0) and (ppo.get("curr",np.nan)>0.0) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_alerts"]},
     {"key":"ppo_zero_down","title":"🔴 PPO cross▼0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_wick",False) and (ppo.get("prev",np.nan)>=0.0) and (ppo.get("curr",np.nan)<0.0) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_alerts"]},
-    {"key":"ppo_adaptive_up","title":"🟢 PPO cross▲adapt","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and (ppo.get("prev",np.nan)<=ctx.get("ppo_adaptive_threshold",0.11)) and (ppo.get("curr",np.nan)>ctx.get("ppo_adaptive_threshold",0.11)) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs adapt {ctx.get('ppo_adaptive_threshold',0):.3f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_alerts"]},
-    {"key":"ppo_adaptive_down","title":"🔴 PPO cross▼adapt","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and (ppo.get("prev",np.nan)>=-ctx.get("ppo_adaptive_threshold",0.11)) and (ppo.get("curr",np.nan)<-ctx.get("ppo_adaptive_threshold",0.11)) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs adapt {-ctx.get('ppo_adaptive_threshold',0):.3f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_alerts"]},
-    {"key":"rsi_cross_adaptive_up","title":"🟢 RSI▲adapt","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("prev",50)<=ctx.get("rsi_adaptive_buy",60)) and (rsi.get("curr",50)>ctx.get("rsi_adaptive_buy",60)) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▲{ctx.get('rsi_adaptive_buy',0):.1f} | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["rsi","rsi_alerts"]},
-    {"key":"rsi_cross_adaptive_down","title":"🔴 RSI▼adapt","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("prev",50)>=ctx.get("rsi_adaptive_sell",40)) and (rsi.get("curr",50)<ctx.get("rsi_adaptive_sell",40)) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼{ctx.get('rsi_adaptive_sell',0):.1f} | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["rsi","rsi_alerts"]},
+    {"key":"ppo_adaptive_up","title":"🟢 PPO cross▲static","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and (ppo.get("prev",np.nan)<=Constants.PPO_CROSS_STATIC) and (ppo.get("curr",np.nan)>Constants.PPO_CROSS_STATIC) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs static {Constants.PPO_CROSS_STATIC:.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_alerts"]},
+    {"key":"ppo_adaptive_down","title":"🔴 PPO cross▼static","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and (ppo.get("prev",np.nan)>=-Constants.PPO_CROSS_STATIC) and (ppo.get("curr",np.nan)<-Constants.PPO_CROSS_STATIC) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs static {-Constants.PPO_CROSS_STATIC:.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_alerts"]},
+    {"key":"rsi_cross_adaptive_up","title":"🟢 RSI▲static","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("prev",50)<=Constants.RSI_CROSS_STATIC_BUY) and (rsi.get("curr",50)>Constants.RSI_CROSS_STATIC_BUY) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▲{Constants.RSI_CROSS_STATIC_BUY:g} | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["rsi","rsi_alerts"]},
+    {"key":"rsi_cross_adaptive_down","title":"🔴 RSI▼static","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("prev",50)>=Constants.RSI_CROSS_STATIC_SELL) and (rsi.get("curr",50)<Constants.RSI_CROSS_STATIC_SELL) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼{Constants.RSI_CROSS_STATIC_SELL:g} | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["rsi","rsi_alerts"]},
     {"key":"hist_rma_buy","title":"🔵⬆️ RMA Rev BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and ctx.get("hist_reversal_buy",False) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"hist_rma_sell","title":"🟣 ⬇️ RMA Rev SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and ctx.get("hist_reversal_sell",False) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"ppohist_buy","title":"🟢🔥 PPO Rev BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and ctx.get("ppohist_reversal_buy",False) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppohist"]},
@@ -946,7 +943,7 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
     # ── PPO ──
     ppo_c, ppo_p = context["ppo_curr"], context["ppo_prev"]
     ps_c,  ps_p  = context["ppo_sig_curr"], context["ppo_sig_prev"]
-    thr = context["ppo_adaptive_threshold"]
+    thr = Constants.PPO_CROSS_STATIC
     _add(AlertKey.PPO_SIGNAL_UP, AlertKey.PPO_SIGNAL_DOWN, ppo_c, ppo_p, ps_c, ps_p, ps_c, ps_p)
     _add(AlertKey.PPO_ZERO_UP,   AlertKey.PPO_ZERO_DOWN,   ppo_c, ppo_p, 0.0, 0.0, 0.0, 0.0)
     _add(AlertKey.PPO_ADAPTIVE_UP, AlertKey.PPO_ADAPTIVE_DOWN, ppo_c, ppo_p, thr, thr, -thr, -thr)
@@ -955,7 +952,7 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
     rsi_c, rsi_p = context["rsi_curr"], context["rsi_prev"]
     ema_c, ema_p = context["rsi_ema_curr"], context["rsi_ema_prev"]
     _add(AlertKey.RSI_EMA5_UP, AlertKey.RSI_EMA5_DOWN, rsi_c, rsi_p, ema_c, ema_p, ema_c, ema_p)
-    buy_thr, sell_thr = context["rsi_adaptive_buy"], context["rsi_adaptive_sell"]
+    buy_thr, sell_thr = Constants.RSI_CROSS_STATIC_BUY, Constants.RSI_CROSS_STATIC_SELL
     _add(AlertKey.RSI_CROSS_ADAPTIVE_UP, AlertKey.RSI_CROSS_ADAPTIVE_DOWN,
          rsi_c, rsi_p, buy_thr, buy_thr, sell_thr, sell_thr)
 
@@ -1016,7 +1013,7 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
         if rk and conditional_states.get(rk, False) and cond:
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
-    # ── Order Block reversal ──
+    # ── Order Block reversal ─��
     for k, ok_key in ((AlertKey.OB_REVERSAL_BUY, "ob_gate_ok_buy"), (AlertKey.OB_REVERSAL_SELL, "ob_gate_ok_sell")):
         rk = ALERT_KEYS.get(k)
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
@@ -2033,8 +2030,6 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
     effective_cpr_ok = gr.effective_cpr_ok
     cpr_adaptive_min_pct_move = gr.cpr_adaptive_min_pct_move
     move_from_prev_close_ok = gr.move_from_prev_close_ok
-    ppo_adaptive_threshold = gr.ppo_adaptive_threshold
-    rsi_adaptive_buy, rsi_adaptive_sell = gr.rsi_adaptive_buy, gr.rsi_adaptive_sell
     buy_common, sell_common = gr.buy_common, gr.sell_common
     buy_trend_common, sell_trend_common = gr.buy_trend_common, gr.sell_trend_common
     buy_trend_common_relaxed, sell_trend_common_relaxed = gr.buy_trend_common_relaxed, gr.sell_trend_common_relaxed
@@ -2336,9 +2331,6 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "ppohist_m2": ppohist_m2, "ppohist_m3": ppohist_m3,
             "ppohist_reversal_buy": ppohist_reversal_buy, "ppohist_reversal_sell": ppohist_reversal_sell,
             "adx_adaptive_threshold": adx_adaptive_threshold,
-            "ppo_adaptive_threshold": ppo_adaptive_threshold,
-            "rsi_adaptive_buy": rsi_adaptive_buy,
-            "rsi_adaptive_sell": rsi_adaptive_sell,
             "buy_wick_ratio": buy_wick_ratio,
             "sell_wick_ratio": sell_wick_ratio,
             "is_green": is_green, "is_red": is_red,
@@ -2935,10 +2927,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     rma_cloud_ok_buy, rma_cloud_ok_sell = gr.rma_cloud_ok_buy, gr.rma_cloud_ok_sell
     adx_val, adx_adaptive_threshold, adx_ok = gr.adx_val, gr.adx_adaptive_threshold, gr.adx_ok
     rvol_ok = gr.rvol_ok
-    ppo_adaptive_threshold = gr.ppo_adaptive_threshold
-    rsi_adaptive_buy, rsi_adaptive_sell = gr.rsi_adaptive_buy, gr.rsi_adaptive_sell
+    ppo_static_level = Constants.PPO_CROSS_STATIC
     buy_common, sell_common = gr.buy_common, gr.sell_common
-
     hist_curr, hist_m1, hist_m2, hist_m3 = context["hist_curr"], context["hist_m1"], context["hist_m2"], context["hist_m3"]
     hist_reversal_buy, hist_reversal_sell = context["hist_reversal_buy"], context["hist_reversal_sell"]
     vwap_curr, vwap_prev, vwap_available = context["vwap_curr"], context["vwap_prev"], context["vwap_available"]
@@ -3297,10 +3287,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         try:
                             live_context = {
                                 "rsi_curr": context.get("rsi_curr"),
-                                "rsi_adaptive_buy": gr.rsi_adaptive_buy,
-                                "rsi_adaptive_sell": gr.rsi_adaptive_sell,
                                 "ppo_curr": context.get("ppo_curr"),
-                                "ppo_adaptive_threshold": gr.ppo_adaptive_threshold,
                                 "buy_wick_ratio": gr.buy_wick_ratio,
                                 "sell_wick_ratio": gr.sell_wick_ratio,
                                 "adx_val": adx_val,
@@ -3576,10 +3563,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 # ── Shadow record for the counterfactual dataset ──
                 shadow_context = {
                     "rsi_curr": context.get("rsi_curr"),
-                    "rsi_adaptive_buy": gr.rsi_adaptive_buy,
-                    "rsi_adaptive_sell": gr.rsi_adaptive_sell,
                     "ppo_curr": context.get("ppo_curr"),
-                    "ppo_adaptive_threshold": gr.ppo_adaptive_threshold,
                     "buy_wick_ratio": gr.buy_wick_ratio,
                     "sell_wick_ratio": gr.sell_wick_ratio,
                     "adx_val": gr.adx_val,
@@ -3707,10 +3691,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 s, t, v = _confluence_for(alert_key)
                 trigger_context = {
                     "rsi_curr": context.get("rsi_curr"),
-                    "rsi_adaptive_buy": gr.rsi_adaptive_buy,
-                    "rsi_adaptive_sell": gr.rsi_adaptive_sell,
                     "ppo_curr": context.get("ppo_curr"),
-                    "ppo_adaptive_threshold": gr.ppo_adaptive_threshold,
                     "buy_wick_ratio": gr.buy_wick_ratio,
                     "sell_wick_ratio": gr.sell_wick_ratio,
                     "adx_val": gr.adx_val,
@@ -4445,7 +4426,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         if not alerts_to_send:
             if not buy_common and not sell_common:
                 reasons.append("Trend filter blocked")
-
             if context.get("pivot_suppressions"):
                 reasons.extend(context["pivot_suppressions"])
 
@@ -4473,40 +4453,41 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     reasons.append(
                         f"PPO<0 blocked: market filter "
                         f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
+
                         f"rvol_ok={rvol_ok})"
                     )
        
-            if ppo_prev <= ppo_adaptive_threshold and ppo_curr > ppo_adaptive_threshold and not buy_common:
+            if ppo_prev <= ppo_static_level and ppo_curr > ppo_static_level and not buy_common:
                 if not base_buy_trend:
-                    reasons.append("PPO>+adapt blocked: base_buy_trend=False")
+                    reasons.append("PPO>+static blocked: base_buy_trend=False")
                 elif not confirmation_buy:
-                    reasons.append("PPO>+adapt blocked: confirmation_buy=False (future cloud)")
+                    reasons.append("PPO>+static blocked: confirmation_buy=False (future cloud)")
                 elif not is_valid_for_buy:
-                    reasons.append("PPO>+adapt blocked: Knox rejected candle")
+                    reasons.append("PPO>+static blocked: Knox rejected candle")
                 else:
                     reasons.append(
-                        f"PPO>+{ppo_adaptive_threshold:.3f} blocked: market filter "
+                        f"PPO>+{ppo_static_level:.2f} blocked: market filter "
                         f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
                         f"rvol_ok={rvol_ok})"             
                     )
         
-            if ppo_prev >= -ppo_adaptive_threshold and ppo_curr < -ppo_adaptive_threshold and not sell_common:
+            if ppo_prev >= -ppo_static_level and ppo_curr < -ppo_static_level and not sell_common:
                 if not base_sell_trend:
-                    reasons.append("PPO<-adapt blocked: base_sell_trend=False")
+                    reasons.append("PPO<-static blocked: base_sell_trend=False")
                 elif not confirmation_sell:
-                    reasons.append("PPO<-adapt blocked: confirmation_sell=False (future cloud)")
+                    reasons.append("PPO<-static blocked: confirmation_sell=False (future cloud)")
                 elif not is_valid_for_sell:
-                    reasons.append("PPO<-adapt blocked: Knox rejected candle")
+                    reasons.append("PPO<-static blocked: Knox rejected candle")
                 else:
                     reasons.append(
-                        f"PPO<-{ppo_adaptive_threshold:.3f} blocked: market filter "
+                        f"PPO<-{ppo_static_level:.2f} blocked: market filter "
                         f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
                         f"rvol_ok={rvol_ok})"
                     )      
 
             if rsi_prev <= rsi_ema_prev and rsi_curr > rsi_ema_curr:
-                if rsi_curr >= rsi_adaptive_buy:
-                    reasons.append(f"RSI>EMA5 blocked: RSI={rsi_curr:.2f} ≥ cap {rsi_adaptive_buy:.1f}")
+                if rsi_curr >= Constants.RSI_SIGNAL_CROSS_MAX_BUY:
+                    reasons.append(f"RSI>EMA5 blocked: RSI={rsi_curr:.2f} ≥ cap {Constants.RSI_SIGNAL_CROSS_MAX_BUY:g}")
                 elif ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY:
                     reasons.append(f"RSI>EMA5 blocked: PPO={ppo_gate_curr:.2f} ≥ guard {Constants.PPO_RSI_GUARD_BUY}")
                 elif not buy_common:
@@ -4524,8 +4505,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         )
 
             if rsi_prev >= rsi_ema_prev and rsi_curr < rsi_ema_curr:
-                if rsi_curr <= rsi_adaptive_sell:
-                    reasons.append(f"RSI<EMA5 blocked: RSI={rsi_curr:.2f} ≤ cap {rsi_adaptive_sell:.1f}")
+                if rsi_curr <= Constants.RSI_SIGNAL_CROSS_MIN_SELL:
+                    reasons.append(f"RSI<EMA5 blocked: RSI={rsi_curr:.2f} ≤ cap {Constants.RSI_SIGNAL_CROSS_MIN_SELL:g}")
                 elif ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL:
                     reasons.append(f"RSI<EMA5 blocked: PPO={ppo_gate_curr:.2f} ≤ guard {Constants.PPO_RSI_GUARD_SELL}")
                 elif not sell_common:

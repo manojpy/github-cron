@@ -375,13 +375,10 @@ _STRUCTURAL_CONFIG_FIELDS: Tuple[str, ...] = (
     "ATR_PCTL_LOOKBACK", "VOLUME_PCTL_LOOKBACK",
     "PIVOT_LOOKBACK_PERIOD",
     # ── adaptive thresholds carried on each alert ──
-    "PPO_ADAPTIVE_CALM", "PPO_ADAPTIVE_VOLATILE",
-    "RSI_ADAPTIVE_BUY_CALM", "RSI_ADAPTIVE_BUY_VOLATILE",
-    "RSI_ADAPTIVE_SELL_CALM", "RSI_ADAPTIVE_SELL_VOLATILE",
     "ADX_ADAPTIVE_TARGET_PCTL", "ADX_STRENGTH_PCTL",
     "ATR_PCTL_VOTE_MIN", "VOLUME_PCTL_VOTE_MIN",
     "RVOL_THRESHOLD", "ADAPTIVE_MULT_CALM", "ADAPTIVE_MULT_VOLATILE",
-    
+
     # ── flags that toggle which votes exist at all ──
     "ENABLE_PPO_GATE", "RSI_GUARD_ENABLED",
     "RMA_CLOUD_ENABLED", "ICHIMOKU_CLOUD_ENABLED", "GAUSSIAN_TREND_ENABLED", "DYNAMIC_FLOW_RIBBON_ENABLED",
@@ -854,7 +851,7 @@ def repair_shop_diagnosis(rows: List[Row], drift_alerts: List[Dict[str, Any]], c
             "scope": {"kind": "global"},
         })
 
-    # ── 7. Sample size warning ──
+    # ── 7. Sample size warning ─��
     if n < 200:
         repairs.append({
             "severity": "medium",

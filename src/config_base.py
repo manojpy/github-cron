@@ -109,10 +109,7 @@ CONFLUENCE_WEIGHTS: Dict[str, float] = {
 
 CONFIG_OVERRIDE_ALLOWED_FIELDS: Set[str] = {
     "CONFLUENCE_MIN_ABS_SCORE",
-    "CONFLUENCE_MIN_PCT",
-    "RSI_ADAPTIVE_BUY_VOLATILE",
-    "RSI_ADAPTIVE_SELL_VOLATILE",
-    "PPO_ADAPTIVE_VOLATILE",
+    "CONFLUENCE_MIN_PCT",   
 }
 
 BRAIN_DISABLED_KEYS_METADATA_KEY = "brain_disabled_alert_keys"
@@ -129,6 +126,9 @@ class Constants:
     PPO_SIGNAL_CROSS_MIN_SELL = -0.30
     RSI_SIGNAL_CROSS_MAX_BUY = 65
     RSI_SIGNAL_CROSS_MIN_SELL = 35
+    PPO_CROSS_STATIC = 0.18             # PPO crosses above +0.18 / below -0.18 (fixed, no volatility scaling)
+    RSI_CROSS_STATIC_BUY = 55           # RSI crosses above this level
+    RSI_CROSS_STATIC_SELL = 45          # RSI crosses below this level
     CIRCUIT_BREAKER_MAX_WAIT = 300
     MAX_USEFUL_RETRY_AFTER_SEC = 20     # longest 429 Retry-After a candle fetch will sit out
     INFINITY_CLAMP = 1e8
