@@ -424,8 +424,6 @@ def test_workflows_use_12_hour_cadence_and_stage_reports():
 # ======================================================================
 """Run-health counters, Brain plan audit trail, and the JSONL round trip."""
 
-
-
 class FakeSdb:
     def __init__(self):
         self.meta = {}
@@ -433,16 +431,17 @@ class FakeSdb:
     async def get_metadata(self, key):
         return self.meta.get(key)
 
+    async def read_metadata_checked(self, key, timeout=5.0, durable=False):
+        return True, self.meta.get(key)
+
     async def set_metadata(self, key, value, ttl=None):
         self.meta[key] = value
         return True
-
 
 def _engine__run_health_and_plan_history():
     eng = object.__new__(BrainEngineV2)
     eng.sdb = FakeSdb()
     return eng
-
 
 def test_plan_history_appends_and_caps():
     eng = _engine__run_health_and_plan_history()
@@ -557,6 +556,9 @@ class FakeSDB:
 
     async def get_metadata(self, k):
         return self.meta.get(k)
+
+    async def read_metadata_checked(self, k, timeout=5.0, durable=False):
+        return True, self.meta.get(k)
 
     async def set_metadata(self, k, v, ttl=None):
         self.meta[k] = v

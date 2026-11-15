@@ -1008,6 +1008,9 @@ def test_auto_open_positions_count_only_delivered_takes():
         async def get_metadata(self, k, timeout=2.0):
             return self.d.get(k)
 
+        async def read_metadata_checked(self, k, timeout=2.0, durable=False):
+            return True, self.d.get(k)
+
         async def set_metadata(self, k, v, timeout=2.0, ttl=None):
             self.d[k] = v
 
