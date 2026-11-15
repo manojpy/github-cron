@@ -238,11 +238,6 @@ def _ds_row_diff(a: Optional[Dict[str, Any]], b: Optional[Dict[str, Any]]) -> Op
                     return f"labels[{h}].{f}"
     return None
 
-
-def _same_ds_row(a: Optional[Dict[str, Any]], b: Optional[Dict[str, Any]]) -> bool:
-    return _ds_row_diff(a, b) is None
-
-
 def build_point_in_time_dataset_cached(rows: Sequence[Row], cached: Optional[Dict[str, Any]], horizons: Sequence[int] = LABEL_HORIZONS,
                                        default_cost_pct: float = 0.0, verify_n: int = 5) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Same dataset as build_point_in_time_dataset, but rows already present in

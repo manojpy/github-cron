@@ -922,8 +922,14 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             pair_wf = engine.validate_threshold_walk_forward(
                 pair_rows, target_winrate=target_wr, min_sample=pair_min_sample,
             )
+            if not pair_wf.get("valid"):
+                pair_threshold_lines.append(
+                    f"  • {pair}: suggested {suggested:.1f} (was {current:.1f}) — "
+                    f"NOT applied, walk-forward not valid yet (n={len(pair_rows)})"
+                )
+                continue
 
-            if pair_wf.get("valid") and pair_wf.get("passed") is False:
+            if pair_wf.get("passed") is False:
                 pair_threshold_lines.append(
                     f"  • {pair}: suggested {suggested:.1f} (was {current:.1f}) — "
                     f"NOT applied, failed walk-forward "
