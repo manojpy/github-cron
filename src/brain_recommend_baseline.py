@@ -1592,7 +1592,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
 
     # ── Experiment ledger: how many candidates were examined this cycle (not
     # just the survivors), persisted so the report can show the family size
-    # behind every "validated" claim. Best-effort: never blocks the report. ─���
+    # behind every "validated" claim. Best-effort: never blocks the report.
     try:
         _led_prev: Dict[str, Any] = {}
         if not self.sdb.degraded:
