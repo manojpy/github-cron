@@ -147,9 +147,9 @@ jobs:
           # step has no visibility into it otherwise, so a report forced that
           # way runs against a shallow 3-day checkout instead of the full
           # archive it actually needs. Parse it here so both triggers agree.
-          ON_DEMAND=$(python3 -c "import json; print(json.load(open('config_macd.json')).get('BRAIN_REPORT_ON_DEMAND', False))" 2>/dev/null || echo "False")
+          ON_DEMAND=$(python3 -c "import json; v=json.load(open('config_macd.json')).get('BRAIN_REPORT_ON_DEMAND', False); print('true' if str(v).strip().lower() in ('true', '1') else 'false')" 2>/dev/null || echo "false")
           # 900 s = one 15-minute slot; 48 slots = 12 hours (00:00/12:00 UTC).
-          if [ "${{ inputs.brain_report }}" = "true" ] || [ "$ON_DEMAND" = "True" ] || [ $(( (NOW / 900) % 48 )) -eq 0 ]; then
+          if [ "${{ inputs.brain_report }}" = "true" ] || [ "$ON_DEMAND" = "true" ]|| [ $(( (NOW / 900) % 48 )) -eq 0 ]; then
             echo "brain_full=true"  >> "$GITHUB_OUTPUT"
             echo "archive_days=185" >> "$GITHUB_OUTPUT"
             echo "🧠 Brain-report run: full 185-day archive"
