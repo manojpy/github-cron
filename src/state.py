@@ -1164,10 +1164,15 @@ class RedisStateStore:
             await self.clear_challenger_weights()
         return ok
 
-    async def batch_get_metadata(self, keys: List[str], timeout: float = 5.0) -> Dict[str, Optional[str]]:
-        """Fetch many metadata keys in ONE Redis round-trip (pipeline)."""
-        if not self._redis or self.degraded or not keys:
-            return {k: None for k in keys}
+    async def batch_get_metadata_checked(self, keys: List[str], timeout: float = 5.0) -> Tuple[bool, Dict[str, Optional[str]]]:
+        """Fetch many metadata keys in ONE Redis round-trip. (True, map) when
+        Redis answered (a missing key maps to None); (False, all None) when the
+        read failed or the store is degraded, so a caller that writes back
+        what it read can tell 'no history' from 'could not read'."""
+        if not keys:
+            return True, {}
+        if not self._redis or self.degraded:
+            return False, {k: None for k in keys}
         try:
             values = await asyncio.wait_for(
                 _rc(self._redis).mget([f"{self.meta_prefix}{k}" for k in keys]),
@@ -1175,10 +1180,13 @@ class RedisStateStore:
             )
             if values is None or len(values) != len(keys):
                 raise RedisError("MGET returned an incomplete response")
-            return {k: v for k, v in zip(keys, cast(List[Optional[str]], values))}
+            return True, {k: v for k, v in zip(keys, cast(List[Optional[str]], values))}
         except Exception as e:
             logger.error(f"batch_get_metadata failed for {len(keys)} keys: {e}")
-            return {k: None for k in keys}
+            return False, {k: None for k in keys}
+
+    async def batch_get_metadata(self, keys: List[str], timeout: float = 5.0) -> Dict[str, Optional[str]]:
+        return (await self.batch_get_metadata_checked(keys, timeout))[1]
 
     async def batch_set_metadata(self, items: Dict[str, str], timeout: float = 5.0, ttl: Optional[int] = None) -> bool:
         """Write many metadata keys in ONE Redis round-trip (pipeline)."""
@@ -3659,23 +3667,29 @@ class RedisStateStore:
             logger.warning(f"CUSUM bulk save failed: {e}")
             return False
 
-    async def load_threshold_history(self, key_suffix: str = "") -> List[float]:
+    async def load_threshold_history_checked(self, key_suffix: str = "") -> Tuple[bool, List[float]]:
         """key_suffix="" (default) is the existing global CONFLUENCE_MIN_ABS_SCORE
         history, unchanged. Pass a pair name to track that pair's own history
-        under a separate list (used by per-pair threshold stability checks)."""
+        under a separate list (used by per-pair threshold stability checks).
+        (True, values) when Redis answered (a missing list is []); (False, [])
+        when the read failed, so the stability gate is not fed an empty history
+        that it would read as 'no history yet, approve'."""
         if self.degraded or not self._redis:
-            return []
+            return False, []
         key = f"{RedisKeyPrefix.THRESHOLD_HISTORY}{key_suffix}"
         try:
             raw_list = await self._safe_redis_op(
                 lambda: _rc(self._redis).lrange(key, 0, 9),
                 2.0, f"threshold_history_load:{key_suffix or 'global'}",
             )
-            if not raw_list:
-                return []
-            return [float(x) for x in raw_list]
+            if raw_list is None:
+                return False, []
+            return True, [float(x) for x in raw_list]
         except Exception:
-            return []
+            return False, []
+
+    async def load_threshold_history(self, key_suffix: str = "") -> List[float]:
+        return (await self.load_threshold_history_checked(key_suffix))[1]
 
     async def save_threshold_value(self, value: float, key_suffix: str = "") -> None:
         if self.degraded or not self._redis:

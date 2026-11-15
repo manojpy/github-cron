@@ -346,10 +346,12 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
 
         # ── Stability Gate check on threshold recommendation ─────────────
         if emit_patch and target_floor is not None:
-            history = await self.sdb.load_threshold_history()
+            _hist_ok, history = await self.sdb.load_threshold_history_checked()
             gate_ok, gate_reason = self.stability_gate.approve(
                 target_floor, history,
             )
+            if not _hist_ok:
+                gate_ok, gate_reason = False, "threshold history could not be read"
             if not gate_ok:
                 threshold_rec["severity"] = "medium"
                 threshold_rec["stability_blocked"] = True
@@ -928,9 +930,10 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                     f"({pair_wf['holdout_wr']:.0%} holdout WR on n={len(pair_rows)})"
                 )
                 continue
-
-            history = await self.sdb.load_threshold_history(key_suffix=pair)
+            _hist_ok, history = await self.sdb.load_threshold_history_checked(key_suffix=pair)
             gate_ok, gate_reason = self.stability_gate.approve(suggested, history)
+            if not _hist_ok:
+                gate_ok, gate_reason = False, "threshold history could not be read"
             if not gate_ok:
                 pair_threshold_lines.append(
                     f"  • {pair}: suggested {suggested:.1f} (was {current:.1f}) — "
@@ -1262,7 +1265,9 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             )
             _prev_streaks: Dict[str, int] = {}
             if not self.sdb.degraded:
-                _raw_streaks = await self.sdb.get_metadata("zone_pass_streaks")
+                _streaks_ok, _raw_streaks = await self.sdb.read_metadata_checked("zone_pass_streaks")
+                if not _streaks_ok:
+                    raise RuntimeError("zone_pass_streaks read failed; zone step skipped so the streak counters are not reset")
                 if _raw_streaks:
                     try:
                         _prev_streaks = {str(k): int(v) for k, v in json_loads(_raw_streaks).items()}
@@ -1587,7 +1592,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
 
     # ── Experiment ledger: how many candidates were examined this cycle (not
     # just the survivors), persisted so the report can show the family size
-    # behind every "validated" claim. Best-effort: never blocks the report. ──
+    # behind every "validated" claim. Best-effort: never blocks the report. ─���
     try:
         _led_prev: Dict[str, Any] = {}
         if not self.sdb.degraded:

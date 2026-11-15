@@ -165,7 +165,9 @@ async def poll_feedback(sdb: Any, token: str, chat_id: str, pairs: Sequence[str]
         updates = (resp or {}).get("result") or []
         if not updates:
             return 0
-        raw_log = await sdb.get_metadata(KEY_FEEDBACK, timeout=3.0)
+        _log_ok, raw_log = await sdb.read_metadata_checked(KEY_FEEDBACK, timeout=3.0)
+        if not _log_ok:
+            return 0
         try:
             log: Dict[str, Any] = json.loads(raw_log) if raw_log else {}
         except Exception:
@@ -278,7 +280,9 @@ async def record_auto_positions(sdb: Any, delivered: Sequence[Tuple[str, str, in
         return
     try:
         t_now = now if now is not None else time.time()
-        raw = await sdb.get_metadata(KEY_AUTO_POSITIONS, timeout=3.0)
+        _pos_ok, raw = await sdb.read_metadata_checked(KEY_AUTO_POSITIONS, timeout=3.0)
+        if not _pos_ok:
+            return
         cur: Dict[str, Any] = json.loads(raw) if raw else {}
         cur = {k: v for k, v in cur.items() if isinstance(v, dict) and t_now - int(v.get("ts", 0)) <= max_age_sec}
         for pair, direction, ts in rows:

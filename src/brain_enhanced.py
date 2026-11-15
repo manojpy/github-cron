@@ -498,7 +498,12 @@ class BrainEngineV2(BrainCore):
         if not plan_id:
             return
         try:
-            raw = await self.sdb.get_metadata(PLAN_HISTORY_KEY)
+            _read_ok, raw = await self.sdb.read_metadata_checked(PLAN_HISTORY_KEY)
+            if not _read_ok:
+                logging.getLogger("macd_bot").warning(
+                    f"Plan lifecycle event {plan_id}:{status} not recorded (history read failed; stored trail left untouched)"
+                )
+                return
             hist = json_loads(raw) if raw else []
             if not isinstance(hist, list):
                 hist = []
@@ -768,7 +773,9 @@ class BrainEngineV2(BrainCore):
                                or reinstate_alerts or weight_adjustments)
             if getattr(cfg, "ENABLE_BRAIN_PLAN_IDS", True) and not _plan_empty:
                 try:
-                    counter_raw = await self.sdb.get_metadata("brain_plan_counter")
+                    _ctr_ok, counter_raw = await self.sdb.read_metadata_checked("brain_plan_counter")
+                    if not _ctr_ok:
+                        raise RuntimeError("brain_plan_counter read failed")
                     counter = int(counter_raw or 0) + 1
                     if not await self.sdb.set_metadata(
                         "brain_plan_counter", str(counter), ttl=365 * 86400
@@ -957,7 +964,9 @@ class BrainEngineV2(BrainCore):
         a later change-point regression can be reverted to real values — not
         just pointed at a hash."""
         try:
-            raw = await self.sdb.get_metadata("brain_config_version_snapshots")
+            _read_ok, raw = await self.sdb.read_metadata_checked("brain_config_version_snapshots")
+            if not _read_ok:
+                return
             snapshots = {}
             if raw:
                 try:
@@ -1084,13 +1093,15 @@ class BrainEngineV2(BrainCore):
         ok = await self.sdb.promote_challenger_to_champion()
         return {"promoted": bool(ok), "reason": "ok" if ok else "redis_failed", "meta": meta}
 
-    async def _load_apply_snapshots(self) -> List[Dict[str, Any]]:
+    async def _load_apply_snapshots(self) -> Tuple[bool, List[Dict[str, Any]]]:
         try:
-            raw = await self.sdb.get_metadata(APPLY_SNAPSHOT_KEY)
+            ok, raw = await self.sdb.read_metadata_checked(APPLY_SNAPSHOT_KEY)
+            if not ok:
+                return False, []
             data = json_loads(raw) if raw else []
-            return data if isinstance(data, list) else []
+            return True, (data if isinstance(data, list) else [])
         except Exception:
-            return []
+            return False, []
 
     async def _store_apply_snapshots(self, snaps: List[Dict[str, Any]]) -> bool:
         try:
@@ -1106,7 +1117,14 @@ class BrainEngineV2(BrainCore):
         """Remember how to undo an applied plan. Best-effort; never raises."""
         if not (overrides or disabled or weights):
             return
-        snaps = await self._load_apply_snapshots()
+        ok, snaps = await self._load_apply_snapshots()
+        if not ok:
+            ok, snaps = await self._load_apply_snapshots()
+        if not ok:
+            logging.getLogger("macd_bot").warning(
+                f"Apply snapshot for {plan_id} not saved (snapshot read failed twice; stored snapshots left untouched)"
+            )
+            return
         snaps.append({
             "plan_id": plan_id or f"plan-{int(time.time())}",
             "applied_at": int(time.time()),
@@ -1189,8 +1207,8 @@ class BrainEngineV2(BrainCore):
         if not getattr(cfg, "BRAIN_AUTO_ROLLBACK_HURT", True):
             return events
         try:
-            snaps = await self._load_apply_snapshots()
-            if not any(s.get("status") == "active" for s in snaps):
+            _snaps_ok, snaps = await self._load_apply_snapshots()
+            if not _snaps_ok or not any(s.get("status") == "active" for s in snaps):
                 return events
             now = int(time.time())
             min_h = float(cfg.BRAIN_ROLLBACK_MIN_HOURS)

@@ -173,7 +173,7 @@ async def recover_paths(rows: List[Dict[str, Any]], sdb: Any, max_calls: int, dr
         stats["short"] = len(need) - stats["missing"]      # early-closed: path ends at the exit candle
         if not need:
             return rows, stats
-        cache: Dict[str, Any] = _jl(await sdb.get_metadata(KEY_RECON, timeout=5.0), {})
+        cache: Dict[str, Any] = _jl(await _strict_get(sdb, KEY_RECON), {})
         found: Dict[str, Dict[str, Any]] = {}
         todo: Dict[str, List[Dict[str, Any]]] = {}
         for r in need:

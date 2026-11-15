@@ -201,6 +201,8 @@ class BrainCore:
                 )
             except Exception:
                 return {}
+            if entries is None:
+                return {}
             tips[kind] = str(entries[0][0]) if entries else "0-0"
         return tips
 
@@ -331,6 +333,7 @@ class BrainCore:
             # of one in one bucket), whereas reading tips afterwards could
             # silently skip rows. Counting a row twice is the safer error.
             stream_tips = await self._stream_tips()
+            self._stream_read_failed = False
             if getattr(cfg, "BRAIN_ARCHIVE_SHALLOW", False):
                 # Alert-only runs check out just a few days of the file archive, so
                 # self._get_rows() (archive first) would build the live calibration
@@ -340,11 +343,16 @@ class BrainCore:
                 real_rows, shadow_rows = await BrainCore._get_rows(self)
             else:
                 real_rows, shadow_rows = await self._get_rows()
+            if getattr(self, "_stream_read_failed", False):
+                logger_run.warning(
+                    "Calibration refresh skipped: an outcome stream could not be read, "
+                    "so the stored curve is kept instead of being rebuilt from partial rows"
+                )
+                return
             n_real, n_shadow = len(real_rows), len(shadow_rows)
             logger_run.info(
                 f"🎯 Calibration refresh input: {n_real} real, {n_shadow} shadow rows"
             )
-
             calib = engine.build_calibration_curves(
                 real_rows,
                 bucket_pct=getattr(cfg, "CALIBRATION_BUCKET_PCT", 5.0),
@@ -640,7 +648,16 @@ class BrainCore:
             int(getattr(cfg, "OUTCOME_LOOKAHEAD_CANDLES", 12))
             + max(0, int(getattr(cfg, "OUTCOME_FILL_DELAY_CANDLES", 1)))
         ) * 900 + 3600
-        prev = await self._load_online_model_state(fresh=True)
+        _prev_ok, _prev_raw = await self.sdb.read_metadata_checked(ONLINE_MODEL_STATE_KEY, timeout=5.0)
+        if not _prev_ok:
+            raise RuntimeError("online model state read failed; step skipped so the stored state is not overwritten")
+        prev: Optional[Dict[str, Any]] = None
+        if _prev_raw:
+            try:
+                _prev_obj = json_loads(_prev_raw)
+                prev = _prev_obj if isinstance(_prev_obj, dict) else None
+            except Exception:
+                prev = None
         res = online_challenger_step(
             prev, champion, rows, now, lag_sec=lag,
             max_age_sec=int(getattr(cfg, "ONLINE_MODEL_MAX_AGE_DAYS", 14)) * 86400,
@@ -1111,6 +1128,10 @@ class BrainCore:
             )
         except Exception as e:
             logging.getLogger("macd_bot").warning(f"Brain failed reading {stream_key}: {e}")
+            self._stream_read_failed = True
+            return []
+        if entries is None:
+            self._stream_read_failed = True
             return []
         if not entries:
             return []

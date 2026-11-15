@@ -760,8 +760,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             # finds warm caches instead of paying 4 serial Redis round trips.
             preloads.start("brain_warm", _make_warm_brain_engine)
         if cfg.ENABLE_OI_FUNDING_FILTER:
-            preloads.start("oi_hist", lambda: state_db.batch_get_metadata(_oi_hist_keys()))
-
+            preloads.start("oi_hist", lambda: state_db.batch_get_metadata_checked(_oi_hist_keys()))
     ticker_task = None
     if cfg.ENABLE_OI_FUNDING_FILTER:
         ticker_task = asyncio.create_task(fetcher.fetch_tickers_batch())
@@ -910,8 +909,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             meta_keys_to_read.append(meta_key)
 
         # Pass 2 — ONE round-trip for ALL history reads
-        prev_raw_map = await preloads.take(
-            "oi_hist", lambda: state_db.batch_get_metadata(meta_keys_to_read)
+        hist_read_ok, prev_raw_map = await preloads.take(
+            "oi_hist", lambda: state_db.batch_get_metadata_checked(meta_keys_to_read)
         )
         new_histories: Dict[str, str] = {}
         for (pair_name, current, meta_key) in oi_entries:
@@ -942,12 +941,11 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             new_oi_hist = (oi_hist + [[now_ts, current.get("oi")]])[-cfg.OI_FUNDING_HISTORY_LEN:]
             new_funding_hist = (funding_hist + [[now_ts, current.get("funding")]])[-cfg.OI_FUNDING_HISTORY_LEN:]
             new_price_hist = (price_hist + [[now_ts, current.get("price")]])[-cfg.OI_FUNDING_HISTORY_LEN:]
-
-            new_histories[meta_key] = json_dumps({
-                "oi_samples": new_oi_hist, "funding_samples": new_funding_hist,
-                "price_samples": new_price_hist, "ts": now_ts,
-            })
-
+            if hist_read_ok:
+                new_histories[meta_key] = json_dumps({
+                    "oi_samples": new_oi_hist, "funding_samples": new_funding_hist,
+                    "price_samples": new_price_hist, "ts": now_ts,
+                })
         # ONE round-trip for ALL writes
         if new_histories:
             await state_db.batch_set_metadata(new_histories, ttl=3 * 3600)
