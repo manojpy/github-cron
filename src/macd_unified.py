@@ -1544,7 +1544,12 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     try:
         cum = await state_db.get_cumulative_outcome_stats(reuse_prescan=True)
         for source, icon in (("Recorded", "📝"), ("Shadowed", "👁"), ("Elliott", "🌊")):
-            logger_main.info(format_outcome_totals(source, cum.get(source), icon))
+            _line = format_outcome_totals(source, cum.get(source), icon)
+            if source == "Elliott":
+                # This bucket holds delivered AND shadowed Elliott outcomes; the Brain brief
+                # counts delivered ones only, so say which this is.
+                _line = _line.replace("Elliott -", "Elliott (delivered + shadow) -", 1)
+            logger_main.info(_line)
     except Exception as exc:
         logger_main.warning(f"Cumulative outcome stats log failed: {exc}")
     logger_main.debug(
@@ -1751,7 +1756,7 @@ async def run_once() -> Optional[bool]:
                 if telegram_queue is None:
                     telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
                 await telegram_queue.send(escape_markdown_v2(
-                    f"🧹 {cfg.BOT_NAME} Redis purge complete\n"
+                    f"🧹 {cfg.BOT_NAME} Redis purge {'PARTIAL' if getattr(sdb, '_last_purge_incomplete', None) else 'complete'}\n"
                     f"{cleared_str}\n"
                     f"Time: {format_ist_time()}"
                 ))

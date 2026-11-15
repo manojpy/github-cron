@@ -141,16 +141,23 @@ async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger
     deleted_daily_cache = 0
     deleted_brain_derived = 0
 
+    incomplete_scans: List[str] = []
+
     async def _scan_keys_with_timeout(match: str, count: int = 100, timeout: float = 10.0) -> List[str]:
-        """Safely consume an async scan_iter with a timeout to prevent runaway loops."""
-        async def _consume():
-            return [k async for k in sdb._redis.scan_iter(match=match, count=count)]
-        
+        """Consume an async scan_iter with a timeout. Keys found before a timeout are
+        still returned (and purged); the prefix is recorded as incomplete."""
+        found: List[str] = []
+
+        async def _consume() -> None:
+            async for k in _rc(sdb._redis).scan_iter(match=match, count=count):
+                found.append(k)
+
         try:
-            return await asyncio.wait_for(_consume(), timeout=timeout)
+            await asyncio.wait_for(_consume(), timeout=timeout)
         except asyncio.TimeoutError:
-            logger.warning(f"⏱️ Redis scan for '{match}' timed out after {timeout}s. Aborting scan for this prefix to protect run deadline.")
-            return []  # Fail-safe: return empty so we don't block the bot
+            incomplete_scans.append(match)
+            logger.warning(f"⏱️ Redis scan for '{match}' timed out after {timeout}s; this prefix may not be fully purged.")
+        return found
 
     async def _batch_unlink(keys: List[str], batch_size: int = 100) -> int:
         """Unlink keys in batches to avoid blocking Redis with massive argument lists."""
@@ -233,8 +240,10 @@ async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger
             deleted_brain_derived = await _batch_unlink(derived_keys)
             logger.info(f"🧹 Brain-derived state cleared: {deleted_brain_derived} key(s)")
 
-        logger.info(
-            f"🧹 MASS RESET complete | "
+
+        sdb._last_purge_incomplete = list(incomplete_scans)
+        (logger.warning if incomplete_scans else logger.info)(
+            f"🧹 MASS RESET {'PARTIAL (scan timed out: ' + ', '.join(incomplete_scans) + ')' if incomplete_scans else 'complete'} | "
             f"States: {deleted_states} | Dedups: {deleted_dedups} | "
             f"Pending: {deleted_pending} | ShadowPending: {deleted_shadow_pending} | "
             f"AlertStats: {deleted_alert_stats} | ShadowStats: {deleted_shadow_stats} | "
@@ -377,6 +386,7 @@ class RedisStateStore:
         self.metadata_expiry_seconds = 7 * 86400
         self._pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None
         self._shadow_pending_outcome_keys_by_pair: Optional[Dict[str, List[str]]] = None
+        self._last_purge_incomplete: List[str] = []
         # pair -> (entry_ts, confluence ratio, redis key) of the shadow trade created this run
         self._shadow_registered_this_run: Dict[str, Tuple[int, float, str]] = {}
         self._dlq_empty_at_start: bool = False
@@ -775,6 +785,26 @@ class RedisStateStore:
             parser=lambda r: r if r else None,
         )
 
+    async def read_metadata_checked(self, key: str, timeout: float = 5.0, durable: bool = False) -> Tuple[bool, Optional[str]]:
+        """(True, value) when Redis answered (value None = the key does not exist);
+        (False, None) when the read failed, timed out or the store is degraded.
+        Read-modify-write callers must stop on False: treating a failed read as
+        'empty' and writing the result back overwrites the stored data."""
+        if self.degraded or not self._redis:
+            return False, None
+        full_key = f"{self.meta_prefix}{key}"
+        try:
+            if durable:
+                raw = await asyncio.wait_for(
+                    _rc(self._redis).getex(full_key, ex=DURABLE_METADATA_TTL_SEC), timeout=timeout
+                )
+            else:
+                raw = await asyncio.wait_for(_rc(self._redis).get(full_key), timeout=timeout)
+        except Exception as e:
+            logger.warning(f"Redis read of {key} failed; the update is skipped so stored data is not overwritten: {e}")
+            return False, None
+        return True, cast(Optional[str], raw if raw else None)
+
     async def set_metadata(self, key: str, value: str, timeout: float = 2.0, ttl: Optional[int] = None) -> bool:
         """True only when Redis confirmed the write. False on any failure or
         when the store is degraded (callers must not assume success)."""
@@ -815,6 +845,21 @@ class RedisStateStore:
             return {}
         return override
 
+    async def _read_raw_config_override_checked(self) -> Optional[Dict[str, Any]]:
+        """Like _read_raw_config_override, but returns None when the read FAILED,
+        so a writer can stop instead of overwriting the stored override."""
+        _ok, _raw = await self.read_metadata_checked(CONFIG_OVERRIDE_METADATA_KEY, durable=True)
+        if not _ok:
+            return None
+        if not _raw:
+            return {}
+        try:
+            override = json_loads(_raw)
+        except (JSONDecodeError, TypeError, ValueError) as e:
+            logger.warning(f"Ignoring malformed config_override in Redis: {e}")
+            return {}
+        return override if isinstance(override, dict) else {}
+
     async def load_config_override(self) -> List[str]:
         override = await self._read_raw_config_override()
         applied = []
@@ -848,7 +893,10 @@ class RedisStateStore:
         if field not in CONFIG_OVERRIDE_ALLOWED_FIELDS:
             logger.warning(f"Refusing to write config_override field '{field}' — not in the allowed safelist")
             return False
-        override = await self._read_raw_config_override()
+        override = await self._read_raw_config_override_checked()
+        if override is None:
+            logger.warning(f"Not writing config_override field '{field}': could not read the stored override")
+            return False
         override[field] = value
         try:
             if not await self.set_metadata(CONFIG_OVERRIDE_METADATA_KEY, json_dumps(override)):
@@ -863,7 +911,10 @@ class RedisStateStore:
         """Delete one field from the live config_override blob (read-modify-write).
         Used by the Brain auto-rollback to restore a field that had NO override
         before a plan wrote one. Returns True if the field is absent afterwards."""
-        override = await self._read_raw_config_override()
+        override = await self._read_raw_config_override_checked()
+        if override is None:
+            logger.warning(f"Not removing config_override field '{field}': could not read the stored override")
+            return False
         if field not in override:
             return True
         override.pop(field, None)
@@ -877,7 +928,13 @@ class RedisStateStore:
         return True
 
     async def get_disabled_alert_keys(self) -> Set[str]:
-        raw = await self.get_durable_metadata(BRAIN_DISABLED_KEYS_METADATA_KEY)
+        _ok, raw = await self.read_metadata_checked(BRAIN_DISABLED_KEYS_METADATA_KEY, timeout=3.0, durable=True)
+        if not _ok:
+            _ok, raw = await self.read_metadata_checked(BRAIN_DISABLED_KEYS_METADATA_KEY, timeout=3.0, durable=True)
+        if not _ok:
+            if not self.degraded:
+                logger.error("Disabled alert-key set could NOT be read: Brain-disabled keys are not enforced this run")
+            return set()
         if not raw:
             return set()
         try:
@@ -911,7 +968,18 @@ class RedisStateStore:
         return out
 
     async def set_alert_key_disabled(self, alert_key: str, disabled: bool) -> bool:
-        current = await self.get_disabled_alert_keys()
+        # Read-modify-write: a FAILED read must stop here. Treating it as "no keys
+        # disabled" and writing back would erase every other disabled key.
+        _ok, _raw = await self.read_metadata_checked(BRAIN_DISABLED_KEYS_METADATA_KEY, durable=True)
+        if not _ok:
+            logger.warning(f"Not changing disabled-key set for '{alert_key}': could not read the stored set")
+            return False
+        try:
+            _stored = json_loads(_raw) if _raw else []
+        except (JSONDecodeError, TypeError, ValueError) as e:
+            logger.warning(f"Ignoring malformed {BRAIN_DISABLED_KEYS_METADATA_KEY} in Redis: {e}")
+            _stored = []
+        current = set(_stored) if isinstance(_stored, list) else set()
         was_disabled = alert_key in current
         if disabled:
             current.add(alert_key)
@@ -929,6 +997,9 @@ class RedisStateStore:
         # undo or fail the disable/enable itself.
         try:
             if disabled != was_disabled:
+                _h_ok, _ = await self.read_metadata_checked(BRAIN_KEY_HISTORY_METADATA_KEY, durable=True)
+                if not _h_ok:
+                    raise RuntimeError("history read failed; not overwriting stored history")
                 hist = await self.get_alert_key_history()
                 now_ts = time.time()
                 if disabled:
@@ -970,7 +1041,19 @@ class RedisStateStore:
         return thresholds.get(pair)
 
     async def set_pair_threshold(self, pair: str, value: float) -> bool:
-        current = await self.get_pair_thresholds()
+        # Read-modify-write: a failed read must not look like "no thresholds stored".
+        _ok, _raw = await self.read_metadata_checked(PAIR_THRESHOLDS_METADATA_KEY, durable=True)
+        if not _ok:
+            logger.warning(f"Not changing pair threshold for '{pair}': could not read the stored thresholds")
+            return False
+        current: Dict[str, float] = {}
+        if _raw:
+            try:
+                _d = json_loads(_raw)
+                if isinstance(_d, dict):
+                    current = {k: float(v) for k, v in _d.items() if isinstance(v, (int, float))}
+            except (JSONDecodeError, TypeError, ValueError) as e:
+                logger.warning(f"Ignoring malformed {PAIR_THRESHOLDS_METADATA_KEY} in Redis: {e}")
         current[pair] = value
         try:
             if not await self.set_metadata(PAIR_THRESHOLDS_METADATA_KEY, json_dumps(current)):

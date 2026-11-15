@@ -1218,7 +1218,10 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
     # Reported only; nothing is applied. ──
     if str(getattr(cfg, "HYPOTHESIS_GEN_MODE", "shadow")) != "off" and not self.sdb.degraded:
         try:
-            _hp_raw = await self.sdb.get_metadata(HYPOTHESIS_POOL_KEY)
+
+            _hp_ok, _hp_raw = await self.sdb.read_metadata_checked(HYPOTHESIS_POOL_KEY)
+            if not _hp_ok:
+                raise RuntimeError("hypothesis pool read failed; not overwriting the stored pool")
             # Alerts a confirmed rule dropped (live veto) never become real trades; their shadow rows keep
             # the rule's forward sample alive so it can still be revoked.
             _hp_rows = (list(real_rows) + [r for r in (shadow_rows or []) if r.get("rejection_reason") == "hypothesis_veto"]
@@ -1588,7 +1591,9 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
     try:
         _led_prev: Dict[str, Any] = {}
         if not self.sdb.degraded:
-            _led_raw = await self.sdb.get_metadata(EXPERIMENT_LEDGER_KEY)
+            _led_ok, _led_raw = await self.sdb.read_metadata_checked(EXPERIMENT_LEDGER_KEY)
+            if not _led_ok:
+                raise RuntimeError("experiment ledger read failed; not overwriting the stored ledger")
             _led_prev = json_loads(_led_raw) if _led_raw else {}
         _led = update_experiment_ledger(
             _led_prev, count_brain_trials(ai_metrics, len(recommendations)), int(time.time()),

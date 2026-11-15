@@ -3794,7 +3794,16 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 if sink is not None:
                     sink.append(_outcome_kw)
                 else:
-                    await sdb.record_pending_outcome(**_outcome_kw)
+                    _rec_ok = await sdb.record_pending_outcome(**_outcome_kw)
+                    if _rec_ok is False and not getattr(sdb, "degraded", False):
+                        # Plain SET on a deterministic key: a retry is idempotent.
+                        _rec_ok = await sdb.record_pending_outcome(**_outcome_kw)
+                    if _rec_ok is False:
+                        DEDUP_STATS["outcome_record_failed"] = DEDUP_STATS.get("outcome_record_failed", 0) + 1
+                        logger_pair.error(
+                            f"[{pair_name}] ALERT DELIVERED BUT OUTCOME NOT RECORDED: {alert_key} @ {ts_curr} "
+                            f"(entry {close_curr}); it will be missing from Brain statistics"
+                        )
             await asyncio.gather(*(_record_one(alert_key) for _, _, alert_key in to_record))
 
         coalesced_dedup_key: Optional[str] = None

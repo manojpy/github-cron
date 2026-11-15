@@ -214,7 +214,9 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
         # overturned later (and on what evidence). Best-effort. ──
         try:
             if not self.sdb.degraded:
-                _h_raw = await self.sdb.get_metadata(HYPOTHESIS_LEDGER_KEY)
+                _h_ok, _h_raw = await self.sdb.read_metadata_checked(HYPOTHESIS_LEDGER_KEY)
+                if not _h_ok:
+                    raise RuntimeError("hypothesis ledger read failed; not overwriting stored history")
                 _h = update_hypothesis_ledger(
                     json_loads(_h_raw) if _h_raw else {}, collect_conclusions(ai_metrics), int(time.time()),
                 )
