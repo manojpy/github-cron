@@ -48,13 +48,9 @@ class SessionManager:
 
     @classmethod
     async def get_session(cls) -> aiohttp.ClientSession:
-        old_session_to_close: Optional[aiohttp.ClientSession] = None
-        async with cls._get_lock():  
+        async with cls._get_lock():
             should_recreate = cls._session is None or cls._session.closed
             if should_recreate:
-                if cls._session and not cls._session.closed:
-                    old_session_to_close = cls._session
-
                 connector = TCPConnector(
                     limit=max(cfg.TCP_CONN_LIMIT, cfg.MAX_PARALLEL_FETCH),
                     limit_per_host=max(cfg.TCP_CONN_LIMIT_PER_HOST, cfg.MAX_PARALLEL_FETCH),
@@ -89,13 +85,6 @@ class SessionManager:
                     logger.debug("HTTP session created")
 
             new_session = cls._session
-
-        if old_session_to_close is not None:
-            try:
-                await old_session_to_close.close()
-                await asyncio.sleep(0.1)
-            except Exception as e:
-                logger.warning(f"Error closing old session: {e}")
 
         assert new_session is not None
         return new_session
@@ -385,6 +374,13 @@ class APICircuitBreaker:
                     # pair): not evidence of an API-wide outage.
                     return
                 self._failing_keys.add(key)
+            elif key is not None and self.state == "HALF_OPEN":
+                # A recovery probe that fails for ONE symbol (a delisted or
+                # rate-limited pair) is not an outage either: re-open only when
+                # two different symbols have failed.
+                self._failing_keys.add(key)
+                if len(self._failing_keys) < 2:
+                    return
             self.failures += 1
             self.last_failure_time = time.time()
 
