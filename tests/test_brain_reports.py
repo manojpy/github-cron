@@ -578,6 +578,12 @@ class FakeSDB:
     async def get_disabled_alert_keys(self):
         return set(self.disabled)
 
+    async def get_disabled_alert_keys_checked(self):
+        return set(self.disabled)
+
+    async def get_config_override_checked(self):
+        return dict(self.override)
+
     async def set_alert_key_disabled(self, ak, flag):
         (self.disabled.add if flag else self.disabled.discard)(ak)
         return True
