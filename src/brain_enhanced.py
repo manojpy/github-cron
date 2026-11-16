@@ -10,7 +10,7 @@ import logging
 import random
 import math
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import os
 from pathlib import Path
 from brain_audit import DataCoverage, HealthStatus, get_audit, reset_audit, ACTION_GATE_MIN_ROWS
@@ -1146,11 +1146,16 @@ class BrainEngineV2(BrainCore):
         since, leave it alone: reverting would clobber the newer decision."""
         out: Dict[str, Any] = {"reverted": [], "skipped": [], "failed": []}
         try:
-            live_ov = await self.sdb.get_config_override()
-            live_dis = await self.sdb.get_disabled_alert_keys()
+            live_ov = await self.sdb.get_config_override_checked()
+            live_dis = await self.sdb.get_disabled_alert_keys_checked()
             live_w = await self.sdb.get_dynamic_weights()
         except Exception as e:
             out["failed"].append(f"state read failed: {e}")
+            out["state_unreadable"] = True
+            return out
+        if live_ov is None or live_dis is None:
+            out["failed"].append("state read failed: the stored override or disabled-key set could not be read")
+            out["state_unreadable"] = True
             return out
 
         for field, d in (snap.get("overrides") or {}).items():
@@ -1279,7 +1284,15 @@ class BrainEngineV2(BrainCore):
                             "evidence": evidence,
                         })
                         continue
+
                     result = await self._revert_snapshot(snap)
+                    if result.get("state_unreadable"):
+                        events.append({
+                            "plan_id": pid, "status": "rollback_withheld",
+                            "reason": "stored state could not be read; the rollback is retried next cycle",
+                            "evidence": evidence,
+                        })
+                        continue
                     snap["status"] = "rolled_back"
                     snap["rolled_back_at"] = now
                     snap["rollback_evidence"] = evidence
@@ -1343,13 +1356,15 @@ class BrainEngineV2(BrainCore):
             snap_overrides: Dict[str, Any] = {}
             snap_disabled: Dict[str, Any] = {}
             snap_weights: Optional[Dict[str, Any]] = None
+            _ov_before: Optional[Dict[str, Any]]
+            _dis_before: Optional[Set[str]]
             try:
-                _ov_before = await self.sdb.get_config_override()
-                _dis_before = await self.sdb.get_disabled_alert_keys()
+                _ov_before = await self.sdb.get_config_override_checked()
+                _dis_before = await self.sdb.get_disabled_alert_keys_checked()
                 _w_before = await self.sdb.get_dynamic_weights()
             except Exception as e:
                 logger_run.debug(f"Rollback snapshot pre-read failed (non-fatal): {e}")
-                _ov_before, _dis_before, _w_before = {}, set(), None
+                _ov_before, _dis_before, _w_before = None, None, None
 
             # Apply config changes
             for patch in plan.get("config_patch", []):
@@ -1369,6 +1384,11 @@ class BrainEngineV2(BrainCore):
                 field = patch.get("path")
                 value = patch.get("suggested")
                 if field in CONFIG_OVERRIDE_ALLOWED_FIELDS:
+                    if _ov_before is None:
+                        logger_run.warning(
+                            f"Skipping config patch {field}: the stored override could not be read, so it could not be rolled back"
+                        )
+                        continue
 
                     ok = await self.sdb.write_config_override(field, value)
                     if ok:
@@ -1379,7 +1399,7 @@ class BrainEngineV2(BrainCore):
                         applied_config = True
                         logger_run.info(f"Applied brain config: {field} = {value}")
 
-            if plan_gate_passed:
+            if plan_gate_passed and _dis_before is not None:
                 for ak in plan.get("disable_alerts", []):
                     ok = await self.sdb.set_alert_key_disabled(ak, True)
                     if ok:
@@ -1396,6 +1416,10 @@ class BrainEngineV2(BrainCore):
                         applied_toggles.append(("reinstate_alert", str(ak)))
                         applied_live = True
                         logger_run.info(f"Applied brain reinstate: {ak}")
+            elif plan_gate_passed:
+                logger_run.warning(
+                    "Skipping disable/reinstate entries — the stored disabled-key set could not be read, so they could not be rolled back"
+                )
             else:
                 logger_run.warning(
                     "Skipping disable/reinstate entries — plan did not pass action gate"

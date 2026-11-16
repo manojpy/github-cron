@@ -534,8 +534,11 @@ async def run(args: argparse.Namespace) -> int:
 
                 # 4. bounded autotune (CONFLUENCE_MIN_PCT, tighten only)
                 at_report: Optional[Dict[str, Any]] = None
+                at_override = await sdb.get_config_override_checked() if at_mode != "off" else {}
+                if at_override is None:
+                    _say("[learner] autotune skipped this cycle: the stored config override could not be read")
+                    at_override, at_mode = {}, "off"
                 if at_mode != "off":
-                    at_override = await sdb.get_config_override()
                     cur_pct = float(at_override.get(AT_FIELD, cfg.CONFLUENCE_MIN_PCT))
                     at_params = {"step": float(cfg.AUTOTUNE_STEP_PCT), "ceiling": float(cfg.AUTOTUNE_CEILING_PCT),
                                  "cooldown_h": float(cfg.AUTOTUNE_COOLDOWN_HOURS), "eval_h": float(cfg.AUTOTUNE_EVAL_HOURS),

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from brain_audit import DataCoverage, HealthStatus, get_audit
 from bot_config import cfg, Constants, CONFLUENCE_WEIGHTS, CONFIG_OVERRIDE_ALLOWED_FIELDS, json_dumps, json_loads
 from brain_helpers import _extract_p_value_for_fdr, HYPOTHESIS_LEDGER_KEY, collect_conclusions, update_hypothesis_ledger
@@ -1168,17 +1168,26 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
     # kept up to date as this loop disables/enables, so one run cannot
     # overshoot it. Re-enables are never blocked by the cap.
     _max_disabled = int(getattr(cfg, "BRAIN_MAX_DISABLED_KEYS", 6))
+    _disabled_chk: Optional[Set[str]] = None
     try:
-        _disabled_now = set(await self.sdb.get_disabled_alert_keys())
+        _disabled_chk = await self.sdb.get_disabled_alert_keys_checked()
     except Exception as e:
         logger.warning(f"Could not read disabled keys for cap check: {e}")
-        _disabled_now = set()
+    if _disabled_chk is None:
+        logger.warning(
+            "Disabled-key set unreadable: auto-disables are held this run so the "
+            "BRAIN_MAX_DISABLED_KEYS cap cannot be bypassed"
+        )
+    _disabled_now = set(_disabled_chk or ())
     for rec in recommendations:
         if not rec.get("pending_auto_action"):
             continue
         ak = rec.get("alert")
         action = rec.get("pending_action")
         if not ak or action not in ("disable", "enable"):
+            continue
+        if action == "disable" and _disabled_chk is None:
+            rec["message"] += " [NOT APPLIED — disabled-key list unreadable, will retry next run]"
             continue
         if (
             action == "disable"

@@ -883,7 +883,16 @@ class RedisStateStore:
         """Read-only: current override dict, safelist-filtered, for inspection
         without mutating cfg. Used by brain.py to check whether a path is
         already disabled before deciding to (re)write it."""
-        override = await self._read_raw_config_override()
+        override = await self.get_config_override_checked()
+        return override if override is not None else {}
+
+    async def get_config_override_checked(self) -> Optional[Dict[str, Any]]:
+        """None when the stored override could NOT be read (Redis failed, timed out or is
+        degraded); {} means the read worked and nothing is overridden. Callers that decide
+        something from the override (autotune, rollback snapshots) must stop on None."""
+        override = await self._read_raw_config_override_checked()
+        if override is None:
+            return None
         return {k: v for k, v in override.items() if k in CONFIG_OVERRIDE_ALLOWED_FIELDS}
 
     async def write_config_override(self, field: str, value: Any) -> bool:
@@ -928,13 +937,18 @@ class RedisStateStore:
         return True
 
     async def get_disabled_alert_keys(self) -> Set[str]:
+        keys = await self.get_disabled_alert_keys_checked()
+        return keys if keys is not None else set()
+
+    async def get_disabled_alert_keys_checked(self) -> Optional[Set[str]]:
+        """None when the stored set could not be read; an empty set means nothing is disabled."""
         _ok, raw = await self.read_metadata_checked(BRAIN_DISABLED_KEYS_METADATA_KEY, timeout=3.0, durable=True)
         if not _ok:
             _ok, raw = await self.read_metadata_checked(BRAIN_DISABLED_KEYS_METADATA_KEY, timeout=3.0, durable=True)
         if not _ok:
             if not self.degraded:
                 logger.error("Disabled alert-key set could NOT be read: Brain-disabled keys are not enforced this run")
-            return set()
+            return None
         if not raw:
             return set()
         try:
