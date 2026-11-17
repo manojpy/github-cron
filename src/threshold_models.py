@@ -9,7 +9,7 @@ import random
 import statistics
 import numpy as np
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from bot_config import cfg
 from threshold_stats import (
     Row,
