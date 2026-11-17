@@ -227,10 +227,8 @@ Every alert that passes the signal gates is still sent to Telegram. What differs
 | ⏭ **Ignored** | Sent, but not recorded because the pair already has an open recorded trade (`ENABLE_SINGLE_ACTIVE_TRADE`). Log line: `NOT RECORDED … trade already open`. |
 | ⏸ **Cooldown** | Sent, but not recorded because a recorded target was hit within the last `TRADE_CLOSE_COOLDOWN_CANDLES` candles. |
 | 👁 **Shadowed** | Alert was blocked by a gate (confluence, cluster penalty, win-rate, calibration, OOD, portfolio heat, brain-disabled). It is not sent, but it is tracked as a counterfactual trade for the Brain. |
-| 🗂 **Candidate** | A valid signal that was delivered but not recorded (cooldown / open trade / weaker same-candle key) or demoted by the single-active-shadow rule. Archived as a `candidate_only` row; excluded from Recorded/Shadowed stats and the scoreboards, but loaded (labelled) into the learner's rule-mining population. Requires `ENABLE_CANDIDATE_LEDGER=true` and `BRAIN_USE_FILE_STORAGE=true`. |
 
 The cooldown (`trade_cooldown:{pair}`) is started only by **Recorded** trades. Shadow trades neither start it nor are skipped by it: they are always registered, and each one stores `cooldown_active` (and `cooldown_hit_ts`) in its context so reports can include or exclude entries made during a live cooldown.
-Candidate-only rows never occupy the single-active shadow slot, never start a cooldown, and never send trade-close notices. A weaker same-candle shadow signal is demoted to candidate (not deleted) when a stronger key takes over the candle. Candidates resolve on the full outcome horizon and keep their point-in-time feature snapshot (including `setup_fingerprint`), so the Brain can learn why a delivered-but-unrecorded or demoted signal won or lost.
 
 ### Reading the totals line
 
