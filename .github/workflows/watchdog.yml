@@ -9,7 +9,6 @@ permissions:
 
 env:
   MAX_SILENCE_MIN: 40
-  LEARN_MAX_AGE_MIN: 480
 
 jobs:
   watchdog:
@@ -88,33 +87,9 @@ jobs:
             fi
           fi
 
-      # ── Learner heartbeat (F-10): learning halts silently if the Cronjobs.org
-      # job stops dispatching learner.yml. Both live vetoes fail open after
-      # PLAYBOOK_MAX_AGE_HOURS, so suppression degrades with no signal at all.
-      if LEARN_JSON=$(gh api "repos/${REPO}/actions/workflows/learner.yml/runs?status=success&per_page=1"); then
-        LEARN_SUCCESS=$(echo "$LEARN_JSON" | jq -r '.workflow_runs[0].created_at // empty')
-        if [ -n "$LEARN_SUCCESS" ]; then
-          LEARN_AGE_MIN=$(( (NOW_EPOCH - $(date -u -d "$LEARN_SUCCESS" +%s)) / 60 ))
-        else
-          LEARN_AGE_MIN=999999
-        fi
-        echo "Minutes since last successful learner run: $LEARN_AGE_MIN"
-        if [ "$LEARN_AGE_MIN" -ge "${LEARN_MAX_AGE_MIN}" ] \
-           && { [ "$LEARN_AGE_MIN" -lt 540 ] || [ $(( LEARN_AGE_MIN / 30 % 4 )) -eq 0 ]; }; then
-          LEARN_ALERT="🧠 Learner stale: no successful learner.yml run in ${LEARN_AGE_MIN} min (expected every ~6 h). Playbook + hypothesis vetoes fail open after 36 h — suppression is degrading silently. Check the Cronjobs.org learner job."
           if [ -n "$ALERT" ]; then
-            ALERT="${ALERT}"$'\n\n'"${LEARN_ALERT}"
-          else
-            ALERT="$LEARN_ALERT"
-          fi
-        fi
-      else
-        echo "::warning::Could not query learner.yml runs"
-      fi
-
-      if [ -n "$ALERT" ]; then
-        {
-          echo "send_alert=true"
+            {
+              echo "send_alert=true"
               echo "alert_msg<<EOF"
               echo "$ALERT"
               echo "EOF"
