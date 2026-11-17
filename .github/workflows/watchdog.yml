@@ -124,13 +124,50 @@ jobs:
             echo "send_alert=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: 🧠 Verify persisted learner artifacts (Redis)
+        id: artifacts
+        continue-on-error: true
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+        run: |
+          python3 -m venv /tmp/wdvenv
+          /tmp/wdvenv/bin/pip install --quiet redis
+          /tmp/wdvenv/bin/python - <<'PY'
+          import json, os, time
+          import redis
+          out = os.environ["GITHUB_OUTPUT"]
+          msgs = []
+          try:
+              r = redis.Redis.from_url(os.environ["REDIS_URL"], socket_timeout=10, socket_connect_timeout=10)
+              now = time.time()
+              raw = r.get("metadata:playbook_current")
+              if not raw:
+                  msgs.append("🧠 Playbook artifact MISSING in Redis (metadata:playbook_current) — learner runs may be green but its writes are not landing.")
+              else:
+                  age_h = (now - float(json.loads(raw).get("generated_ts") or 0)) / 3600.0
+                  print(f"playbook artifact age: {age_h:.1f} h")
+                  if age_h > 36:
+                      msgs.append(f"🧠 Playbook artifact STALE: generated {age_h:.1f} h ago (> 36 h). A successful learner.yml run is not proof of a persisted playbook — check the learner's Redis write step.")
+              ttl = r.ttl("metadata:pair_key_ev")
+              print(f"pair_key_ev TTL: {ttl}")
+              if ttl == -2:
+                  print("::warning::pair_key_ev table missing/expired — runtime EV evidence falls back to pooled verdicts until the next 12 h Brain report")
+          except Exception as e:
+              print(f"::warning::artifact check could not reach Redis: {e!r}")
+          with open(out, "a") as f:
+              if msgs:
+                  f.write("send_alert=true\n")
+                  f.write("alert_msg<<EOF\n\n" + "\n\n".join(msgs) + "\nEOF\n")
+              else:
+                  f.write("send_alert=false\n")
+          PY
+
       - name: 📨 Send Telegram Alert
-        if: steps.check.outputs.send_alert == 'true'
+        if: steps.check.outputs.send_alert == 'true' || steps.artifacts.outputs.send_alert == 'true'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          ALERT_MSG: ${{ steps.check.outputs.alert_msg }}
-
+          ALERT_MSG: "${{ steps.check.outputs.alert_msg }}${{ steps.artifacts.outputs.alert_msg }}"
         run: |
           RESP=$(curl -sS --max-time 20 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
@@ -146,7 +183,7 @@ jobs:
         if: always()
         run: |
           echo "## 🚨 Watchdog Check" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.check.outputs.send_alert }}" = "true" ]; then
+          if [ "${{ steps.check.outputs.send_alert }}" = "true" ] || [ "${{ steps.artifacts.outputs.send_alert }}" = "true" ]; then
             echo "**Alert sent** — see Telegram" >> $GITHUB_STEP_SUMMARY
           else
             echo "✅ No issues detected" >> $GITHUB_STEP_SUMMARY
