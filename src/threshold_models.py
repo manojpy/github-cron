@@ -537,6 +537,7 @@ def oos_permutation_importance(rows: List[Row], min_sample: int = 30, n_permutat
     # ── Build feature matrices on a SHARED feat_names so holdout columns
     #    line up with train columns; otherwise the feat_idx+1 shuffle index
     #    below would point at different features in the two splits. ──
+
     X_train, y_train, feat_names = build_market_state_features(train_rows)
     X_hold, y_hold, _ = build_market_state_features(holdout_rows, feat_names)
     if not feat_names:
@@ -676,32 +677,8 @@ def train_market_state_model(rows: List[Row], min_sample: int = 150, train_frac:
         drift_check = {"valid": False, "error": "drift_check_failed"}
 
     X_train, y_train, feat_names = build_market_state_features(train_rows)
-    # ── Phase 4: OOS permutation feature selection, run on TRAIN rows only so
-    # the acceptance holdout plays no part in choosing features. Unmeasurable
-    # features are kept (absence of evidence is not evidence of noise). ──
-    _fs_mode = str(getattr(cfg, "MARKET_STATE_FEATURE_SELECTION", "off"))
-    _fs_dropped: List[str] = []
-    if _fs_mode != "off":
-        try:
-            _imp = oos_permutation_importance(
-                train_rows,
-                min_sample=int(getattr(cfg, "MARKET_STATE_FS_MIN_SAMPLE", 30)),
-                n_permutations=int(getattr(cfg, "MARKET_STATE_FS_PERMUTATIONS", 10)),
-            )
-            _floor = float(getattr(cfg, "MARKET_STATE_FS_MIN_IMPORTANCE", 0.0))
-            _keep = {str(i["feature"]) for i in _imp
-                     if float(i.get("importance_ev") or 0.0) > _floor}
-            _measured = {str(i["feature"]) for i in _imp}
-            _fs_dropped = sorted(f for f in feat_names if f in _measured and f not in _keep)
-            if (_fs_mode == "live" and _fs_dropped
-                    and len(feat_names) - len(_fs_dropped) >= int(getattr(cfg, "MARKET_STATE_FS_MIN_FEATURES", 8))):
-                feat_names = [f for f in feat_names if f not in set(_fs_dropped)]
-                X_train, y_train, feat_names = build_market_state_features(train_rows, feat_names)
-            else:
-                _fs_dropped = _fs_dropped if _fs_mode == "shadow" else []
-        except Exception:
-            _fs_dropped = []
     X_hold, y_hold, _ = build_market_state_features(holdout_rows, feat_names)
+
     # ── Fit on TRAIN, apply to both. The scaler is returned below and
     #    re-applied by predict_market_state_proba at serve time — so the
     #    live feature distribution matches the one the coefficients saw. ──
@@ -797,11 +774,6 @@ def train_market_state_model(rows: List[Row], min_sample: int = 150, train_frac:
         "trained_at": int(time.time()),
         "drift_check": drift_check,
         "horizon_check": horizon_check,
-        "feature_selection": {
-            "mode": _fs_mode,
-            "dropped": _fs_dropped,
-            "n_features": len(feat_names),
-        },
     }
 
 def predict_market_state_proba(model: Optional[Dict[str, Any]], votes: Optional[Dict[str, bool]], context: Optional[Dict[str, Any]], session: str = "unknown", direction: str = "buy") -> Optional[float]:
@@ -867,46 +839,13 @@ def _model_snapshot(m: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "trained_at": int(m.get("trained_at") or 0),
         "feature_names": list(m["feature_names"]),
-
         "scaler": m.get("scaler"),
         "beta": [float(b) for b in m["beta"]],
-        "ev_baseline_proof": m.get("ev_baseline_proof"),
     }
 
 def _snapshot_vec(row: Row, snap: Dict[str, Any]) -> List[float]:
     X, _y, _n = build_market_state_features([dict(row, win=bool(row.get("win")))], snap["feature_names"])
     return _apply_scaler(X, snap.get("scaler"))[0]
-
-def online_ev_noninferior(deltas: List[float], stamps: List[float],
-                          margin_pct: float = 0.02, z: float = 1.645) -> Dict[str, Any]:
-    """Phase 4 profitability acceptance for online-model promotion.
-
-    `deltas` are paired per-test-trade net-P&L differences (online minus
-    champion), in % per trade, over the SAME prequential trades the Brier
-    comparison uses: each model earns the trade's realised net P&L if it would
-    take it, 0 if it would skip. Brier gain measures calibration, not money —
-    this is the money check.
-
-    Non-inferior when the one-sided LOWER bound of the mean difference is not
-    below -margin_pct (time-blocked SE, same cluster_se as the Brier gate).
-    status: insufficient | noninferior | worse.
-    """
-    from plan_replay import cluster_se
-    n = len(deltas)
-    if n == 0:
-        return {"status": "insufficient", "noninferior": False, "mean": None,
-                "lo": None, "n": 0, "n_blocks": 0}
-    mean = sum(deltas) / n
-    se, nb = cluster_se(deltas, stamps)
-    lo = None if se == float("inf") else mean - z * se
-    ok = lo is not None and lo >= -float(margin_pct)
-    return {
-        "status": "noninferior" if ok else ("insufficient" if lo is None else "worse"),
-        "noninferior": bool(ok),
-        "mean": round(mean, 6),
-        "lo": None if lo is None else round(lo, 6),
-        "n": n, "n_blocks": nb,
-    }
 
 def online_challenger_step(state: Optional[Dict[str, Any]], champion: Optional[Dict[str, Any]], rows: List[Row], now: int, *, lag_sec: int = 14400, max_age_sec: int = 14 * 86400, min_eval: int = 60, max_drift: float = 1.0, z: float = 1.645) -> Dict[str, Any]:
     """Prequential (test-then-train) comparison of an online-updated copy of the
@@ -952,16 +891,6 @@ def online_challenger_step(state: Optional[Dict[str, Any]], champion: Optional[D
     )
     base = st["base"]
     skipped = 0
-    # Phase 4: paired profitability stream. Take decision = "would this trade be
-    # +EV at the configured bracket?" i.e. p >= breakeven probability implied by
-    # RR and round-trip costs. Config-only, so no lookahead is introduced.
-    st.setdefault("ev_pairs", [])   # legacy v1 states predate this field
-    _rr = float(getattr(cfg, "OUTCOME_RR_TARGET", 2.0))
-    _stop = float(getattr(cfg, "OUTCOME_MAE_LOSS_PCT", 1.0)) / 100.0
-    _cost = (float(getattr(cfg, "BRAIN_FEE_PCT", 0.0006))
-             + float(getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003))) * 2.0
-    _cost_pct = _cost * 100.0
-    _p_be = (1.0 + (_cost / _stop if _stop > 0 else 0.0)) / (_rr + 1.0)
     for r in fresh:
         ts = int(r["entry_ts"])
         served = next((h for h in reversed(hist) if int(h.get("trained_at") or 0) <= ts), hist[0])
@@ -972,20 +901,11 @@ def online_challenger_step(state: Optional[Dict[str, Any]], champion: Optional[D
         except Exception:
             skipped += 1
             continue
-
         y = 1.0 if r.get("win") else 0.0
         st["pairs"].append([ts, round((p_ch - y) ** 2 - (p_on - y) ** 2, 6)])
-        _pnl = float(row_net_pnl_pct(r, _cost_pct))
-        st["ev_pairs"].append([
-            ts,
-            round((_pnl if p_on >= _p_be else 0.0)
-                  - (_pnl if p_ch >= _p_be else 0.0), 6),
-        ])
         st["beta"] = online_update_beta(st["beta"], x_on, y)
         st["n_updates"] = int(st["n_updates"]) + 1
-
     del st["pairs"][:-ONLINE_PAIRS_MAX]
-    del st["ev_pairs"][:-ONLINE_PAIRS_MAX]
     if cutoff > int(st["last_ts"]):
         st["last_ts"] = cutoff
 
@@ -1009,15 +929,6 @@ def online_challenger_step(state: Optional[Dict[str, Any]], champion: Optional[D
                 "mean_brier_gain": round(mean, 5), "lo": round(lo, 5), "hi": round(hi, 5), "n_blocks": nb,
                 "status": "online_better" if lo > 0 else "batch_better" if hi < 0 else "indistinguishable",
             })
-
-    summary["ev_check"] = online_ev_noninferior(
-        [float(p[1]) for p in st["ev_pairs"]],
-        [float(p[0]) for p in st["ev_pairs"]],
-        margin_pct=float(getattr(cfg, "ONLINE_PROMOTE_EV_MARGIN_PCT", 0.02)),
-        z=z,
-    )
-    summary["ev_check"]["p_breakeven"] = round(_p_be, 4)
-    
     return {"state": st, "summary": summary}
 
 def online_model_for_serving(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -1032,7 +943,6 @@ def online_model_for_serving(state: Optional[Dict[str, Any]]) -> Optional[Dict[s
         "valid": True, "beta": list(state["beta"]), "feature_names": list(base["feature_names"]),
         "scaler": base.get("scaler"), "trained_at": int(state.get("promoted_at") or 0),
         "provenance": "online", "base_trained_at": int(base.get("trained_at") or 0),
-        "ev_baseline_proof": base.get("ev_baseline_proof"),
     }
 
 def net_ev_baseline_audit(rows: List[Row], horizon: int = 12, min_train: int = 100, min_test: int = 40, test_frac: float = 0.3, z: float = 1.645, default_cost_pct: float = 0.0) -> Dict[str, Any]:

@@ -1231,24 +1231,10 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             _hp_ok, _hp_raw = await self.sdb.read_metadata_checked(HYPOTHESIS_POOL_KEY)
             if not _hp_ok:
                 raise RuntimeError("hypothesis pool read failed; not overwriting the stored pool")
-
             # Alerts a confirmed rule dropped (live veto) never become real trades; their shadow rows keep
             # the rule's forward sample alive so it can still be revoked.
-            # Candidate-only rows (delivered-but-unrecorded / demoted same-candle signals) join the rule
-            # search via shadow_pool_rows; they never enter real/shadow stats or the scoreboards.
-            import asyncio, os
-            from pathlib import Path
-            from archive_reader import load_archived_outcomes
-            _cand_rows: List[Dict[str, Any]] = []
-            _cand_dir = getattr(cfg, "OUTCOME_DATA_DIR", None) or os.environ.get("OUTCOME_DATA_DIR")
-            if _cand_dir and Path(_cand_dir).exists():
-                _cand_rows = [r for r in await asyncio.to_thread(
-                    load_archived_outcomes, _cand_dir,
-                    window_days=int(getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30)),
-                    shadow=True, include_candidates=True,
-                ) if r.get("candidate_only")]
             _hp_rows = (list(real_rows) + [r for r in (shadow_rows or []) if r.get("rejection_reason") == "hypothesis_veto"]
-                        + shadow_pool_rows(list(shadow_rows or []) + _cand_rows))
+                        + shadow_pool_rows(shadow_rows or []))
             _hp_pool, _hp_sum = update_hypothesis_pool(
                 json_loads(_hp_raw) if _hp_raw else {}, _hp_rows, int(time.time()),
                 cost_pct=(float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100,
@@ -1421,46 +1407,16 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
         ai_metrics["market_state_model"] = {
             k: v for k, v in ms_model.items() if k != "beta"
         }
-        # ── Phase 4: baseline-proof acceptance. The model already cleared OOS EV;
-        # this additionally requires it to beat the simple chronological baselines
-        # (take_all / key_rule / trailing) in net P&L on unseen trades. 'shadow'
-        # reports the decision but persists; 'live' withholds the refresh so the
-        # previously served model stays live. Fails open on 'insufficient' unless
-        # MARKET_STATE_BASELINE_STRICT is on. ──
-        _ms_bl_mode = str(getattr(cfg, "MARKET_STATE_BASELINE_MODE", "off"))
-        _ms_bl_status = str((_nev_proof or {}).get("status") or "missing")
-        _ms_bl_bad = _ms_bl_status == "not_better" or (
-            bool(getattr(cfg, "MARKET_STATE_BASELINE_STRICT", False))
-            and _ms_bl_status != "validated"
-        )
-        _ms_baseline_ok = not (_ms_bl_mode == "live" and ms_model.get("valid") and _ms_bl_bad)
-        _ms_baseline_note = (
-            f"baseline audit '{_ms_bl_status}'"
-            + (f" (delta_vs_{(_nev_proof or {}).get('best_baseline')}="
-               f"{(_nev_proof or {}).get('delta_vs_best')}, lo={(_nev_proof or {}).get('delta_lo')})"
-               if _nev_proof else "")
-        )
-        ai_metrics["market_state_baseline_gate"] = {
-            "mode": _ms_bl_mode, "proof_status": _ms_bl_status,
-            "would_withhold": bool(ms_model.get("valid") and _ms_bl_bad),
-            "withheld": bool(not _ms_baseline_ok),
-        }
-        if ms_model.get("valid") and _ms_bl_bad and _ms_bl_mode != "off":
-            logging.getLogger("macd_bot").info(
-                f"🤖 Market-state baseline gate ({_ms_bl_mode}): "
-                f"{'WITHHELD' if not _ms_baseline_ok else 'would withhold'} — {_ms_baseline_note}"
-            )
         # Online copy of the model vs the batch model that was being served.
         # Own try/except: a failure here must not touch the batch refresh below.
         try:
-            _champ = ms_model if (ms_model.get("valid") and _ms_baseline_ok) else await self._load_batch_market_state_model()
+            _champ = ms_model if ms_model.get("valid") else await self._load_batch_market_state_model()
             _on = await self.online_model_cycle(real_rows, _champ)
             if _on:
                 ai_metrics["online_model"] = _on
         except Exception as e:
             audit.record_analysis_exception("online_model", e)
-
-        if ms_model.get("valid") and _ms_baseline_ok:
+        if ms_model.get("valid"):
             await self._persist_market_state_model(ms_model)
             # Persist ML calibration curve for dispatch-time lookup
             ml_curve = ms_model.get("ml_calibration")
@@ -1519,7 +1475,6 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                         f"{_populations_note} "
                         f"Treat as descriptive, not a model-selection verdict."
                     )
-
                 recommendations.append({
                     "type": "ml_vs_conf_ece",
                     "severity": "low",
@@ -1529,16 +1484,6 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                         f"{_caveat}"
                     ),
                 })
-        elif ms_model.get("valid"):
-            recommendations.append({
-                "type": "market_state_model_withheld",
-                "severity": "medium",
-                "message": (
-                    f"🤖 Market-state model passed OOS EV but was NOT persisted: "
-                    f"{_ms_baseline_note}. It has not beaten the simple historical "
-                    f"baselines in net P&L on unseen trades — previous model kept live."
-                ),
-            })
         else:
             recommendations.append({
                 "type": "market_state_model_rejected",

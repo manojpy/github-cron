@@ -42,40 +42,6 @@ from brain_helpers import (
     _resolve_config_path,
     _to_opt_float,
 )
-
-# ── Phase 5: one unified, restrict-only edge ceiling ──────────────────
-_VERDICT_RANK: Dict[str, int] = {"BLOCKED": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
-
-
-def edge_verdict_cap(
-    net_ev: Optional[float], p_ev: Optional[float], n: int,
-    oos_validated: bool, pair_specific: bool, novel: bool,
-    *, min_n: int, keep_p: float, block_p: float,
-) -> Tuple[str, str]:
-    """The strongest quality verdict the HISTORICAL evidence permits.
-
-    Restrict-only: this can never raise a verdict. It exists so a stack of
-    favourable technical indicators cannot override an established negative
-    edge, and so an unproven setup cannot read as proven. Pair-specific
-    (hierarchical shrunk) evidence outranks the pooled per-key estimate.
-    Caps at LOW rather than BLOCKED, matching the other restrict-only gates.
-    Returns (cap, reason).
-    """
-    if n < min_n or net_ev is None or p_ev is None:
-        return "MEDIUM", f"edge unproven: n={n} < {min_n}"
-    if novel:
-        return "MEDIUM", "novel input: model is outside its training envelope"
-    _strong = bool(oos_validated or pair_specific)
-    if net_ev < 0 and p_ev <= block_p and _strong:
-        return "LOW", (f"proven negative edge: net EV {net_ev:+.3f}%/trade, "
-                       f"P(EV>0)={p_ev:.0%} over {n} samples")
-    if net_ev > 0 and p_ev >= keep_p and _strong:
-        return "HIGH", (f"proven positive edge: net EV {net_ev:+.3f}%/trade, "
-                        f"P(EV>0)={p_ev:.0%} over {n} samples")
-    return "MEDIUM", (f"edge uncertain: net EV {net_ev:+.3f}%/trade, "
-                      f"P(EV>0)={p_ev:.0%} over {n} samples")
-
-
 class BrainCore:
     """Brain core — the persistence + verdict half of the engine.
 
@@ -149,12 +115,9 @@ class BrainCore:
             return None
 
         wr = wins / total
-        # Point-estimate WR at small n is noisy: require the Wilson LOWER bound to
-        # clear the bar, so an override rests on statistically credible shadow
-        # evidence (mirrors the auto-disable / re-enable discipline).
-        lo, _hi, _ = engine.wilson_ci(wins, total)
-        if lo < cfg.BRAIN_REWARDABLE_MIN_SHADOW_WR:
+        if wr < cfg.BRAIN_REWARDABLE_MIN_SHADOW_WR:
             return None
+
         cooldown_seconds = getattr(cfg, "BRAIN_OVERRIDE_COOLDOWN_SECONDS", 4 * 3600)
         cooldown_key = f"{_OVERRIDE_COOLDOWN_PREFIX}{alert_key}"
         try:
@@ -167,7 +130,7 @@ class BrainCore:
         if not acquired:
             return None
 
-        return f"{conf_pct:.0f}% confluence, shadow WR {wr:.0%} (95% lo {lo:.0%}) over {total} tracked rejections"
+        return f"{conf_pct:.0f}% confluence, shadow WR {wr:.0%} over {total} tracked rejections"
 
     # ── Calibration live gate ────────────────────────────────────────────
 
@@ -715,40 +678,21 @@ class BrainCore:
 
         # st is the stored state updated in place, or a fresh one (promoted=False)
         # after a restart from a new base, which therefore always demotes.
-
         was_promoted = bool(prev and prev.get("promoted"))
         status = summary.get("status")
         drift_ok = bool(summary.get("drift_ok", True))
-        # ── Phase 4: profitability acceptance. Brier gain says the online copy
-        # predicts better; it does not say it MAKES more money. Require the
-        # paired net-P&L check to be non-inferior too. Fail open on insufficient
-        # evidence (calibration-gate discipline); block on evidence of harm. ──
-        _ev_mode = str(getattr(cfg, "ONLINE_PROMOTE_EV_CHECK", "off"))
-        _ev = summary.get("ev_check") or {}
-        _ev_bad = _ev.get("status") == "worse"
-        _ev_ok = (_ev_mode != "live") or (not _ev_bad)
-        if _ev_mode != "off" and _ev_bad:
-            logging.getLogger("macd_bot").info(
-                f"🧠 Online model EV check: WORSE than champion "
-                f"(mean {_ev.get('mean')}%/trade, lo {_ev.get('lo')}, n={_ev.get('n')}) "
-                f"— mode={_ev_mode}"
-            )
-        summary["ev_check_mode"] = _ev_mode
-        summary["ev_ok"] = bool(_ev_ok)
-        ok = status == "online_better" and drift_ok and _ev_ok
+        ok = status == "online_better" and drift_ok
         min_passes = int(getattr(cfg, "CHALLENGER_MIN_CONSECUTIVE_PASSES", 3))
         min_gap = int(getattr(cfg, "CHALLENGER_STREAK_MIN_GAP_SEC", 3600))
         if ok:
             if now - int(st.get("last_pass_ts") or 0) >= min_gap:
                 st["passes"] = int(st.get("passes") or 0) + 1
                 st["last_pass_ts"] = now
-        elif status != "insufficient" or not drift_ok or (_ev_mode == "live" and _ev_bad):
+        elif status != "insufficient" or not drift_ok:
             st["passes"] = 0
         summary["passes"] = int(st.get("passes") or 0)
         summary["would_promote"] = bool(ok and int(st.get("passes") or 0) >= min_passes)
-        if st.get("promoted") and (
-            status == "batch_better" or not drift_ok or (_ev_mode == "live" and _ev_bad)
-        ):
+        if st.get("promoted") and (status == "batch_better" or not drift_ok):
             st["promoted"], st["promoted_at"] = False, None
 
         if was_promoted and not st.get("promoted"):
@@ -1145,7 +1089,6 @@ class BrainCore:
             )
             if plan:
                 result["trade_plan"] = plan
-
         _zone_mode = str(getattr(cfg, "ZONE_MODE", "live"))
         if _zone_mode == "live" and result.get("verdict") != "BLOCKED":
             _zone = engine.zone_lookup(
@@ -1153,61 +1096,6 @@ class BrainCore:
             )
             if _zone:
                 result["trade_zone"] = _zone
-        # ── Phase 5: one unified, explainable decision object. Every input is
-        # already gathered above; this consolidates them and applies a
-        # restrict-only ceiling so technical strength cannot override a
-        # proven negative edge. ──
-        _dec_mode = str(getattr(cfg, "BRAIN_DECISION_MODE", "off"))
-        if _dec_mode != "off":
-            _src = str(ev_model_result.get("net_ev_source") or "alert_baseline")
-            _pair_specific = _src == "hierarchical_shrunk"
-            _net_ev = ev_model_result.get("net_ev")
-            _p_ev = ev_model_result.get("p_ev_positive")
-            _n_ev = int(result.get("n_oos") or ev_model_result.get("n") or 0)
-            _novel = bool((epistemic or {}).get("novel"))
-            _cap, _cap_reason = edge_verdict_cap(
-                float(_net_ev) if _net_ev is not None else None,
-                float(_p_ev) if _p_ev is not None else None,
-                _n_ev,
-                bool(ev_model_result.get("oos_validated")),
-                _pair_specific,
-                _novel,
-                min_n=int(getattr(cfg, "BRAIN_DECISION_MIN_N", 40)),
-                keep_p=float(getattr(cfg, "BRAIN_DECISION_KEEP_P", 0.85)),
-                block_p=float(getattr(cfg, "BRAIN_DECISION_BLOCK_P", 0.15)),
-            )
-            _v = str(result.get("verdict") or "")
-            _final = _v
-            if (_dec_mode == "live" and _v in _VERDICT_RANK and _cap in _VERDICT_RANK
-                    and _VERDICT_RANK[_v] > _VERDICT_RANK[_cap]):
-                _final = _cap
-                result["verdict_before_edge_cap"] = _v
-                result["verdict"] = _cap
-                result["edge_cap"] = {"applied": True, "cap": _cap, "reason": _cap_reason}
-            result["brain_decision"] = {
-                "mode": _dec_mode,
-                "verdict": _final,
-                "technical_pct": round(float(conf_pct), 2),
-                "edge_cap": _cap,
-                "edge_reason": _cap_reason,
-                "net_ev": _net_ev,
-                "p_ev_positive": _p_ev,
-                "n": _n_ev,
-                "evidence_source": _src,
-                "pair_specific": _pair_specific,
-                "oos_validated": bool(ev_model_result.get("oos_validated")),
-                "regime": regime,
-                "market_state_p_win": market_state_p_win,
-                "novel": _novel,
-                "evidence_state": result.get("evidence_state"),
-                "conflict": (
-                    "technical_over_negative_edge"
-                    if _cap == "LOW"
-                    and float(conf_pct) >= float(getattr(cfg, "ALERT_TAKE_MIN_CONVICTION", 70.0))
-                    else None
-                ),
-                "restrict_only": True,
-            }
         return result
 
     # ── Kill switch ──────────────────────────────────────────────────────

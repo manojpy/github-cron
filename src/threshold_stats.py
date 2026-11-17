@@ -854,66 +854,6 @@ def ev_first_objective(rows: List[Row], min_sample: int = 20, fee_pct: Optional[
     _EV_FIRST_CACHE[_cache_key] = _result
     return dict(_result)
 
-def pair_key_ev_table(rows: List[Row], cost_pct: float, *, min_pair_n: int = 25,
-                      shrink_k: float = 30.0, z: float = 1.96) -> Dict[str, Dict[str, Any]]:
-    """Hierarchical per-(pair, alert_key) net-EV evidence, empirical-Bayes shrunk
-    toward the alert-key pool. Pure: archive rows in, JSON-able table out.
-
-        w   = n_pair / (n_pair + shrink_k)
-        ev  = w * mean_pair + (1 - w) * mean_key
-        se  = sqrt(w^2 * se_pair^2 + (1 - w)^2 * se_key^2)
-        lo/hi = ev -/+ z * se
-
-    The parent pool contains the pair's own trades, so lo/hi are approximate;
-    min_pair_n plus the shrinkage weight keep a cell honest until it has its own
-    depth. Cells below min_pair_n are omitted so dispatch falls back to the
-    pooled verdict rather than trusting a noisy cell. Recorded rows only — the
-    same population as the pooled quality verdict (no Recorded/Shadow mixing).
-    """
-    by_key: Dict[str, List[float]] = {}
-    by_cell: Dict[Tuple[str, str], List[float]] = {}
-    for r in rows:
-        ak, pair = r.get("alert_key"), r.get("pair")
-        if not ak or not pair or r.get("entry_ts") is None:
-            continue
-        v = row_net_pnl_pct(r, cost_pct)
-        if v is None:
-            continue
-        by_key.setdefault(str(ak), []).append(float(v))
-        by_cell.setdefault((str(ak), str(pair)), []).append(float(v))
-
-    def _ms(xs: List[float]) -> Tuple[float, float]:
-        n = len(xs)
-        m = sum(xs) / n
-        if n < 2:
-            return m, 0.0
-        var = sum((x - m) ** 2 for x in xs) / (n - 1)
-        return m, (var / n) ** 0.5
-
-    out: Dict[str, Dict[str, Any]] = {}
-    for (ak, pair), xs in by_cell.items():
-        n = len(xs)
-        if n < min_pair_n:
-            continue
-        parent = by_key.get(ak) or []
-        if not parent:
-            continue
-        m_c, se_c = _ms(xs)
-        m_k, se_k = _ms(parent)
-        w = n / (n + shrink_k)
-        ev = w * m_c + (1.0 - w) * m_k
-        se = ((w * se_c) ** 2 + ((1.0 - w) * se_k) ** 2) ** 0.5
-        out.setdefault(ak, {})[pair] = {
-            "n": n,
-            "ev": round(ev, 6),
-            "lo": round(ev - z * se, 6),
-            "hi": round(ev + z * se, 6),
-            "w": round(w, 4),
-            "parent_n": len(parent),
-            "parent_ev": round(m_k, 6),
-        }
-    return out
-
 def per_trade_ev(calibrated_p: float, reward_r: float, risk_r: float = 1.0, fee_pct: Optional[float] = None, slippage_pct: Optional[float] = None, sl_pct: Optional[float] = None) -> Dict[str, Any]:
     """Per-trade EV from a calibrated probability (future pipeline).
 

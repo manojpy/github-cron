@@ -36,7 +36,7 @@ from alerts import TelegramQueue, escape_markdown_v2
 from archive_reader import load_archived_outcomes
 from autopsy import build_intelligence, format_intelligence
 from bot_config import _get_session_from_ts
-from brain_helpers import HYPOTHESIS_POOL_KEY, MARKET_STATE_MODEL_KEY
+from brain_helpers import HYPOTHESIS_POOL_KEY
 from autotune import FIELD as AT_FIELD, KEY_AUTOTUNE
 from autotune import committed as at_committed, evaluate_pending as at_evaluate, observe as at_observe, propose as at_propose
 from hypothesis_gen import compact_rules, shadow_pool_rows, update_hypothesis_pool
@@ -56,10 +56,7 @@ from playbook import (
     ControlModel, KEY_CURRENT, KEY_LEDGER, KEY_PREV, KEY_SCORE, KEY_STATE, KEY_STATE_PREV,
     build_playbook, default_params, format_summary,
 )
-from scoreboard import (
-    KEY_SUPPRESSION, build_scoreboard, build_suppression_scorecard,
-    default_suppression_criteria, format_scoreboard, format_suppression_scorecard,
-)
+from scoreboard import build_scoreboard, format_scoreboard
 from state import RedisStateStore
 _TTL = 90 * 86400
 KEY_AUTOPSY = "brain_autopsy"
@@ -98,17 +95,6 @@ def criteria_from_cfg() -> Dict[str, Any]:
         "max_dd_r": float(cfg.PLAYBOOK_MAX_DD_R),
     }
 
-def suppression_criteria_from_cfg() -> Dict[str, Any]:
-    c = default_suppression_criteria()
-    c.update({
-        "min_blocks": int(cfg.SUPPRESSION_MIN_BLOCKS),
-        "min_n": int(cfg.SUPPRESSION_MIN_N),
-        "precision_target": float(cfg.SUPPRESSION_PRECISION_TARGET),
-        "max_opportunity_loss": float(cfg.SUPPRESSION_MAX_OPPORTUNITY_LOSS),
-        "recent_days": int(cfg.SUPPRESSION_RECENT_DAYS),
-    })
-    return c
-
 
 def typical_cost_by_pair(rows: List[Dict[str, Any]], min_rows: int = 5) -> Dict[str, float]:
     """Median realized round-trip cost per pair (spreads / slippage differ by pair)."""
@@ -120,15 +106,13 @@ def typical_cost_by_pair(rows: List[Dict[str, Any]], min_rows: int = 5) -> Dict[
             by.setdefault(str(r["pair"]), []).append(float(c))
     return {p: statistics.median(v) for p, v in by.items() if len(v) >= min_rows}
 
-def load_rows(data_dir: str, window_days: int, *, include_candidates: bool = False) -> List[Dict[str, Any]]:
-    """Real alerts are tagged LIVE and shadow (would-have-fired) rows SHADOW.
-    Candidate-only rows keep their candidate_only flag and are loaded only when
-    include_candidates=True (the learner routes them to rule mining, never stats)."""
+
+def load_rows(data_dir: str, window_days: int) -> List[Dict[str, Any]]:
+    """Real alerts are tagged LIVE and shadow (would-have-fired) rows SHADOW."""
     rows: List[Dict[str, Any]] = []
     for shadow in (False, True):
         try:
-            got = load_archived_outcomes(data_dir, window_days=window_days, shadow=shadow,
-                                         include_candidates=include_candidates)
+            got = load_archived_outcomes(data_dir, window_days=window_days, shadow=shadow)
         except Exception as e:  # a missing shadow/ folder must not kill the run
             _say(f"[learner] could not read {'shadow' if shadow else 'real'} archive: {e}")
             continue
@@ -137,6 +121,7 @@ def load_rows(data_dir: str, window_days: int, *, include_candidates: bool = Fal
             r["source"] = "SHADOW" if shadow else "LIVE"
             rows.append(r)
     return rows
+
 
 async def fetch_control_candles(days: int) -> Tuple[Dict[str, Tuple[Any, Any, Any, Any, Any]], str]:
     """Closed 15m candles per pair for the no-alert control.  Needs >=50% of pairs."""
@@ -276,40 +261,6 @@ async def recover_paths(rows: List[Dict[str, Any]], sdb: Any, max_calls: int, dr
         _say(f"[learner] path recovery skipped: {e!r}")
         return rows, stats
 
-async def _model_health(sdb: RedisStateStore, now_ts: float) -> Tuple[str, bool]:
-    """Phase 6: is the served market-state model still fresh?
-
-    The Brain refreshes it on the 12-hourly report; nothing watched its age, so a
-    silently failing report left an old model serving indefinitely. Returns
-    (text, alert_needed). Never raises. NOTE: MARKET_STATE_MODEL_KEY is an
-    ABSOLUTE Redis key (brain.py SETs it directly), not a meta_prefix-relative
-    one like ONLINE_MODEL_STATE_KEY — so it is read raw, not via get_metadata.
-    """
-    try:
-        rc = sdb._redis
-        if rc is None:
-            return ("🤖 Model health: Redis unavailable.", False)
-        raw = await asyncio.wait_for(
-            cast(Awaitable[Optional[str]], rc.get(MARKET_STATE_MODEL_KEY)), timeout=5.0,
-        )
-        if not raw:
-            return ("🤖 Model health: no market-state model stored yet.", False)
-        m = _jl(raw, {})
-        trained = float(m.get("trained_at") or 0)
-        if trained <= 0:
-            return ("🤖 Model health: stored model carries no trained_at stamp.", True)
-        age_h = (now_ts - trained) / 3600.0
-        limit = float(getattr(cfg, "LEARNER_MODEL_MAX_AGE_HOURS", 36.0))
-        proof = (m.get("ev_baseline_proof") or {}).get("status") or "missing"
-        stale = age_h > limit
-        return (
-            f"🤖 Model health: age {age_h:.1f}h (limit {limit:g}h), baseline proof '{proof}'"
-            + (" — STALE: the Brain report has stopped refreshing it." if stale else ""),
-            stale,
-        )
-    except Exception as e:
-        return (f"🤖 Model health: could not read the stored model ({e!r}).", False)
-
 def _jl(raw: Optional[str], default: Any) -> Any:
     try:
         return json.loads(raw) if raw else default
@@ -413,18 +364,13 @@ async def run(args: argparse.Namespace) -> int:
             return 2
 
         now_ts = time.time()
-        rows = load_rows(data_dir, int(cfg.PLAYBOOK_WINDOW_DAYS), include_candidates=True)
+        rows = load_rows(data_dir, int(cfg.PLAYBOOK_WINDOW_DAYS))
         rstats: Dict[str, int] = {}
         if not args.no_recon and int(cfg.PLAYBOOK_RECON_MAX_CALLS) > 0:
             rows, rstats = await recover_paths(rows, sdb, int(cfg.PLAYBOOK_RECON_MAX_CALLS), bool(args.dry_run))
             _say(f"[learner] path recovery: {rstats}")
-        # Candidate-only rows join rule mining ONLY. Everything that grades
-        # suppression or rebuilds stats (playbook, scoreboards, veto, firewall,
-        # trend, anatomy) keeps using representatives — no contamination.
-        candidate_rows = [r for r in rows if r.get("candidate_only")]
-        rows = [r for r in rows if not r.get("candidate_only")]
         n_path = sum(1 for r in rows if r.get("path_fav"))
-        _say(f"[learner] rows={len(rows)} with_path={n_path} candidates={len(candidate_rows)}")
+        _say(f"[learner] rows={len(rows)} with_path={n_path}")
 
         control = None
         control_note = "skipped (--no-control)"
@@ -457,17 +403,7 @@ async def run(args: argparse.Namespace) -> int:
                            "reason": f"scoreboard criteria {prev_sb['criteria_hash']} -> {sb['criteria_hash']}"})
             changes.append({"key": "*", "event": "CRITERIA_CHANGED", "from": prev_sb["criteria_hash"],
                             "to": sb["criteria_hash"], "detail": "pass criteria were edited", "plan": None})
-
-        # ── Phase 6: did suppression actually help, and is the served model fresh? ──
-        supp = build_suppression_scorecard(
-            rows, cost_pct=cost_pct, fixed=fixed, now_ts=now_ts,
-            criteria=suppression_criteria_from_cfg(),
-        )
-        health_text, health_alert = await _model_health(sdb, now_ts)
-        text = (format_summary(blob, changes, name_fn=pretty_alert)
-                + "\n" + format_scoreboard(sb)
-                + "\n" + format_suppression_scorecard(supp)
-                + "\n" + health_text)
+        text = format_summary(blob, changes, name_fn=pretty_alert) + "\n\n" + format_scoreboard(sb)
         fb_log = _jl(await sdb.get_metadata(KEY_FEEDBACK, timeout=5.0), {})
 
         if fb_log:
@@ -658,8 +594,7 @@ async def run(args: argparse.Namespace) -> int:
                     due_win = (now_ts - float(wp_prev.get("last_run_ts") or 0)) >= win_days * 86400
                     wp, wsum = update_hypothesis_pool(
                         wp_prev, [r for r in rows if r.get("source") == "LIVE"]
-                        + shadow_pool_rows([r for r in rows if r.get("source") == "SHADOW"] + candidate_rows),
-                        int(now_ts), cost_pct=cost_pct,
+                        + shadow_pool_rows([r for r in rows if r.get("source") == "SHADOW"]), int(now_ts), cost_pct=cost_pct,
                         budget=int(cfg.INTEL_WIN_BUDGET) if due_win else 0, shadow_max=int(cfg.HYPOTHESIS_SHADOW_MAX),
                         forward_min_n=int(cfg.HYPOTHESIS_FORWARD_MIN_N), expire_days=int(cfg.HYPOTHESIS_EXPIRE_DAYS), direction="win",
                     )
@@ -734,10 +669,8 @@ async def run(args: argparse.Namespace) -> int:
             (KEY_CURRENT, json_dumps(blob)),
             (KEY_STATE, json_dumps(new_state)),
             (KEY_SCORE, json_dumps(sb)),
-            (KEY_SUPPRESSION, json_dumps(supp)),
             (KEY_LEDGER, json_dumps(led)),
         ]
-
         if ap_blob is not None:
             writes.append((KEY_AUTOPSY, json_dumps(ap_blob)))
         if intel_blob is not None:
@@ -758,9 +691,8 @@ async def run(args: argparse.Namespace) -> int:
         _say(f"[learner] playbook {blob['label']} written ({len(blob['entries'])} entries, {len(changes)} change(s))")
 
         mode = str(cfg.PLAYBOOK_NOTIFY)
-        if mode == "always" or (mode == "changes" and (changes or health_alert)):
+        if mode == "always" or (mode == "changes" and changes):
             await notify(text)
-
         if ap_blob is not None and ap_due and ap_text:
             await notify(ap_text)
         if intel_blob is not None:

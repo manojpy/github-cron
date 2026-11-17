@@ -218,7 +218,6 @@ def _parse_jsonl_row(raw: dict, *, drop_stale_schema: bool = True, include_ellio
             **coerce_path_fields(raw),
             "adx_val": float(_adx_val) if _adx_val is not None and _adx_val != "" else None,
             "rejection_reason": _rejection_reason,
-            "candidate_only": _coerce_bool(raw.get("candidate_only"), default=False),
             # ── Provenance — lets downstream consumers audit vintage ──
 
             "schema_version": row_schema,
@@ -237,7 +236,7 @@ def _opt_fill_price(v: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
-def load_archived_outcomes(data_dir: str, window_days: int = 30, shadow: bool = False, *, drop_stale_schema: bool = True, return_stats: bool = False, include_elliott: bool = False, include_candidates: bool = False):
+def load_archived_outcomes(data_dir: str, window_days: int = 30, shadow: bool = False, *, drop_stale_schema: bool = True, return_stats: bool = False, include_elliott: bool = False):
     """Load outcomes from archived JSONL files (newest first).
 
     Rows are filtered on three axes:
@@ -269,7 +268,6 @@ def load_archived_outcomes(data_dir: str, window_days: int = 30, shadow: bool = 
         "migrated_forward": 0,
         "dropped_before_window": 0,
         "dropped_duplicate_sid": 0,
-        "dropped_candidate_only": 0,
         "upgraded_early": 0,
         "kept": 0,
     }
@@ -345,9 +343,6 @@ def load_archived_outcomes(data_dir: str, window_days: int = 30, shadow: bool = 
                         continue
                     if "win" not in raw:
                         stats["dropped_missing_win"] += 1
-                        continue
-                    if raw.get("candidate_only") and not include_candidates:
-                        stats["dropped_candidate_only"] += 1
                         continue
                     migrated = False
          
