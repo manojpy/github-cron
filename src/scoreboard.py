@@ -102,13 +102,15 @@ def build_suppression_scorecard(
     sl, tp, h = float(fixed["sl"]), float(fixed["tp"]), int(fixed["h"])
     cut = float(now_ts) - float(C["recent_days"]) * 86400.0
 
+
     delivered: List[Tuple[Row, float, float]] = []
     by_reason: Dict[str, List[Tuple[Row, float, float]]] = {}
     for r in rows:
         if r.get("candidate_only") or r.get("entry_ts") is None:
             continue
         src = r.get("source")
-        ctx = r.get("context") if isinstance(r.get("context"), dict) else {}
+        _ctx_raw = r.get("context")
+        ctx: Dict[str, Any] = _ctx_raw if isinstance(_ctx_raw, dict) else {}
         reason = r.get("rejection_reason") or ctx.get("rejection_reason")
         if src == "LIVE":
             bucket = delivered
