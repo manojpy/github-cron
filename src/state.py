@@ -1768,6 +1768,31 @@ class RedisStateStore:
             await self.record_vote_count(alert_key, confluence_votes)
         return True
 
+    async def _demote_replaced_shadow(self, old_key: str) -> None:
+        """A stronger same-candle key took over the single-active slot. Keep the
+        weaker pending row as a candidate-only outcome (so the full candidate
+        population reaches the archive) instead of deleting it. Falls back to
+        the old delete behaviour only when the row cannot be rewritten."""
+        try:
+            raw = await asyncio.wait_for(_rc(self._redis).get(old_key), timeout=2.0)
+            if raw:
+                d = json_loads(raw)
+                ctx = dict(d.get("context") or {})
+                ctx["candidate_only"] = True
+                ctx["demoted_by"] = "stronger_same_candle"
+                d["context"] = ctx
+                await asyncio.wait_for(
+                    _rc(self._redis).set(old_key, json_dumps(d), xx=True, keepttl=True),
+                    timeout=2.0,
+                )
+                return
+        except Exception as e:
+            logger.warning(f"Shadow demote-on-replace failed for {old_key}: {e} — deleting instead")
+        try:
+            await asyncio.wait_for(_rc(self._redis).delete(old_key), timeout=2.0)
+        except Exception:
+            pass
+
     async def record_shadow_pending_outcome(
         self,
         pair: str,
@@ -1866,13 +1891,13 @@ class RedisStateStore:
 
             if not candidate_only:
                 if replace_key is not None and replace_key != key:
-                    await asyncio.wait_for(_rc(self._redis).delete(replace_key), timeout=2.0)
+                    await self._demote_replaced_shadow(replace_key)
                 self._shadow_registered_this_run[pair] = (int(entry_ts), ratio, key)
             logger.info(
                 f"[{pair}] Shadow pending created: {alert_key} @ {entry_ts} → {key}"
                 + (" (candidate-only)" if candidate_only else "")
                 + (" (live cooldown active)" if cooldown_active else "")
-                + (f" (replaced weaker {replace_key})" if replace_key else "")
+                + (f" (demoted weaker {replace_key} to candidate)" if replace_key else "")
             )
             return "candidate" if candidate_only else "created"
         except Exception as e:
@@ -2531,6 +2556,7 @@ class RedisStateStore:
             raws = await asyncio.wait_for(_rc(self._redis).mget(keys), timeout=2.0)
             if raws is None or len(raws) != len(keys):
                 return None
+
             best: Optional[Dict[str, Any]] = None
             for k, raw in zip(keys, raws):
                 if not raw:
@@ -2538,6 +2564,8 @@ class RedisStateStore:
                 d = json_loads(raw)
                 if d.get("closed_ts") is not None:
                     continue
+                if (d.get("context") or {}).get("candidate_only"):
+                    continue   # candidate-only rows never occupy the single-active slot
                 ets = int(d["entry_ts"])
                 parts = str(k).split(":")
                 if is_elliott_key(parts[-2] if len(parts) >= 2 else "") != elliott:
@@ -3188,14 +3216,13 @@ class RedisStateStore:
                         resolved_count += 1
 
                         if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
-                            if conf_score is None or conf_total is None:
+                            if (conf_score is None or conf_total is None) and not _candidate_only:
                                 logger_pair.warning(
                                     f"[{pair}] Shadow archived row for {alert_key} dropped: "
                                     f"score={conf_score} total={conf_total}. "
                                     f"Confluence was not computed for this alert's direction "
                                     f"(check ENABLE_CONFLUENCE_GATE and gate_passed)."
-                                )
-
+                                )                  
                             elif _early_final:
                                 _frow = self._early_archive_row(
                                     pair, result, _fin_json or "", True, final=True,

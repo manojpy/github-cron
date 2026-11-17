@@ -596,6 +596,7 @@ async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, a
                 "gaussian_gate_ok_buy": gr.gaussian_gate_ok_buy,
                 "gaussian_gate_ok_sell": gr.gaussian_gate_ok_sell,
             })
+
         for _, _, alert_key in alerts_to_send:
             direction = "buy" if alert_key in BUY_ALERT_KEYS else "sell"
             score: Optional[float] = None
@@ -604,22 +605,36 @@ async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, a
             if confluence_scores and alert_key in confluence_scores:
                 score, total, votes = confluence_scores[alert_key]
 
+            row_context = {
+                **(extra_context or {}),
+                "rejection_reason": block_reason,
+                "macro_shadow": macro_shadow,
+                "cluster_penalty": cluster_penalty,
+                "effective_score": effective_score,
+                "effective_required": effective_required,
+                "feature_version": FEATURE_SET_VERSION,
+                **rich_fields,
+                **exhaustion_trade_fields(context or {}, direction),
+            }
+            # Same point-in-time setup identity the win-rate shadow path stores,
+            # so EVERY rejection/candidate row can be mined and matched live.
+            try:
+                from feature_store import setup_fingerprint
+                row_context["setup_fingerprint"] = setup_fingerprint({
+                    "pair": pair_name, "alert_key": alert_key, "direction": direction,
+                    "session": _get_session_from_ts(ts_curr),
+                    "score": score, "total": total, "context": row_context,
+                })
+            except Exception:
+                pass
+
             await sdb.record_shadow_pending_outcome(
                 pair_name, alert_key, direction, ts_curr, close_curr,
                 confluence_score=score,
                 confluence_total=total,
                 confluence_votes=votes,
                 candidate_only=candidate_only,
-                context={
-                    **(extra_context or {}),
-                    "rejection_reason": block_reason,
-                    "macro_shadow": macro_shadow,
-                    "cluster_penalty": cluster_penalty,
-                    "effective_score": effective_score,
-                    "effective_required": effective_required,
-                    **rich_fields,
-                    **exhaustion_trade_fields(context or {}, direction),
-                },
+                context=row_context,
             )
     except Exception as e:
         if logger_pair is not None:
@@ -3590,7 +3605,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     # historical baselines) must not hard-block a live alert.
                                     _bl_mode = str(getattr(cfg, "ML_EV_BASELINE_GATE_MODE", "off"))
                                     _bl_proven = _model_baseline_proven(ml_market_state_model)
-                                    _bl_ok = (_bl_mode != "live") or _bl_proven
+                                    # 'off' = no baseline requirement; 'shadow'/'live' both
+                                    # require proof before an unproven model may hard-block.
+                                    _bl_ok = (_bl_mode == "off") or _bl_proven
                                     if getattr(cfg, "ENABLE_ML_EV_GATE", False) and not qualify and not _bl_ok:
                                         logger_pair.info(
                                             f"[{pair_name}] ML-EV gate NOT applied for {alert_key}: "

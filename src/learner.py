@@ -120,13 +120,15 @@ def typical_cost_by_pair(rows: List[Dict[str, Any]], min_rows: int = 5) -> Dict[
             by.setdefault(str(r["pair"]), []).append(float(c))
     return {p: statistics.median(v) for p, v in by.items() if len(v) >= min_rows}
 
-
-def load_rows(data_dir: str, window_days: int) -> List[Dict[str, Any]]:
-    """Real alerts are tagged LIVE and shadow (would-have-fired) rows SHADOW."""
+def load_rows(data_dir: str, window_days: int, *, include_candidates: bool = False) -> List[Dict[str, Any]]:
+    """Real alerts are tagged LIVE and shadow (would-have-fired) rows SHADOW.
+    Candidate-only rows keep their candidate_only flag and are loaded only when
+    include_candidates=True (the learner routes them to rule mining, never stats)."""
     rows: List[Dict[str, Any]] = []
     for shadow in (False, True):
         try:
-            got = load_archived_outcomes(data_dir, window_days=window_days, shadow=shadow)
+            got = load_archived_outcomes(data_dir, window_days=window_days, shadow=shadow,
+                                         include_candidates=include_candidates)
         except Exception as e:  # a missing shadow/ folder must not kill the run
             _say(f"[learner] could not read {'shadow' if shadow else 'real'} archive: {e}")
             continue
@@ -135,7 +137,6 @@ def load_rows(data_dir: str, window_days: int) -> List[Dict[str, Any]]:
             r["source"] = "SHADOW" if shadow else "LIVE"
             rows.append(r)
     return rows
-
 
 async def fetch_control_candles(days: int) -> Tuple[Dict[str, Tuple[Any, Any, Any, Any, Any]], str]:
     """Closed 15m candles per pair for the no-alert control.  Needs >=50% of pairs."""
@@ -412,13 +413,18 @@ async def run(args: argparse.Namespace) -> int:
             return 2
 
         now_ts = time.time()
-        rows = load_rows(data_dir, int(cfg.PLAYBOOK_WINDOW_DAYS))
+        rows = load_rows(data_dir, int(cfg.PLAYBOOK_WINDOW_DAYS), include_candidates=True)
         rstats: Dict[str, int] = {}
         if not args.no_recon and int(cfg.PLAYBOOK_RECON_MAX_CALLS) > 0:
             rows, rstats = await recover_paths(rows, sdb, int(cfg.PLAYBOOK_RECON_MAX_CALLS), bool(args.dry_run))
             _say(f"[learner] path recovery: {rstats}")
+        # Candidate-only rows join rule mining ONLY. Everything that grades
+        # suppression or rebuilds stats (playbook, scoreboards, veto, firewall,
+        # trend, anatomy) keeps using representatives — no contamination.
+        candidate_rows = [r for r in rows if r.get("candidate_only")]
+        rows = [r for r in rows if not r.get("candidate_only")]
         n_path = sum(1 for r in rows if r.get("path_fav"))
-        _say(f"[learner] rows={len(rows)} with_path={n_path}")
+        _say(f"[learner] rows={len(rows)} with_path={n_path} candidates={len(candidate_rows)}")
 
         control = None
         control_note = "skipped (--no-control)"
@@ -652,7 +658,8 @@ async def run(args: argparse.Namespace) -> int:
                     due_win = (now_ts - float(wp_prev.get("last_run_ts") or 0)) >= win_days * 86400
                     wp, wsum = update_hypothesis_pool(
                         wp_prev, [r for r in rows if r.get("source") == "LIVE"]
-                        + shadow_pool_rows([r for r in rows if r.get("source") == "SHADOW"]), int(now_ts), cost_pct=cost_pct,
+                        + shadow_pool_rows([r for r in rows if r.get("source") == "SHADOW"] + candidate_rows),
+                        int(now_ts), cost_pct=cost_pct,
                         budget=int(cfg.INTEL_WIN_BUDGET) if due_win else 0, shadow_max=int(cfg.HYPOTHESIS_SHADOW_MAX),
                         forward_min_n=int(cfg.HYPOTHESIS_FORWARD_MIN_N), expire_days=int(cfg.HYPOTHESIS_EXPIRE_DAYS), direction="win",
                     )

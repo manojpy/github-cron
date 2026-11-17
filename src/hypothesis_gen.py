@@ -61,9 +61,14 @@ SHADOW_POOL_REASONS = ("run_cap",)
 
 
 def shadow_pool_rows(rows: Sequence[Row]) -> List[Row]:
-    """The shadow rows allowed into the rule search (see SHADOW_POOL_REASONS)."""
-    return [r for r in rows if r.get("rejection_reason") in SHADOW_POOL_REASONS]
-
+    """The shadow rows allowed into the rule search (see SHADOW_POOL_REASONS),
+    plus candidate-only rows: delivered-but-unrecorded alerts (cooldown / open
+    trade / weaker same-candle key) and single-active demotions. Those controls
+    select neither on the outcome nor on the features, so candidates are an
+    unbiased addition to the mining population. They keep their candidate_only
+    label and never enter Recorded/Shadowed stats or the scoreboards."""
+    return [r for r in rows
+            if r.get("rejection_reason") in SHADOW_POOL_REASONS or r.get("candidate_only")]
 
 def row_features(r: Row, setup: bool = False) -> Dict[str, Any]:
     """Everything knowable when the alert fired, flattened to one dict.

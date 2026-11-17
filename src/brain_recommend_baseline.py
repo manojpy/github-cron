@@ -1231,10 +1231,24 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             _hp_ok, _hp_raw = await self.sdb.read_metadata_checked(HYPOTHESIS_POOL_KEY)
             if not _hp_ok:
                 raise RuntimeError("hypothesis pool read failed; not overwriting the stored pool")
+
             # Alerts a confirmed rule dropped (live veto) never become real trades; their shadow rows keep
             # the rule's forward sample alive so it can still be revoked.
+            # Candidate-only rows (delivered-but-unrecorded / demoted same-candle signals) join the rule
+            # search via shadow_pool_rows; they never enter real/shadow stats or the scoreboards.
+            import asyncio, os
+            from pathlib import Path
+            from archive_reader import load_archived_outcomes
+            _cand_rows: List[Dict[str, Any]] = []
+            _cand_dir = getattr(cfg, "OUTCOME_DATA_DIR", None) or os.environ.get("OUTCOME_DATA_DIR")
+            if _cand_dir and Path(_cand_dir).exists():
+                _cand_rows = [r for r in await asyncio.to_thread(
+                    load_archived_outcomes, _cand_dir,
+                    window_days=int(getattr(cfg, "BRAIN_ANALYSIS_WINDOW_DAYS", 30)),
+                    shadow=True, include_candidates=True,
+                ) if r.get("candidate_only")]
             _hp_rows = (list(real_rows) + [r for r in (shadow_rows or []) if r.get("rejection_reason") == "hypothesis_veto"]
-                        + shadow_pool_rows(shadow_rows or []))
+                        + shadow_pool_rows(list(shadow_rows or []) + _cand_rows))
             _hp_pool, _hp_sum = update_hypothesis_pool(
                 json_loads(_hp_raw) if _hp_raw else {}, _hp_rows, int(time.time()),
                 cost_pct=(float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100,

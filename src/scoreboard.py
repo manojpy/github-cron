@@ -155,28 +155,31 @@ def build_suppression_scorecard(
             verdict = "EFFECTIVE"
         else:
             verdict = "NO_BENEFIT_YET"
+
         per[reason] = {
             "verdict": verdict, "n": n, "n_blocks": p["n_blocks"],
             "ev": p["ev"], "lcb": p["lcb"], "ucb": p["ucb"],
             "precision": precision, "precision_lo": prec_lo,
             "opportunity_loss": opp, "profitable_held_back": wins,
+            "opportunity_cost_pct": round(sum(pn for _, pn, _ in items if pn > 0), 4),
             "recent": {"n": pr["n"], "ev": pr["ev"], "lcb": pr["lcb"]},
-        }
-
+        }     
     pd, ps = _pool(delivered), _pool(sup_items)
     allp = _pool(delivered + sup_items)
     lift = (None if pd["ev"] is None or allp["ev"] is None
             else float(pd["ev"]) - float(allp["ev"]))
     overall_precision = ((len(sup_items) - sup_wins) / len(sup_items)) if sup_items else None
+    overall_prec_lo = _precision_lo(len(sup_items) - sup_wins, len(sup_items))
     overall_opp = (sup_wins / total_wins) if total_wins else None
+    overall_opp_cost = round(sum(pn for _, pn, _ in sup_items if pn > 0), 4)
     crit = [
         _crit("S1", "delivered EV beats take-everything EV (%)",
               None if lift is None else round(lift, 3), "> 0",
               lift is not None and lift > 0),
-        _crit("S2", "overall suppression precision",
-              None if overall_precision is None else f"{overall_precision:.0%}",
+        _crit("S2", "overall suppression precision (95% lower bound)",
+              None if overall_prec_lo is None else f"{overall_prec_lo:.0%}",
               f">= {C['precision_target']:.0%}",
-              overall_precision is not None and overall_precision >= float(C["precision_target"])),
+              overall_prec_lo is not None and overall_prec_lo >= float(C["precision_target"])),
         _crit("S3", "overall opportunity loss",
               None if overall_opp is None else f"{overall_opp:.0%}",
               f"<= {C['max_opportunity_loss']:.0%}",
@@ -188,7 +191,8 @@ def build_suppression_scorecard(
         "suppressed": {"n": ps["n"], "ev": ps["ev"], "ucb": ps["ucb"]},
         "take_everything": {"n": allp["n"], "ev": allp["ev"]},
         "suppression_lift": lift,
-        "precision": overall_precision, "opportunity_loss": overall_opp,
+        "precision": overall_precision, "precision_lo": overall_prec_lo,
+        "opportunity_loss": overall_opp, "opportunity_cost_pct": overall_opp_cost,
         "reasons": per, "criteria_checks": crit,
         "status": ("NO_SUPPRESSION" if not sup_items else
                    "HELPING" if all(c["pass"] for c in crit) else "MIXED"),
@@ -210,7 +214,8 @@ def format_suppression_scorecard(sc: Mapping[str, Any]) -> str:
            f"  delivered {d['n']} ({_ev(d['ev'])}/trade) · held back {s['n']} ({_ev(s['ev'])}/trade)",
            f"  take-everything baseline: {a['n']} trades, {_ev(a['ev'])}/trade "
            f"→ suppression lift {_ev(sc.get('suppression_lift'))}",
-           f"  precision {_pct(sc.get('precision'))} · opportunity loss {_pct(sc.get('opportunity_loss'))}"]
+           f"  precision {_pct(sc.get('precision'))} (lo {_pct(sc.get('precision_lo'))}) · "
+           f"opportunity loss {_pct(sc.get('opportunity_loss'))} · held-back winners net {_ev(sc.get('opportunity_cost_pct'))}"]
     for c in sc.get("criteria_checks") or []:
         v = "n/a" if c["value"] is None else c["value"]
         out.append(f"  {'✅' if c['pass'] else '❌'} {c['id']} {c['label']}: {v} (need {c['target']})")
@@ -218,7 +223,8 @@ def format_suppression_scorecard(sc: Mapping[str, Any]) -> str:
         out.append(
             f"  · {reason}: {r['verdict']} — n={r['n']}/{r['n_blocks']} blocks, "
             f"held-back EV {_ev(r['ev'])}, precision {_pct(r['precision'])} "
-            f"(lo {_pct(r['precision_lo'])}), opportunity loss {_pct(r['opportunity_loss'])}"
+            f"(lo {_pct(r['precision_lo'])}), opportunity loss {_pct(r['opportunity_loss'])}, "
+            f"held-back winners net {_ev(r.get('opportunity_cost_pct'))}"
         )
     return "\n".join(out)
 
