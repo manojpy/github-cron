@@ -502,8 +502,7 @@ def setup_scorecard(rows: Sequence[Row], *, fixed: Mapping[str, float], cost_pct
 # ── Conviction anatomy ────────────────────────────────────────────────────────
 
 ANATOMY_FEATURES = ("conviction", "net_ev", "ev_p5", "p_ev_positive", "ensemble_p", "quality_score", "market_state_p_win",
-                    "gate_margin", "conf_pct")
-
+                    "gate_margin", "conf_pct", "independent_groups", "vote_duplication")
 
 def _anatomy_value(r: Row, name: str) -> Optional[float]:
     """The value of one conviction ingredient as it was stored BEFORE the outcome existed."""
@@ -513,6 +512,12 @@ def _anatomy_value(r: Row, name: str) -> Optional[float]:
         if name == "conviction":
             seen = ctx.get("advisor_seen")
             v = seen.get("conviction") if isinstance(seen, dict) else None
+        elif name in ("independent_groups", "vote_duplication"):
+            seen = ctx.get("advisor_seen")
+            ev = seen.get("evidence") if isinstance(seen, dict) else None
+            vg = ev.get("vote_groups") if isinstance(ev, dict) else None
+            v = (vg.get("groups_on" if name == "independent_groups" else "duplication")
+                 if isinstance(vg, dict) else None)
         elif name in ("gate_margin", "conf_pct"):
             es, rq, total = r.get("effective_score"), r.get("effective_required"), r.get("total")
             if es is None or not total or float(total) <= 0:

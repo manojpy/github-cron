@@ -1139,27 +1139,60 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
         action_gate["stability"] = False
         action_gate["actionable"] = False
     ai_metrics["action_gate"] = action_gate
+
     if not action_gate.get("actionable", False):
-        # Downgrade all config patches to informational
+        # Per-key stability scoping: when ONLY the CUSUM stability layer failed and
+        # the drifting keys are known, freeze just those keys — an unrelated drifting
+        # key must not block tuning / re-enables everywhere else. Any other failed
+        # layer (data quality, OOS, profitability, risk, execution) still blocks
+        # portfolio-wide. Unknown path->key mapping fails safe (blocked).
+        _drift = set(_active_drift_keys or ()) if not _cusum_read_failed else set()
+        _stability_only = (
+            bool(_drift)
+            and action_gate.get("data_quality", True)
+            and action_gate.get("oos_prediction", True)
+            and action_gate.get("profitability", True)
+            and action_gate.get("risk", True)
+            and action_gate.get("execution", True)
+            and not action_gate.get("stability", True)
+        )
+        _rev: Dict[str, List[str]] = {}
+        if _stability_only:
+            from alert_registry import ALERT_KEYS, resolve_alert_config_path
+            for _ak in ALERT_KEYS:
+                _p = resolve_alert_config_path(_ak)
+                if _p:
+                    _rev.setdefault(_p, []).append(_ak)
+
+        def _patch_is_drifting(patch: Dict[str, Any]) -> bool:
+            if not _stability_only:
+                return True   # non-stability failure: block everything (old behaviour)
+            _keys = _rev.get(str(patch.get("path")))
+            if not _keys:
+                return True   # cannot map path -> keys: fail safe
+            return any(k in _drift for k in _keys)
+
         for patch in config_patch:
-            patch["_blocked_by_action_gate"] = True
-            patch["reason"] = (
-                f"[GATE BLOCKED] {patch.get('reason', '')} "
-                f"— OOS EV evidence insufficient"
-            )
-        # Only RISK-INCREASING auto-actions (re-enable) need this gate.
-        # A disable is protective and stands on its own per-alert evidence
-        # (upper CI bound below the disable threshold, net EV negative,
-        # minimum sample). Gating it on portfolio-wide EV/drawdown/drift
-        # would stop the Brain from switching off a losing alert exactly
-        # when the system as a whole is doing worst.
+            if _patch_is_drifting(patch):
+                patch["_blocked_by_action_gate"] = True
+                patch["reason"] = (
+                    f"[GATE BLOCKED] {patch.get('reason', '')} "
+                    "— OOS EV evidence insufficient"
+                )
+        # Only RISK-INCREASING auto-actions (re-enable) need this gate. A disable is
+        # protective and stands on its own per-alert evidence. Re-enables are scoped
+        # to the drifting key itself when the failure is stability-only.
         for rec in recommendations:
             if rec.get("pending_auto_action") and rec.get("pending_action") != "disable":
+                _rk = rec.get("alert")
+                if _stability_only and _rk and _rk not in _drift:
+                    continue   # this key is not drifting: let its re-enable proceed
                 rec["pending_auto_action"] = False
                 rec["message"] += " [BLOCKED by action gate]"
         logger.info(
             f"🚫 Action gate BLOCKED config patches and re-enables "
-            f"(protective disables still proceed): {action_gate}"
+            f"(protective disables still proceed; stability_only={bool(_stability_only)}, "
+            f"drift_keys={sorted(_drift)[:5]}): {action_gate}"
         )
 
     # ── Execute deferred auto-actions. 'disable' always gets here; 'enable'
@@ -1237,6 +1270,33 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
                 f"stays pending for the next Brain run"
             )
             rec["message"] += " [NOT APPLIED — will retry next run]"
+
+    # ── Hierarchical per-(pair, key) EV table (Phase 3b): computed on the
+    # report's recorded rows, persisted with a long TTL so the 15-min dispatch
+    # path reads it cheaply. Fails open: on any error dispatch keeps using the
+    # pooled per-key verdict. ──
+    try:
+        from threshold_stats import pair_key_ev_table
+        _pk_cost = (float(getattr(cfg, "BRAIN_FEE_PCT", 0.0006))
+                    + float(getattr(cfg, "BRAIN_SLIPPAGE_PCT", 0.0003))) * 200.0
+        _pk_table = pair_key_ev_table(
+            real_rows, _pk_cost,
+            min_pair_n=int(getattr(cfg, "EV_FILTER_PAIR_MIN_N", 25)),
+            shrink_k=float(getattr(cfg, "EV_FILTER_SHRINK_K", 30.0)),
+        )
+        _pk_ok = await self.sdb.set_pair_key_ev(_pk_table)
+        ai_metrics["pair_key_ev"] = {
+            "keys": len(_pk_table),
+            "cells": sum(len(v) for v in _pk_table.values()),
+            "persisted": bool(_pk_ok),
+        }
+        logger.info(
+            f"Pair-key EV table: {ai_metrics['pair_key_ev']['cells']} cells "
+            f"across {ai_metrics['pair_key_ev']['keys']} keys "
+            f"({'persisted' if _pk_ok else 'NOT persisted'})"
+        )
+    except Exception as e:
+        logger.warning(f"Pair-key EV table build/persist failed: {e}")
 
     _phase_mark("fdr_and_actionability")
 

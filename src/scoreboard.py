@@ -57,6 +57,169 @@ def _pool(items: List[Tuple[Row, float, float]]) -> Dict[str, Any]:
         "p_profit": sum(1 for p in pn if p > 0) / n,
     }
 
+KEY_SUPPRESSION = "learner_suppression_scorecard"
+
+
+def default_suppression_criteria() -> Dict[str, Any]:
+    return {"min_blocks": 20, "min_n": 30, "precision_target": 0.55,
+            "max_opportunity_loss": 0.35, "recent_days": 14}
+
+
+def _precision_lo(losers: int, n: int) -> Optional[float]:
+    """One-sided 95% Wilson lower bound on the share of held-back trades that
+    would have lost money. Local import keeps scoreboard's import graph flat."""
+    from threshold_stats import wilson_ci
+    if n <= 0:
+        return None
+    lo, _hi, _ = wilson_ci(losers, n)
+    return lo
+
+
+def build_suppression_scorecard(
+    rows: Sequence[Row], *, cost_pct: float, fixed: Mapping[str, float],
+    now_ts: float, criteria: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Did suppression actually help? Two questions the playbook scoreboard
+    does not answer:
+
+      suppression precision  of the alerts a gate held back, what share would
+                             have LOST money on the fixed bracket after costs?
+      opportunity loss       of ALL profitable opportunities (delivered plus
+                             held back), what share did suppression remove?
+
+    Population: delivered (LIVE) rows and genuinely suppressed SHADOW rows.
+    Candidate-only rows (delivered but unrecorded) are NOT suppression and are
+    excluded. Every reason is replayed on the SAME fixed bracket as the
+    scoreboard, with the same cluster-robust SE over 3h blocks. A reason is
+    EFFECTIVE only when its precision lower bound clears the target AND its
+    opportunity share is bounded; COSTLY when the held-back trades provably
+    earned money or it removes too much of the good book; RECOVERING when the
+    recent window's held-back trades now earn money after losing before.
+    Criteria are pre-committed and hashed, exactly like the playbook scoreboard.
+    """
+    C = dict(default_suppression_criteria())
+    C.update(criteria or {})
+    sl, tp, h = float(fixed["sl"]), float(fixed["tp"]), int(fixed["h"])
+    cut = float(now_ts) - float(C["recent_days"]) * 86400.0
+
+    delivered: List[Tuple[Row, float, float]] = []
+    by_reason: Dict[str, List[Tuple[Row, float, float]]] = {}
+    for r in rows:
+        if r.get("candidate_only") or r.get("entry_ts") is None:
+            continue
+        src = r.get("source")
+        ctx = r.get("context") if isinstance(r.get("context"), dict) else {}
+        reason = r.get("rejection_reason") or ctx.get("rejection_reason")
+        if src == "LIVE":
+            bucket = delivered
+        elif src == "SHADOW" and reason:
+            bucket = by_reason.setdefault(str(reason), [])
+        else:
+            continue
+        res = replay_plan(r, sl, tp, h, cost_pct)
+        if res is not None:
+            bucket.append((r, res[1], sl))
+
+    def _wins(items: List[Tuple[Row, float, float]]) -> int:
+        return sum(1 for _, p, _ in items if p > 0)
+
+    del_wins = _wins(delivered)
+    sup_items = [it for items in by_reason.values() for it in items]
+    sup_wins = _wins(sup_items)
+    total_wins = del_wins + sup_wins
+
+    per: Dict[str, Any] = {}
+    for reason, items in sorted(by_reason.items()):
+        p = _pool(items)
+        n = int(p["n"])
+        wins = _wins(items)
+        losers = n - wins
+        precision = (losers / n) if n else None
+        prec_lo = _precision_lo(losers, n)
+        opp = (wins / total_wins) if total_wins else None
+        recent = [it for it in items if float(it[0]["entry_ts"]) > cut]
+        pr = _pool(recent)
+        enough = n >= int(C["min_n"]) and p["n_blocks"] >= int(C["min_blocks"])
+        if not enough:
+            verdict = "COLLECTING"
+        elif (pr["lcb"] is not None and pr["lcb"] > 0
+              and p["ev"] is not None and p["ev"] <= 0):
+            verdict = "RECOVERING"
+        elif p["lcb"] is not None and p["lcb"] > 0:
+            verdict = "COSTLY"
+        elif opp is not None and opp > float(C["max_opportunity_loss"]):
+            verdict = "COSTLY"
+        elif prec_lo is not None and prec_lo >= float(C["precision_target"]):
+            verdict = "EFFECTIVE"
+        else:
+            verdict = "NO_BENEFIT_YET"
+        per[reason] = {
+            "verdict": verdict, "n": n, "n_blocks": p["n_blocks"],
+            "ev": p["ev"], "lcb": p["lcb"], "ucb": p["ucb"],
+            "precision": precision, "precision_lo": prec_lo,
+            "opportunity_loss": opp, "profitable_held_back": wins,
+            "recent": {"n": pr["n"], "ev": pr["ev"], "lcb": pr["lcb"]},
+        }
+
+    pd, ps = _pool(delivered), _pool(sup_items)
+    allp = _pool(delivered + sup_items)
+    lift = (None if pd["ev"] is None or allp["ev"] is None
+            else float(pd["ev"]) - float(allp["ev"]))
+    overall_precision = ((len(sup_items) - sup_wins) / len(sup_items)) if sup_items else None
+    overall_opp = (sup_wins / total_wins) if total_wins else None
+    crit = [
+        _crit("S1", "delivered EV beats take-everything EV (%)",
+              None if lift is None else round(lift, 3), "> 0",
+              lift is not None and lift > 0),
+        _crit("S2", "overall suppression precision",
+              None if overall_precision is None else f"{overall_precision:.0%}",
+              f">= {C['precision_target']:.0%}",
+              overall_precision is not None and overall_precision >= float(C["precision_target"])),
+        _crit("S3", "overall opportunity loss",
+              None if overall_opp is None else f"{overall_opp:.0%}",
+              f"<= {C['max_opportunity_loss']:.0%}",
+              overall_opp is not None and overall_opp <= float(C["max_opportunity_loss"])),
+    ]
+    return {
+        "criteria": C, "criteria_hash": criteria_hash(C),
+        "delivered": {"n": pd["n"], "ev": pd["ev"], "lcb": pd["lcb"]},
+        "suppressed": {"n": ps["n"], "ev": ps["ev"], "ucb": ps["ucb"]},
+        "take_everything": {"n": allp["n"], "ev": allp["ev"]},
+        "suppression_lift": lift,
+        "precision": overall_precision, "opportunity_loss": overall_opp,
+        "reasons": per, "criteria_checks": crit,
+        "status": ("NO_SUPPRESSION" if not sup_items else
+                   "HELPING" if all(c["pass"] for c in crit) else "MIXED"),
+        "note": ("Fixed bracket, after costs. Suppressed = shadow rows carrying a "
+                 "rejection reason; candidate-only rows are excluded. A gate that "
+                 "holds back winners is COSTLY however high its precision looks."),
+    }
+
+
+def format_suppression_scorecard(sc: Mapping[str, Any]) -> str:
+    def _pct(v: Any) -> str:
+        return "n/a" if v is None else f"{float(v):.0%}"
+
+    def _ev(v: Any) -> str:
+        return "n/a" if v is None else f"{float(v):+.2f}%"
+
+    d, s, a = sc["delivered"], sc["suppressed"], sc["take_everything"]
+    out = [f"🧮 SUPPRESSION [{sc.get('criteria_hash')}] — {sc.get('status')}",
+           f"  delivered {d['n']} ({_ev(d['ev'])}/trade) · held back {s['n']} ({_ev(s['ev'])}/trade)",
+           f"  take-everything baseline: {a['n']} trades, {_ev(a['ev'])}/trade "
+           f"→ suppression lift {_ev(sc.get('suppression_lift'))}",
+           f"  precision {_pct(sc.get('precision'))} · opportunity loss {_pct(sc.get('opportunity_loss'))}"]
+    for c in sc.get("criteria_checks") or []:
+        v = "n/a" if c["value"] is None else c["value"]
+        out.append(f"  {'✅' if c['pass'] else '❌'} {c['id']} {c['label']}: {v} (need {c['target']})")
+    for reason, r in (sc.get("reasons") or {}).items():
+        out.append(
+            f"  · {reason}: {r['verdict']} — n={r['n']}/{r['n_blocks']} blocks, "
+            f"held-back EV {_ev(r['ev'])}, precision {_pct(r['precision'])} "
+            f"(lo {_pct(r['precision_lo'])}), opportunity loss {_pct(r['opportunity_loss'])}"
+        )
+    return "\n".join(out)
+
 def _crit(cid: str, label: str, value: Any, target: str, passed: bool) -> Dict[str, Any]:
     return {"id": cid, "label": label, "value": value, "target": target, "pass": bool(passed)}
 

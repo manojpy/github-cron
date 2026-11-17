@@ -1779,10 +1779,9 @@ class RedisStateStore:
         confluence_total: Optional[float] = None,
         confluence_votes: Optional[Dict[str, bool]] = None,
         context: Optional[Dict[str, Any]] = None,
-
+        candidate_only: bool = False,
     ) -> str:
-        """Returns one of: 'created', 'disabled', 'failed', 'skipped_active'.
-
+        """Returns one of: 'created', 'candidate', 'disabled', 'failed', 'skipped_active'.
         Shadow trades are registered even while the pair is inside the live
         cooldown; the row's context carries `cooldown_active` (and the hit
         candle in `cooldown_hit_ts`) so reports can include or exclude them.
@@ -1808,21 +1807,32 @@ class RedisStateStore:
             float(confluence_score) / float(confluence_total)
             if confluence_score is not None and confluence_total else -1.0
         )
+
         replace_key: Optional[str] = None
-        if getattr(cfg, "ENABLE_SINGLE_ACTIVE_SHADOW", True) and not _is_ew:
+        if getattr(cfg, "ENABLE_SINGLE_ACTIVE_SHADOW", True) and not _is_ew and not candidate_only:
             mine = self._shadow_registered_this_run.get(pair)
             if mine is not None and mine[0] == int(entry_ts):
                 if ratio <= mine[1]:
-                    return "skipped_active"        # a stronger key already represents this candle
-                replace_key = mine[2]              # this key is stronger: it takes over
+                    if not getattr(cfg, "ENABLE_CANDIDATE_LEDGER", True):
+                        return "skipped_active"    # a stronger key already represents this candle
+                    candidate_only = True          # weaker key: archive as candidate, never represents the candle
+                else:
+                    replace_key = mine[2]          # this key is stronger: it takes over
             else:
                 active = await self.get_active_shadow_trade(pair)
                 if active is not None:
+                    if not getattr(cfg, "ENABLE_CANDIDATE_LEDGER", True):
+                        logger.info(
+                            f"[{pair}] Shadow skipped: {active['alert_key']} @ {active['entry_ts']} "
+                            f"still open — not registering {alert_key} @ {entry_ts}"
+                        )
+                        return "skipped_active"
                     logger.info(
-                        f"[{pair}] Shadow skipped: {active['alert_key']} @ {active['entry_ts']} "
-                        f"still open — not registering {alert_key} @ {entry_ts}"
+                        f"[{pair}] Shadow demoted to candidate: {active['alert_key']} @ {active['entry_ts']} "
+                        f"still open — tracking {alert_key} @ {entry_ts} as candidate-only"
                     )
-                    return "skipped_active"
+                    candidate_only = True
+
         try:
             payload = json_dumps({
                 "direction": direction,
@@ -1835,6 +1845,7 @@ class RedisStateStore:
                     **(context or {}),
                     "cooldown_active": cooldown_active,
                     "cooldown_hit_ts": _cd_hit,
+                    "candidate_only": bool(candidate_only),
                 },
             })
         except Exception as e:
@@ -1852,15 +1863,18 @@ class RedisStateStore:
                 _rc(self._redis).set(key, payload, ex=ttl),
                 timeout=2.0,
             )
-            if replace_key is not None and replace_key != key:
-                await asyncio.wait_for(_rc(self._redis).delete(replace_key), timeout=2.0)
-            self._shadow_registered_this_run[pair] = (int(entry_ts), ratio, key)
+
+            if not candidate_only:
+                if replace_key is not None and replace_key != key:
+                    await asyncio.wait_for(_rc(self._redis).delete(replace_key), timeout=2.0)
+                self._shadow_registered_this_run[pair] = (int(entry_ts), ratio, key)
             logger.info(
                 f"[{pair}] Shadow pending created: {alert_key} @ {entry_ts} → {key}"
+                + (" (candidate-only)" if candidate_only else "")
                 + (" (live cooldown active)" if cooldown_active else "")
                 + (f" (replaced weaker {replace_key})" if replace_key else "")
             )
-            return "created"
+            return "candidate" if candidate_only else "created"
         except Exception as e:
             logger.warning(
                 f"Failed to record shadow pending outcome for {pair}:{alert_key}: {e}"
@@ -2487,6 +2501,8 @@ class RedisStateStore:
                 d = json_loads(raw)
                 if d.get("closed_ts") is not None:
                     continue
+                if (d.get("context") or {}).get("candidate_only"):
+                    continue   # candidate-only rows never occupy the single-active slot
                 ets = int(d["entry_ts"])
                 parts = str(k).split(":")
                 if is_elliott_key(parts[-2] if len(parts) >= 2 else "") != elliott:
@@ -3032,16 +3048,18 @@ class RedisStateStore:
                 pending_writes = 0
                 for key, raw in zip(keys, raw_values):
                     try:
+                        _payload = json_loads(raw) if raw else {}
+                        _candidate_only = bool((_payload.get("context") or {}).get("candidate_only"))
                         _fin_idx, _fin_json, _fin_new = (
                             self._early_finalize_plan(raw, data_15m, i15)
-                            if cfg.ENABLE_TRADE_CLOSE_NOTICE else (None, None, False)
+                            if cfg.ENABLE_TRADE_CLOSE_NOTICE and not _candidate_only else (None, None, False)
                         )
                         _early_final = _fin_idx is not None
                         result, skip_reason = self._parse_pending_outcome_row(
                             key, raw, data_15m, i15, end_idx=_fin_idx,
                         )
                         if skip_reason:
-                            if skip_reason == "not_ready" and raw and cfg.ENABLE_TRADE_CLOSE_NOTICE:
+                            if skip_reason == "not_ready" and raw and cfg.ENABLE_TRADE_CLOSE_NOTICE and not _candidate_only:
                                 _closed = _fin_json if _fin_new else None
                                 if _closed is not None:
                                     write_pipe.set(key, _closed, xx=True, keepttl=True)
@@ -3087,30 +3105,34 @@ class RedisStateStore:
                         shadow_effective_required = row_context.get("effective_required")
                         shadow_macro_multiplier = row_context.get("macro_multiplier")
                         shadow_cluster_penalty = row_context.get("cluster_penalty")
-
-                        stats_key = f"{RedisKeyPrefix.SHADOW_STATS}{pair}:{alert_key}"
-                        write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
-                        if result.get("outcome_class") == "timeout":
-                            write_pipe.hincrby(stats_key, "timeout_wins" if win else "timeouts", 1)
-                        write_pipe.expire(stats_key, stats_ttl)
-                        totals_key = (
-                            f"{RedisKeyPrefix.OUTCOME_TOTALS}"
-                            f"{'Elliott' if is_elliott_key(str(alert_key)) else 'Shadowed'}"
-                        )
-                        write_pipe.hincrby(totals_key, "wins" if win else "losses", 1)
-                        if result.get("outcome_class") == "timeout":
-                            write_pipe.hincrby(totals_key, "timeout_wins" if win else "timeouts", 1)
-                        write_pipe.expire(totals_key, stats_ttl)
-
+                        if not _candidate_only:
+                            stats_key = f"{RedisKeyPrefix.SHADOW_STATS}{pair}:{alert_key}"
+                            write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
+                            if result.get("outcome_class") == "timeout":
+                                write_pipe.hincrby(stats_key, "timeout_wins" if win else "timeouts", 1)
+                            write_pipe.expire(stats_key, stats_ttl)
+                            totals_key = (
+                                f"{RedisKeyPrefix.OUTCOME_TOTALS}"
+                                f"{'Elliott' if is_elliott_key(str(alert_key)) else 'Shadowed'}"
+                            )
+                            write_pipe.hincrby(totals_key, "wins" if win else "losses", 1)
+                            if result.get("outcome_class") == "timeout":
+                                write_pipe.hincrby(totals_key, "timeout_wins" if win else "timeouts", 1)
+                            write_pipe.expire(totals_key, stats_ttl)
                         if (
                             conf_score is not None
                             and conf_total is not None
                             and conf_total > 0
                         ):
                             conf_pct = (conf_score / conf_total) * 100.0
+
+
                             if (
-                                not getattr(cfg, "BRAIN_USE_FILE_STORAGE", False)
-                                or getattr(cfg, "ENABLE_OUTCOME_STREAM_TAIL", True)
+                                not _candidate_only
+                                and (
+                                    not getattr(cfg, "BRAIN_USE_FILE_STORAGE", False)
+                                    or getattr(cfg, "ENABLE_OUTCOME_STREAM_TAIL", True)
+                                )
                             ):
                                 shadow_stream_fields: Dict[StreamField, StreamField] = {
                                     "pair": str(pair),
@@ -3152,7 +3174,7 @@ class RedisStateStore:
                                     approximate=True,
                                 )
 
-                            if conf_pct >= hiconf_pct:
+                            if conf_pct >= hiconf_pct and not _candidate_only:
                                 hiconf_key = f"{RedisKeyPrefix.SHADOW_HICONF_STATS}{alert_key}"
                                 write_pipe.hincrby(
                                     hiconf_key,
@@ -3173,11 +3195,13 @@ class RedisStateStore:
                                     f"Confluence was not computed for this alert's direction "
                                     f"(check ENABLE_CONFLUENCE_GATE and gate_passed)."
                                 )
+
                             elif _early_final:
                                 _frow = self._early_archive_row(
                                     pair, result, _fin_json or "", True, final=True,
                                 )
                                 if _frow is not None:
+                                    _frow["candidate_only"] = _candidate_only
                                     resolved_for_file.append(_frow)
                             else:
                                 resolved_for_file.append({
@@ -3217,7 +3241,8 @@ class RedisStateStore:
                                     "gate_passed": result.get("gate_passed"),
                                     # Only the rows a delivery control dropped keep their context: the learner needs the
                                     # features / stored verdict to re-test the rule or verdict group that dropped them.
-                                    **({"context": row_context} if shadow_rejection_reason in ("hypothesis_veto", "verdict_firewall") else {}),
+                                    "candidate_only": _candidate_only,
+                                    **({"context": row_context} if _candidate_only or shadow_rejection_reason in ("hypothesis_veto", "verdict_firewall") else {}),
                                 })
                     except Exception as e:
                         logger_pair.debug(
@@ -3304,6 +3329,44 @@ class RedisStateStore:
             logger.warning(f"batch_get_alert_win_rates({pair}) failed for {len(alert_keys)} keys: {e}")
             return {k: (None, 0) for k in alert_keys}
 
+    # ── Hierarchical per-(pair, key) EV table (Phase 3b) ──────────────────
+    # Written by the Brain report run; read once per dispatch run (memoized on
+    # the instance). Long TTL so a missed report does not starve the filter;
+    # when absent/stale the dispatch path falls back to the pooled verdict.
+    async def set_pair_key_ev(self, table: Dict[str, Dict[str, Any]]) -> bool:
+        if self.degraded or not self._redis:
+            return False
+        ttl = int(getattr(cfg, "EV_PAIR_TABLE_TTL_HOURS", 36)) * 3600
+        try:
+            await asyncio.wait_for(
+                _rc(self._redis).set(f"{self.meta_prefix}pair_key_ev", json_dumps(table), ex=ttl),
+                timeout=3.0,
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"set_pair_key_ev failed: {e}")
+            return False
+
+    async def get_pair_key_ev(self) -> Optional[Dict[str, Dict[str, Any]]]:
+        cached = getattr(self, "_pair_key_ev_cache", None)
+        if cached is not None:
+            return cached or None
+        if self.degraded or not self._redis:
+            return None
+        try:
+            raw = await asyncio.wait_for(
+                _rc(self._redis).get(f"{self.meta_prefix}pair_key_ev"),
+                timeout=3.0,
+            )
+            table = json_loads(raw) if raw else {}
+            self._pair_key_ev_cache = table
+            return table or None
+        except Exception as e:
+            logger.warning(f"get_pair_key_ev failed: {e}")
+            self._pair_key_ev_cache = {}
+            return None
+
+    
     OUTCOME_TOTALS_FIELDS: ClassVar[Tuple[str, ...]] = ("wins", "losses", "timeouts", "timeout_wins")
     OUTCOME_TOTALS_RECONCILE_SEC: ClassVar[int] = 86400
 

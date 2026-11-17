@@ -62,6 +62,58 @@ VOTE_LABELS = {
     "vwap_momentum": "VWAP momentum",
 }
 
+# ── Phase 5: independent-evidence groups ──────────────────────────────
+# Several confluence votes are computed from the SAME underlying series, so
+# counting them separately inflates the evidence: ppo_cross and
+# ppo_gate_momentum both read the PPO gate, rsi_guard and rsi_guard_momentum
+# both read the smoothed RSI, adx and adx_strength both read ADX. A group is
+# ONE piece of independent evidence however many of its members agree.
+# This never changes the confluence score or any gate — it only describes
+# how much of the agreement is genuinely independent.
+VOTE_GROUPS: Dict[str, Sequence[str]] = {
+    "trend": ("base_trend",),
+    "cloud": ("gaussian_trend", "cirrus_cloud", "rma_cloud",
+              "dynamic_flow_ribbon", "rma_cloud_momentum"),
+    "oscillator": ("ppo_cross", "rsi_guard", "momentum_osc",
+                   "ppo_gate_momentum", "rsi_guard_momentum"),
+    "trend_strength": ("adx", "adx_strength"),
+    "volatility": ("rvol", "atr_percentile"),
+    "volume": ("volume_percentile",),
+    "location": ("cpr", "order_block"),
+    "positioning": ("oi_funding",),
+    "vwap": ("vwap_momentum",),
+}
+
+
+def vote_group_support(votes: Optional[Dict[str, bool]]) -> Dict[str, Any]:
+    """How much of the confluence agreement is INDEPENDENT evidence.
+
+    A group is 'present' when at least one of its votes was measured this
+    cycle (an abstained vote is absent, not disagreeing) and 'on' when at
+    least one present member is True. Pure: no config, no I/O.
+    """
+    v = votes or {}
+    detail: Dict[str, Dict[str, Any]] = {}
+    on = present = votes_on = 0
+    for gname, members in VOTE_GROUPS.items():
+        measured = [m for m in members if m in v]
+        if not measured:
+            continue
+        n_on = sum(1 for m in measured if bool(v[m]))
+        present += 1
+        votes_on += n_on
+        if n_on:
+            on += 1
+        detail[gname] = {"on": bool(n_on), "n_on": n_on, "n_measured": len(measured)}
+    return {
+        "groups_on": on,
+        "groups_present": present,
+        "votes_on": votes_on,
+        "duplication": max(0, votes_on - on),
+        "detail": detail,
+    }
+
+
 _CONFIDENCE = {"ACTIONABLE": "HIGH", "ELIGIBLE": "MEDIUM"}
 _LIMITED_STATES = ("INSUFFICIENT", "SHADOW", "")
 
@@ -81,6 +133,7 @@ class PairAdvice:
     notes: List[str] = field(default_factory=list)
     qualifier: str = ""                # e.g. "small size" for an unproven TAKE
     exh_adj: Optional[Dict[str, Any]] = None   # late-trend exhaustion adjustment (stored with the trade)
+    evidence: Optional[Dict[str, Any]] = None  # independent-group support + Brain edge ceiling (stored with the trade)
 
     @property
     def label(self) -> str:
@@ -205,7 +258,7 @@ def _support_text(votes: Optional[Dict[str, bool]], weights: Optional[Dict[str, 
     return f" Supported by {', '.join(support)}." if support else ""
 
 
-def _advise_pair_core(*, direction: str, score: Optional[float], total: Optional[float], required: Optional[float], votes: Optional[Dict[str, bool]], tqs: Sequence[Optional[Dict[str, Any]]], bias: str, conflicting: bool = False, take_min: float = 70.0, watch_min: float = 50.0, shadow_cap: float = 55.0, default_sl_pct: float = 0.5, default_rr: float = 2.0, vote_weights: Optional[Dict[str, float]] = None, unproven_take_min_pct: Optional[float] = None, unproven_size: float = 0.25, price: Optional[float] = None) -> PairAdvice:
+def _advise_pair_core(*, direction: str, score: Optional[float], total: Optional[float], required: Optional[float], votes: Optional[Dict[str, bool]], tqs: Sequence[Optional[Dict[str, Any]]], bias: str, conflicting: bool = False, take_min: float = 70.0, watch_min: float = 50.0, shadow_cap: float = 55.0, default_sl_pct: float = 0.5, default_rr: float = 2.0, vote_weights: Optional[Dict[str, float]] = None, unproven_take_min_pct: Optional[float] = None, unproven_size: float = 0.25, price: Optional[float] = None, vote_group_mode: str = "off", vote_group_min_independent: int = 3, vote_group_conviction_cap: float = 65.0, edge_ceiling: Optional[str] = None, edge_reason: Optional[str] = None) -> PairAdvice:
     data = [t for t in tqs if isinstance(t, dict) and _num(t.get("net_ev")) is not None]
     blocked = any(isinstance(t, dict) and str(t.get("verdict")) == "BLOCKED" for t in tqs)
     pct = (score / total) if (score is not None and total) else None
@@ -282,6 +335,7 @@ def _advise_pair_core(*, direction: str, score: Optional[float], total: Optional
         else:
             why = f"{tech}, but {reason}.{support_txt}"
             size_line = ""
+
         return PairAdvice(
             verdict=verdict, conviction=None, confidence="LOW",
             brain_line="🧠 Brain: no track record for this setup yet",
@@ -289,6 +343,7 @@ def _advise_pair_core(*, direction: str, score: Optional[float], total: Optional
             why_line=f"💡 Why: {why}",
             risk_label=label, risk_line=risk_line, plan_line=plan_line,
             size_line=size_line, qualifier=qualifier,
+            evidence={"vote_groups": vote_group_support(votes)},
         )
 
     # ═════════ conviction blend ═════════
@@ -319,6 +374,17 @@ def _advise_pair_core(*, direction: str, score: Optional[float], total: Optional
     limited = state in _LIMITED_STATES
     if limited:
         conv = min(conv, shadow_cap)
+    # ── Phase 5: several votes read the same series, so a high raw count can
+    # be one observation repeated. When too few INDEPENDENT groups agree,
+    # conviction cannot reach TAKE. ──
+    _groups = vote_group_support(votes)
+    _thin_evidence = (
+        vote_group_mode == "live"
+        and _groups["groups_present"] > 0
+        and _groups["groups_on"] < int(vote_group_min_independent)
+    )
+    if _thin_evidence:
+        conv = min(conv, float(vote_group_conviction_cap))
     conviction = int(round(_clamp(conv)))
 
     # ── verdict ──
@@ -334,9 +400,16 @@ def _advise_pair_core(*, direction: str, score: Optional[float], total: Optional
         verdict, why_neg = WATCH, ""
     else:
         verdict, why_neg = AVOID, "historical evidence does not justify the risk"
+
     if conflicting and verdict == TAKE:
         verdict = WATCH
-
+    # ── Phase 5: the Brain's historical edge ceiling. A stack of favourable
+    # indicators must not out-vote a proven negative edge. ──
+    _edge_applied = False
+    if edge_ceiling in (WATCH, AVOID):
+        _rank = {TAKE: 2, WATCH: 1, AVOID: 0}
+        if _rank.get(verdict, 0) > _rank[edge_ceiling]:
+            verdict, _edge_applied = edge_ceiling, True
     confidence = _CONFIDENCE.get(state, "LOW")
 
     if p_mean is None or (state in ("SHADOW", "") and abs(p_mean - 0.5) < 0.05):
@@ -383,6 +456,13 @@ def _advise_pair_core(*, direction: str, score: Optional[float], total: Optional
         risks.append("recent win-rate drift")
     if ev is not None and ev < 0:
         risks.append(f"expected value {ev:+.2f}%")
+    if _thin_evidence:
+        risks.append(
+            f"only {_groups['groups_on']} independent evidence group(s) agree "
+            f"({_groups['duplication']} duplicated vote(s))"
+        )
+    if _edge_applied:
+        risks.append(edge_reason or "historical edge does not support a stronger call")
     if not risks:
         risks.append("setup invalidated by a close beyond the stop")
     risk_line = "; ".join(risks[:3]) + "."
@@ -399,6 +479,12 @@ def _advise_pair_core(*, direction: str, score: Optional[float], total: Optional
         verdict=verdict, conviction=conviction, confidence=confidence,
         brain_line=brain_line, edge_line=edge_line, why_line=f"💡 Why: {why}",
         risk_label="Risk", risk_line=risk_line, plan_line=plan_line, size_line=size_line,
+        evidence={
+            "vote_groups": _groups,
+            "thin_independent_support": bool(_thin_evidence),
+            "edge_ceiling": edge_ceiling,
+            "edge_ceiling_applied": bool(_edge_applied),
+        },
     )
 
 # ── Playbook overlay (learner output; restrict-only by default) ───────────
@@ -565,13 +651,21 @@ def _apply_exhaustion(advice: PairAdvice, info: Optional[Dict[str, Any]], mode: 
         return advice
     return advice
 
-
 def advise_pair(*, exhaustion: Optional[Dict[str, Any]] = None, exhaustion_mode: str = "off",
                 exhaustion_params: Optional[Dict[str, Any]] = None, **kwargs: Any) -> PairAdvice:
-    """Core advice -> playbook overlay -> late-trend exhaustion overlay."""
+    """Core advice -> playbook overlay -> exhaustion overlay -> edge ceiling.
+
+    The Brain's historical edge ceiling is re-asserted last so no overlay
+    (a validated-plan upgrade, an exhaustion adjustment) can lift a verdict
+    above what the historical profitability evidence supports.
+    """
     advice = _advise_pair_playbook(**kwargs)
-    return _apply_exhaustion(advice, exhaustion, exhaustion_mode, dict(exhaustion_params or {}), kwargs)
-
-
-
-
+    advice = _apply_exhaustion(advice, exhaustion, exhaustion_mode, dict(exhaustion_params or {}), kwargs)
+    _ceil = kwargs.get("edge_ceiling")
+    if _ceil in (WATCH, AVOID):
+        _rank = {TAKE: 2, WATCH: 1, AVOID: 0}
+        if _rank.get(advice.verdict, 0) > _rank[_ceil]:
+            advice.verdict = _ceil
+            advice.qualifier = ""
+            advice.size_line = ""
+    return advice

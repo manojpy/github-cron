@@ -40,6 +40,9 @@ from alert_registry import alert_family_of
 from plan_replay import cluster_se
 from threshold_stats import row_net_pnl_pct
 from threshold_models import _PRICE_LEVEL_CTX
+from feature_store import pair_class, confluence_bucket
+
+
 
 Row = Dict[str, Any]
 Atom = Tuple[str, str, Any]          # (feature, op, value); op: ge | lt | eq
@@ -94,8 +97,13 @@ def row_features(r: Row, setup: bool = False) -> Dict[str, Any]:
             f["fam"] = f"{fam}|{r['direction']}" if r.get("direction") else fam
         if r.get("pair"):
             f["pair"] = str(r["pair"])
+            f["pair_class"] = pair_class(r["pair"])
+        score = r.get("score", r.get("conf_score"))
+        total = r.get("total", r.get("conf_total"))
+        cb = confluence_bucket(score, total)
+        if cb:
+            f["conf_bucket"] = cb
     return f
-
 
 def _match(atom: Sequence[Any], f: Dict[str, Any]) -> bool:
     v = f.get(atom[0])

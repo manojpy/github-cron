@@ -59,6 +59,67 @@ _POST_HOC_KEYS = frozenset({
 def _row_id(r: Row) -> str:
     return r.get("_stream_id") or f'{r.get("pair")}:{r.get("alert_key")}:{r["entry_ts"]}'
 
+# ── Setup fingerprint (Phase 2): the categorical "setup" a trade belongs to ──
+# Pure and read-side: derived only from fields knowable at the signal candle, so
+# the SAME fingerprint is produced offline (archive) and live (dispatch). This is
+# what lets hypothesis mining learn combinations (alert × pair-class × session ×
+# regime × confluence) instead of isolated votes.
+
+_PAIR_CLASS_MAJOR = frozenset({"BTCUSD", "ETHUSD"})
+_PAIR_CLASS_MID = frozenset({
+    "BNBUSD", "XRPUSD", "SOLUSD", "ADAUSD", "AVAXUSD", "DOTUSD", "LTCUSD",
+    "LINKUSD", "BCHUSD", "ATOMUSD", "NEARUSD", "APTUSD", "SUIUSD", "TRXUSD",
+})
+
+
+def pair_class(pair: Any) -> str:
+    """Liquidity tier. Majors behave differently from low-cap alts; pooling them
+    hides pair-specific edge. Extend the sets as the traded universe grows."""
+    p = str(pair or "").upper()
+    if p in _PAIR_CLASS_MAJOR:
+        return "major"
+    if p in _PAIR_CLASS_MID:
+        return "mid"
+    return "low" if p else "unknown"
+
+
+def confluence_bucket(score: Any, total: Any) -> Optional[str]:
+    """Confluence-% bucket (the 'strength' axis of the fingerprint), or None."""
+    try:
+        s, t = float(score), float(total)
+    except (TypeError, ValueError):
+        return None
+    if t <= 0 or not math.isfinite(s) or not math.isfinite(t):
+        return None
+    pct = s / t * 100.0
+    if pct >= 90:
+        return "conf_90+"
+    if pct >= 80:
+        return "conf_80_90"
+    if pct >= 70:
+        return "conf_70_80"
+    return "conf_<70"
+
+def setup_fingerprint(r: Row) -> Dict[str, Any]:
+    """Categorical setup identity of a row, point-in-time. Mirrors the atoms
+    hypothesis_gen.row_features(setup=True) mines, so reports and rules agree."""
+    ctx = r.get("context") or {}
+    atr, adxp = ctx.get("atr_pctl"), ctx.get("adx_pctl")
+    regime = None
+    if isinstance(atr, (int, float)) and isinstance(adxp, (int, float)):
+        regime = "volatile" if atr >= 0.8 else ("trending" if adxp >= 0.6 else "ranging")
+    ak = r.get("alert_key")
+    score = r.get("score", r.get("conf_score"))
+    total = r.get("total", r.get("conf_total"))
+    return {
+        "pair_class": pair_class(r.get("pair")),
+        "session": r.get("session"),
+        "direction": r.get("direction"),
+        "regime": regime,
+        "confluence_bucket": confluence_bucket(score, total),
+        "alert_key": str(ak) if ak else None,
+    }
+
 def row_feature_version(row: Row) -> str:
     v = (row.get("context") or {}).get("feature_version")
     return str(v) if v else LEGACY_VERSION

@@ -485,7 +485,76 @@ async def _hypothesis_veto_drops(*, sdb: "RedisStateStore", pair_name: str, aler
     )
     return True
 
-async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, alerts_to_send: List[Tuple[str, str, str]], ts_curr: int, close_curr: float, block_reason: str, *, confluence_scores: Optional[Dict[str, Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]]] = None, macro_shadow: Optional[Dict[str, Any]] = None, cluster_penalty: Optional[float] = None, effective_score: Optional[float] = None, effective_required: Optional[float] = None, gr: Optional[GateResult] = None, context: Optional[Dict[str, Any]] = None, logger_pair: Optional[logging.Logger] = None, extra_context: Optional[Dict[str, Any]] = None) -> None:
+def _brain_edge_ceiling(tqs: List[Optional[Dict[str, Any]]]) -> Tuple[Optional[str], Optional[str]]:
+    """Restrict-only ceiling from the Brain's unified decision (Phase 5).
+
+    A proven negative historical edge caps the pair at AVOID; a novel input
+    caps it at WATCH. Thin evidence alone caps nothing — the evidence-state
+    machinery already handles that. Returns (None, None) when no family
+    carries a brain_decision, so this is inert until Phase 5 Part A is on.
+    """
+    ceil: Optional[str] = None
+    reason: Optional[str] = None
+    for t in tqs:
+        d = (t or {}).get("brain_decision")
+        if not isinstance(d, dict):
+            continue
+        if d.get("edge_cap") == "LOW":
+            return "AVOID", str(d.get("edge_reason") or "proven negative historical edge")
+        if d.get("novel") and ceil != "AVOID":
+            ceil, reason = "WATCH", "input is outside the model's training envelope"
+    return ceil, reason
+
+def _model_baseline_proven(model: Optional[Dict[str, Any]]) -> bool:
+    """True when the market-state model's ev_baseline_proof passed the simple
+    historical baselines (take-all / key-rule / trailing). Phase 4: an unproven
+    model must not be allowed to hard-block a live alert. The passing status
+    set is configurable so it can be matched to net_ev_baseline_audit's actual
+    output without a code change."""
+    if not isinstance(model, dict):
+        return False
+    proof = model.get("ev_baseline_proof") or {}
+    status = str(proof.get("status") or "").strip().lower()
+    allowed = {
+        s.strip().lower()
+        for s in str(getattr(cfg, "ML_EV_BASELINE_PASS_STATUSES", "validated")).split(",")
+        if s.strip()
+    }
+    return status in allowed
+
+
+async def _ev_runtime_decision(sdb: "RedisStateStore", pair_name: str, alert_key: str,
+                               tq: Optional[Dict[str, Any]], want: str) -> Optional[Tuple[float, int, str, str]]:
+    """Decisive EV evidence for the runtime filter, or None.
+    want='block': proven negative EV. want='keep': proven positive EV.
+    Prefers hierarchical per-(pair, key) evidence (shrunk toward the key pool)
+    when the cell is deep enough; a deep-but-indecisive cell is NOT overridden
+    by the pooled verdict. Thin/absent cells fall back to the pooled per-key
+    quality verdict. Returns (ev, n, source, explainable_note)."""
+    try:
+        table = await sdb.get_pair_key_ev()
+    except Exception:
+        table = None
+    cell = ((table or {}).get(alert_key) or {}).get(pair_name)
+    if cell and int(cell.get("n", 0)) >= getattr(cfg, "EV_FILTER_PAIR_MIN_N", 25):
+        ev, lo, hi, n = float(cell["ev"]), float(cell["lo"]), float(cell["hi"]), int(cell["n"])
+        if want == "block" and hi < 0:
+            return (ev, n, "pair", f"net EV {ev:+.3f}%/trade (95% hi {hi:+.3f}) over {n} pair samples")
+        if want == "keep" and lo > 0:
+            return (ev, n, "pair", f"net EV {ev:+.3f}%/trade (95% lo {lo:+.3f}) over {n} pair samples")
+        return None   # deep pair evidence exists but is not decisive: do not fall back to pooled
+    if tq:
+        n = int(tq.get("n_oos") or 0)
+        p = tq.get("p_ev_positive")
+        ev = tq.get("net_ev")
+        if n >= getattr(cfg, "EV_FILTER_MIN_N", 40) and p is not None and ev is not None:
+            if want == "block" and p <= getattr(cfg, "EV_FILTER_BLOCK_P_EV", 0.15) and ev < 0:
+                return (float(ev), n, "pooled", f"net EV {ev:+.3f}%/trade, p_ev {p:.2f} over {n} samples")
+            if want == "keep" and p >= getattr(cfg, "EV_FILTER_KEEP_P_EV", 0.85) and ev > 0:
+                return (float(ev), n, "pooled", f"net EV {ev:+.3f}%/trade, p_ev {p:.2f} over {n} samples")
+    return None
+
+async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, alerts_to_send: List[Tuple[str, str, str]], ts_curr: int, close_curr: float, block_reason: str, *, confluence_scores: Optional[Dict[str, Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]]] = None, macro_shadow: Optional[Dict[str, Any]] = None, cluster_penalty: Optional[float] = None, effective_score: Optional[float] = None, effective_required: Optional[float] = None, gr: Optional[GateResult] = None, context: Optional[Dict[str, Any]] = None, logger_pair: Optional[logging.Logger] = None, extra_context: Optional[Dict[str, Any]] = None, candidate_only: bool = False) -> None:
     """Shadow-log every alert that reached the dispatch stage but was then
     blocked by a non-win-rate gate (OOD, calibration, confluence, macro,
     cluster, portfolio-heat). The win-rate path already has its own shadow
@@ -535,11 +604,13 @@ async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, a
             votes: Optional[Dict[str, bool]] = None
             if confluence_scores and alert_key in confluence_scores:
                 score, total, votes = confluence_scores[alert_key]
+
             await sdb.record_shadow_pending_outcome(
                 pair_name, alert_key, direction, ts_curr, close_curr,
                 confluence_score=score,
                 confluence_total=total,
                 confluence_votes=votes,
+                candidate_only=candidate_only,
                 context={
                     **(extra_context or {}),
                     "rejection_reason": block_reason,
@@ -556,7 +627,7 @@ async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, a
             logger_pair.debug(f"Counterfactual shadow write failed ({block_reason}): {e}")
 
     # Structured "why rejected" surface (roadmap #26)
-    if getattr(cfg, "ENABLE_ALERT_WHY_REJECTED", True) and logger_pair is not None:
+    if getattr(cfg, "ENABLE_ALERT_WHY_REJECTED", True) and logger_pair is not None and not candidate_only:
         try:
             for title, _extra, alert_key in alerts_to_send:
                 detail_bits = [f"reason={block_reason}"]
@@ -674,6 +745,7 @@ def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int
         same.sort(key=lambda i: -_ev(i))          # strongest edge first (stable)
         s_items = [items[i] for i in same]
         s_keys = [keys[i] for i in same]
+        _edge_ceil, _edge_reason = _brain_edge_ceiling([tq_by_key.get(k) for k in s_keys])
         advice = advise_pair(
             direction=direction, score=score, total=total, required=required,
             votes=votes, tqs=[tq_by_key.get(k) for k in s_keys],
@@ -707,7 +779,13 @@ def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int
                 "conf": (score / total * 100.0) if (score is not None and total) else None,
                 "adx": adx_val,
             },
+            edge_ceiling=_edge_ceil,
+            edge_reason=_edge_reason,
+            vote_group_mode=str(getattr(cfg, "VOTE_GROUP_MODE", "off")),
+            vote_group_min_independent=int(getattr(cfg, "VOTE_GROUP_MIN_INDEPENDENT", 3)),
+            vote_group_conviction_cap=float(getattr(cfg, "VOTE_GROUP_CONVICTION_CAP", 65.0)),
         )
+
         if decision_sink is not None:
             decision_sink.update({
                 "verdict": advice.verdict,
@@ -715,8 +793,10 @@ def build_pair_msg_and_verdict(*, pair: str, direction: str, price: Any, ts: int
                 "confidence": advice.confidence,
                 "qualifier": advice.qualifier or None,
                 "exhaustion_adj": advice.exh_adj,
+                "evidence": advice.evidence,
+                "edge_ceiling": _edge_ceil,
                 "keys": list(s_keys),
-            })
+            })      
 
         # Informational evidence block. Own try/except: a failure here must never
         # degrade the rest of the alert, and nothing below depends on it.
@@ -3363,11 +3443,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         if str(getattr(cfg, "ALERT_HYPOTHESIS_VETO_MODE", "off")) != "off" and hyp_ctx is not None:
                             try:
                                 from hypothesis_gen import row_features as _hyp_features
-                                _hyp_rules = brain_engine.playbook_extra("hyp_rules")
+                                _hyp_rules = brain_engine.playbook_extra("hyp_rules")            
                                 _hyp_feats = _hyp_features({
                                     "context": hyp_ctx, "votes": alert_votes,
                                     "session": _get_session_from_ts(ts_curr), "direction": direction,
                                     "alert_key": alert_key, "pair": pair_name,
+                                    "score": alert_score, "total": alert_total,
                                 }, setup=True) if _hyp_rules else None
                             except Exception:
                                 _hyp_rules, _hyp_feats = None, None
@@ -3390,10 +3471,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 _win_rules = brain_engine.playbook_extra("win_rules")
                                 _loss_rules = brain_engine.playbook_extra("hyp_rules")
                                 if _win_rules or _loss_rules:
+
                                     alert_setup_by_key[alert_key] = _setup_advice(_setup_features({
                                         "context": hyp_ctx, "votes": alert_votes,
                                         "session": _get_session_from_ts(ts_curr), "direction": direction,
                                         "alert_key": alert_key, "pair": pair_name,
+                                        "score": alert_score, "total": alert_total,
                                     }, setup=True), _win_rules, _loss_rules)
                             except Exception as e:
                                 alert_setup_by_key[alert_key] = None
@@ -3503,8 +3586,19 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                         }
                                         # Shadow stays in context/logs only — not in Telegram
                                         # (already stored on context["ml_ev_shadow_by_alert"])
-                                    # Hard gate (only when explicitly enabled)
-                                    if getattr(cfg, "ENABLE_ML_EV_GATE", False) and not qualify:
+                                    # Hard gate (only when explicitly enabled).
+                                    # Phase 4: an unproven model (has not beat the simple
+                                    # historical baselines) must not hard-block a live alert.
+                                    _bl_mode = str(getattr(cfg, "ML_EV_BASELINE_GATE_MODE", "off"))
+                                    _bl_proven = _model_baseline_proven(ml_market_state_model)
+                                    _bl_ok = (_bl_mode != "live") or _bl_proven
+                                    if getattr(cfg, "ENABLE_ML_EV_GATE", False) and not qualify and not _bl_ok:
+                                        logger_pair.info(
+                                            f"[{pair_name}] ML-EV gate NOT applied for {alert_key}: "
+                                            f"model baseline proof missing/not validated "
+                                            f"(mode={_bl_mode}) — unproven model may not hard-block"
+                                        )
+                                    if getattr(cfg, "ENABLE_ML_EV_GATE", False) and not qualify and _bl_ok:
                                         logger_pair.info(
                                             f"[{pair_name}] ML-EV gate dropped {alert_key}: "
                                             f"EV={ev.get('net_ev')} < {cfg.ML_EV_MIN_THRESHOLD}"
@@ -3537,12 +3631,69 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     f"ML-EV path failed for {alert_key}: {e}"
                                 )
 
+                    # ── EV-first suppression (Phase 3a/3b): a passing win rate must not
+                    # protect a proven negative-EV setup. Prefers hierarchical
+                    # per-(pair, key) evidence; falls back to the pooled per-key
+                    # verdict. Shadow mode only logs. ──
+                    _ev_mode = str(getattr(cfg, "EV_FILTER_MODE", "off"))
+                    if _ev_mode != "off":
+                        _ev_dec = await _ev_runtime_decision(
+                            sdb, pair_name, alert_key, alert_tq_by_key.get(alert_key), want="block",
+                        )
+                        if _ev_dec is not None:
+                            _ev_val, _ev_n, _ev_src, _ev_note = _ev_dec
+                            if _ev_mode == "live":
+                                logger_pair.info(
+                                    f"[{pair_name}] EV filter blocked {alert_key} [{_ev_src}]: {_ev_note}"
+                                )
+                                await _record_counterfactual_block(
+                                    sdb, pair_name, [(alert_title, alert_extra, alert_key)],
+                                    ts_curr, close_curr, block_reason="ev_filter",
+                                    confluence_scores={alert_key: _confluence_for(alert_key)},
+                                    gr=gr, context=context, logger_pair=logger_pair,
+                                )
+                                continue
+                            logger_pair.info(
+                                f"[{pair_name}] EV filter WOULD block {alert_key} [{_ev_src}]: {_ev_note} (shadow)"
+                            )
+
                     surviving_alerts.append((alert_title, alert_extra, alert_key))
                     continue
 
                 # ── Alert failed the win-rate filter ──
+                # EV-first escape hatch (Phase 3a/3b): low WR alone must not suppress a
+                # setup with proven positive net EV. Prefers hierarchical pair-specific
+                # evidence; falls back to the pooled per-key verdict. Shadow mode logs only.
+                _ev_mode = str(getattr(cfg, "EV_FILTER_MODE", "off"))
+                if _ev_mode != "off":
+                    _tq_fail = None
+                    if brain_engine and alert_total and alert_score is not None:
+                        try:
+                            _tq_fail = await brain_engine.get_trade_quality(
+                                pair_name, alert_key, direction,
+                                alert_score / alert_total * 100.0, adx_val,
+                                live_context=None, votes=_confluence_for(alert_key)[2],
+                                session=current_session or "unknown",
+                            )
+                        except Exception:
+                            _tq_fail = None
+                    _ev_dec = await _ev_runtime_decision(sdb, pair_name, alert_key, _tq_fail, want="keep")
+                    if _ev_dec is not None:
+                        _ev_val, _ev_n, _ev_src, _ev_note = _ev_dec
+                        if _ev_mode == "live":
+                            logger_pair.info(
+                                f"[{pair_name}] 🧠 EV override for {alert_key}: "
+                                f"WR={failing_rate:.0%} below {cfg.MIN_WIN_RATE:.0%}, but {_ev_note}"
+                            )
+                            alert_extra = f"{alert_extra} | EV override [{_ev_src}]: {_ev_note}"
+                            surviving_alerts.append((alert_title, alert_extra, alert_key))
+                            continue
+                        logger_pair.info(
+                            f"[{pair_name}] EV filter WOULD keep {alert_key} [{_ev_src}]: {_ev_note} (shadow)"
+                        )
                 # Check for a rewardable override before dropping.
                 override_reason = None
+
                 if brain_engine:
                     try:
                         override_reason = await brain_engine.check_rewardable_override(
@@ -3593,6 +3744,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     "gaussian_gate_ok_sell": gr.gaussian_gate_ok_sell,
                     **exhaustion_trade_fields(context, direction),
                 }
+                from feature_store import setup_fingerprint
+                shadow_context["setup_fingerprint"] = setup_fingerprint({
+                    "pair": pair_name, "alert_key": alert_key, "direction": direction,
+                    "session": _get_session_from_ts(ts_curr),
+                    "score": alert_score, "total": alert_total, "context": shadow_context,
+                })
                 if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
                     await sdb.record_shadow_pending_outcome(
                         pair_name, alert_key, direction, ts_curr, close_curr,
@@ -3615,11 +3772,27 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             """Records this pair's fired alerts for later win-rate scoring.
             With `sink`, the rows are appended to it instead of written (DLQ capture)."""
             to_record = list(alerts_to_send)
+
+            async def _track_unrecorded(reason: str, items: List[Tuple[str, str, str]]) -> None:
+                # Delivered-but-unrecorded alerts are still valid candidates: archive
+                # their outcomes (candidate-only) so policy replay sees the full
+                # population. They never touch Recorded/Shadowed stats.
+                if not items or not getattr(cfg, "ENABLE_CANDIDATE_LEDGER", True):
+                    return
+                await _record_counterfactual_block(
+                    sdb, pair_name, items, ts_curr, close_curr,
+                    block_reason=reason,
+                    confluence_scores={ak: _confluence_for(ak) for _, _, ak in items},
+                    gr=gr, context=context, logger_pair=logger_pair,
+                    candidate_only=True,
+                )
+
             if record_status == "COOLDOWN":
                 logger_pair.info(
-                    f"[{pair_name}] NOT RECORDED ts={ts_curr}:  cooldown after trade close"
+                    f"[{pair_name}] NOT RECORDED ts={ts_curr}:  cooldown after trade close "
                     f"(hit candle {(record_active or {}).get('hit_ts')})"
                 )
+                await _track_unrecorded("delivered_unrecorded_cooldown", alerts_to_send)
                 return
             if cfg.ENABLE_SINGLE_ACTIVE_TRADE:
                 if record_status == "IGNORED":
@@ -3627,12 +3800,17 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         f"[{pair_name}] NOT RECORDED ts={ts_curr}: trade already open "
                         f"({(record_active or {}).get('alert_key')} @ {(record_active or {}).get('entry_ts')})"
                     )
+                    await _track_unrecorded("delivered_unrecorded_active", alerts_to_send)
                     return
                 # One trade per pair per candle: the strongest edge represents it.
                 def _edge(a: Tuple[str, str, str]) -> float:
                     v = (alert_tq_by_key.get(a[2]) or {}).get("net_ev")
                     return float(v) if isinstance(v, (int, float)) else -999.0
                 to_record = [max(alerts_to_send, key=_edge)]
+                await _track_unrecorded(
+                    "delivered_unrecorded_same_candle",
+                    [a for a in alerts_to_send if a[2] != to_record[0][2]],
+                )
             recorded = [ak for _, _, ak in to_record]
             logger_pair.info(
                 f"[{pair_name}] RECORD ts={ts_curr} keys={recorded}"
