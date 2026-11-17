@@ -522,7 +522,6 @@ def _model_baseline_proven(model: Optional[Dict[str, Any]]) -> bool:
     }
     return status in allowed
 
-
 async def _ev_runtime_decision(sdb: "RedisStateStore", pair_name: str, alert_key: str,
                                tq: Optional[Dict[str, Any]], want: str) -> Optional[Tuple[float, int, str, str]]:
     """Decisive EV evidence for the runtime filter, or None.
@@ -546,12 +545,12 @@ async def _ev_runtime_decision(sdb: "RedisStateStore", pair_name: str, alert_key
     if tq:
         n = int(tq.get("n_oos") or 0)
         p = tq.get("p_ev_positive")
-        ev = tq.get("net_ev")
-        if n >= getattr(cfg, "EV_FILTER_MIN_N", 40) and p is not None and ev is not None:
-            if want == "block" and p <= getattr(cfg, "EV_FILTER_BLOCK_P_EV", 0.15) and ev < 0:
-                return (float(ev), n, "pooled", f"net EV {ev:+.3f}%/trade, p_ev {p:.2f} over {n} samples")
-            if want == "keep" and p >= getattr(cfg, "EV_FILTER_KEEP_P_EV", 0.85) and ev > 0:
-                return (float(ev), n, "pooled", f"net EV {ev:+.3f}%/trade, p_ev {p:.2f} over {n} samples")
+        ev_pooled = tq.get("net_ev")
+        if n >= getattr(cfg, "EV_FILTER_MIN_N", 40) and p is not None and ev_pooled is not None:
+            if want == "block" and p <= getattr(cfg, "EV_FILTER_BLOCK_P_EV", 0.15) and ev_pooled < 0:
+                return (float(ev_pooled), n, "pooled", f"net EV {ev_pooled:+.3f}%/trade, p_ev {p:.2f} over {n} samples")
+            if want == "keep" and p >= getattr(cfg, "EV_FILTER_KEEP_P_EV", 0.85) and ev_pooled > 0:
+                return (float(ev_pooled), n, "pooled", f"net EV {ev_pooled:+.3f}%/trade, p_ev {p:.2f} over {n} samples")
     return None
 
 async def _record_counterfactual_block(sdb: "RedisStateStore", pair_name: str, alerts_to_send: List[Tuple[str, str, str]], ts_curr: int, close_curr: float, block_reason: str, *, confluence_scores: Optional[Dict[str, Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]]] = None, macro_shadow: Optional[Dict[str, Any]] = None, cluster_penalty: Optional[float] = None, effective_score: Optional[float] = None, effective_required: Optional[float] = None, gr: Optional[GateResult] = None, context: Optional[Dict[str, Any]] = None, logger_pair: Optional[logging.Logger] = None, extra_context: Optional[Dict[str, Any]] = None, candidate_only: bool = False) -> None:
