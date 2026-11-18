@@ -531,3 +531,11 @@ def test_counters_reconcile_including_unparseable(tmp_path):
     assert stats["dropped_unparseable"] == 1
     dropped = sum(v for k, v in stats.items() if k.startswith("dropped_")) + stats["lines_malformed"]
     assert stats["lines_total"] == stats["kept"] + dropped
+
+def test_new_key_families_are_audited_and_need_a_ttl():
+    # co-key credit hashes and candidate-only rows are expiring families, not orphans
+    assert ra.classify_key("alert_stats_co:BTCUSD:vwap_buy") == ("alert_stats_co", "ttl_required")
+    assert ra.classify_key("candidate_events:XAUTUSD") == ("candidate_events", "ttl_required")
+    assert ra.classify_key("alert_stats:BTCUSD:vwap_buy")[0] == "alert_stats"        # longest prefix still wins
+    rep = ra.summarize([_rec("candidate_events:XAUTUSD", -1), _rec("alert_stats_co:BTCUSD:k", DAY)])
+    assert {(f["kind"], f["family"]) for f in rep["findings"]} == {("NO_TTL_LEAK", "candidate_events")}

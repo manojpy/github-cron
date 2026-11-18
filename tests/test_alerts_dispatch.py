@@ -1417,4 +1417,402 @@ def test_exhaustion_veto_decision_and_shadow_recording(monkeypatch):
     assert len(seen) == 1 and seen[0][1] == "strong_reversal_buy" and seen[0][2] == "buy"
     assert seen[0][3]["rejection_reason"] == "exhaustion_veto" and seen[0][3]["exh_score"] == 5
 
+# ======================================================================
+# one recorded trade per pair across Elliott + MACD, candidate-only rows,
+# shadow flags, pullback WATCH rules, co-key credit reader
+# ======================================================================
+"""In-memory Redis stand-in (no fakeredis dependency) for the cross-source tests."""
+import fnmatch
+from datetime import datetime, timezone
 
+from elliott_wave import ComponentScore, WaveSetup
+import elliott_alerts as EA
+
+T_OPEN = int(datetime(2026, 11, 18, 0, 0, tzinfo=timezone.utc).timestamp())   # 05:30 IST
+
+
+class _MiniPipe:
+    def __init__(self, r):
+        self.r, self.ops = r, []
+
+    def __getattr__(self, name):
+        def rec(*a, **k):
+            self.ops.append((name, a, k))
+        return rec
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def execute(self):
+        return [self.r._op(n, *a, **k) for n, a, k in self.ops]
+
+
+class _MiniRedis:
+    def __init__(self):
+        self.d, self.ttl = {}, {}
+
+    def _op(self, name, *a, **k):
+        d = self.d
+        if name == "get":
+            return d.get(a[0])
+        if name == "set":
+            key, val = a
+            if (k.get("nx") and key in d) or (k.get("xx") and key not in d):
+                return None
+            d[key] = val
+            if k.get("ex"):
+                self.ttl[key] = k["ex"]
+            elif not k.get("keepttl"):
+                self.ttl.pop(key, None)
+            return True
+        if name == "mget":
+            return [d.get(x) for x in a[0]]
+        if name == "exists":
+            return int(a[0] in d)
+        if name == "lpush":
+            d.setdefault(a[0], []).insert(0, a[1])
+            return len(d[a[0]])
+        if name == "ltrim":
+            d[a[0]] = d.get(a[0], [])[a[1]:a[2] + 1]
+            return True
+        if name == "lrange":
+            return d.get(a[0], [])[a[1]:(None if a[2] == -1 else a[2] + 1)]
+        if name == "llen":
+            return len(d.get(a[0], []))
+        if name == "expire":
+            self.ttl[a[0]] = a[1]
+            return True
+        if name == "hincrby":
+            h = d.setdefault(a[0], {})
+            h[a[1]] = str(int(h.get(a[1], 0)) + int(a[2]))
+            return int(h[a[1]])
+        if name == "hgetall":
+            return dict(d.get(a[0], {}))
+        raise NotImplementedError(name)
+
+    def __getattr__(self, name):
+        async def call(*a, **k):
+            return self._op(name, *a, **k)
+        return call
+
+    def pipeline(self, transaction=False):
+        return _MiniPipe(self)
+
+    async def scan_iter(self, match="*", count=0):
+        for k in list(self.d):
+            if fnmatch.fnmatchcase(k, match):
+                yield k
+
+
+def _mini_store():
+    s = object.__new__(state.RedisStateStore)
+    s.degraded = False
+    s._redis = _MiniRedis()
+    s._pending_outcome_keys_by_pair = None
+    s._shadow_pending_outcome_keys_by_pair = None
+    s._shadow_registered_this_run = {}
+    s._recorded_this_run = {}
+    s._claim_token = "tok"
+    s._close_event_ids = set()
+    s.trade_close_events = []
+    return s
+
+
+def _one_trade_cfg(monkeypatch):
+    for k, v in dict(
+        ENABLE_WIN_RATE_FILTER=True, ENABLE_BRAIN=True, ENABLE_SINGLE_ACTIVE_TRADE=True,
+        ENABLE_TRADE_CLOSE_NOTICE=True, ONE_TRADE_ACROSS_SOURCES=True, TRADE_CLOSE_COOLDOWN_CANDLES=3,
+        DRY_RUN_MODE=False, CANDIDATE_LOG_MAX_PER_PAIR=300, ENABLE_PULLBACK_CONTINUATION=True,
+        PULLBACK_SEND_WATCH=True, TRADE_CLOSE_COOLDOWN_ON_STOP=False,
+    ).items():
+        monkeypatch.setattr(cfg, k, v, raising=False)
+
+
+def _wave(pair="XAUTUSD", direction="sell", ts=T_OPEN):
+    return WaveSetup(
+        family="wave3", direction=direction, status="eligible", reason="", score=93.0, components={},
+        labels={}, event_id=f"ev-{pair}-{ts}", structure_id=f"st-{pair}", signal_idx=10, signal_ts=ts,
+        entry_price=3833.9, trigger_level=3841.15, entry_distance_atr=1.36, invalidation=3862.83,
+        stop=3851.49, targets=(3803.98, 3775.44), rr=1.7, atr=10.0, age_bars=0, htf_bias=1,
+        detail={"structure": ComponentScore("structure", 25, 25, "", {})}, features={}, pair=pair)
+
+
+def _put(sdb, prefix, pair, key, ts, direction, **extra):
+    row = {"direction": direction, "entry_ts": ts, "entry_price": 100.0, **extra}
+    sdb._redis.d[f"{prefix}{pair}:{key}:{ts}"] = json.dumps(row)
+
+
+def _candidates(sdb, pair):
+    return [json.loads(x) for x in sdb._redis.d.get(f"{state.RedisKeyPrefix.CANDIDATE_EVENTS}{pair}", [])]
+
+
+class _TgCapture:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, m):
+        self.sent.append(m)
+        return True
+
+
+def test_elliott_footer_shows_candle_open_time():
+    msg = EA.format_elliott_message([_wave()])
+    assert "05:30 IST" in msg and "05:45" not in msg
+
+
+def test_active_trade_spans_sources_and_the_switch_restores_isolation(monkeypatch):
+    _one_trade_cfg(monkeypatch)
+    sdb = _mini_store()
+    _put(sdb, state.RedisKeyPrefix.OUTCOME_PENDING, "XAUTUSD", "elliott_wave3_sell", T_OPEN, "sell")
+    got = asyncio.run(sdb.get_active_trade("XAUTUSD"))
+    assert got and got["alert_key"] == "elliott_wave3_sell"          # a MACD alert now sees the Elliott trade
+    assert asyncio.run(sdb.get_active_trade("XAUTUSD", elliott=False)) is not None   # default semantics
+    monkeypatch.setattr(cfg, "ONE_TRADE_ACROSS_SOURCES", False, raising=False)
+    assert asyncio.run(sdb.get_active_trade("XAUTUSD")) is None      # old isolation
+    assert asyncio.run(sdb.get_active_trade("XAUTUSD", elliott=True)) is not None
+    assert asyncio.run(sdb.get_active_trade("XAUTUSD", elliott=None)) is not None
+
+
+def test_pair_record_state_open_closed_and_cooldown(monkeypatch):
+    _one_trade_cfg(monkeypatch)
+    sdb = _mini_store()
+    key = f"{state.RedisKeyPrefix.OUTCOME_PENDING}XAUTUSD:elliott_wave3_sell:{T_OPEN}"
+    _put(sdb, state.RedisKeyPrefix.OUTCOME_PENDING, "XAUTUSD", "elliott_wave3_sell", T_OPEN, "sell")
+    st, det = asyncio.run(sdb.pair_record_state("XAUTUSD", T_OPEN + 900, "sell"))
+    assert st == "IGNORED" and det["direction"] == "sell"
+    assert asyncio.run(sdb.pair_record_state("XAUTUSD", T_OPEN + 900, "buy"))[0] == "IGNORED"   # either direction
+    sdb._redis.d[key] = json.dumps({"direction": "sell", "entry_ts": T_OPEN, "closed_ts": T_OPEN + 1800})
+    assert asyncio.run(sdb.pair_record_state("XAUTUSD", T_OPEN + 2700, "sell"))[0] == "RECORDED"
+    asyncio.run(sdb._start_trade_cooldown("XAUTUSD", T_OPEN + 1800, LOG, "Recorded", "sell"))
+    st, det = asyncio.run(sdb.pair_record_state("XAUTUSD", T_OPEN + 2700, "sell"))
+    assert st == "COOLDOWN" and det["until_ts"] > det["hit_ts"]
+    assert asyncio.run(sdb.pair_record_state("XAUTUSD", T_OPEN + 2700, "buy"))[0] == "RECORDED"
+
+
+def test_trade_recorded_this_run_blocks_the_other_source_despite_stale_prescan(monkeypatch):
+    _one_trade_cfg(monkeypatch)
+    sdb = _mini_store()
+    sdb._pending_outcome_keys_by_pair = {}                        # the run-start scan: nothing open
+    mkey = sorted(A.BUY_ALERT_KEYS)[0]
+    assert asyncio.run(sdb.record_pending_outcome(
+        "BTCUSD", mkey, "buy", T_OPEN, 100.0, confluence_score=5.0, confluence_total=10.0)) is True
+    st, det = asyncio.run(sdb.pair_record_state("BTCUSD", T_OPEN, "buy"))
+    assert st == "IGNORED" and det["alert_key"] == mkey
+    assert asyncio.run(sdb.pair_record_state("ETHUSD", T_OPEN, "buy"))[0] == "RECORDED"
+
+
+def test_elliott_cooldown_honoured_by_recording_and_started_by_an_elliott_target(monkeypatch):
+    _one_trade_cfg(monkeypatch)
+    sdb = _mini_store()
+    row = {"direction": "sell", "entry_ts": T_OPEN, "closed_reason": "target", "closed_candle_ts": T_OPEN + 1800,
+           "context": {"elliott_wave_family": "wave3"}}
+    asyncio.run(sdb._publish_close_events("XAUTUSD", [row], "Recorded", LOG))
+    assert asyncio.run(sdb.in_trade_cooldown("XAUTUSD", T_OPEN + 2700, direction="sell")) == T_OPEN + 1800
+    mkey = sorted(A.SELL_ALERT_KEYS)[0]
+    # the cooldown now also stops a MACD recording, and an Elliott one
+    assert asyncio.run(sdb.record_pending_outcome("XAUTUSD", mkey, "sell", T_OPEN + 2700, 100.0, 5.0, 10.0)) is True
+    assert not any(k.startswith(state.RedisKeyPrefix.OUTCOME_PENDING) for k in sdb._redis.d)
+    assert asyncio.run(sdb.record_pending_outcome("XAUTUSD", "elliott_wave3_sell", "sell", T_OPEN + 2700, 100.0, 93.0, 100.0)) is True
+    assert not any(k.startswith(state.RedisKeyPrefix.OUTCOME_PENDING) for k in sdb._redis.d)
+    monkeypatch.setattr(cfg, "ONE_TRADE_ACROSS_SOURCES", False, raising=False)     # old isolation: no cooldown from Elliott
+    sdb2 = _mini_store()
+    asyncio.run(sdb2._publish_close_events("XAUTUSD", [row], "Recorded", LOG))
+    assert asyncio.run(sdb2.in_trade_cooldown("XAUTUSD", T_OPEN + 2700, direction="sell")) is None
+
+
+def test_elliott_delivers_a_blocked_alert_labelled_and_does_not_record_it(monkeypatch):
+    _one_trade_cfg(monkeypatch)
+    sdb, tg = _mini_store(), _TgCapture()
+    _put(sdb, state.RedisKeyPrefix.OUTCOME_PENDING, "XAUTUSD", "pivot_x", T_OPEN - 900, "sell")
+    sel = [("XAUTUSD", _wave("XAUTUSD", "sell")), ("ETHUSD", _wave("ETHUSD", "buy"))]
+    verdicts = asyncio.run(EA._one_trade_gate(sdb, sel, LOG))
+    stats = {"errors": 0, "delivered": 0}
+    got = asyncio.run(EA._deliver(sel, T_OPEN + 900, sdb, tg, LOG, stats, {}, rec_state=verdicts))
+    assert len(got) == 2 and stats["delivered"] == 2                       # both are SENT
+    assert "Ignored" in tg.sent[0] and "XAUTUSD sell trade open since" in tg.sent[0]
+    pend = [k for k in sdb._redis.d if k.startswith(state.RedisKeyPrefix.OUTCOME_PENDING)]
+    assert not any("XAUTUSD:elliott" in k for k in pend)                    # blocked pair: not recorded
+    assert any("ETHUSD:elliott_wave3_buy" in k for k in pend)               # free pair: recorded
+    rows = _candidates(sdb, "XAUTUSD")
+    assert rows and rows[0]["reason"] == "ignored_open_trade" and rows[0]["open_key"] == "pivot_x"
+    assert _candidates(sdb, "ETHUSD") == []
+
+
+def test_elliott_one_trade_gate_is_off_when_the_switch_is_off(monkeypatch):
+    _one_trade_cfg(monkeypatch)
+    monkeypatch.setattr(cfg, "ONE_TRADE_ACROSS_SOURCES", False, raising=False)
+    sdb = _mini_store()
+    _put(sdb, state.RedisKeyPrefix.OUTCOME_PENDING, "XAUTUSD", "pivot_x", T_OPEN - 900, "sell")
+    assert asyncio.run(EA._one_trade_gate(sdb, [("XAUTUSD", _wave())], LOG)) == {}
+
+
+def test_shadow_overlap_recorded_active_and_skipped_active_rows(monkeypatch):
+    _one_trade_cfg(monkeypatch)
+    mkey = sorted(A.BUY_ALERT_KEYS)[0]
+    sdb = _mini_store()
+    sk = f"{state.RedisKeyPrefix.SHADOW_PENDING}SOLUSD:{mkey}:{T_OPEN - 900}"
+    sdb._redis.d[sk] = json.dumps({"direction": "buy", "entry_ts": T_OPEN - 900, "entry_price": 100.0, "context": {}})
+    sdb._redis.ttl[sk] = 777
+    asyncio.run(sdb.record_pending_outcome("SOLUSD", mkey, "buy", T_OPEN, 100.0, 5.0, 10.0))
+    assert json.loads(sdb._redis.d[sk])["context"]["overlapped_by_recorded"] is True
+    assert sdb._redis.ttl[sk] == 777                                         # TTL untouched (keepttl)
+    # a shadow registered while a Recorded trade is open carries recorded_active
+    sdb = _mini_store()
+    asyncio.run(sdb.record_pending_outcome("ADAUSD", mkey, "buy", T_OPEN, 1.0, 5.0, 10.0))
+    res = asyncio.run(sdb.record_shadow_pending_outcome("ADAUSD", mkey, "sell", T_OPEN + 900, 1.0, 5.0, 10.0, None, {}))
+    srow = json.loads(sdb._redis.d[f"{state.RedisKeyPrefix.SHADOW_PENDING}ADAUSD:{mkey}:{T_OPEN + 900}"])
+    assert res == "created" and srow["context"]["recorded_active"] is True
+    # a later shadow while that one is open is skipped, and the skip is logged, not dropped silently
+    res2 = asyncio.run(sdb.record_shadow_pending_outcome("ADAUSD", mkey, "sell", T_OPEN + 1800, 1.0, 5.0, 10.0, None, {}))
+    ev = _candidates(sdb, "ADAUSD")
+    assert res2 == "skipped_active" and ev and ev[0]["reason"] == "skipped_active"
+    assert not any(k.endswith(str(T_OPEN + 1800)) for k in sdb._redis.d if k.startswith(state.RedisKeyPrefix.SHADOW_PENDING))
+    # candidate rows are capped and can be switched off
+    monkeypatch.setattr(cfg, "CANDIDATE_LOG_MAX_PER_PAIR", 2, raising=False)
+    for i in range(5):
+        asyncio.run(sdb.log_candidate_event("ADAUSD", mkey, "buy", T_OPEN + i, "ignored_open_trade"))
+    assert len(_candidates(sdb, "ADAUSD")) == 2
+    monkeypatch.setattr(cfg, "CANDIDATE_LOG_MAX_PER_PAIR", 0, raising=False)
+    asyncio.run(sdb.log_candidate_event("XRPUSD", mkey, "buy", T_OPEN, "ignored_open_trade"))
+    assert _candidates(sdb, "XRPUSD") == []
+
+
+def test_watch_levels_render_with_price_precision_and_fail_closed():
+    assert A._fmt_level(0.0382) == "0.0382" and A._fmt_level(3811.85) == "3,811.85" and A._fmt_level(2.5) == "2.500"
+    info = {"depth_atr": 8.2, "retrace": 0.6, "trigger": 0.0371, "invalidation": 0.0392}
+    txt = A._pullback_levels_text(info)
+    assert "trigger 0.0371" in txt and "invalid beyond 0.0392" in txt and "trigger 0.0 " not in txt
+    ok = {"trigger": 0.0371, "invalidation": 0.0392}
+    assert A._watch_levels_problem(ok, 0.0379, "sell") is None
+    for bad, why in (({"trigger": None, "invalidation": 0.0392}, "trigger missing"),
+                     ({"trigger": 0.0371, "invalidation": None}, "invalidation missing"),
+                     ({"trigger": 0.0, "invalidation": 0.0}, "positive price"),
+                     ({"trigger": 0.0379, "invalidation": 0.0392}, "not below price"),
+                     ({"trigger": 0.0371, "invalidation": 0.0370}, "not above price"),
+                     ({"trigger": 0.0001, "invalidation": 0.0392}, "50% away")):
+        assert why in (A._watch_levels_problem(bad, 0.0379, "sell") or "")
+    assert A._watch_levels_problem({"trigger": 0.0382, "invalidation": 0.0370}, 0.0379, "buy") is None
+    assert "price unavailable" in A._watch_levels_problem(ok, None, "sell")
+
+
+def _watch_ctx(trig=0.0371, inv=0.0392, side="sell"):
+    return {f"pullback_state_{side}": "exhaustion",
+            f"pullback_info_{side}": {"low_ts": T_OPEN, "votes": ["rejection", "rsi_turn"], "trigger": trig,
+                                      "invalidation": inv, "depth_atr": 8.2, "retrace": 0.6}}
+
+
+def _watch_gr(ts=T_OPEN):
+    return NS(pair_name="SKYAIUSD", ts_curr=ts, close_curr=0.0379)
+
+
+def test_pullback_watch_rules_by_pair_state(monkeypatch):
+    _one_trade_cfg(monkeypatch)
+    mkey = sorted(A.BUY_ALERT_KEYS)[0]
+
+    async def claim(*a, **k):
+        return True
+    # recorded trade open, OPPOSITE direction (Elliott): suppressed, and the log keeps both directions
+    A._PULLBACK_WATCH_QUEUE.clear()
+    sdb = _mini_store(); sdb.claim_recent_alert = claim
+    _put(sdb, state.RedisKeyPrefix.OUTCOME_PENDING, "SKYAIUSD", "elliott_wave3_buy", T_OPEN - 900, "buy")
+    assert asyncio.run(A.send_pullback_watch(_watch_ctx(), _watch_gr(), sdb, None, LOG)) == 0
+    ev = _candidates(sdb, "SKYAIUSD")
+    assert ev[0]["reason"] == "watch_suppressed_open_trade" and ev[0]["same_direction"] is False \
+        and ev[0]["open_direction"] == "buy" and not A._PULLBACK_WATCH_QUEUE
+    # shadow open: sent
+    sdb = _mini_store(); sdb.claim_recent_alert = claim
+    _put(sdb, state.RedisKeyPrefix.SHADOW_PENDING, "SKYAIUSD", mkey, T_OPEN - 900, "sell")
+    assert asyncio.run(A.send_pullback_watch(_watch_ctx(), _watch_gr(), sdb, None, LOG)) == 1
+    block = A._PULLBACK_WATCH_QUEUE[0][2].replace("\\", "")
+    assert "trigger 0.0371" in block and "invalid beyond 0.0392" in block and "Cooldown" not in block
+    # cooldown: sent, with the cooldown line
+    A._PULLBACK_WATCH_QUEUE.clear()
+    sdb = _mini_store(); sdb.claim_recent_alert = claim
+    asyncio.run(sdb._start_trade_cooldown("SKYAIUSD", T_OPEN - 900, LOG, "Recorded", "sell"))
+    assert asyncio.run(A.send_pullback_watch(_watch_ctx(), _watch_gr(), sdb, None, LOG)) == 1
+    assert "Cooldown" in A._PULLBACK_WATCH_QUEUE[0][2]
+    # nothing open: sent
+    A._PULLBACK_WATCH_QUEUE.clear()
+    assert asyncio.run(A.send_pullback_watch(_watch_ctx(), _watch_gr(), _wd(claim), None, LOG)) == 1
+    A._PULLBACK_WATCH_QUEUE.clear()
+    # bad levels: not sent, no claim taken, logged
+    taken = []
+
+    async def claim2(*a, **k):
+        taken.append(a)
+        return True
+    sdb = _mini_store(); sdb.claim_recent_alert = claim2
+    assert asyncio.run(A.send_pullback_watch(_watch_ctx(None, 0.0392), _watch_gr(), sdb, None, LOG)) == 0
+    assert not taken and _candidates(sdb, "SKYAIUSD")[0]["reason"] == "watch_bad_levels"
+    A._PULLBACK_WATCH_QUEUE.clear()
+
+
+def _wd(claim):
+    s = _mini_store()
+    s.claim_recent_alert = claim
+    return s
+
+
+def test_pullback_watch_flush_rechecks_a_trade_opened_after_queueing(monkeypatch):
+    _one_trade_cfg(monkeypatch)
+    mkey = sorted(A.BUY_ALERT_KEYS)[0]
+    released, tg = [], _TgCapture()
+
+    async def claim(*a, **k):
+        return True
+
+    async def release(pair, key):
+        released.append((pair, key))
+        return True
+    A._PULLBACK_WATCH_QUEUE.clear()
+    sdb = _mini_store(); sdb.claim_recent_alert = claim; sdb.release_recent_alert = release
+    assert asyncio.run(A.send_pullback_watch(_watch_ctx(), _watch_gr(), sdb, None, LOG)) == 1
+    asyncio.run(sdb.record_pending_outcome("SKYAIUSD", mkey, "buy", T_OPEN, 0.0379, 5.0, 10.0))   # a trade opens later in the run
+    assert asyncio.run(A.flush_pullback_watch(sdb, tg, LOG)) == 0 and not tg.sent
+    assert released == [("SKYAIUSD", f"pbwatch_sell_{T_OPEN}")]            # claim given back: it can be sent after the close
+    assert _candidates(sdb, "SKYAIUSD")[-1]["reason"] == "watch_suppressed_open_trade"
+    # with no open trade the same queue is sent as before
+    A._PULLBACK_WATCH_QUEUE.clear()
+    sdb = _mini_store(); sdb.claim_recent_alert = claim; sdb.release_recent_alert = release
+    asyncio.run(A.send_pullback_watch(_watch_ctx(), _watch_gr(), sdb, None, LOG))
+    assert asyncio.run(A.flush_pullback_watch(sdb, tg, LOG)) == 1 and len(tg.sent) == 1
+
+
+def test_admits_shadow_leaves_out_rows_that_could_not_have_been_followed():
+    import threshold_repair as tr
+    policy = {"relax_gates": ["confluence_gate"]}
+    row = {"alert_key": "x", "context": {"rejection_reason": "confluence_gate"}}
+    assert tr._admits_shadow(row, policy, {}) is True                       # an ordinary blocked opportunity
+    for flag in ("recorded_active", "cooldown_active"):
+        flagged = {**row, "context": {**row["context"], flag: True}}
+        assert tr._admits_shadow(flagged, policy, {}) is False              # could not have been followed
+
+
+def test_cokey_credit_keys_and_reader_merge(monkeypatch):
+    _one_trade_cfg(monkeypatch)
+    buy = sorted(A.BUY_ALERT_KEYS)
+    sell = sorted(A.SELL_ALERT_KEYS)
+    primary, b1, b2, s1 = buy[0], buy[1], buy[2], sell[0]
+    f = state.RedisStateStore._cokey_credit_keys
+    ctx = {"co_fired_keys": [b1, s1, b2, primary, b1, "elliott_wave3_buy", "not_a_key"]}
+    assert f(primary, "buy", ctx) == [b1, b2]                       # same direction, deduplicated, no primary/Elliott/unknown
+    assert f(primary, "buy", None) == [] and f(primary, "buy", {"co_fired_keys": None}) == []
+    monkeypatch.setattr(cfg, "ENABLE_COKEY_STATS_CREDIT", True, raising=False)
+    monkeypatch.setattr(cfg, "MIN_WIN_RATE_SAMPLE", 20, raising=False)
+    sdb = _mini_store()
+    sdb._redis.d[f"alert_stats:ETHUSD:{b1}"] = {"wins": "5", "losses": "14"}
+    sdb._redis.d[f"alert_stats_co:ETHUSD:{b1}"] = {"wins": "1", "losses": "0"}
+    out = asyncio.run(sdb.batch_get_alert_win_rates("ETHUSD", [b1, b2]))
+    assert out[b1] == (6 / 20, 20) and out[b2] == (None, 0)          # 5+1 wins of 20: the credit reaches the minimum sample
+    monkeypatch.setattr(cfg, "ENABLE_COKEY_STATS_CREDIT", False, raising=False)
+    assert asyncio.run(sdb.batch_get_alert_win_rates("ETHUSD", [b1]))[b1] == (None, 19)   # switch off: own samples only
+
+
+def test_dedup_summary_reports_delivered_but_unscored_alerts():
+    base = {"claims_taken": 1}
+    assert "not scored" not in A.format_dedup_summary(dict(base))
+    line = A.format_dedup_summary({**base, "unscored_open_trade": 2, "unscored_cooldown": 1})
+    assert "delivered but not scored: trade open 2, cooldown 1" in line

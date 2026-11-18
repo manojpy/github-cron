@@ -787,3 +787,129 @@ def test_alert_pending_resolve_jsonl_brain_quality(tmp_path, monkeypatch):
     assert folded == 1
     assert calib["curves"]["ppo_cross_buy"]["n"] == 2
     assert calib["curves"]["ppo_cross_buy"]["buckets"][0]["observed"] == 1.0
+
+# ======================================================================
+# win-rate posterior, break-even target, override proof, playbook age,
+# baseline proof for the live ML-EV gate
+# ======================================================================
+"""Statistical helpers and live-gate preconditions added in the Brain audit."""
+
+
+def test_prob_wr_at_least_matches_beta_tail_and_edges():
+    f = engine.prob_wr_at_least
+    # values cross-checked against numerical integration of the Beta(1+w, 1+l) upper tail
+    assert abs(f(6, 14, 0.3933) - 0.21824) < 1e-4
+    assert abs(f(9, 11, 0.55) - 0.1841) < 1e-4
+    assert abs(f(10, 10, 0.55) - 0.3210) < 1e-4
+    assert abs(f(5, 5, 0.5) - 0.5) < 1e-9
+    assert f(0, 0, 0.55) == 1.0 and f(3, 3, 0.0) == 1.0 and f(3, 3, 1.0) == 0.0   # "no evidence" never blocks
+    assert f(-4, -1, 0.5) == 1.0                                                   # negative counts are clamped
+    assert f(10, 5, 0.5) > f(9, 6, 0.5) > f(8, 7, 0.5)                             # monotone in wins
+    assert f(8, 7, 0.4) > f(8, 7, 0.5) > f(8, 7, 0.6)                              # and in the target
+    assert 0.0 <= f(5000, 5000, 0.5) <= 1.0                                        # no overflow at large n
+
+
+def test_breakeven_and_gate_target(monkeypatch):
+    for k, v in dict(OUTCOME_MAE_LOSS_PCT=1.0, OUTCOME_RR_TARGET=2.0, BRAIN_FEE_PCT=0.0006,
+                     BRAIN_SLIPPAGE_PCT=0.0003, MIN_WIN_RATE=0.55, GATE_BREAKEVEN_MARGIN=0.05).items():
+        monkeypatch.setattr(brain_mod.cfg, k, v, raising=False)
+    assert abs(brain_mod.cfg.breakeven_wr() - 0.3933) < 1e-3          # (1 + 0.18R) / (1 + 2R)
+    monkeypatch.setattr(brain_mod.cfg, "GATE_TARGET_MODE", "fixed", raising=False)
+    assert brain_mod.cfg.gate_target_wr() == 0.55
+    monkeypatch.setattr(brain_mod.cfg, "GATE_TARGET_MODE", "breakeven", raising=False)
+    assert abs(brain_mod.cfg.gate_target_wr() - (0.3933 + 0.05)) < 1e-3
+    monkeypatch.setattr(brain_mod.cfg, "MIN_WIN_RATE", 0.40, raising=False)       # never above the configured floor
+    assert brain_mod.cfg.gate_target_wr() == 0.40
+    monkeypatch.setattr(brain_mod.cfg, "OUTCOME_RR_TARGET", 3.0, raising=False)   # a wider target lowers break-even
+    assert brain_mod.cfg.breakeven_wr() < 0.3933
+
+
+class _OverrideSdb:
+    degraded = False
+    _redis = object()
+
+    def __init__(self, wins, losses, acquire=True):
+        self.h, self.acquire = {"wins": str(wins), "losses": str(losses)}, acquire
+
+    async def _safe_redis_op(self, fn, timeout, label):
+        return self.h if label.startswith("brain_hiconf") else self.acquire
+
+
+def _override(monkeypatch, wins, losses, proven=True):
+    for k, v in dict(BRAIN_REWARDABLE_MIN_CONFLUENCE_PCT=80.0, BRAIN_REWARDABLE_MIN_SHADOW_SAMPLE=10,
+                     BRAIN_REWARDABLE_MIN_SHADOW_WR=0.60, BRAIN_REWARDABLE_REQUIRE_PROVEN_EDGE=proven,
+                     OUTCOME_MAE_LOSS_PCT=1.0, OUTCOME_RR_TARGET=2.0, BRAIN_FEE_PCT=0.0006,
+                     BRAIN_SLIPPAGE_PCT=0.0003).items():
+        monkeypatch.setattr(brain_mod.cfg, k, v, raising=False)
+    b = object.__new__(brain_mod.BrainCore)
+    b.sdb = _OverrideSdb(wins, losses)
+    return asyncio.run(b.check_rewardable_override("vwap_buy", 85.0, 100.0))
+
+
+def test_rewardable_override_needs_a_proven_edge_not_a_point_estimate(monkeypatch):
+    assert _override(monkeypatch, 6, 4) is None                  # 60% of 10: Wilson lower bound 31% < 39.3% break-even
+    assert _override(monkeypatch, 7, 3)                          # 70% of 10: lower bound 39.7% just clears 39.3%
+    out = _override(monkeypatch, 13, 8)                          # 62% of 21: lower bound 40.9% >= 39.3%
+    assert out and "shadow WR 62%" in out and "21 tracked" in out
+    assert _override(monkeypatch, 6, 4, proven=False)            # switch off: the old point-estimate rule
+
+
+def test_override_cooldown_and_thin_samples_still_block(monkeypatch):
+    assert _override(monkeypatch, 5, 3) is None                  # below the minimum shadow sample
+    for k, v in dict(BRAIN_REWARDABLE_MIN_CONFLUENCE_PCT=80.0, BRAIN_REWARDABLE_MIN_SHADOW_SAMPLE=10,
+                     BRAIN_REWARDABLE_MIN_SHADOW_WR=0.60, BRAIN_REWARDABLE_REQUIRE_PROVEN_EDGE=True).items():
+        monkeypatch.setattr(brain_mod.cfg, k, v, raising=False)
+    b = object.__new__(brain_mod.BrainCore)
+    b.sdb = _OverrideSdb(13, 8, acquire=False)                   # an override already fired inside the cooldown
+    assert asyncio.run(b.check_rewardable_override("vwap_buy", 85.0, 100.0)) is None
+
+
+def test_playbook_age_and_loader(monkeypatch):
+    monkeypatch.setattr(brain_mod.cfg, "PLAYBOOK_MODE", "veto", raising=False)
+    b = object.__new__(brain_mod.BrainCore)
+    b._playbook_cache = None
+    assert b.playbook_age_hours() is None                        # never loaded this run
+    b._playbook_cache = {}
+    assert b.playbook_age_hours() == float("inf")                # loaded, but no playbook written yet
+    b._playbook_cache = {"generated_ts": time.time() - 7200}
+    assert 1.99 < b.playbook_age_hours() < 2.01
+    monkeypatch.setattr(brain_mod.cfg, "PLAYBOOK_MODE", "off", raising=False)
+    assert b.playbook_age_hours() is None                        # playbook not in use: nothing to warn about
+
+    calls = []
+
+    async def fake_load():
+        calls.append(1)
+        b._playbook_cache = {"generated_ts": time.time() - 3600}
+    b._playbook_cache = None
+    b._load_playbook_blob = fake_load
+    monkeypatch.setattr(brain_mod.cfg, "PLAYBOOK_MODE", "veto", raising=False)
+    asyncio.run(b.ensure_playbook_loaded())                      # a quiet run: no alert has loaded it yet
+    assert calls == [1] and 0.99 < b.playbook_age_hours() < 1.01
+    monkeypatch.setattr(brain_mod.cfg, "PLAYBOOK_MODE", "off", raising=False)
+    asyncio.run(b.ensure_playbook_loaded())
+    assert calls == [1]                                          # off: no Redis read
+
+    async def boom():
+        raise RuntimeError("redis down")
+    b._load_playbook_blob = boom
+    monkeypatch.setattr(brain_mod.cfg, "PLAYBOOK_MODE", "veto", raising=False)
+    asyncio.run(b.ensure_playbook_loaded())                      # never raises
+
+
+def test_baseline_proof_gates_the_live_ml_model(monkeypatch):
+    from brain_helpers import baseline_proof_ok
+    cfg_ = brain_mod.cfg
+    monkeypatch.setattr(cfg_, "ML_BASELINE_PROOF_MAX_AGE_HOURS", 72.0, raising=False)
+    monkeypatch.setattr(cfg_, "ML_REQUIRE_BASELINE_PROOF", True, raising=False)
+    now = time.time()
+    ok = {"ev_baseline_proof": {"status": "validated", "at": now - 3600}}
+    assert baseline_proof_ok(ok) is True
+    assert baseline_proof_ok({"ev_baseline_proof": {"status": "not_better", "at": now}}) is False
+    assert baseline_proof_ok({"ev_baseline_proof": {"status": "validated", "at": now - 80 * 3600}}) is False   # stale
+    assert baseline_proof_ok({"ev_baseline_proof": {"status": "validated", "at": now + 3600}}) is False        # from the future
+    assert baseline_proof_ok({"ev_baseline_proof": {"status": "validated"}}) is False                            # no timestamp
+    assert baseline_proof_ok({}) is False and baseline_proof_ok(None) is False
+    assert baseline_proof_ok({"ev_baseline_proof": {"status": "validated", "at": "garbage"}}) is False
+    monkeypatch.setattr(cfg_, "ML_REQUIRE_BASELINE_PROOF", False, raising=False)
+    assert baseline_proof_ok(None) is True                      # switch off: the old behaviour
