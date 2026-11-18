@@ -913,3 +913,394 @@ def test_baseline_proof_gates_the_live_ml_model(monkeypatch):
     assert baseline_proof_ok({"ev_baseline_proof": {"status": "validated", "at": "garbage"}}) is False
     monkeypatch.setattr(cfg_, "ML_REQUIRE_BASELINE_PROOF", False, raising=False)
     assert baseline_proof_ok(None) is True                      # switch off: the old behaviour
+
+# ======================================================================
+# statistical core: action gate, walk-forward purge/embargo, CUSUM, online challenger
+# ======================================================================
+def _sc_cfg(monkeypatch, **extra):
+    """Fixed bracket (1% stop, RR 2, 0.18% round-trip cost) so every figure is hand-checkable."""
+    vals = dict(OUTCOME_MAE_LOSS_PCT=1.0, OUTCOME_RR_TARGET=2.0, BRAIN_FEE_PCT=0.0006,
+                BRAIN_SLIPPAGE_PCT=0.0003, OUTCOME_LOOKAHEAD_CANDLES=12, OUTCOME_FILL_DELAY_CANDLES=1,
+                BRAIN_EV_GATE_P_THRESHOLD=0.85, BRAIN_EV_GATE_P5_FLOOR=-0.10,
+                BRAIN_CUSUM_TARGET_WR=0.40, BRAIN_CUSUM_DRIFT_DELTA=0.15, BRAIN_CUSUM_THRESHOLD=8.0,
+                CONFLUENCE_MIN_PCT=60.0, CONFLUENCE_MIN_ABS_SCORE=18.0)
+    vals.update(extra)
+    for k, v in vals.items():
+        monkeypatch.setattr(brain_mod.cfg, k, v, raising=False)
+
+
+def _sc_row(ts, win, score=5.0, pair="BTCUSD", key="vwap_buy", **kw):
+    r = {"pair": pair, "alert_key": key, "direction": "buy", "entry_ts": int(ts), "score": score,
+         "win": bool(win), "outcome_reason": "target_hit" if win else "stop_hit",
+         "pct_move": 2.0 if win else -1.0, "votes": {"a": True}}
+    r.update(kw)
+    return r
+
+
+def _sc_book(n=600, p_hi=0.65, p_lo=0.20, step=600, end_ago=10 * 86400, seed=3):
+    """n resolved trades ending `end_ago` seconds ago; high scores (>=5) win more often."""
+    rnd = random.Random(seed)
+    t0 = int(time.time()) - end_ago - n * step
+    rows = []
+    for i in range(n):
+        sc = rnd.uniform(0, 10)
+        rows.append(_sc_row(t0 + i * step, rnd.random() < (p_hi if sc >= 5 else p_lo), score=sc))
+    return rows
+
+
+# ── rolling_walk_forward ───────────────────────────────────────────────
+def test_walk_forward_needs_enough_rows_and_valid_folds(monkeypatch):
+    _sc_cfg(monkeypatch)
+    short = engine.rolling_walk_forward(_sc_book(n=50))
+    assert short == {"valid": False, "error": "insufficient_data", "n": 50}
+    # Every train row's outcome window spills past the cut -> nothing trainable -> no valid fold.
+    none = engine.rolling_walk_forward(_sc_book(), lookahead_sec=10 ** 9)
+    assert none["valid"] is False and none["error"] == "too_few_valid_folds" and none["n_folds"] == 0
+
+
+def test_walk_forward_purges_train_and_embargoes_test(monkeypatch):
+    import threshold_validation as tv
+    _sc_cfg(monkeypatch)
+    rows = _sc_book()
+    ordered = sorted(rows, key=lambda r: r["entry_ts"])
+    fold = len(ordered) // 6
+    cuts = [ordered[fold * (i + 1)]["entry_ts"] for i in range(5)]
+    look, emb = (1 + 12 + 1) * 900, 900
+    seen_train, seen_test = [], []
+    real_rec, real_ev = tv.recommend_threshold, tv.ev_and_kelly_for
+
+    def spy_rec(train, **kw):
+        seen_train.append(train)
+        return real_rec(train, **kw)
+
+    def spy_ev(test, *a, **kw):
+        seen_test.append(test)
+        return real_ev(test, *a, **kw)
+
+    monkeypatch.setattr(tv, "recommend_threshold", spy_rec)
+    monkeypatch.setattr(tv, "ev_and_kelly_for", spy_ev)
+    out = tv.rolling_walk_forward(rows, n_folds=5)
+    assert out["valid"] and seen_train and seen_test
+    for train in seen_train:
+        top = max(r["entry_ts"] for r in train)
+        cut = min(c for c in cuts if c > top)                    # the fold this train set belongs to
+        assert top + look < cut - emb                            # purge: no label reaches into the test period
+        assert len(train) < fold * (cuts.index(cut) + 1)         # ...and some rows really were dropped
+    for test in seen_test:
+        low = min(r["entry_ts"] for r in test)
+        cut = max(c for c in cuts if c <= low)
+        assert low >= cut + emb                                  # embargo: first 15 minutes of the fold skipped
+
+
+def test_walk_forward_pass_rate_is_the_share_of_positive_folds(monkeypatch):
+    _sc_cfg(monkeypatch)
+    good = engine.rolling_walk_forward(_sc_book(), n_folds=5)
+    assert good["valid"] and good["oos_ev_mean"] > 0
+    assert good["p_ev_positive"] == good["positive_fold_rate"] == 1.0
+    # A book that loses after costs (WR 20% < 39.3% break-even) can never reach the 0.70 gate.
+    bad = engine.rolling_walk_forward(_sc_book(p_hi=0.2, p_lo=0.2, seed=4), n_folds=5)
+    assert (not bad["valid"]) or bad["p_ev_positive"] < 0.70
+
+
+# ── _action_gate_check ────────────────────────────────────────────────
+class _AuditOK:
+    def can_run(self, name):
+        return True, ""
+
+
+def _gate(monkeypatch, rows=None, oos=0.90, ev=(0.95, 0.20), **kw):
+    """Run the gate with the OOS and EV layers pinned, so each test isolates one layer."""
+    import brain_enhanced as be
+    _sc_cfg(monkeypatch)
+    monkeypatch.setattr(be, "get_audit", lambda: _AuditOK())
+    monkeypatch.setattr(engine, "rolling_walk_forward",
+                        lambda rows, **k: {"valid": oos is not None, "p_ev_positive": oos})
+    monkeypatch.setattr(engine, "ev_first_objective",
+                        lambda rows, **k: {"valid": True, "p_ev_positive": ev[0], "ev_p5": ev[1]}
+                        if ev else {"valid": False})
+    return be.BrainEngineV2._action_gate_check(rows if rows is not None else _sc_book(n=150), **kw)
+
+
+def test_action_gate_all_layers_pass_on_a_profitable_stable_book(monkeypatch):
+    import brain_enhanced as be
+    _sc_cfg(monkeypatch)
+    monkeypatch.setattr(be, "get_audit", lambda: _AuditOK())
+    g = be.BrainEngineV2._action_gate_check(_sc_book(), active_drift_keys=[])   # real OOS + EV, nothing pinned
+    layers = ("data_quality", "oos_prediction", "profitability", "stability", "risk", "execution")
+    assert {k: g[k] for k in layers} == dict.fromkeys(layers, True)
+    assert g["actionable"] is True
+
+
+def test_action_gate_data_and_oos_layers(monkeypatch):
+    assert _gate(monkeypatch)["actionable"] is True                              # baseline for the cases below
+    thin = _gate(monkeypatch, rows=_sc_book(n=99))
+    assert thin["data_quality"] is False and thin["actionable"] is False         # 99 rows < 100
+    assert _gate(monkeypatch, rows=_sc_book(n=100))["data_quality"] is True      # 100 is enough
+    assert _gate(monkeypatch, oos=0.70)["oos_prediction"] is True                # boundary is >= 0.70
+    low = _gate(monkeypatch, oos=0.69)
+    assert low["oos_prediction"] is False and low["actionable"] is False
+    assert _gate(monkeypatch, oos=None)["oos_prediction"] is False               # no valid walk-forward = no pass
+
+
+def test_action_gate_profitability_thresholds(monkeypatch):
+    assert _gate(monkeypatch, ev=(0.85, -0.09))["profitability"] is True         # p >= 0.85 and p5 > -0.10
+    assert _gate(monkeypatch, ev=(0.84, 0.20))["profitability"] is False
+    assert _gate(monkeypatch, ev=(0.95, -0.10))["profitability"] is False        # p5 must be strictly above the floor
+    g = _gate(monkeypatch, ev=None)
+    assert g["profitability"] is False and g["actionable"] is False              # no valid EV = not profitable
+
+
+def test_action_gate_stability_prefers_the_persisted_alarm_set(monkeypatch):
+    drift = [{"type": "cusum_drift", "alert": "vwap_buy"}]
+    assert _gate(monkeypatch, active_drift_keys=["vwap_buy"])["stability"] is False
+    # Authoritative: an empty persisted set means "no alarm" even if this report's recs mention drift.
+    assert _gate(monkeypatch, active_drift_keys=[], recommendations=drift)["stability"] is True
+    # Without the persisted set, fall back to this cycle's recommendation list.
+    assert _gate(monkeypatch, recommendations=drift)["stability"] is False
+    assert _gate(monkeypatch, recommendations=[{"type": "other"}])["stability"] is True
+    assert _gate(monkeypatch)["stability"] is True
+
+
+def test_action_gate_execution_needs_nonzero_costs(monkeypatch):
+    assert _gate(monkeypatch)["execution"] is True
+    monkeypatch.setattr(brain_mod.cfg, "BRAIN_FEE_PCT", 0.0, raising=False)
+    import brain_enhanced as be
+    g = be.BrainEngineV2._action_gate_check(_sc_book(n=150))
+    assert g["execution"] is False and g["actionable"] is False
+
+
+def test_action_gate_risk_trips_on_recent_streak_and_fails_closed_on_error(monkeypatch):
+    now = int(time.time())
+    book = _sc_book(n=150) + [_sc_row(now - 3600 + i * 60, False) for i in range(6)]   # 6 straight losses, last hour
+    g = _gate(monkeypatch, rows=book)
+    assert g["risk"] is False and g["risk_consecutive_losses"] == 6 and g["actionable"] is False
+    assert _gate(monkeypatch)["risk"] is True                                          # old book: nothing in the window
+
+    class _Boom:
+        def __init__(self, **kw):
+            pass
+
+        def evaluate(self, rows):
+            raise RuntimeError("redis down")
+
+    monkeypatch.setattr(engine, "KillSwitch", _Boom)
+    import brain_enhanced as be
+    g = be.BrainEngineV2._action_gate_check(_sc_book(n=150))
+    assert g["risk"] is False and "fail-closed" in g["risk_reason"] and g["actionable"] is False
+
+
+# ── _shadow_weight_check ──────────────────────────────────────────────
+def _shadow(n_a, n_b, win_a, win_b, move_a=2.0, move_b=2.0):
+    rows = [{"entry_ts": 1000 + i, "votes": {"a": True, "b": False}, "win": win_a, "pct_move": move_a}
+            for i in range(n_a)]
+    rows += [{"entry_ts": 2000 + i, "votes": {"a": False, "b": True}, "win": win_b, "pct_move": move_b}
+             for i in range(n_b)]
+    return rows
+
+
+def test_shadow_weight_check_vetoes_worse_weights_and_passes_thin_or_equal(monkeypatch):
+    import brain_enhanced as be
+    _sc_cfg(monkeypatch)
+    check = be.BrainEngineV2._shadow_weight_check
+    cur, new = {"a": 20.0, "b": 1.0}, {"a": 1.0, "b": 20.0}      # current keeps the 'a' rows, proposal keeps 'b'
+    ok, why = check(_shadow(20, 20, True, False), cur, new)
+    assert ok is False and "shadow WR 100%→0%" in why
+    ok, why = check(_shadow(20, 20, True, True, move_a=2.0, move_b=0.5), cur, new)   # same WR, much lower EV
+    assert ok is False and "shadow EV" in why
+    ok, why = check(_shadow(20, 20, True, False), cur, cur)
+    assert ok is True and "stable" in why
+    ok, why = check(_shadow(10, 10, True, False), cur, new)      # fewer than 15 kept rows: cannot veto
+    assert ok is True and "too thin" in why
+
+
+# ── CUSUMDetector ─────────────────────────────────────────────────────
+def test_cusum_detects_edge_decay_and_round_trips_its_state():
+    from threshold_validation import CUSUMDetector
+    det = CUSUMDetector(target_wr=0.40, drift_delta=0.15, threshold=8.0)
+    fired = [det.update(False) for _ in range(30)]
+    assert fired.index(True) == 24 and not any(fired[:24])        # 25th straight loss: 25 x 0.325 = 8.125 > 8
+    ok = CUSUMDetector(target_wr=0.40, drift_delta=0.15, threshold=8.0)
+    assert not any(ok.update(i % 2 == 0) for i in range(400))     # a 50% book sits above the 40% reference
+    assert ok.status()["s_neg"] < 8.0 and ok.s_pos > 0            # only the decay side can alarm
+    clone = CUSUMDetector.from_dict(det.to_dict())
+    assert clone.to_dict() == det.to_dict() and clone.status()["drift_detected"] is True
+    legacy = CUSUMDetector.from_dict({"s_neg": 1.0, "n": 4})      # old state without settings: old defaults
+    assert (legacy.mu, legacy.delta, legacy.h) == (0.55, 0.10, 2.0)
+
+
+# ── _check_cusum_drift ────────────────────────────────────────────────
+class _CusumSdb:
+    """Persists (watermark, state) per key the way load/save_cusum_bulk do, minus Redis."""
+    def __init__(self, fail_load=False):
+        self.store, self.fail_load, self.saves = {}, fail_load, 0
+
+    async def load_cusum_bulk(self, keys):
+        if self.fail_load:
+            return None
+        return {k: self.store.get(k, (0, None)) for k in keys}
+
+    async def save_cusum_bulk(self, items):
+        self.saves += 1
+        for k, st, wm in items:
+            self.store[k] = (wm, json.loads(json.dumps(st)))
+        return True
+
+
+def _cusum_engine(sdb):
+    b = object.__new__(brain_mod.BrainCore)
+    b.sdb, b._cusum_detectors = sdb, {}
+    return b
+
+
+def _cusum_rows(n, key="vwap_buy", pair="BTCUSD", t0=100000, win=False):
+    return [{"pair": pair, "alert_key": key, "entry_ts": t0 + i * 900, "win": win} for i in range(n)]
+
+
+def test_cusum_feeds_each_outcome_once_across_replays_and_restarts(monkeypatch):
+    _sc_cfg(monkeypatch)
+    sdb = _CusumSdb()
+    rows = _cusum_rows(10)
+    eng = _cusum_engine(sdb)
+    assert asyncio.run(eng._check_cusum_drift(rows)) == []
+    wm, st = sdb.store["vwap_buy"]
+    assert st["n"] == 10 and wm == rows[-1]["entry_ts"]
+    assert st["seen"] == sorted(f"BTCUSD|{r['entry_ts']}" for r in rows)
+    asyncio.run(eng._check_cusum_drift(rows))                                    # same window, same process
+    assert sdb.store["vwap_buy"][1]["n"] == 10
+    asyncio.run(_cusum_engine(sdb)._check_cusum_drift(rows))                     # same window, fresh process
+    assert sdb.store["vwap_buy"][1]["n"] == 10
+    asyncio.run(_cusum_engine(sdb)._check_cusum_drift(rows + _cusum_rows(3, t0=200000)))
+    assert sdb.store["vwap_buy"][1]["n"] == 13                                   # only the 3 new ones
+
+
+def test_cusum_late_resolving_trade_on_another_pair_is_not_dropped(monkeypatch):
+    _sc_cfg(monkeypatch)
+    sdb = _CusumSdb()
+    a, b = _cusum_rows(1, pair="BTCUSD"), _cusum_rows(1, pair="ETHUSD")          # same entry_ts, different pair
+    assert a[0]["entry_ts"] == b[0]["entry_ts"]
+    asyncio.run(_cusum_engine(sdb)._check_cusum_drift(a))                         # ETH has not resolved yet
+    asyncio.run(_cusum_engine(sdb)._check_cusum_drift(a + b))                     # it resolves a run later
+    assert sdb.store["vwap_buy"][1]["n"] == 2                                     # a timestamp-only watermark would give 1
+
+
+def test_cusum_alarm_fires_once_threshold_crossed_and_stops_consuming(monkeypatch):
+    _sc_cfg(monkeypatch)
+    sdb = _CusumSdb()
+    alerts = asyncio.run(_cusum_engine(sdb)._check_cusum_drift(_cusum_rows(30)))
+    assert [a["type"] for a in alerts] == ["cusum_drift"] and alerts[0]["n"] == 25
+    st = sdb.store["vwap_buy"][1]
+    assert st["n"] == 25 and len(st["seen"]) == 25                                # break: rows 26-30 stay unconsumed
+    assert st["s_neg"] > st["h"] == 8.0
+
+
+def test_cusum_legacy_watermark_state_and_setting_rebase(monkeypatch):
+    _sc_cfg(monkeypatch)
+    rows = _cusum_rows(6)                                                         # ts 100000 .. 104500
+    # Legacy state (no seen-list): everything at or below the watermark counts as consumed.
+    sdb = _CusumSdb()
+    sdb.store["vwap_buy"] = (rows[2]["entry_ts"], {"mu": 0.40, "delta": 0.15, "h": 8.0, "s_pos": 0.0,
+                                                   "s_neg": 1.0, "n": 3})
+    asyncio.run(_cusum_engine(sdb)._check_cusum_drift(rows))
+    assert sdb.store["vwap_buy"][1]["n"] == 3 + 3                                 # rows 3..5 only
+    # the row sitting exactly on the watermark counts as consumed and is remembered, so it is never re-fed
+    assert sdb.store["vwap_buy"][1]["seen"] == sorted(f"BTCUSD|{r['entry_ts']}" for r in rows)
+    # State built under the old 55% / h=2 settings is re-based once and its alarm cleared.
+    sdb2 = _CusumSdb()
+    sdb2.store["vwap_buy"] = (rows[0]["entry_ts"], {"mu": 0.55, "delta": 0.10, "h": 2.0, "s_pos": 0.0,
+                                                    "s_neg": 5.0, "n": 50, "seen": [f"BTCUSD|{rows[0]['entry_ts']}"]})
+    asyncio.run(_cusum_engine(sdb2)._check_cusum_drift(rows[:2]))                 # one new loss
+    st = sdb2.store["vwap_buy"][1]
+    assert (st["mu"], st["delta"], st["h"]) == (0.40, 0.15, 8.0)
+    assert st["n"] == 51 and st["s_neg"] == pytest.approx(0.325)                  # cleared, then +0.325
+
+
+def test_cusum_skips_the_cycle_when_redis_read_fails(monkeypatch):
+    _sc_cfg(monkeypatch)
+    sdb = _CusumSdb(fail_load=True)
+    assert asyncio.run(_cusum_engine(sdb)._check_cusum_drift(_cusum_rows(30))) == []
+    assert sdb.saves == 0 and sdb.store == {}                                     # no fake-zero watermark replay
+
+
+# ── online challenger ─────────────────────────────────────────────────
+def _champ(trained_at=1000, beta=None):
+    return {"valid": True, "trained_at": trained_at, "feature_names": ["vote:a"], "scaler": None,
+            "beta": beta if beta is not None else [0.0] * 7}      # intercept + vote:a + 4 sessions + direction
+
+
+def _orow(ts, win):
+    return {"entry_ts": int(ts), "win": bool(win), "votes": {"a": True}, "session": "ny", "direction": "buy"}
+
+
+def test_online_challenger_requires_a_valid_champion():
+    from threshold_models import online_challenger_step
+    out = online_challenger_step(None, None, [_orow(5000, True)], 100000)
+    assert out == {"state": None, "summary": {"status": "no_champion"}}
+    out = online_challenger_step(None, {"valid": False, "beta": [0.0] * 7, "feature_names": ["vote:a"]},
+                                 [_orow(5000, True)], 100000)
+    assert out["summary"]["status"] == "no_champion"
+
+
+def test_online_challenger_only_learns_from_resolved_trades_and_never_twice():
+    from threshold_models import online_challenger_step
+    now, lag = 100000, 14400                                      # cutoff 85600
+    rows = [_orow(500, True),                                     # before the champion was trained: ignored
+            _orow(85600, True), _orow(85601, True)]               # exactly at the cutoff: used; 1s later: too fresh
+    out = online_challenger_step(None, _champ(), rows, now, lag_sec=lag)
+    s = out["summary"]
+    assert s["n_new"] == 1 and s["n_updates"] == 1 and out["state"]["last_ts"] == 85600
+    again = online_challenger_step(out["state"], _champ(), rows, now, lag_sec=lag)   # same rows, next run
+    assert again["summary"]["n_new"] == 0 and again["summary"]["n_updates"] == 1
+    later = online_challenger_step(again["state"], _champ(), rows, now + 3600, lag_sec=lag)
+    assert later["summary"]["n_new"] == 1 and later["summary"]["n_updates"] == 2     # the 85601 row has now aged in
+
+
+def test_online_challenger_verdict_needs_min_eval_and_a_clear_gap():
+    from threshold_models import online_challenger_step
+    from plan_replay import BLOCK_SEC
+    now = 10 ** 7
+
+    def rows(n, f):
+        return [_orow(5000 + i * BLOCK_SEC, f(i)) for i in range(n)]
+
+    few = online_challenger_step(None, _champ(), rows(59, lambda i: True), now, min_eval=60)["summary"]
+    assert few["status"] == "insufficient" and few["n_eval"] == 59 and "mean_brier_gain" not in few
+    exact = online_challenger_step(None, _champ(), rows(60, lambda i: True), now, min_eval=60)["summary"]
+    assert exact["n_eval"] == 60 and exact["status"] != "insufficient"            # the 60th pair is enough
+    # Champion says ~12%, trades keep winning: the online copy adapts and is measurably better.
+    low = _champ(beta=[-2.0] + [0.0] * 6)
+    better = online_challenger_step(None, low, rows(80, lambda i: True), now, min_eval=60)["summary"]
+    assert better["status"] == "online_better" and better["lo"] > 0 and better["n_eval"] == 80
+    # Champion is calibrated at 50% and outcomes alternate: chasing the last result only hurts.
+    worse = online_challenger_step(None, _champ(), rows(80, lambda i: i % 2 == 0), now, min_eval=60)["summary"]
+    assert worse["status"] == "batch_better" and worse["hi"] < 0
+
+
+def test_online_challenger_drift_cap_restart_and_retrained_champion():
+    from threshold_models import online_challenger_step
+    now = 10 ** 6
+    rows = [_orow(5000 + i * 900, True) for i in range(40)]
+    big = online_challenger_step(None, _champ(beta=[-2.0] + [0.0] * 6), rows, now, max_drift=1e-6)["summary"]
+    assert big["max_coef_drift"] > 0 and big["drift_ok"] is False
+    first = online_challenger_step(None, _champ(), rows, now)
+    assert first["summary"]["drift_ok"] is True
+    # Past max_age the online copy is thrown away and restarted from the champion.
+    restart = online_challenger_step(first["state"], _champ(), rows, now + 15 * 86400, max_age_sec=14 * 86400)
+    assert restart["state"]["started_at"] == now + 15 * 86400
+    # A retrained champion is appended to history and reported as the one being served.
+    cont = online_challenger_step(first["state"], _champ(trained_at=9000), rows, now + 3600)
+    assert len(cont["state"]["history"]) == 2 and cont["summary"]["served_trained_at"] == 9000
+    assert cont["summary"]["base_trained_at"] == 1000
+
+
+def test_online_model_is_served_only_after_promotion():
+    from threshold_models import online_challenger_step, online_model_for_serving
+    out = online_challenger_step(None, _champ(), [_orow(5000 + i * 900, i % 3 == 0) for i in range(30)], 10 ** 6)
+    st = out["state"]
+    assert online_model_for_serving(st) is None and online_model_for_serving(None) is None
+    st = dict(st, promoted=True, promoted_at=777)
+    m = online_model_for_serving(st)
+    assert m["provenance"] == "online" and m["trained_at"] == 777 and m["base_trained_at"] == 1000
+    assert m["beta"] == st["beta"] and m["beta"] is not st["beta"]
+    assert online_model_for_serving(dict(st, beta=[0.0, 1.0])) is None            # length mismatch: refuse
+
+
