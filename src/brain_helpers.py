@@ -27,6 +27,25 @@ HYPOTHESIS_LEDGER_KEY = "brain_hypothesis_ledger"
 HYPOTHESIS_POOL_KEY = "brain_hypothesis_pool"
 ACTION_PLAN_KEY = "brain_action_plan"
 
+def baseline_proof_ok(model: Optional[Dict[str, Any]]) -> bool:
+    """May this market-state model act on LIVE decisions?
+
+    True when ML_REQUIRE_BASELINE_PROOF is off, or when the Brain's net-EV baseline
+    audit (stored on the model as `ev_baseline_proof`) says 'validated' and is no
+    older than ML_BASELINE_PROOF_MAX_AGE_HOURS. A model that merely predicts wins
+    better than chance is not enough: it must beat the simple rules in net P&L on
+    newer trades. Never raises; any doubt means False."""
+    if not getattr(cfg, "ML_REQUIRE_BASELINE_PROOF", True):
+        return True
+    try:
+        proof = (model or {}).get("ev_baseline_proof") or {}
+        if proof.get("status") != "validated":
+            return False
+        age_h = (time.time() - float(proof.get("at", 0))) / 3600.0
+        return 0.0 <= age_h <= float(getattr(cfg, "ML_BASELINE_PROOF_MAX_AGE_HOURS", 72.0))
+    except Exception:
+        return False
+
 def pick_family_leaf(family_leaves: Optional[Dict[str, Any]], alert_key: str, direction: str,
                      regime: str, min_n: int):
     """Family-pooled stand-in evidence for an alert key with no EV model.

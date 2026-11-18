@@ -49,6 +49,30 @@ def wilson_ci(wins: int, n: int, z: float = 1.96) -> Tuple[float, float, float]:
     margin = (z / denom) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
     return max(0.0, centre - margin), min(1.0, centre + margin), p
 
+def prob_wr_at_least(wins: int, losses: int, target: float) -> float:
+    """P(true win rate >= target) under a flat Beta(1 + wins, 1 + losses) prior.
+
+    Exact (no SciPy): for integer shape parameters the Beta CDF equals a
+    binomial tail, P(p >= t) = P(Binomial(n + 1, t) <= wins) with n = wins + losses.
+    Terms are summed in log space so large n cannot overflow.
+    Returns 1.0 for an empty sample ("no evidence against") and for target <= 0,
+    0.0 for target >= 1."""
+    wins, losses = max(0, int(wins)), max(0, int(losses))
+    n = wins + losses
+    if n == 0 or target <= 0.0:
+        return 1.0
+    if target >= 1.0:
+        return 0.0
+    m = n + 1
+    lt, l1t = math.log(target), math.log1p(-target)
+    lg_m = math.lgamma(m + 1)
+    total = 0.0
+    for k in range(0, wins + 1):
+        total += math.exp(
+            lg_m - math.lgamma(k + 1) - math.lgamma(m - k + 1) + k * lt + (m - k) * l1t
+        )
+    return max(0.0, min(1.0, total))
+
 def two_proportion_p_value(wins_a: int, n_a: int, wins_b: int, n_b: int) -> float:
     """Two-sided two-proportion z-test p-value (no SciPy).
 

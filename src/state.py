@@ -13,7 +13,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from plan_replay import outcome_path_fields, outcome_path_stream_fields
 from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError, CONFIG_OVERRIDE_ALLOWED_FIELDS, CONFIG_OVERRIDE_METADATA_KEY, BRAIN_DISABLED_KEYS_METADATA_KEY, PAIR_THRESHOLDS_METADATA_KEY, _get_session_from_ts
 from fetcher import compute_backoff
-from alert_registry import is_elliott_key
+from alert_registry import direction_of, is_elliott_key
 
 StreamField = Union[bytes, memoryview, str, int, float]
 BRAIN_KEY_HISTORY_METADATA_KEY = "brain_alert_key_history"
@@ -192,6 +192,9 @@ async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger
 
         if clear_alert_stats:
             alert_stats_keys = await _scan_keys_with_timeout(f"{RedisKeyPrefix.ALERT_STATS}*", count=100)
+            alert_stats_keys = list(alert_stats_keys) + list(
+                await _scan_keys_with_timeout(f"{RedisKeyPrefix.ALERT_STATS_CO}*", count=100)
+            )
             deleted_alert_stats = await _batch_unlink(alert_stats_keys)
             await _batch_unlink([f"{RedisKeyPrefix.OUTCOME_TOTALS}Recorded",
                                  f"{RedisKeyPrefix.OUTCOME_TOTALS}Elliott"])
@@ -344,6 +347,10 @@ class RedisKeyPrefix:
     LOCK = "lock:"
     OUTCOME_PENDING = "outcome_pending:"
     ALERT_STATS = "alert_stats:"
+    # Credit for same-candle, same-direction keys that were NOT the recorded trade.
+    # Deliberately NOT under "alert_stats:" so the totals reseed (which sums that
+    # prefix) cannot double-count the one real trade.
+    ALERT_STATS_CO = "alert_stats_co:"
     OUTCOME_LOG_STREAM = "outcome_log_stream"
     SHADOW_PENDING = "shadow_pending:"
     SHADOW_STATS = "shadow_stats:"
@@ -2686,6 +2693,25 @@ class RedisStateStore:
         ):
             await self._start_trade_cooldown(pair, cooldown_hit_ts, logger_pair, source, cooldown_dir)
 
+    @staticmethod
+    def _cokey_credit_keys(primary: str, direction: Any, context: Optional[Dict[str, Any]]) -> List[str]:
+        """Alert keys that fired on the same candle, in the same direction, as the
+        recorded trade `primary`. Their entry, stop and target are the same, so the
+        trade's result is also theirs. Opposite-direction keys and Elliott keys are
+        never credited. Order is kept; duplicates and unknown keys are dropped."""
+        if not isinstance(context, dict):
+            return []
+        want = str(direction).lower()
+        out: List[str] = []
+        for ck in context.get("co_fired_keys") or []:
+            ck = str(ck)
+            if ck == primary or ck in out or is_elliott_key(ck):
+                continue
+            if direction_of(ck) != want:
+                continue
+            out.append(ck)
+        return out
+
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int, logger_pair: logging.Logger) -> None:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not self._redis:
             return
@@ -2806,6 +2832,13 @@ class RedisStateStore:
                         if result.get("outcome_class") == "timeout":
                             write_pipe.hincrby(stats_key, "timeout_wins" if win else "timeouts", 1)
                         write_pipe.expire(stats_key, stats_ttl)
+                        if getattr(cfg, "ENABLE_COKEY_STATS_CREDIT", False) and not is_elliott_key(str(alert_key)):
+                            # Same candle + same direction = same entry, stop and target = same
+                            # result. Credited to a separate hash (see RedisKeyPrefix.ALERT_STATS_CO).
+                            for _ck in self._cokey_credit_keys(str(alert_key), direction, row_context):
+                                _co_stats = f"{RedisKeyPrefix.ALERT_STATS_CO}{pair}:{_ck}"
+                                write_pipe.hincrby(_co_stats, "wins" if win else "losses", 1)
+                                write_pipe.expire(_co_stats, stats_ttl)
                         # Elliott rows keep their own running total so the legacy
                         # Recorded / Shadowed win rates stay pure MACD.
                         totals_key = (
@@ -3283,17 +3316,24 @@ class RedisStateStore:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not alert_keys:
             return {k: (None, 0) for k in alert_keys}
         try:
+            _co_on = bool(getattr(cfg, "ENABLE_COKEY_STATS_CREDIT", False))
             async with _rc(self._redis).pipeline(transaction=False) as pipe:
                 for ak in alert_keys:
                     pipe.hgetall(f"{RedisKeyPrefix.ALERT_STATS}{pair}:{ak}")
-                raw_results = await asyncio.wait_for(_execute_pipeline(pipe), timeout=timeout)
+                if _co_on:
+                    # Same round trip: the credited counts of keys that fired alongside a recorded trade.
+                    for ak in alert_keys:
+                        pipe.hgetall(f"{RedisKeyPrefix.ALERT_STATS_CO}{pair}:{ak}")
+                raw_all = await asyncio.wait_for(_execute_pipeline(pipe), timeout=timeout)
+            raw_results = raw_all[:len(alert_keys)]
+            co_results = raw_all[len(alert_keys):] if _co_on else [None] * len(alert_keys)
             out: Dict[str, Tuple[Optional[float], int]] = {}
-            for ak, data in zip(alert_keys, raw_results):
-                if not data:
+            for ak, data, co in zip(alert_keys, raw_results, co_results):
+                if not data and not co:
                     out[ak] = (None, 0)
                     continue
-                wins = int(data.get("wins", 0))
-                losses = int(data.get("losses", 0))
+                wins = int((data or {}).get("wins", 0)) + int((co or {}).get("wins", 0))
+                losses = int((data or {}).get("losses", 0)) + int((co or {}).get("losses", 0))
                 total = wins + losses
                 if total < cfg.MIN_WIN_RATE_SAMPLE:
                     out[ak] = (None, total)

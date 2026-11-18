@@ -156,8 +156,17 @@ class BotConfig(BaseModel):
     OUTCOME_LOOKAHEAD_CANDLES: int = Field(default=12, ge=1, le=96) 
     OUTCOME_FAVORABLE_MOVE_PCT: float = Field(default=0.5, ge=0.01, le=10.0) 
     OUTCOME_FILL_DELAY_CANDLES: int = Field(default=1, ge=0, le=4, description="15m candles of latency assumed between signal and simulated fill, used to compute fill_price/entry_slip_pct for realistic net P&L. 0 = no live-order bot exists, so this can never be a real broker fill.")
-    MIN_WIN_RATE_SAMPLE: int = Field(default=20, ge=1)    
+    MIN_WIN_RATE_SAMPLE: int = Field(default=20, ge=1)   
     MIN_WIN_RATE: float = Field(default=0.55, ge=0.0, le=1.0)    
+    GATE_TARGET_MODE: str = Field(default="fixed", pattern="^(fixed|breakeven)$", description="Win-rate target the LIVE gates (pair+key win-rate filter, calibration gate, trade-quality calibration layer) compare against. fixed = MIN_WIN_RATE. breakeven = the cost-aware break-even win rate of the fixed bracket (stop OUTCOME_MAE_LOSS_PCT, reward OUTCOME_RR_TARGET, round-trip fees and slippage) plus GATE_BREAKEVEN_MARGIN, never above MIN_WIN_RATE. Reports keep using MIN_WIN_RATE")
+    GATE_BREAKEVEN_MARGIN: float = Field(default=0.05, ge=0.0, le=0.30, description="Safety margin added to the break-even win rate when GATE_TARGET_MODE = breakeven")
+    WIN_RATE_FILTER_MODE: str = Field(default="point", pattern="^(point|posterior)$", description="How the pair+key win-rate filter judges its Redis stats. point = block when the observed win rate is below the gate target (noisy at 20 samples). posterior = block only when the chance that the true win rate reaches the gate target is below WIN_RATE_FILTER_MIN_PROB (flat Beta prior)")
+    WIN_RATE_FILTER_MIN_PROB: float = Field(default=0.20, ge=0.01, le=0.50, description="posterior mode: block when P(true win rate >= gate target) is below this")
+    BRAIN_REWARDABLE_REQUIRE_PROVEN_EDGE: bool = Field(default=True, description="A rewardable override additionally needs the Wilson 95% LOWER bound of the high-confluence shadow win rate to be at or above the cost-aware break-even win rate, so 10 lucky shadow samples cannot override a recorded-trade block")
+    LEARNER_STALE_NOTICE_HOURS: float = Field(default=12.0, ge=0.0, le=168.0, description="Send one Telegram notice per this many hours while the learner playbook is older than PLAYBOOK_MAX_AGE_HOURS or missing (both live vetoes fail open then). 0 = off")
+    ENABLE_COKEY_STATS_CREDIT: bool = Field(default=False, description="When one alert key is recorded as the trade for a pair and candle (ENABLE_SINGLE_ACTIVE_TRADE), also credit its resolved win or loss to every SAME-DIRECTION key that fired on that candle, in a separate hash (alert_stats_co:). Their entry, stop and target are identical, so the outcome is theirs too. Read by the pair+key win-rate filter only; Recorded totals, the stream and the archive still count the trade once")
+    ML_REQUIRE_BASELINE_PROOF: bool = Field(default=True, description="The market-state model may drive LIVE scoring (ENABLE_MARKET_STATE_LIVE_SCORE) or the ML-EV hard gate (ENABLE_ML_EV_GATE) only while the Brain's net-EV baseline audit says it beat the simple chronological baselines on newer trades (status 'validated', not older than ML_BASELINE_PROOF_MAX_AGE_HOURS). Shadow scoring is unaffected")
+    ML_BASELINE_PROOF_MAX_AGE_HOURS: float = Field(default=72.0, ge=1.0, le=720.0, description="Maximum age of the net-EV baseline proof when ML_REQUIRE_BASELINE_PROOF is on")
     OUTCOME_MAE_LOSS_PCT: float = Field(default=0.5, ge=0.01, le=10.0)   
     OUTCOME_PRIMARY_METRIC: str = Field(default="mfe", pattern="^(mfe|net_pnl_pct|close)$")
     OUTCOME_RR_TARGET: float = Field(default=2.0, ge=1.0, le=5.0) 
@@ -802,8 +811,25 @@ class BotConfig(BaseModel):
             )
         return self
 
+    def breakeven_wr(self) -> float:
+        """Win rate at which the fixed bracket earns zero after costs.
+
+        Stop = 1R, target = OUTCOME_RR_TARGET R, round-trip cost =
+        2 x (fee + slippage) as a share of the stop distance:
+            breakeven = (1 + cost_R) / (1 + RR)
+        With a 1% stop, RR 2.0 and 0.06% fee + 0.03% slippage per side this is 39.3%."""
+        stop_pct = max(float(self.OUTCOME_MAE_LOSS_PCT), 1e-6)
+        cost_r = 2.0 * (float(self.BRAIN_FEE_PCT) + float(self.BRAIN_SLIPPAGE_PCT)) * 100.0 / stop_pct
+        return min(0.95, max(0.05, (1.0 + cost_r) / (1.0 + float(self.OUTCOME_RR_TARGET))))
+
+    def gate_target_wr(self) -> float:
+        """Win-rate target for the live gates (see GATE_TARGET_MODE)."""
+        if self.GATE_TARGET_MODE == "breakeven":
+            return min(float(self.MIN_WIN_RATE), self.breakeven_wr() + float(self.GATE_BREAKEVEN_MARGIN))
+        return float(self.MIN_WIN_RATE)
+
     @model_validator(mode='after')
-    def validate_logic(self) -> 'BotConfig':   
+    def validate_logic(self) -> 'BotConfig':
         errors = []
         warnings = []
 

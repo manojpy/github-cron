@@ -62,7 +62,7 @@ from fetcher import (
 )
 
 from state import RedisStateStore, TokenBucket, _rc
-from brain_helpers import KILL_SWITCH_KEY, kill_switch_mode, evidence_block_lines
+from brain_helpers import KILL_SWITCH_KEY, kill_switch_mode, evidence_block_lines, baseline_proof_ok
 from gates import GateResult, IndicatorCache
 import threshold_engine as engine
 
@@ -86,6 +86,8 @@ DEDUP_STATS: Dict[str, int] = {
     "duplicate_suppressed": 0,   # per-alert-key duplicate inside its window
     "coalesced_suppressed": 0,   # pair+direction bundle already sent inside window
     "recovered_midrun": 0,       # Redis recovered mid-run and the dedup claim was retried
+    "unscored_open_trade": 0,    # delivered alert keys NOT scored: a trade was already open on the pair
+    "unscored_cooldown": 0,      # delivered alert keys NOT scored: cooldown after a closed trade
 }
 
 def format_dedup_summary(stats: Optional[Dict[str, int]] = None) -> str:
@@ -100,6 +102,11 @@ def format_dedup_summary(stats: Optional[Dict[str, int]] = None) -> str:
         f"suppressed: duplicate {s.get('duplicate_suppressed', 0)}, "
         f"coalesced {s.get('coalesced_suppressed', 0)}"
         + (f" | recovered mid-run {s['recovered_midrun']}" if s.get("recovered_midrun") else "")
+        + (
+            f" | delivered but not scored: trade open {s.get('unscored_open_trade', 0)}, "
+            f"cooldown {s.get('unscored_cooldown', 0)}"
+            if s.get("unscored_open_trade") or s.get("unscored_cooldown") else ""
+        )
     )
 
 def reset_dedup_stats() -> None:
@@ -3211,6 +3218,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         alert_tq_by_key: Dict[str, Optional[Dict[str, Any]]] = {}
         alert_pb_by_key: Dict[str, Optional[Dict[str, Any]]] = {}
         alert_setup_by_key: Dict[str, Optional[Dict[str, Any]]] = {}
+        win_rate_map: Dict[str, Tuple[Optional[float], int]] = {}
 
         if alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER:
             alert_keys_to_check = [ak for _, _, ak in alerts_to_send]
@@ -3224,19 +3232,32 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 direction = "buy" if alert_key in BUY_ALERT_KEYS else "sell"
                 win_rate, sample = win_rate_map.get(alert_key, (None, 0))
                 failing_rate, fail_note = None, None
-                if win_rate is not None and win_rate < cfg.MIN_WIN_RATE:
-                    failing_rate = win_rate
-                    fail_note = f"{win_rate:.0%} over {sample} samples (need >= {cfg.MIN_WIN_RATE:.0%})"
+                _gate_target = cfg.gate_target_wr()
+                if win_rate is not None:
+                    if cfg.WIN_RATE_FILTER_MODE == "posterior":
+                        # Block only when the stats say the true rate probably misses the
+                        # target, not merely when a noisy 20-sample point estimate does.
+                        _wins_n = int(round(win_rate * sample))
+                        _p_reach = engine.prob_wr_at_least(_wins_n, sample - _wins_n, _gate_target)
+                        if _p_reach < cfg.WIN_RATE_FILTER_MIN_PROB:
+                            failing_rate = win_rate
+                            fail_note = (
+                                f"{win_rate:.0%} over {sample} samples, only {_p_reach:.0%} chance the "
+                                f"true rate reaches {_gate_target:.0%} (need >= {cfg.WIN_RATE_FILTER_MIN_PROB:.0%})"
+                            )
+                    elif win_rate < _gate_target:
+                        failing_rate = win_rate
+                        fail_note = f"{win_rate:.0%} over {sample} samples (need >= {_gate_target:.0%})"
                 if current_session is not None:
                     session_win_rate, session_sample = await sdb.get_alert_win_rate_session(
                         pair_name, alert_key, current_session
                     )
-                    if session_win_rate is not None and session_win_rate < cfg.MIN_WIN_RATE:
+                    if session_win_rate is not None and session_win_rate < _gate_target:
                         if failing_rate is None or session_win_rate < failing_rate:
                             failing_rate = session_win_rate
                             fail_note = (
                                 f"{session_win_rate:.0%} in {current_session} session over "
-                                f"{session_sample} samples (need >= {cfg.MIN_WIN_RATE:.0%})"
+                                f"{session_sample} samples (need >= {_gate_target:.0%})"
                             )
 
                 alert_score, alert_total, alert_votes = _confluence_for(alert_key)
@@ -3250,14 +3271,14 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     if curve is not None:
                         conf_pct = alert_score / alert_total * 100.0
                         ok, cal_wr, _reason = engine.calibration_gate_decision(
-                            curve, conf_pct, cfg.MIN_WIN_RATE,
+                            curve, conf_pct, _gate_target,
                             min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
                             slack=getattr(cfg, "CALIBRATION_SLACK", 0.05),
                         )
                         if not ok:
                             logger_pair.info(
                                 f"[{pair_name}] calibration gate dropped {alert_key}: "
-                                f"calibrated WR {cal_wr:.0%} below floor at conf {conf_pct:.0f}%"
+                                f"calibrated WR {cal_wr:.0%} below {_gate_target:.0%} floor at conf {conf_pct:.0f}%"
                             )
                             await _record_counterfactual_block(
                                 sdb, pair_name,
@@ -3272,7 +3293,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 telegram_queue, sdb,
                                 pair_name=pair_name, alert_key=alert_key, gate="calibration gate",
                                 lines=[
-                                    f"calibrated WR {cal_wr:.0%} below {cfg.MIN_WIN_RATE:.0%} "
+                                    f"calibrated WR {cal_wr:.0%} below {_gate_target:.0%} "
                                     f"floor at confluence {conf_pct:.0f}%"
                                 ] if cal_wr is not None else [],
                                 score=alert_score, total=alert_total, logger_pair=logger_pair,
@@ -3504,7 +3525,11 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                         # Shadow stays in context/logs only — not in Telegram
                                         # (already stored on context["ml_ev_shadow_by_alert"])
                                     # Hard gate (only when explicitly enabled)
-                                    if getattr(cfg, "ENABLE_ML_EV_GATE", False) and not qualify:
+                                    if (
+                                        getattr(cfg, "ENABLE_ML_EV_GATE", False)
+                                        and not qualify
+                                        and baseline_proof_ok(ml_market_state_model)
+                                    ):
                                         logger_pair.info(
                                             f"[{pair_name}] ML-EV gate dropped {alert_key}: "
                                             f"EV={ev.get('net_ev')} < {cfg.ML_EV_MIN_THRESHOLD}"
@@ -3554,7 +3579,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 if override_reason:
                     logger_pair.info(
                         f"[{pair_name}] 🧠 Rewardable override for {alert_key}: "
-                        f"WR={failing_rate:.0%} below {cfg.MIN_WIN_RATE:.0%}, but {override_reason}"
+                        f"WR={failing_rate:.0%} below {_gate_target:.0%}, but {override_reason}"
                     )
                     alert_extra = f"{alert_extra} | override: {override_reason}"
                     surviving_alerts.append((alert_title, alert_extra, alert_key))
@@ -3620,6 +3645,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     f"[{pair_name}] NOT RECORDED ts={ts_curr}:  cooldown after trade close"
                     f"(hit candle {(record_active or {}).get('hit_ts')})"
                 )
+                DEDUP_STATS["unscored_cooldown"] += len(alerts_to_send)
                 return
             if cfg.ENABLE_SINGLE_ACTIVE_TRADE:
                 if record_status == "IGNORED":
@@ -3627,12 +3653,22 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         f"[{pair_name}] NOT RECORDED ts={ts_curr}: trade already open "
                         f"({(record_active or {}).get('alert_key')} @ {(record_active or {}).get('entry_ts')})"
                     )
+                    DEDUP_STATS["unscored_open_trade"] += len(alerts_to_send)
                     return
+
                 # One trade per pair per candle: the strongest edge represents it.
-                def _edge(a: Tuple[str, str, str]) -> float:
+                # Same-direction alerts on one candle share entry, stop and target, so
+                # they all have the same outcome; the choice only decides whose
+                # statistics get the credit. Known EV wins. With no EV for any key the
+                # key with the FEWEST resolved samples on this pair is recorded, so
+                # measurement rotates across keys instead of always crediting
+                # whichever key is defined first (which left the rest never measured).
+                def _edge(a: Tuple[str, str, str]) -> Tuple[float, int]:
                     v = (alert_tq_by_key.get(a[2]) or {}).get("net_ev")
-                    return float(v) if isinstance(v, (int, float)) else -999.0
+                    ev = float(v) if isinstance(v, (int, float)) else -999.0
+                    return ev, -int((win_rate_map.get(a[2]) or (None, 0))[1] or 0)
                 to_record = [max(alerts_to_send, key=_edge)]
+
             recorded = [ak for _, _, ak in to_record]
             logger_pair.info(
                 f"[{pair_name}] RECORD ts={ts_curr} keys={recorded}"

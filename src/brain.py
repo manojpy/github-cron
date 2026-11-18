@@ -27,6 +27,7 @@ from threshold_engine import CUSUMDetector, StabilityGate
 from brain_audit import get_audit, HealthStatus
 import brain_recommend_baseline as _baseline
 from brain_helpers import (
+    baseline_proof_ok,
     CALIBRATION_CURVES_KEY,
     KILL_SWITCH_KEY,
     pick_family_leaf,
@@ -113,10 +114,12 @@ class BrainCore:
         total = wins + losses
         if total < cfg.BRAIN_REWARDABLE_MIN_SHADOW_SAMPLE:
             return None
-
         wr = wins / total
         if wr < cfg.BRAIN_REWARDABLE_MIN_SHADOW_WR:
             return None
+        lo95, _hi95, _p = engine.wilson_ci(wins, total)
+        if getattr(cfg, "BRAIN_REWARDABLE_REQUIRE_PROVEN_EDGE", True) and lo95 < cfg.breakeven_wr():
+            return None   # a point estimate on a few samples is not proof of a profitable edge
 
         cooldown_seconds = getattr(cfg, "BRAIN_OVERRIDE_COOLDOWN_SECONDS", 4 * 3600)
         cooldown_key = f"{_OVERRIDE_COOLDOWN_PREFIX}{alert_key}"
@@ -130,7 +133,10 @@ class BrainCore:
         if not acquired:
             return None
 
-        return f"{conf_pct:.0f}% confluence, shadow WR {wr:.0%} over {total} tracked rejections"
+        return (
+            f"{conf_pct:.0f}% confluence, shadow WR {wr:.0%} over {total} tracked rejections "
+            f"(95% lower bound {lo95:.0%})"
+        )
 
     # ── Calibration live gate ────────────────────────────────────────────
 
@@ -942,6 +948,21 @@ class BrainCore:
         except Exception:
             return None
 
+    def playbook_age_hours(self) -> Optional[float]:
+        """Age of the learner playbook already in this run's cache, in hours.
+        None = not checked (playbook off, not loaded this run, or Redis trouble: no I/O here).
+        float('inf') = the read worked but there is no playbook. Never raises."""
+        try:
+            blob = self._playbook_cache
+            if blob is None or getattr(cfg, "PLAYBOOK_MODE", "off") == "off":
+                return None
+            ts = float(blob.get("generated_ts", 0)) if blob else 0.0
+            if ts <= 0:
+                return float("inf")
+            return max(0.0, (time.time() - ts) / 3600.0)
+        except Exception:
+            return None
+
     async def get_trade_quality(self, pair: str, alert_key: str, direction: str, conf_pct: float, adx_val: Optional[float] = None, live_context: Optional[Dict[str, Any]] = None, votes: Optional[Dict[str, bool]] = None, session: str = "unknown") -> Optional[Dict[str, Any]]:
         """Dispatch hook: report-only trade-quality verdict for one
         prospective alert, from the per-alert EV/regime evidence the last
@@ -1038,9 +1059,12 @@ class BrainCore:
         market_state_p_win = None
         ml_calibration_curve = None
         epistemic = None
+        _ms_proof_ok = True
         _epi_mode = str(getattr(cfg, "EPISTEMIC_GATE_MODE", "shadow"))
         if getattr(cfg, "ENABLE_MARKET_STATE_MODEL", True):
             model = await self._load_market_state_model()
+            _ms_proof_ok = baseline_proof_ok(model)
+
             market_state_p_win = engine.predict_market_state_proba(
                 model, votes=votes, context=context, session=session, direction=direction,
             )
@@ -1063,12 +1087,12 @@ class BrainCore:
             result = engine.trade_quality_score(
                 row, ev_model_result, calibration_curve, bundle.get("regime_info"),
                 regime_gate=_rg_seg, regime_gate_mode=_rg_mode,
-                target_wr=getattr(cfg, "MIN_WIN_RATE", 0.55),
+                target_wr=cfg.gate_target_wr(),
                 calibration_min_sample=getattr(cfg, "CALIBRATION_MIN_SAMPLE", 15),
                 calibration_slack=getattr(cfg, "CALIBRATION_SLACK", 0.05),
                 market_state_p_win=market_state_p_win,
 
-                use_market_state_live=getattr(cfg, "ENABLE_MARKET_STATE_LIVE_SCORE", False),
+                use_market_state_live=getattr(cfg, "ENABLE_MARKET_STATE_LIVE_SCORE", False) and _ms_proof_ok,
                 ml_calibration_curve=ml_calibration_curve,
                 epistemic=epistemic, epistemic_mode=_epi_mode,
                 uncertainty_mode=str(getattr(cfg, "UNCERTAINTY_GATE_MODE", "shadow")),

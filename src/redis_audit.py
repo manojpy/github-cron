@@ -49,6 +49,7 @@ FAMILIES: List[Tuple[str, str, str]] = [
     ("lock", "lock:", "ttl_required"),
     ("outcome_pending", "outcome_pending:", "ttl_required"),
     ("alert_stats", "alert_stats:", "ttl_required"),
+    ("alert_stats_co", "alert_stats_co:", "ttl_required"),
     ("shadow_pending", "shadow_pending:", "ttl_required"),
     ("shadow_stats", "shadow_stats:", "ttl_required"),
     ("shadow_hiconf", "shadow_hiconf:", "ttl_required"),

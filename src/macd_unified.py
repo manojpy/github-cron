@@ -1046,7 +1046,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             logger_main.warning(f"Calibration curve pre-load failed (fail-open): {e}")
             calibration_curves = {}
 
-    # ── ML-EV: market-state model + ML calibration curve, also loaded
+    # ��─ ML-EV: market-state model + ML calibration curve, also loaded
     # ONCE per run. Both blobs are immutable within a run, so per-pair
     # re-loads (30 pairs × 2 GETs × JSON parses) are pure waste.
     ml_market_state_model: Optional[Dict[str, Any]] = None
@@ -1463,8 +1463,32 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                     f"skipped as stale. The run began {reference_time % 900}s after the 15m close "
                     f"(limit {int(cfg.MAX_CANDLE_STALENESS_SEC) - 900}s), so this candle was not scanned."
                 ))
+
         except Exception as _late_err:
             logger_main.warning(f"Late-start notice failed (non-fatal): {_late_err}")
+
+    # Learner heartbeat. A playbook older than PLAYBOOK_MAX_AGE_HOURS (or missing) is ignored,
+    # so the playbook veto and the hypothesis veto silently fail open and nothing else says so.
+    # Uses the playbook this run already loaded (no extra Redis read); one notice per window.
+    _stale_notice_h = float(getattr(cfg, "LEARNER_STALE_NOTICE_HOURS", 12.0))
+    if _stale_notice_h > 0 and brain_engine_shared is not None:
+        try:
+            _pb_age_h = brain_engine_shared.playbook_age_hours()
+            _pb_limit_h = float(getattr(cfg, "PLAYBOOK_MAX_AGE_HOURS", 36.0))
+            if _pb_age_h is not None and _pb_age_h > _pb_limit_h:
+                if await state_db.claim_notice("learner_stale", int(_stale_notice_h * 3600)):
+                    _pb_what = (
+                        "no learner playbook found"
+                        if _pb_age_h == float("inf") else
+                        f"learner playbook is {_pb_age_h:.0f}h old (limit {_pb_limit_h:.0f}h)"
+                    )
+                    await telegram_queue.send(escape_markdown_v2(
+                        f"⚠️ {cfg.BOT_NAME}: {_pb_what}.\n"
+                        "The playbook veto and the hypothesis veto are inactive (fail open) "
+                        "until the learner runs again. Check the learner workflow and its scheduler job."
+                    ))
+        except Exception as _lrn_err:
+            logger_main.warning(f"Learner-stale notice failed (non-fatal): {_lrn_err}")
 
     # A kill switch that tripped during THIS run must also stop this run's queued
     # alerts. Give their dedup claims back so nothing stays suppressed afterwards.
