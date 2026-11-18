@@ -1046,7 +1046,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             logger_main.warning(f"Calibration curve pre-load failed (fail-open): {e}")
             calibration_curves = {}
 
-    # �� ML-EV: market-state model + ML calibration curve, also loaded
+    # ML-EV: market-state model + ML calibration curve, also loaded
     # ONCE per run. Both blobs are immutable within a run, so per-pair
     # re-loads (30 pairs × 2 GETs × JSON parses) are pure waste.
     ml_market_state_model: Optional[Dict[str, Any]] = None
