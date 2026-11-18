@@ -224,7 +224,8 @@ Every alert that passes the signal gates is still sent to Telegram. What differs
 | Label | Meaning |
 |-------|---------|
 | 📝 **Recorded** | Counted as a trade. One recorded trade per pair at a time, across **all** sources: an open Elliott Wave trade and an open MACD trade share the same slot (`ONE_TRADE_ACROSS_SOURCES`). |
-| ⏭ **Ignored** | Sent with the line `⏭ Ignored ��� <pair> <side> trade open since <time>, not recorded`, but not recorded because the pair already has an open recorded trade (until its target, stop or 12-candle horizon). Logged as a candidate-only row (`ignored_open_trade`). |
+| 📝 **Recorded** | Counted as a trade. One recorded trade per pair at a time, across **all** sources: an open Elliott Wave trade and an open MACD trade share the same slot (`ONE_TRADE_ACROSS_SOURCES`). |
+| ⏭ **Ignored** | Sent with the line `⏭ Ignored — <pair> <side> trade open since <time>, not recorded`, but not recorded because the pair already has an open recorded trade (until its target, stop or 12-candle horizon). Logged as a candidate-only row (`ignored_open_trade`). |
 | ⏸ **Cooldown** | Sent, but not recorded because a recorded target was hit within the last `TRADE_CLOSE_COOLDOWN_CANDLES` candles (Elliott or MACD target alike, same direction). Logged as a candidate-only row (`ignored_cooldown`). |
 | 👁 **Shadowed** | Alert was blocked by a gate (confluence, cluster penalty, win-rate, calibration, OOD, portfolio heat, brain-disabled). It is not sent, but it is tracked as a counterfactual trade for the Brain. |
 
