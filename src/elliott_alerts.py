@@ -5,11 +5,14 @@ Sits between the pure engine (elliott_wave.py) and the bot's infrastructure
 alerts, the pullback WATCH message and the heat-gate release have finished, so it
 cannot change any legacy decision.
 
-Isolation, by design (do not "fix" any of these):
-  Elliott rows bypass the legacy one-open-trade slot and the re-entry cooldown
-  (see RedisStateStore.record_pending_outcome / record_shadow_pending_outcome /
-  get_active_trade). A MACD trade never blocks a wave count and vice versa.
-  The bypass does NOT remove Elliott's own protections:
+One trade per pair, across sources (ONE_TRADE_ACROSS_SOURCES, default on):
+  an open Elliott OR MACD trade blocks RECORDING of any other alert on that pair,
+  and a target hit starts the same-direction cooldown for both. A blocked wave
+  alert is still SENT, labelled "Ignored", and logged as a candidate-only row; it is
+  never recorded. Wave tracking (elliott_tracker) is unaffected. With the switch
+  off, Elliott rows bypass the slot and the cooldown as before (see
+  RedisStateStore.record_pending_outcome / get_active_trade).
+  Elliott's own protections are unchanged either way:
     one Telegram alert and one Recorded row per wave structure
     (`structure_id`, claimed in Redis for ELLIOTT_WAVE_EVENT_TTL_HOURS);
     one Shadowed row per wave structure (separate claim);
@@ -60,7 +63,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import elliott_tracker as tracker
 from alert_registry import ELLIOTT_REGISTRY, is_elliott_key
-from alerts import escape_markdown_v2, queue_failed_alert
+from alerts import _record_status_line, escape_markdown_v2, queue_failed_alert
 from bot_config import Constants, cfg, format_ist_time, json_dumps, json_loads, logger
 from brain_helpers import EVIDENCE_CARDS_KEY, evidence_block_lines, evidence_card_lookup
 from elliott_wave import (
@@ -207,7 +210,7 @@ def scan_pair(pair: str, pd_15m: Any, reference_time: int,
     return int(i), res
 
 
-# ── message ────────────────────────────────────────────────────────────
+# ── message ─────────────────────────────────────────────────���──────────
 def _px(x: float) -> str:
     ax = abs(x)
     if ax >= 1000:
@@ -227,9 +230,9 @@ def _gate_line(s: WaveSetup) -> Optional[str]:
     parts.append("wick/reversal ✓")
     return "Legacy gate: " + " · ".join(parts)
 
-
 def _setup_block(s: WaveSetup, verdict: Optional[str] = None,
-                 evidence_lines: Optional[List[str]] = None) -> str:
+                 evidence_lines: Optional[List[str]] = None,
+                 record_line: Optional[str] = None) -> str:
     e = escape_markdown_v2
     side = "BUY" if s.direction == "buy" else "SELL"
     icon = "🟢" if s.direction == "buy" else "🔴"
@@ -243,6 +246,7 @@ def _setup_block(s: WaveSetup, verdict: Optional[str] = None,
     tgt = " · ".join(f"T{i + 1} {_px(t)}" for i, t in enumerate(s.targets))
     lines = [
         f"{icon} *{e(s.pair)}* — Elliott {e(_FAMILY_TITLE[s.family])} {e(side)}",
+        *([e(record_line)] if record_line else []),
         e(f"Score {s.score:.0f}/100 · R/R {s.rr:.1f} · HTF {htf} · age {s.age_bars} bars"),
         e(f"Count: {f.get('elliott_wave_count', '')}"),
         e(f"Entry {_px(s.entry_price)} · Stop {_px(s.stop)} · {tgt}"),
@@ -271,16 +275,20 @@ def _evidence_lines_for(s: WaveSetup, cards: Optional[Dict[str, Optional[Dict[st
         logger.debug(f"Elliott evidence block skipped: {exc!r}")
         return []
 
-
 def format_elliott_message(setups: List[WaveSetup],
                            verdicts: Optional[Dict[str, str]] = None,
-                           evidence_cards: Optional[Dict[str, Optional[Dict[str, Any]]]] = None) -> str:
+                           evidence_cards: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
+                           record_lines: Optional[Dict[str, str]] = None) -> str:
     e = escape_markdown_v2
     verdicts = verdicts or {}
+    record_lines = record_lines or {}
     head = e(f"🌊 {cfg.BOT_NAME} — Elliott Wave ({len(setups)})")
     body = "\n\n".join(
-        _setup_block(s, verdicts.get(s.family), _evidence_lines_for(s, evidence_cards)) for s in setups)
-    ts = max(s.signal_ts for s in setups) + INTERVAL_MIN * 60
+        _setup_block(s, verdicts.get(s.family), _evidence_lines_for(s, evidence_cards),
+                     record_lines.get(s.event_id)) for s in setups)
+    # The OPEN time of the last closed 15m candle (the candle the setup fired on), like the
+    # trade-update lines. It used to print the close time (open + 15 min).
+    ts = max(s.signal_ts for s in setups)
     foot = (f"📆 {e(format_ist_time(ts, '%d-%m-%Y'))} "
             f"⏰ {e(format_ist_time(ts, '%H:%M IST'))}")
     note = e("* = input unavailable, scored 0")
@@ -485,8 +493,7 @@ async def _claim_pair_slots(sdb: RedisStateStore, pairs: List[str]
 def _pending_ttl() -> int:
     return max((int(cfg.OUTCOME_LOOKAHEAD_CANDLES) + 4) * 15 * 60, 24 * 3600)
 
-
-def _shadow_entry(pair: str, s: WaveSetup, disp: str) -> Tuple[str, str, int, float]:
+def _shadow_entry(pair: str, s: WaveSetup, disp: str, recorded_active: bool = False) -> Tuple[str, str, int, float]:
     ak = alert_key_of(s)
     ts = int(s.signal_ts)
     key = f"{RedisKeyPrefix.SHADOW_PENDING}{pair}:{ak}:{ts}"
@@ -499,8 +506,9 @@ def _shadow_entry(pair: str, s: WaveSetup, disp: str) -> Tuple[str, str, int, fl
         "confluence_votes": None,
         "context": {
             **_jsonable(_context(s, disp)),
-            "cooldown_active": False,      # Elliott never reads the legacy cooldown
+            "cooldown_active": False,      # Elliott shadows never read the legacy cooldown
             "cooldown_hit_ts": None,
+            "recorded_active": bool(recorded_active),
         },
     })
     return key, payload, _pending_ttl(), float(s.score) / 100.0
@@ -567,10 +575,16 @@ async def _record_shadow_batch(sdb: RedisStateStore,
     mirror: List[Tuple[str, WaveSetup, str]] = []
     entries: List[Tuple[str, str, int]] = []
     meta: List[Tuple[str, str, int, float]] = []
+    _ra: Dict[str, bool] = {}
+    for pair in {p for p, _s, _d in owned}:
+        try:
+            _ra[pair] = (await sdb.get_active_trade(pair, elliott=None)) is not None
+        except Exception:
+            _ra[pair] = False
     for pair, s, disp in owned:
         if not is_elliott_key(alert_key_of(s)):
             continue                      # not ours to mirror: use the store
-        key, payload, ttl, ratio = _shadow_entry(pair, s, disp)
+        key, payload, ttl, ratio = _shadow_entry(pair, s, disp, _ra.get(pair, False))
         mirror.append((pair, s, disp))
         entries.append((key, payload, ttl))
         meta.append((pair, key, int(s.signal_ts), ratio))
@@ -620,6 +634,9 @@ async def _record_delivered_batch(sdb: RedisStateStore,
         mirror.append((pair, s))
         entries.append(_recorded_entry(pair, s, "delivered"))
     if mirror and await _write_entries(sdb, entries):
+        for _p, _s in mirror:
+            sdb.note_recorded_this_run(_p, alert_key_of(_s), _s.direction, int(_s.signal_ts))
+            await sdb.mark_shadow_overlap(_p, int(_s.signal_ts))
         mirrored_ids = {s.structure_id for _, s in mirror}
         left = [(p, s) for p, s in selected if s.structure_id not in mirrored_ids]
     else:
@@ -838,9 +855,11 @@ async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stat
             except Exception as exc:
                 log.debug(f"Elliott evidence cards unavailable: {exc!r}")
                 evidence_cards = {}
+
+        rec_state = await _one_trade_gate(sdb, selected, log)
         delivered_ids = await _deliver(selected, reference_time, sdb, tg, log,
                                        stats, why_not, verdicts, releases,
-                                       evidence_cards=evidence_cards)
+                                       evidence_cards=evidence_cards, rec_state=rec_state)
         for _, s in selected:
             if s.event_id not in delivered_ids and s.event_id in slots:
                 p, k = slots[s.event_id]
@@ -938,20 +957,44 @@ async def _run(parsed_cache, pairs, reference_time, sdb, tg, log, suppress, stat
     )
     return stats
 
+async def _one_trade_gate(sdb: RedisStateStore, selected: List[Tuple[str, WaveSetup]],
+                          log: logging.Logger) -> Dict[str, Tuple[str, Optional[Dict[str, Any]]]]:
+    """event_id -> ('RECORDED' | 'IGNORED' | 'COOLDOWN', detail) for the setups about to be sent.
+    Empty (everything records, as before) when the switch or the win-rate filter is off.
+    Fails open: a Redis problem records normally."""
+    out: Dict[str, Tuple[str, Optional[Dict[str, Any]]]] = {}
+    if not (getattr(cfg, "ONE_TRADE_ACROSS_SOURCES", True) and cfg.ENABLE_WIN_RATE_FILTER):
+        return out
+    for pair, s in selected:
+        try:
+            out[s.event_id] = await sdb.pair_record_state(pair, int(s.signal_ts), s.direction)
+        except Exception as exc:
+            log.warning(f"[{pair}] Elliott one-trade check failed (recording normally): {exc!r}")
+    return out
+
 
 async def _deliver(selected: List[Tuple[str, WaveSetup]], reference_time: int,
                    sdb: RedisStateStore, tg: Any, log: logging.Logger,
                    stats: Dict[str, int], why_not: Dict[str, str],
                    verdicts: Optional[Dict[str, str]] = None,
                    releases: Optional[List[str]] = None,
-                   evidence_cards: Optional[Dict[str, Optional[Dict[str, Any]]]] = None) -> set:
+                   evidence_cards: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
+                   rec_state: Optional[Dict[str, Tuple[str, Optional[Dict[str, Any]]]]] = None) -> set:
     """Send ONE Telegram message with the selected setups, then record them as
     Recorded outcomes. A failed send is parked in the dead-letter queue together
     with the outcome rows it owes; if even that fails the claims are released so
     the next run can try again."""
     releases = releases if releases is not None else []
-    message = format_elliott_message([s for _, s in selected], verdicts, evidence_cards)
-    outcomes = [_outcome_kwargs(p, s, "delivered") for p, s in selected]
+    rec_state = rec_state or {}
+    # A pair with an open trade (any source) or in cooldown still gets the alert, labelled;
+    # only the Recorded row is skipped.
+    recordable = [(p, s) for p, s in selected
+                  if rec_state.get(s.event_id, ("RECORDED", None))[0] == "RECORDED"]
+    blocked = [(p, s) for p, s in selected
+               if rec_state.get(s.event_id, ("RECORDED", None))[0] != "RECORDED"]
+    record_lines = {s.event_id: _record_status_line(*rec_state[s.event_id]) for _, s in blocked}
+    message = format_elliott_message([s for _, s in selected], verdicts, evidence_cards, record_lines)
+    outcomes = [_outcome_kwargs(p, s, "delivered") for p, s in recordable]
     sent = False
     try:
         sent = bool(await tg.send(message))
@@ -961,15 +1004,22 @@ async def _deliver(selected: List[Tuple[str, WaveSetup]], reference_time: int,
         log.error(f"Elliott Telegram send raised: {exc!r}")
 
     if sent:
-        for pair in await _record_delivered_batch(sdb, selected, outcomes, log):
+        for pair in await _record_delivered_batch(sdb, recordable, outcomes, log):
             stats["errors"] += 1
             log.error(f"[{pair}] Elliott alert sent but its outcome row could not be recorded")
+        for pair, s in blocked:
+            st, det = rec_state[s.event_id]
+            log.info(f"[{pair}] Elliott NOT RECORDED ({st}): {alert_key_of(s)} @ {int(s.signal_ts)}")
+            await sdb.log_candidate_event(
+                pair, alert_key_of(s), s.direction, int(s.signal_ts),
+                "ignored_open_trade" if st == "IGNORED" else "ignored_cooldown",
+                {"open_key": (det or {}).get("alert_key"), "open_direction": (det or {}).get("direction"),
+                 "hit_ts": (det or {}).get("hit_ts")})
         stats["delivered"] += len(selected)
         return {s.event_id for _, s in selected}
-
     queued = await queue_failed_alert(
         sdb, "ELLIOTT", message, int(reference_time), [], "elliott_wave", log,
-        outcomes=outcomes,
+        outcomes=outcomes,   # only the rows this pair may record; a blocked setup owes none
     )
     if queued:
         # Delivery is owed and will be retried by the DLQ replay; keep the claims.

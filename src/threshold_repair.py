@@ -114,7 +114,8 @@ def _passes_policy(r: Row, policy: Dict[str, Any], current: Dict[str, Any], is_r
 
 def _admits_shadow(r: Row, policy: Dict[str, Any], current: Dict[str, Any]) -> bool:
     """Would a previously BLOCKED opportunity be taken under the proposal?"""
-    if (r.get("context") or {}).get("cooldown_active"):
+    _rctx = r.get("context") or {}
+    if _rctx.get("cooldown_active") or _rctx.get("recorded_active"):
         return False
     relax = set(policy.get("relax_gates") or [])
     for field in ("min_conf_pct", "min_abs_score"):

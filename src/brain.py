@@ -959,9 +959,20 @@ class BrainCore:
             ts = float(blob.get("generated_ts", 0)) if blob else 0.0
             if ts <= 0:
                 return float("inf")
+
             return max(0.0, (time.time() - ts) / 3600.0)
         except Exception:
             return None
+
+    async def ensure_playbook_loaded(self) -> None:
+        """Fill the playbook cache when no alert has needed it yet this run. The veto path only
+        loads it once an alert reaches the veto, so a quiet run would otherwise never learn the
+        playbook's age. At most one cached GET; never raises."""
+        try:
+            if getattr(cfg, "PLAYBOOK_MODE", "off") != "off":
+                await self._load_playbook_blob()
+        except Exception:
+            pass
 
     async def get_trade_quality(self, pair: str, alert_key: str, direction: str, conf_pct: float, adx_val: Optional[float] = None, live_context: Optional[Dict[str, Any]] = None, votes: Optional[Dict[str, bool]] = None, session: str = "unknown") -> Optional[Dict[str, Any]]:
         """Dispatch hook: report-only trade-quality verdict for one

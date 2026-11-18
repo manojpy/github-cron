@@ -1800,16 +1800,55 @@ _PULLBACK_HOST_KEYS = frozenset({
     "ppohist_buy", "ppohist_sell",
 })
 
+def _fmt_level(n: float) -> str:
+    """A price LEVEL with the same precision rule as _format_price (no '$'). `_fmt_num`
+    prints one decimal, which turned 0.0382 into '0.0' on cheap pairs."""
+    a = abs(float(n))
+    if a >= 10:
+        return f"{n:,.2f}"
+    if a >= 1:
+        return f"{n:.3f}"
+    if a >= 0.01:
+        return f"{n:.4f}"
+    return f"{n:.6g}"
+
+
+def _watch_levels_problem(info: Dict[str, Any], close: Any, side: str) -> Optional[str]:
+    """Why a pullback WATCH cannot state its own trigger and invalidation, or None when it can.
+    A WATCH that cannot say what it waits for (or when it is void) is worse than none."""
+    if not isinstance(close, (int, float)) or isinstance(close, bool) or not np.isfinite(close) or close <= 0:
+        return "price unavailable"
+    levels: Dict[str, float] = {}
+    for name in ("trigger", "invalidation"):
+        v = info.get(name)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return f"{name} missing"
+        if not np.isfinite(v) or v <= 0:
+            return f"{name} is not a positive price ({v!r})"
+        if abs(v - close) / close > 0.5:
+            return f"{name} {v!r} is more than 50% away from price {close!r}"
+        levels[name] = float(v)
+    if side == "buy":
+        if levels["trigger"] <= close:
+            return "trigger is not above price"
+        if levels["invalidation"] >= close:
+            return "invalidation is not below price"
+    else:
+        if levels["trigger"] >= close:
+            return "trigger is not below price"
+        if levels["invalidation"] <= close:
+            return "invalidation is not above price"
+    return None
+
 
 def _pullback_levels_text(info: Dict[str, Any]) -> str:
     trig, inv = info.get("trigger"), info.get("invalidation")
     parts = [f"pullback {info.get('depth_atr', 0):.1f} ATR ({info.get('retrace', 0) * 100:.0f}% of last leg)"]
     if isinstance(trig, (int, float)):
-        parts.append(f"trigger {_fmt_num(trig)}")
+        parts.append(f"trigger {_fmt_level(trig)}")
     if isinstance(inv, (int, float)):
-        parts.append(f"invalid beyond {_fmt_num(inv)}")
+        parts.append(f"invalid beyond {_fmt_level(inv)}")
     return " | ".join(parts)
-
 
 def pullback_message_line(context: Dict[str, Any], direction: str, keys: List[str]) -> Optional[str]:
     """Telegram line for a batch whose host alert fired on a CONFIRMED pullback."""
@@ -1900,9 +1939,9 @@ def _join_lines(*parts: Optional[str]) -> Optional[str]:
     return "\n".join(kept) if kept else None
 
 # Pullback WATCH entries gathered during evaluation and sent as ONE message after the
-# real alerts: (pair, dedup_key, escaped_block). One process = one run, so a module
-# list is safe; it is emptied by flush_pullback_watch().
-_PULLBACK_WATCH_QUEUE: List[Tuple[str, str, str]] = []
+# real alerts: (pair, dedup_key, escaped_block, side, candle_ts). One process = one run,
+# so a module list is safe; it is emptied by flush_pullback_watch().
+_PULLBACK_WATCH_QUEUE: List[Tuple[str, str, str, str, int]] = []
 
 async def send_pullback_watch(context: Dict[str, Any], gr: GateResult, sdb: RedisStateStore, telegram_queue: "TelegramQueue", logger_pair: logging.Logger) -> int:
     """Informational WATCH: pullback shows exhaustion, trigger candle not closed yet.
@@ -1915,10 +1954,15 @@ async def send_pullback_watch(context: Dict[str, Any], gr: GateResult, sdb: Redi
         return 0
     if not any(context.get(f"pullback_state_{s}") == "exhaustion" for s in ("buy", "sell")):
         return 0
-    # One recorded trade per pair: a WATCH for a pair that already has an open trade
-    # adds nothing, so it is only sent for pairs with no active trade.
+
+    # One recorded trade per pair (Elliott or MACD, either direction): a WATCH for a pair
+    # that already has an open trade adds nothing. Logged as a candidate row so the choice
+    # can be audited. Cooldown, an open shadow, or nothing open: the WATCH goes out.
+    # (flush_pullback_watch repeats this check, because a trade can open later in the run.)
     if cfg.ENABLE_SINGLE_ACTIVE_TRADE and cfg.ENABLE_WIN_RATE_FILTER:
-        if await sdb.get_active_trade(gr.pair_name):
+        _open = await sdb.get_active_trade(gr.pair_name)
+        if _open:
+            await _log_watch_suppressed(sdb, gr.pair_name, context, _open, int(gr.ts_curr), logger_pair)
             return 0
     queued = 0
     for side in ("buy", "sell"):
@@ -1927,6 +1971,12 @@ async def send_pullback_watch(context: Dict[str, Any], gr: GateResult, sdb: Redi
         if len(_PULLBACK_WATCH_QUEUE) >= int(cfg.PULLBACK_WATCH_MAX_PER_RUN):
             break      # no claim taken, so the setup is offered again next run
         info = context.get(f"pullback_info_{side}") or {}
+        _bad = _watch_levels_problem(info, gr.close_curr, side)
+        if _bad:
+            logger_pair.warning(f"[{gr.pair_name}] pullback {side.upper()} WATCH not sent: {_bad}")
+            await sdb.log_candidate_event(
+                gr.pair_name, "pullback_watch", side, int(gr.ts_curr), "watch_bad_levels", {"detail": _bad})
+            continue
         dedup_key = f"pbwatch_{side}_{info.get('low_ts')}"
         claim = await sdb.claim_recent_alert(
             gr.pair_name, dedup_key, gr.ts_curr, window_sec=int(cfg.PULLBACK_WATCH_DEDUP_SEC),
@@ -1939,14 +1989,40 @@ async def send_pullback_watch(context: Dict[str, Any], gr: GateResult, sdb: Redi
             f"👀 {gr.pair_name} — {word} WATCH (not a signal yet)",
             f"Pullback in the {trend} is losing momentum ({', '.join(info.get('votes', []))}).",
             _pullback_levels_text(info),
+
             f"Waits for a 15m close beyond the trigger. Price {_format_price(gr.close_curr)}",
-            f"⏰ {format_ist_time(gr.ts_curr, '%d-%m-%Y %H:%M IST')}",
         ]
+        if cfg.ENABLE_WIN_RATE_FILTER:
+            _cd_hit = await sdb.in_trade_cooldown(gr.pair_name, int(gr.ts_curr), direction=side)
+            if _cd_hit is not None:
+                lines.append(
+                    "⏸ Cooldown — recording paused until the "
+                    f"{format_ist_time(_cd_hit + int(cfg.TRADE_CLOSE_COOLDOWN_CANDLES) * 900 + 900, '%H:%M IST')} candle")
+        lines.append(f"⏰ {format_ist_time(gr.ts_curr, '%d-%m-%Y %H:%M IST')}")
         _PULLBACK_WATCH_QUEUE.append(
-            (gr.pair_name, dedup_key, "\n".join(escape_markdown_v2(x) for x in lines))
+            (gr.pair_name, dedup_key, "\n".join(escape_markdown_v2(x) for x in lines),
+             side, int(gr.ts_curr))
         )
         queued += 1
     return queued
+
+async def _log_watch_suppressed(sdb: RedisStateStore, pair: str, context: Dict[str, Any],
+                                open_trade: Dict[str, Any], ts: int, logger_pair: logging.Logger,
+                                side: Optional[str] = None) -> None:
+    """Candidate row for a WATCH held back because a Recorded trade is open on the pair.
+    The direction of both is stored, so 'opposite-direction suppression' can be audited
+    later (does it predict stop-outs?)."""
+    sides = [side] if side else [
+        s for s in ("buy", "sell") if context.get(f"pullback_state_{s}") == "exhaustion"]
+    for s in sides:
+        same = str(open_trade.get("direction", "")).lower() in (("buy", "long") if s == "buy" else ("sell", "short"))
+        logger_pair.info(
+            f"[{pair}] pullback {s.upper()} WATCH suppressed: {open_trade.get('direction')} trade "
+            f"({open_trade.get('alert_key')}) already open")
+        await sdb.log_candidate_event(
+            pair, "pullback_watch", s, ts, "watch_suppressed_open_trade",
+            {"open_direction": open_trade.get("direction"), "open_key": open_trade.get("alert_key"),
+             "same_direction": bool(same)})
 
 async def flush_pullback_watch(sdb: RedisStateStore, telegram_queue: "TelegramQueue", logger_run: logging.Logger, suppress: bool = False) -> int:
     """Send the queued WATCH entries as one (or, if long, a few) messages. A failed
@@ -1956,7 +2032,29 @@ async def flush_pullback_watch(sdb: RedisStateStore, telegram_queue: "TelegramQu
     _PULLBACK_WATCH_QUEUE.clear()
     if not items:
         return 0
-    chunks: List[List[Tuple[str, str, str]]] = [[]]
+    # The real alerts are out by now: a trade may have been recorded on one of these pairs
+    # AFTER its WATCH was queued (by the MACD path or by Elliott). Check again, and give the
+    # dedup claim back so the WATCH can still be sent once that trade has closed.
+    if cfg.ENABLE_SINGLE_ACTIVE_TRADE and cfg.ENABLE_WIN_RATE_FILTER and not sdb.degraded:
+        kept: List[Tuple[str, str, str, str, int]] = []
+        for it in items:
+            _open = None
+            try:
+                _open = await sdb.get_active_trade(it[0])
+            except Exception as e:
+                logger_run.debug(f"[{it[0]}] pullback WATCH open-trade re-check failed: {e}")
+            if not _open:
+                kept.append(it)
+                continue
+            await _log_watch_suppressed(sdb, it[0], {}, _open, it[4], logger_run, side=it[3])
+            try:
+                await sdb.release_recent_alert(it[0], it[1])
+            except Exception as e:
+                logger_run.debug(f"[{it[0]}] pullback WATCH claim release failed: {e}")
+        items = kept
+        if not items:
+            return 0
+    chunks: List[List[Tuple[str, str, str, str, int]]] = [[]]
     size = 0
     for it in items:
         if chunks[-1] and size + len(it[2]) + 2 > 3800:
@@ -1969,17 +2067,17 @@ async def flush_pullback_watch(sdb: RedisStateStore, telegram_queue: "TelegramQu
         ok = False
         if not suppress:
             try:
-                ok = bool(await telegram_queue.send("\n\n".join(b for _, _, b in chunk)))
+                ok = bool(await telegram_queue.send("\n\n".join(it[2] for it in chunk)))
             except Exception as e:
                 logger_run.warning(f"pullback WATCH send failed: {e}")
         if ok:
             sent += len(chunk)
         else:
-            for pair, dedup_key, _ in chunk:
+            for it in chunk:
                 try:
-                    await sdb.release_recent_alert(pair, dedup_key)
+                    await sdb.release_recent_alert(it[0], it[1])
                 except Exception as e:
-                    logger_run.debug(f"[{pair}] pullback WATCH claim release failed: {e}")
+                    logger_run.debug(f"[{it[0]}] pullback WATCH claim release failed: {e}")
     return sent
 
 async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[Dict[str, np.ndarray]],
@@ -3646,7 +3744,13 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     f"(hit candle {(record_active or {}).get('hit_ts')})"
                 )
                 DEDUP_STATS["unscored_cooldown"] += len(alerts_to_send)
+                if sink is None:
+                    for _t, _e, _k in alerts_to_send:
+                        await sdb.log_candidate_event(
+                            pair_name, _k, "buy" if _k in BUY_ALERT_KEYS else "sell", int(ts_curr),
+                            "ignored_cooldown", {"hit_ts": (record_active or {}).get("hit_ts")})
                 return
+
             if cfg.ENABLE_SINGLE_ACTIVE_TRADE:
                 if record_status == "IGNORED":
                     logger_pair.info(
@@ -3654,6 +3758,14 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         f"({(record_active or {}).get('alert_key')} @ {(record_active or {}).get('entry_ts')})"
                     )
                     DEDUP_STATS["unscored_open_trade"] += len(alerts_to_send)
+                    if sink is None:
+                        for _t, _e, _k in alerts_to_send:
+                            await sdb.log_candidate_event(
+                                pair_name, _k, "buy" if _k in BUY_ALERT_KEYS else "sell", int(ts_curr),
+                                "ignored_open_trade",
+                                {"open_key": (record_active or {}).get("alert_key"),
+                                 "open_direction": (record_active or {}).get("direction"),
+                                 "open_entry_ts": (record_active or {}).get("entry_ts")})
                     return
 
                 # One trade per pair per candle: the strongest edge represents it.
@@ -4010,11 +4122,22 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             record_status != "COOLDOWN"
             and cfg.ENABLE_SINGLE_ACTIVE_TRADE and alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER
         ):
+
             record_active = await sdb.get_active_trade(pair_name)
             if record_active:
                 record_status = "IGNORED"
             record_line = _record_status_line(record_status, record_active)
-        
+        if record_status == "RECORDED" and alerts_to_send and cfg.ENABLE_BRAIN:
+            # Never blocks anything: the alert is sent AND recorded. The open shadow row is
+            # flagged overlapped_by_recorded when the trade is written (state.mark_shadow_overlap).
+            try:
+                _osh = await sdb.get_active_shadow_trade(pair_name, elliott=None)
+            except Exception:
+                _osh = None
+            if _osh and int(_osh.get("entry_ts", 0)) < int(ts_curr):
+                _ov = "👁 Shadow counterfactual already open on this pair — recorded normally, overlap flagged for reports."
+                record_line = f"{record_line}\n{_ov}" if record_line else _ov
+
         if alerts_to_send and cfg.ENABLE_CLOUD_VOTE_LINE and record_status != "IGNORED":
             _cloud_line = _cloud_vote_line(gr, bool(is_buy_batch))
             logger_pair.info(f"[{pair_name}] {_cloud_line}")

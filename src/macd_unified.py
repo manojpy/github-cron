@@ -1046,7 +1046,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             logger_main.warning(f"Calibration curve pre-load failed (fail-open): {e}")
             calibration_curves = {}
 
-    # ─ ML-EV: market-state model + ML calibration curve, also loaded
+    # �� ML-EV: market-state model + ML calibration curve, also loaded
     # ONCE per run. Both blobs are immutable within a run, so per-pair
     # re-loads (30 pairs × 2 GETs × JSON parses) are pure waste.
     ml_market_state_model: Optional[Dict[str, Any]] = None
@@ -1469,10 +1469,12 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     # Learner heartbeat. A playbook older than PLAYBOOK_MAX_AGE_HOURS (or missing) is ignored,
     # so the playbook veto and the hypothesis veto silently fail open and nothing else says so.
-    # Uses the playbook this run already loaded (no extra Redis read); one notice per window.
+    # Loads the playbook if no alert has yet (cached; at most one GET), so quiet runs are covered.
+    # One notice per window.
     _stale_notice_h = float(getattr(cfg, "LEARNER_STALE_NOTICE_HOURS", 12.0))
     if _stale_notice_h > 0 and brain_engine_shared is not None:
         try:
+            await brain_engine_shared.ensure_playbook_loaded()
             _pb_age_h = brain_engine_shared.playbook_age_hours()
             _pb_limit_h = float(getattr(cfg, "PLAYBOOK_MAX_AGE_HOURS", 36.0))
             if _pb_age_h is not None and _pb_age_h > _pb_limit_h:

@@ -351,6 +351,9 @@ class RedisKeyPrefix:
     # Deliberately NOT under "alert_stats:" so the totals reseed (which sums that
     # prefix) cannot double-count the one real trade.
     ALERT_STATS_CO = "alert_stats_co:"
+    # Candidate-only rows: signals that were seen or sent but not recorded/shadowed.
+    # A capped list per pair; nothing resolves or reports from it.
+    CANDIDATE_EVENTS = "candidate_events:"
     OUTCOME_LOG_STREAM = "outcome_log_stream"
     SHADOW_PENDING = "shadow_pending:"
     SHADOW_STATS = "shadow_stats:"
@@ -396,6 +399,10 @@ class RedisStateStore:
         self._last_purge_incomplete: List[str] = []
         # pair -> (entry_ts, confluence ratio, redis key) of the shadow trade created this run
         self._shadow_registered_this_run: Dict[str, Tuple[int, float, str]] = {}
+        # pair -> the Recorded trade written THIS run. The pending-key pre-scan is taken once
+        # at the start of the run, so without this a trade recorded by one module (MACD or
+        # Elliott) would be invisible to the other module later in the same run.
+        self._recorded_this_run: Dict[str, Dict[str, Any]] = {}
         self._dlq_empty_at_start: bool = False
         self._dlq_pushed_this_run: bool = False
         self.trade_close_events: List[Dict[str, Any]] = []
@@ -1716,15 +1723,14 @@ class RedisStateStore:
             return True
         if self.degraded:
             return False
-        # Elliott Wave rows are exempt from the legacy re-entry cooldown BY DESIGN:
-        # the Elliott module is independent of the MACD alerts and keeps its own
-        # duplicate prevention (one claim per wave structure) and its own per-run cap.
-        # Do not "fix" this: a MACD target hit must never silence a wave count.
+
+        # One trade per pair across sources (ONE_TRADE_ACROSS_SOURCES, default on): an
+        # Elliott row honours the same re-entry cooldown as a MACD row. Turn the switch
+        # off to restore the old isolation (Elliott exempt, own claims and caps only).
         _cd_hit = (
-            None if is_elliott_key(alert_key)
+            None if (is_elliott_key(alert_key) and not getattr(cfg, "ONE_TRADE_ACROSS_SOURCES", True))
             else await self.in_trade_cooldown(pair, entry_ts, direction=direction)
         )
-
         if _cd_hit is not None:
             logger.info(
                 f"[{pair}] Cooldown after target (hit candle {_cd_hit}) — "
@@ -1771,6 +1777,8 @@ class RedisStateStore:
                 f"Failed to record pending outcome for {pair}:{alert_key}: {e}"
             )
             return False
+        self.note_recorded_this_run(pair, alert_key, direction, int(entry_ts))
+        await self.mark_shadow_overlap(pair, int(entry_ts))
         if confluence_votes is not None:
             await self.record_vote_count(alert_key, confluence_votes)
         return True
@@ -1809,6 +1817,11 @@ class RedisStateStore:
         _is_ew = is_elliott_key(alert_key)
         _cd_hit = None if _is_ew else await self.in_trade_cooldown(pair, entry_ts)
         cooldown_active = _cd_hit is not None
+        # Mirror of cooldown_active: a Recorded trade (any source) is open on this pair, so
+        # this shadow could not have been followed. Reports leave such rows out of the
+        # "followable" book; gate evaluation keeps them.
+        _ra = await self.get_active_trade(pair, elliott=None)
+        recorded_active = _ra is not None
 
         key = f"{RedisKeyPrefix.SHADOW_PENDING}{pair}:{alert_key}:{entry_ts}"
         ratio = (
@@ -1829,6 +1842,9 @@ class RedisStateStore:
                         f"[{pair}] Shadow skipped: {active['alert_key']} @ {active['entry_ts']} "
                         f"still open — not registering {alert_key} @ {entry_ts}"
                     )
+                    await self.log_candidate_event(
+                        pair, alert_key, direction, entry_ts, "skipped_active",
+                        {"open_shadow_key": active["alert_key"], "open_shadow_ts": active["entry_ts"]})
                     return "skipped_active"
         try:
             payload = json_dumps({
@@ -1842,6 +1858,7 @@ class RedisStateStore:
                     **(context or {}),
                     "cooldown_active": cooldown_active,
                     "cooldown_hit_ts": _cd_hit,
+                    "recorded_active": recorded_active,
                 },
             })
         except Exception as e:
@@ -2464,49 +2481,131 @@ class RedisStateStore:
         except Exception:
             return None, None, False
 
-    async def get_active_trade(self, pair: str, elliott: bool = False) -> Optional[Dict[str, Any]]:
+    async def get_active_trade(self, pair: str, elliott: Optional[bool] = False) -> Optional[Dict[str, Any]]:
         """The open recorded trade for this pair, or None.
 
-        `elliott=False` (the default, used by every legacy caller) looks only at
-        non-Elliott rows, so an open Elliott trade can never block a MACD alert;
-        `elliott=True` looks only at Elliott rows.
+        `elliott=None` looks at every source. `elliott=True` looks only at Elliott
+        rows. `elliott=False` (the default, used by every legacy caller) looks only
+        at non-Elliott rows, EXCEPT that with ONE_TRADE_ACROSS_SOURCES on (default)
+        it also means "every source": one recorded trade per pair, whoever opened it.
 
-        Open = a pending-outcome row that exists and is not marked closed.
+        Open = a pending-outcome row that exists and is not marked closed, or a trade
+        this run has just recorded (the key pre-scan is taken once, at run start).
         Uses the run-level key pre-scan (no extra SCAN); costs one pipelined
-
         GET batch, and only when the pair has pending keys at all."""
+        if elliott is False and getattr(cfg, "ONE_TRADE_ACROSS_SOURCES", True):
+            elliott = None
         if self.degraded or not self._redis:
             return None
+        best: Optional[Dict[str, Any]] = None
         try:
             keys = await self._fetch_pending_keys(
                 pair, "_pending_outcome_keys_by_pair", RedisKeyPrefix.OUTCOME_PENDING,
                 logger, "pending",
             )
-            if not keys:
-                return None
-            raws = await asyncio.wait_for(_rc(self._redis).mget(keys), timeout=2.0)
-            if raws is None or len(raws) != len(keys):
-                return None
-            best: Optional[Dict[str, Any]] = None
-            for k, raw in zip(keys, raws):
-                if not raw:
-                    continue
-                d = json_loads(raw)
-                if d.get("closed_ts") is not None:
-                    continue
-                ets = int(d["entry_ts"])
-                parts = str(k).split(":")
-                if is_elliott_key(parts[-2] if len(parts) >= 2 else "") != elliott:
-                    continue
-                if best is None or ets > best["entry_ts"]:
-                    best = {"pair": pair, "alert_key": parts[-2] if len(parts) >= 2 else "",
-                            "direction": str(d.get("direction", "")), "entry_ts": ets}
-            return best
+            raws = await asyncio.wait_for(_rc(self._redis).mget(keys), timeout=2.0) if keys else []
+            if raws is not None and len(raws) == len(keys):
+                for k, raw in zip(keys, raws):
+                    if not raw:
+                        continue
+                    d = json_loads(raw)
+                    if d.get("closed_ts") is not None:
+                        continue
+                    ets = int(d["entry_ts"])
+                    parts = str(k).split(":")
+                    is_ew = is_elliott_key(parts[-2] if len(parts) >= 2 else "")
+                    if elliott is not None and is_ew != elliott:
+                        continue
+                    if best is None or ets > best["entry_ts"]:
+                        best = {"pair": pair, "alert_key": parts[-2] if len(parts) >= 2 else "",
+                                "direction": str(d.get("direction", "")), "entry_ts": ets}
         except Exception as e:
             logger.warning(f"get_active_trade failed for {pair}: {e}")
-            return None
+            best = None
+        # A trade written earlier in THIS run is open by definition (a Redis problem above
+        # still leaves it valid).
+        mine = self.__dict__.get("_recorded_this_run", {}).get(pair)
+        if mine is not None and (elliott is None or bool(mine.get("elliott")) == elliott):
+            if best is None or int(mine["entry_ts"]) >= int(best["entry_ts"]):
+                best = {k: mine[k] for k in ("pair", "alert_key", "direction", "entry_ts")}
+        return best
 
-    async def get_active_shadow_trade(self, pair: str, elliott: bool = False) -> Optional[Dict[str, Any]]:
+    def note_recorded_this_run(self, pair: str, alert_key: str, direction: str, entry_ts: int) -> None:
+        """Remember a Recorded trade written in this run (see get_active_trade). No I/O."""
+        self.__dict__.setdefault("_recorded_this_run", {})[pair] = {
+            "pair": pair, "alert_key": alert_key, "direction": str(direction),
+            "entry_ts": int(entry_ts), "elliott": is_elliott_key(alert_key),
+        }
+
+    async def pair_record_state(self, pair: str, entry_ts: int, direction: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """The one-trade-per-pair verdict for a NEW alert on `pair`:
+        ('COOLDOWN', {hit_ts, until_ts}) | ('IGNORED', open_trade) | ('RECORDED', None).
+        Same order and meaning as the MACD path in alerts.py; used by the Elliott module.
+        Fails open (a Redis problem means 'RECORDED')."""
+        try:
+            hit = await self.in_trade_cooldown(pair, entry_ts, direction=direction)
+            if hit is not None:
+                return "COOLDOWN", {
+                    "hit_ts": hit,
+                    "until_ts": hit + int(cfg.TRADE_CLOSE_COOLDOWN_CANDLES) * 900,
+                }
+            if cfg.ENABLE_SINGLE_ACTIVE_TRADE:
+                active = await self.get_active_trade(pair, elliott=None)
+                if active:
+                    return "IGNORED", active
+        except Exception as e:
+            logger.warning(f"pair_record_state failed for {pair}: {e}")
+        return "RECORDED", None
+
+    async def log_candidate_event(self, pair: str, alert_key: str, direction: str, entry_ts: int,
+                                  reason: str, extra: Optional[Dict[str, Any]] = None) -> None:
+        """Candidate-only row: a signal that was seen or sent but NOT recorded or shadowed
+        (reason: ignored_open_trade, ignored_cooldown, skipped_active, ...). A capped
+        list per pair; never an outcome row, so no report or Brain reader counts it.
+        Never raises, never blocks."""
+        cap = int(getattr(cfg, "CANDIDATE_LOG_MAX_PER_PAIR", 300))
+        if cap <= 0 or self.degraded or not self._redis:
+            return
+        try:
+            row = json_dumps({
+                "pair": pair, "alert_key": alert_key, "direction": direction,
+                "entry_ts": int(entry_ts), "reason": reason, "logged_ts": int(time.time()),
+                **(extra or {}),
+            })
+            key = f"{RedisKeyPrefix.CANDIDATE_EVENTS}{pair}"
+            async with _rc(self._redis).pipeline(transaction=False) as pipe:
+                pipe.lpush(key, row)
+                pipe.ltrim(key, 0, cap - 1)
+                pipe.expire(key, 14 * 86400)
+                await asyncio.wait_for(_execute_pipeline(pipe), timeout=2.0)
+        except Exception as e:
+            logger.debug(f"[{pair}] candidate event not logged ({reason}): {e}")
+
+    async def mark_shadow_overlap(self, pair: str, entry_ts: int) -> None:
+        """A Recorded trade has just opened. If a Shadowed trade from an EARLIER candle is
+        still open on the pair, flag that shadow row `overlapped_by_recorded` so reports
+        can see the two counted the same market move. Never blocks the recording; never raises."""
+        try:
+            sh = await self.get_active_shadow_trade(pair, elliott=None)
+            if not sh or int(sh["entry_ts"]) >= int(entry_ts):
+                return
+            key = f"{RedisKeyPrefix.SHADOW_PENDING}{pair}:{sh['alert_key']}:{sh['entry_ts']}"
+            raw = await asyncio.wait_for(_rc(self._redis).get(key), timeout=2.0)
+            if not raw:
+                return
+            d = json_loads(raw)
+            ctx = d.get("context") if isinstance(d.get("context"), dict) else {}
+            if ctx.get("overlapped_by_recorded"):
+                return
+            ctx["overlapped_by_recorded"] = True
+            ctx["overlapped_by_recorded_ts"] = int(entry_ts)
+            d["context"] = ctx
+            await asyncio.wait_for(
+                _rc(self._redis).set(key, json_dumps(d), xx=True, keepttl=True), timeout=2.0)
+        except Exception as e:
+            logger.debug(f"[{pair}] shadow overlap flag failed (non-fatal): {e}")
+
+    async def get_active_shadow_trade(self, pair: str, elliott: Optional[bool] = False) -> Optional[Dict[str, Any]]:
         """The open shadow trade for this pair, or None. Same meaning of 'open' as
         get_active_trade (pending row exists and is not marked closed), read from
         the shadow pending keys. Fails open: a Redis problem means 'none open'."""
@@ -2529,9 +2628,10 @@ class RedisStateStore:
                 d = json_loads(raw)
                 if d.get("closed_ts") is not None:
                     continue
+
                 ets = int(d["entry_ts"])
                 parts = str(k).split(":")
-                if is_elliott_key(parts[-2] if len(parts) >= 2 else "") != elliott:
+                if elliott is not None and is_elliott_key(parts[-2] if len(parts) >= 2 else "") != elliott:
                     continue
                 if best is None or ets > best["entry_ts"]:
                     best = {"pair": pair, "alert_key": parts[-2] if len(parts) >= 2 else "",
@@ -2675,8 +2775,9 @@ class RedisStateStore:
                     "win": d.get("horizon_win"),
                     "elliott": is_ew,
                 })
-            # Elliott closes never start the legacy re-entry cooldown (by design).
-            starts_cooldown = not is_ew and (reason == "target" or (
+            # With ONE_TRADE_ACROSS_SOURCES (default) an Elliott close starts the same
+            # re-entry cooldown as a MACD close; off = the old isolation.
+            starts_cooldown = (not is_ew or getattr(cfg, "ONE_TRADE_ACROSS_SOURCES", True)) and (reason == "target" or (
                 reason in ("stop", "both")
                 and getattr(cfg, "TRADE_CLOSE_COOLDOWN_ON_STOP", False)
             ))
