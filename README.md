@@ -223,12 +223,14 @@ Every alert that passes the signal gates is still sent to Telegram. What differs
 
 | Label | Meaning |
 |-------|---------|
-| 📝 **Recorded** | Counted as a trade. One recorded trade per pair per candle (the strongest edge). |
-| ⏭ **Ignored** | Sent, but not recorded because the pair already has an open recorded trade (`ENABLE_SINGLE_ACTIVE_TRADE`). Log line: `NOT RECORDED … trade already open`. |
-| ⏸ **Cooldown** | Sent, but not recorded because a recorded target was hit within the last `TRADE_CLOSE_COOLDOWN_CANDLES` candles. |
+| 📝 **Recorded** | Counted as a trade. One recorded trade per pair at a time, across **all** sources: an open Elliott Wave trade and an open MACD trade share the same slot (`ONE_TRADE_ACROSS_SOURCES`). |
+| ⏭ **Ignored** | Sent with the line `⏭ Ignored ��� <pair> <side> trade open since <time>, not recorded`, but not recorded because the pair already has an open recorded trade (until its target, stop or 12-candle horizon). Logged as a candidate-only row (`ignored_open_trade`). |
+| ⏸ **Cooldown** | Sent, but not recorded because a recorded target was hit within the last `TRADE_CLOSE_COOLDOWN_CANDLES` candles (Elliott or MACD target alike, same direction). Logged as a candidate-only row (`ignored_cooldown`). |
 | 👁 **Shadowed** | Alert was blocked by a gate (confluence, cluster penalty, win-rate, calibration, OOD, portfolio heat, brain-disabled). It is not sent, but it is tracked as a counterfactual trade for the Brain. |
 
-The cooldown (`trade_cooldown:{pair}`) is started only by **Recorded** trades. Shadow trades neither start it nor are skipped by it: they are always registered, and each one stores `cooldown_active` (and `cooldown_hit_ts`) in its context so reports can include or exclude entries made during a live cooldown.
+The cooldown (`trade_cooldown:{pair}`) is started only by **Recorded** trades. Shadow trades neither start it nor are skipped by it: they are registered (subject to the one-open-shadow rule below), and each one stores `cooldown_active` (and `cooldown_hit_ts`) and `recorded_active` in its context. `recorded_active: true` means a Recorded trade was open on the pair when the shadow was registered, so it could not have been followed: the Brain's "followable" replays leave those rows out, while gate evaluation keeps them. If a Recorded trade opens while an earlier shadow is still open, that shadow row is flagged `overlapped_by_recorded: true`.
+
+**Candidate-only rows** (`candidate_events:<pair>`, newest first, capped by `CANDIDATE_LOG_MAX_PER_PAIR`, 14-day TTL) record signals that were seen or sent but neither recorded nor shadowed: `ignored_open_trade`, `ignored_cooldown`, `skipped_active` (a second shadow while one is open), `watch_suppressed_open_trade` and `watch_bad_levels` (pullback WATCH messages held back). They are never outcome rows, so no total, report or model counts them.
 
 ### Reading the totals line
 
@@ -243,7 +245,7 @@ This line is logged on every run (every 15 minutes) and is also included in the 
 - A trade counts as Target Achieved if its target is hit before its stop, and as Stop loss Hit if the stop comes first. If neither is hit within `OUTCOME_LOOKAHEAD_CANDLES` (12 candles = 3 h), it is counted by whether it closed in profit, so those timeouts are folded into the two counts.
 - Trades are counted as soon as their target or stop is hit, even before the 12 candles are over. A `<Recorded|Shadowed> trade closed | …` line is logged at that moment.
 - A new shadow registration does not change the total until it resolves, which can take up to 12 candles. `Pre-scanned N shadow pending outcome(s)` at run start shows how many are still open.
-- Shadow rows record every blocked alert key, including several on the same pair and candle. They do not follow the one-trade-per-pair rule, so Shadowed and Recorded win rates are not directly comparable.
+- With `ENABLE_SINGLE_ACTIVE_SHADOW` (on) there is one open shadow per pair: the strongest blocked key represents the candle and later signals are skipped (and logged as `skipped_active` candidate rows). Recorded and Shadowed rows are still chosen differently (Recorded: highest estimated net EV; Shadowed: highest confluence ratio), so their win rates are not directly comparable.
 - Several shadow gates only activate once enough history exists: the win-rate filter needs `MIN_WIN_RATE_SAMPLE` resolved trades per pair and alert key, calibration needs curves from past outcomes, and the OOD gate needs `OOD_MIN_HISTORY` vote-count samples. Until then the confluence gate is the main source of shadow trades.
 
 ---
