@@ -73,6 +73,29 @@ def prob_wr_at_least(wins: int, losses: int, target: float) -> float:
         )
     return max(0.0, min(1.0, total))
 
+def curve_pooled_wr(curve: Optional[Dict[str, Any]]) -> Tuple[Optional[float], int]:
+    """(win rate, n) of ONE alert key across ALL pairs, read from its calibration curve
+    (summed over the confluence buckets). (None, 0) when there is no usable curve."""
+    try:
+        buckets = (curve or {}).get("buckets") or []
+        n = sum(int(b["n"]) for b in buckets)
+        if n <= 0:
+            return None, 0
+        return sum(float(b["observed"]) * int(b["n"]) for b in buckets) / n, n
+    except (KeyError, TypeError, ValueError):
+        return None, 0
+
+def shrunk_prob_wr_at_least(wins: int, losses: int, target: float, prior_wr: Optional[float] = None, strength: float = 0.0) -> float:
+    """prob_wr_at_least with a Beta prior centred on `prior_wr` and worth `strength`
+    pseudo-trades (empirical-Bayes shrinkage toward a pooled rate). The pseudo-counts are
+    rounded to whole numbers, at least 1 each, so the exact binomial identity behind
+    prob_wr_at_least still applies. No prior or zero strength = the flat prior."""
+    if prior_wr is None or strength <= 0:
+        return prob_wr_at_least(wins, losses, target)
+    a0 = max(1, int(round(strength * prior_wr)))
+    b0 = max(1, int(round(strength * (1.0 - prior_wr))))
+    return prob_wr_at_least(wins + a0 - 1, losses + b0 - 1, target)
+
 def two_proportion_p_value(wins_a: int, n_a: int, wins_b: int, n_b: int) -> float:
     """Two-sided two-proportion z-test p-value (no SciPy).
 

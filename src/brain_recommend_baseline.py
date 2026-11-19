@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from bot_config import cfg, json_dumps, json_loads, CONFLUENCE_WEIGHTS
 from state import _rc
 import threshold_engine as engine
-from threshold_quality import gate_shadow_comparison, prediction_track_record, future_edge_track_record
+from threshold_quality import gate_shadow_comparison, prediction_track_record, future_edge_track_record, skipped_signal_study
 from feature_store import dataset_coverage
 from plan_replay import volatility_plan_study
 from hypothesis_gen import shadow_pool_rows, update_hypothesis_pool
@@ -1175,9 +1175,26 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
             (float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100,
         )
         ai_metrics["data_foundation"] = {**dataset_coverage(_ds), "cache": _ds_cache}
-
     except Exception as e:
         audit.record_analysis_exception("data_foundation", e)
+
+    # ── Skipped signals: what the alerts that never became a Recorded trade would have
+    # earned (graded candidate rows) and what each suppression reason held back (shadow
+    # rows). Report only. A failed Redis read leaves the block out; it is never read as zero. ──
+    try:
+        _cand = (
+            await self.sdb.load_candidate_resolved()
+            if getattr(cfg, "CANDIDATE_RESOLVE_OUTCOMES", True) else []
+        )
+        if _cand is not None:
+            _study = skipped_signal_study(
+                list(real_rows), list(shadow_rows or []), _cand,
+                min_n=int(getattr(cfg, "BRAIN_AUTO_DISABLE_MIN_SAMPLE", 200)) // 10,
+            )
+            if _study.get("valid"):
+                ai_metrics["skipped_signals"] = _study
+    except Exception as e:
+        audit.record_analysis_exception("skipped_signals", e)
 
     # ── Net-EV audit: does the market-state model beat simple chronological
     # rules in net P&L on newer, unseen trades? Report-only. ──

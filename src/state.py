@@ -352,8 +352,10 @@ class RedisKeyPrefix:
     # prefix) cannot double-count the one real trade.
     ALERT_STATS_CO = "alert_stats_co:"
     # Candidate-only rows: signals that were seen or sent but not recorded/shadowed.
-    # A capped list per pair; nothing resolves or reports from it.
+    # A capped list per pair. Rows that carry an entry price are graded later into
+    # CANDIDATE_RESOLVED (a hash per pair); neither is an outcome table.
     CANDIDATE_EVENTS = "candidate_events:"
+    CANDIDATE_RESOLVED = "candidate_resolved:"
     OUTCOME_LOG_STREAM = "outcome_log_stream"
     SHADOW_PENDING = "shadow_pending:"
     SHADOW_STATS = "shadow_stats:"
@@ -1844,7 +1846,9 @@ class RedisStateStore:
                     )
                     await self.log_candidate_event(
                         pair, alert_key, direction, entry_ts, "skipped_active",
-                        {"open_shadow_key": active["alert_key"], "open_shadow_ts": active["entry_ts"]})
+                        {"open_shadow_key": active["alert_key"], "open_shadow_ts": active["entry_ts"],
+                         "entry_price": entry_price, "score": confluence_score, "total": confluence_total,
+                         "votes_on": sorted(k for k, v in (confluence_votes or {}).items() if v)})
                     return "skipped_active"
         try:
             payload = json_dumps({
@@ -1891,7 +1895,7 @@ class RedisStateStore:
             )
             return "failed"
 
-    # ── Vote-count history (OOD gate) ──────────────────────────────────────
+    # ── Vote-count history (OOD gate) ───���──────────────────────────────────
 
     async def record_vote_count(self, alert_key: str, votes: Dict[str, bool]) -> None:
         if self.degraded or not self._redis:
@@ -2580,6 +2584,120 @@ class RedisStateStore:
                 await asyncio.wait_for(_execute_pipeline(pipe), timeout=2.0)
         except Exception as e:
             logger.debug(f"[{pair}] candidate event not logged ({reason}): {e}")
+
+    async def resolve_candidate_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
+                                         logger_pair: logging.Logger) -> None:
+        """Grade this pair's candidate-only rows (alerts sent or seen but not recorded or
+        shadowed) that carry an entry price, once their horizon has passed. Same grader and
+        same stop / target / horizon / cost rules as a Recorded trade, but the result goes
+        ONLY to the hash candidate_resolved:<pair>: never to the outcome streams, the file
+        archive, the outcome totals or any win-rate statistic. A signal that did not become a
+        trade therefore cannot leak into the numbers the gates and models learn from.
+        Rows without an entry price (WATCH messages) are not gradable and are skipped.
+        Never raises."""
+        if (
+            self.degraded or not self._redis
+            or not getattr(cfg, "ENABLE_BRAIN", False)
+            or not getattr(cfg, "CANDIDATE_RESOLVE_OUTCOMES", True)
+            or int(getattr(cfg, "CANDIDATE_LOG_MAX_PER_PAIR", 300)) <= 0
+        ):
+            return
+        list_key = f"{RedisKeyPrefix.CANDIDATE_EVENTS}{pair}"
+        done_key = f"{RedisKeyPrefix.CANDIDATE_RESOLVED}{pair}"
+        keep_sec = 30 * 86400
+        try:
+            async with _rc(self._redis).pipeline(transaction=False) as pipe:
+                pipe.lrange(list_key, 0, -1)
+                pipe.hkeys(done_key)
+                raw_rows, done_ids = await asyncio.wait_for(_execute_pipeline(pipe), timeout=2.0)
+            if not raw_rows:
+                return
+            done = {x.decode() if isinstance(x, bytes) else str(x) for x in (done_ids or [])}
+            now = int(time.time())
+
+            def _id_ts(rid: str) -> int:
+                try:
+                    return int(rid.rsplit("|", 1)[1])
+                except Exception:
+                    return 0
+
+            stale = [rid for rid in done if _id_ts(rid) < now - keep_sec]
+            seen = set(done)
+            graded: List[Tuple[str, str]] = []
+            for raw in raw_rows:
+                if len(graded) >= 50:
+                    break
+                try:
+                    d = json_loads(raw)
+                    px = d.get("entry_price")
+                    if not isinstance(px, (int, float)) or px <= 0:
+                        continue
+                    ak, et = str(d["alert_key"]), int(d["entry_ts"])
+                    rid = f"{ak}|{et}"
+                    if rid in seen:
+                        continue
+                    payload = json_dumps({
+                        "direction": d["direction"], "entry_ts": et, "entry_price": float(px),
+                        "confluence_score": d.get("score"), "confluence_total": d.get("total"),
+                        "context": {},
+                    })
+                    result, _skip = self._parse_pending_outcome_row(
+                        f"candidate_pending:{pair}:{ak}:{et}", payload, data_15m, i15)
+                    if result is None:
+                        continue              # not_ready yet, or the candle is outside the fetched window
+                    seen.add(rid)
+                    graded.append((rid, json_dumps({
+                        "pair": pair, "alert_key": ak, "direction": result["direction"], "entry_ts": et,
+                        "reason": d.get("reason"), "win": bool(result["win"]),
+                        "pct_move": round(float(result["pct_move"]), 4),
+                        "net_pnl_pct": result.get("net_pnl_pct"),
+                        "realized_cost_pct": result.get("realized_cost_pct"),
+                        "outcome_reason": result.get("outcome_reason"), "tp_first": result.get("tp_first"),
+                        "mae": result.get("mae"), "mfe": result.get("mfe"),
+                        "score": d.get("score"), "total": d.get("total"),
+                        "votes_on": d.get("votes_on"), "resolved_ts": now,
+                    })))
+                except Exception as e:
+                    logger_pair.debug(f"[{pair}] candidate row not graded: {e}")
+            if not graded and not stale:
+                return
+            async with _rc(self._redis).pipeline(transaction=False) as pipe:
+                for rid, blob in graded:
+                    pipe.hset(done_key, rid, blob)
+                if stale:
+                    pipe.hdel(done_key, *stale)
+                pipe.expire(done_key, keep_sec)
+                await asyncio.wait_for(_execute_pipeline(pipe), timeout=2.0)
+            if graded:
+                logger_pair.info(f"[{pair}] Candidate outcomes graded: {len(graded)}")
+        except Exception as e:
+            logger_pair.debug(f"[{pair}] candidate outcome resolution skipped: {e}")
+
+    async def load_candidate_resolved(self, limit: int = 5000) -> Optional[List[Dict[str, Any]]]:
+        """Graded candidate rows across all pairs, newest first. None means the read failed
+        (a caller must not read that as 'no data')."""
+        if self.degraded or not self._redis:
+            return None
+        try:
+            keys = [k async for k in _rc(self._redis).scan_iter(
+                match=f"{RedisKeyPrefix.CANDIDATE_RESOLVED}*", count=500)]
+            rows: List[Dict[str, Any]] = []
+            if keys:
+                async with _rc(self._redis).pipeline(transaction=False) as pipe:
+                    for k in keys:
+                        pipe.hgetall(k)
+                    hashes = await asyncio.wait_for(_execute_pipeline(pipe), timeout=10.0)
+                for h in hashes:
+                    for blob in (h or {}).values():
+                        try:
+                            rows.append(json_loads(blob))
+                        except Exception:
+                            continue
+            rows.sort(key=lambda r: int(r.get("entry_ts") or 0), reverse=True)
+            return rows[: max(1, int(limit))]
+        except Exception as e:
+            logger.warning(f"Candidate outcome load failed: {e}")
+            return None
 
     async def mark_shadow_overlap(self, pair: str, entry_ts: int) -> None:
         """A Recorded trade has just opened. If a Shadowed trade from an EARLIER candle is

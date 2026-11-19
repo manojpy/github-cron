@@ -20,7 +20,9 @@ from threshold_models import (
 from threshold_stats import (
     Row,
     _percentile,
+    ev_and_kelly_for,
     ev_first_objective,
+    wilson_ci,
     per_trade_ev,
     row_net_pnl_pct,
     sample_evidence_state,
@@ -1184,3 +1186,58 @@ def trade_quality_score(
         result["size_hint_note"] = "advisory_only"
 
     return result
+
+# Sent-but-not-recorded reasons: the alert reached Telegram, so a follower could have taken it.
+_FOLLOWABLE_REASONS = ("ignored_open_trade", "ignored_cooldown")
+
+def skipped_signal_study(real_rows: List[Row], shadow_rows: List[Row], candidate_rows: List[Row], min_n: int = 20) -> Dict[str, Any]:
+    """What the alerts that did NOT become Recorded trades would have earned, under the same
+    stop / target / horizon / costs. Report only; nothing here changes a decision.
+
+    * candidates: graded sent-but-not-recorded rows, by reason (win rate with Wilson interval, net EV).
+    * followable: Recorded plus the sent-but-not-recorded rows (everything a follower saw), and its
+      net-EV gap to Recorded alone. These rows share market moves with Recorded ones, so the sample
+      is overstated; the report says so.
+    * suppression: shadow rows by rejection reason. precision = share that would have LOST
+      (suppression was right); opportunity_loss = share that would have WON (a good alert held back);
+      mean_net / sum_net = net P&L the suppression avoided (negative) or forwent (positive)."""
+    fee, slip = _resolve_costs(None, None)
+    total_cost = (fee * 2 + slip * 2) * 100
+
+    def _summ(rows: List[Row]) -> Dict[str, Any]:
+        n = len(rows)
+        if not n:
+            return {"n": 0}
+        wins = sum(1 for r in rows if r.get("win"))
+        ev, _hk, _wr = ev_and_kelly_for(rows)
+        lo, hi, _p = wilson_ci(wins, n)
+        return {"n": n, "wins": wins, "wr": wins / n, "lo": lo, "hi": hi, "net_ev": ev}
+
+    out: Dict[str, Any] = {"valid": False, "min_n": int(min_n)}
+    cand = [r for r in (candidate_rows or []) if r.get("win") is not None]
+    by_reason: Dict[str, List[Row]] = {}
+    for r in cand:
+        by_reason.setdefault(str(r.get("reason") or "unknown"), []).append(r)
+    out["candidates"] = {k: _summ(v) for k, v in sorted(by_reason.items())}
+    rec_rows = list(real_rows or [])
+    out["recorded"] = _summ(rec_rows)
+    follow = [r for r in cand if r.get("reason") in _FOLLOWABLE_REASONS]
+    if rec_rows and follow:
+        both = _summ(rec_rows + follow)
+        out["followable"] = {**both, "extra_n": len(follow), "gap_ev": both["net_ev"] - out["recorded"]["net_ev"]}
+
+    def _sup(rows: List[Row]) -> Dict[str, Any]:
+        pnls = [row_net_pnl_pct(r, total_cost) for r in rows]
+        n = len(pnls)
+        lost = sum(1 for p in pnls if p <= 0)
+        return {"n": n, "precision": lost / n, "opportunity_loss": 1.0 - lost / n,
+                "mean_net": sum(pnls) / n, "sum_net": sum(pnls)}
+
+    groups: Dict[str, List[Row]] = {}
+    for r in (shadow_rows or []):
+        groups.setdefault(str(r.get("rejection_reason") or "unknown"), []).append(r)
+    out["suppression"] = {k: _sup(v) for k, v in sorted(groups.items())}
+    if shadow_rows:
+        out["suppression_total"] = _sup(list(shadow_rows))
+    out["valid"] = bool(cand or groups)
+    return out

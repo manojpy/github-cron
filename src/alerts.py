@@ -1800,6 +1800,30 @@ _PULLBACK_HOST_KEYS = frozenset({
     "ppohist_buy", "ppohist_sell",
 })
 
+def _posterior_win_rate_verdict(win_rate: float, sample: int, target: float, curve: Optional[Dict[str, Any]]) -> Optional[Tuple[float, str]]:
+    """Posterior-mode pair+key win-rate filter. Returns (win_rate, note) when the alert should
+    be blocked, None when it may go ahead. Blocks only when the stats say the true rate probably
+    misses the target, not merely when a noisy 20-sample point estimate does. A thin pair+key
+    sample borrows strength from the SAME alert key on every pair (the overall rate on its
+    calibration curve): a few pseudo-trades centred on that rate, so a noisy 20 trades neither
+    condemn a good key nor excuse a bad one (WIN_RATE_PRIOR_STRENGTH, 0 = off)."""
+    wins = int(round(win_rate * sample))
+    prior_wr, prior_n = None, 0
+    if cfg.WIN_RATE_PRIOR_STRENGTH > 0 and curve:
+        prior_wr, prior_n = engine.curve_pooled_wr(curve)
+        if prior_n < cfg.WIN_RATE_PRIOR_MIN_POOLED_N:
+            prior_wr = None
+    p_reach = engine.shrunk_prob_wr_at_least(wins, sample - wins, target, prior_wr, cfg.WIN_RATE_PRIOR_STRENGTH)
+    if p_reach >= cfg.WIN_RATE_FILTER_MIN_PROB:
+        return None
+    note = (
+        f"{win_rate:.0%} over {sample} samples, only {p_reach:.0%} chance the "
+        f"true rate reaches {target:.0%} (need >= {cfg.WIN_RATE_FILTER_MIN_PROB:.0%})"
+    )
+    if prior_wr is not None:
+        note += f"; pulled toward this alert's overall {prior_wr:.0%} (n={prior_n})"
+    return win_rate, note
+
 def _fmt_level(n: float) -> str:
     """A price LEVEL with the same precision rule as _format_price (no '$'). `_fmt_num`
     prints one decimal, which turned 0.0382 into '0.0' on cheap pairs."""
@@ -3335,14 +3359,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     if cfg.WIN_RATE_FILTER_MODE == "posterior":
                         # Block only when the stats say the true rate probably misses the
                         # target, not merely when a noisy 20-sample point estimate does.
-                        _wins_n = int(round(win_rate * sample))
-                        _p_reach = engine.prob_wr_at_least(_wins_n, sample - _wins_n, _gate_target)
-                        if _p_reach < cfg.WIN_RATE_FILTER_MIN_PROB:
-                            failing_rate = win_rate
-                            fail_note = (
-                                f"{win_rate:.0%} over {sample} samples, only {_p_reach:.0%} chance the "
-                                f"true rate reaches {_gate_target:.0%} (need >= {cfg.WIN_RATE_FILTER_MIN_PROB:.0%})"
-                            )
+                        _verdict = _posterior_win_rate_verdict(
+                            win_rate, sample, _gate_target, (calibration_curves or {}).get(alert_key))
+                        if _verdict is not None:
+                            failing_rate, fail_note = _verdict
                     elif win_rate < _gate_target:
                         failing_rate = win_rate
                         fail_note = f"{win_rate:.0%} over {sample} samples (need >= {_gate_target:.0%})"
@@ -3746,9 +3766,15 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 DEDUP_STATS["unscored_cooldown"] += len(alerts_to_send)
                 if sink is None:
                     for _t, _e, _k in alerts_to_send:
+                        _cs, _ct, _cv = _confluence_for(_k)
                         await sdb.log_candidate_event(
                             pair_name, _k, "buy" if _k in BUY_ALERT_KEYS else "sell", int(ts_curr),
-                            "ignored_cooldown", {"hit_ts": (record_active or {}).get("hit_ts")})
+                            "ignored_cooldown",
+                            {"hit_ts": (record_active or {}).get("hit_ts"),
+                             "entry_price": float(close_curr) if close_curr else None,
+                             "score": _cs, "total": _ct,
+                             "votes_on": sorted(k for k, v in (_cv or {}).items() if v)})
+
                 return
 
             if cfg.ENABLE_SINGLE_ACTIVE_TRADE:
@@ -3760,12 +3786,17 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     DEDUP_STATS["unscored_open_trade"] += len(alerts_to_send)
                     if sink is None:
                         for _t, _e, _k in alerts_to_send:
+                            _cs, _ct, _cv = _confluence_for(_k)
                             await sdb.log_candidate_event(
                                 pair_name, _k, "buy" if _k in BUY_ALERT_KEYS else "sell", int(ts_curr),
                                 "ignored_open_trade",
                                 {"open_key": (record_active or {}).get("alert_key"),
                                  "open_direction": (record_active or {}).get("direction"),
-                                 "open_entry_ts": (record_active or {}).get("entry_ts")})
+                                 "open_entry_ts": (record_active or {}).get("entry_ts"),
+                                 "entry_price": float(close_curr) if close_curr else None,
+                                 "score": _cs, "total": _ct,
+                                 "votes_on": sorted(k for k, v in (_cv or {}).items() if v)})
+
                     return
 
                 # One trade per pair per candle: the strongest edge represents it.

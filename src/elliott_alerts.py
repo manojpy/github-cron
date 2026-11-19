@@ -1014,7 +1014,8 @@ async def _deliver(selected: List[Tuple[str, WaveSetup]], reference_time: int,
                 pair, alert_key_of(s), s.direction, int(s.signal_ts),
                 "ignored_open_trade" if st == "IGNORED" else "ignored_cooldown",
                 {"open_key": (det or {}).get("alert_key"), "open_direction": (det or {}).get("direction"),
-                 "hit_ts": (det or {}).get("hit_ts")})
+                 "hit_ts": (det or {}).get("hit_ts"),
+                 "entry_price": float(s.entry_price), "score": float(s.score), "total": 100.0})
         stats["delivered"] += len(selected)
         return {s.event_id for _, s in selected}
     queued = await queue_failed_alert(

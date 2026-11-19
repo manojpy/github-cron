@@ -28,6 +28,22 @@ from repair_ledger import (
     control_summary,
 )
 
+def drift_scope_allows_reenable(rec: Dict[str, Any], action_gate: Dict[str, Any], active_drift_keys: Optional[List[str]], read_failed: bool, scope: str) -> bool:
+    """May this re-enable go ahead although the action gate is closed? Only under
+    ACTION_GATE_DRIFT_SCOPE=per_key, only for an 'enable', only when the CUSUM stability layer
+    is the SOLE failing layer, only when the CUSUM state was read, and only when this alert
+    key's own detector has no alarm. Drift on another key says nothing about this one, and one
+    drifted key among 58 would otherwise freeze every re-enable, so suppression could only ever
+    grow. Data, OOS, EV, risk and execution failures still block everything."""
+    return (
+        scope == "per_key"
+        and rec.get("pending_action") == "enable"
+        and action_gate.get("failed_layers") == ["stability"]
+        and not read_failed
+        and not action_gate.get("disabled")
+        and rec.get("alert") not in set(active_drift_keys or ())
+    )
+
 async def build_full_recommendations(self) -> Dict[str, Any]:
     # ── Phase timer — one INFO line per phase so a slow report can be
     # diagnosed from the workflow log without a profiler. Overhead is
@@ -1155,6 +1171,12 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
         # when the system as a whole is doing worst.
         for rec in recommendations:
             if rec.get("pending_auto_action") and rec.get("pending_action") != "disable":
+                if drift_scope_allows_reenable(
+                        rec, action_gate, _active_drift_keys, _cusum_read_failed,
+                        str(getattr(cfg, "ACTION_GATE_DRIFT_SCOPE", "per_key"))):
+                    # Config patches (settings shared by every key) stay frozen above.
+                    rec["message"] += " [action gate: CUSUM alarm is on other keys only, none on this one]"
+                    continue
                 rec["pending_auto_action"] = False
                 rec["message"] += " [BLOCKED by action gate]"
         logger.info(

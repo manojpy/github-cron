@@ -255,6 +255,7 @@ class BrainEngineV2(BrainCore):
         _GATE_KEYS = ("data_quality", "oos_prediction", "profitability",
                       "stability", "risk", "execution")
         gate["actionable"] = all(gate[k] for k in _GATE_KEYS)
+        gate["failed_layers"] = [k for k in _GATE_KEYS if not gate[k]]
         return gate
 
     @staticmethod

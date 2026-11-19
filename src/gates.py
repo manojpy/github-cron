@@ -413,8 +413,11 @@ async def _resolve_pair_outcomes(pair_name, data_15m, i15, sdb, logger_pair):
     if not cfg.ENABLE_WIN_RATE_FILTER:
         return
     await sdb.resolve_pending_outcomes(pair_name, data_15m, i15, logger_pair)
+
     if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
         await sdb.resolve_shadow_pending_outcomes(pair_name, data_15m, i15, logger_pair)
+    # Signals that were sent or seen but never became a trade: graded into their own hash.
+    await sdb.resolve_candidate_outcomes(pair_name, data_15m, i15, logger_pair)
 
 async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, correlation_id: str, reference_time: int, pair_oi: Optional[Dict[str, Any]] = None, resolve_outcomes: bool = True) -> Union[GateResult, Tuple[str, Dict[str, Any]], None]:
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
