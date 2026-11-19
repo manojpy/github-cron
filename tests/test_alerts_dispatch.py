@@ -1960,3 +1960,116 @@ def test_outcome_resolution_pass_also_grades_candidates(monkeypatch):
     monkeypatch.setattr(cfg, "ENABLE_WIN_RATE_FILTER", False, raising=False)
     asyncio.run(gates._resolve_pair_outcomes("X", None, 5, _Sdb(), LOG))
     assert calls == []
+
+# ======================================================================
+# pair-class pool: Recorded outcomes pooled by group of pairs (Part 6)
+# ======================================================================
+def _pool_cfg(monkeypatch, days=60):
+    monkeypatch.setattr(cfg, "COHORT_POOL_WINDOW_DAYS", days, raising=False)
+
+
+def _pool_write(sdb, pair, key, wins, losses, entry_ts):
+    async def go():
+        async with sdb._redis.pipeline() as pipe:
+            for i in range(wins + losses):
+                sdb._cohort_pool_write(pipe, pair, key, i < wins, entry_ts)
+            await pipe.execute()
+    asyncio.run(go())
+
+
+def test_recorded_outcome_also_feeds_the_pair_class_pool(monkeypatch):
+    _pool_cfg(monkeypatch)
+    log, pipes = [], []
+    sdb = _make_store(monkeypatch, log)
+    real = sdb._redis.pipeline
+    sdb._redis.pipeline = lambda: pipes.append(real()) or pipes[-1]
+    _resolve(sdb)
+    ops = [op for p in pipes for op in p.ops]
+    wk = 1_700_000_000 // 604800
+    key = "cohort_pool:large_cap:ppo_cross_up"                    # ETHUSD belongs to the large-cap class
+    assert ("hincrby", (key, f"ETHUSD|w|{wk}", 1)) in ops
+    assert ("expire", (key, (60 + 14) * 86400)) in ops
+    assert not any(op[0] == "hincrby" and str(op[1][0]).startswith("alert_stats_co:") for op in ops)
+    pipes.clear()
+    _pool_cfg(monkeypatch, days=0)
+    sdb2 = _make_store(monkeypatch, [])
+    real2 = sdb2._redis.pipeline
+    sdb2._redis.pipeline = lambda: pipes.append(real2()) or pipes[-1]
+    _resolve(sdb2)
+    assert not any(str(op[1][0]).startswith("cohort_pool:") for p in pipes for op in p.ops if op[0] != "get")   # off = no writes
+
+
+def test_pair_class_prior_leaves_the_asking_pair_out_and_ignores_old_weeks(monkeypatch):
+    _pool_cfg(monkeypatch)
+    sdb, now = _mini_store(), int(time.time())
+    _pool_write(sdb, "ETHUSD", "vwap_buy", 3, 0, now)             # the asking pair itself
+    _pool_write(sdb, "BTCUSD", "vwap_buy", 2, 5, now)             # same class, this week
+    _pool_write(sdb, "SOLUSD", "vwap_buy", 0, 0, now)
+    _pool_write(sdb, "BNBUSD", "vwap_buy", 50, 0, now - 20 * 604800)   # same class but far outside the window
+    _pool_write(sdb, "PIPPINUSD", "vwap_buy", 9, 0, now)          # a different class: its own pool
+    prior = asyncio.run(sdb.batch_get_cohort_priors("ETHUSD", ["vwap_buy", "ppo_sell"]))
+    assert prior["vwap_buy"] == (2 / 7, 7) and prior["ppo_sell"] == (None, 0)     # ETH's 3 wins are not its own prior
+    assert asyncio.run(sdb.batch_get_cohort_priors("BTCUSD", ["vwap_buy"]))["vwap_buy"] == (1.0, 3)   # leave-one-out, the other way
+    assert asyncio.run(sdb.batch_get_cohort_priors("LABUSD", ["vwap_buy"]))["vwap_buy"] == (1.0, 9)    # low-cap pool
+    assert asyncio.run(sdb.batch_get_cohort_priors("SUIUSD", ["vwap_buy"]))["vwap_buy"] == (None, 0)   # mid-cap pool is empty
+    assert asyncio.run(sdb.batch_get_cohort_priors("ETHUSD", [])) == {}
+    edge = _mini_store()                                            # window = 60 days = 9 weeks: week 9 back is in, week 10 back is out
+    _pool_write(edge, "BTCUSD", "k", 4, 0, now - 9 * 604800)
+    _pool_write(edge, "SOLUSD", "k", 0, 8, now - 10 * 604800)
+    assert asyncio.run(edge.batch_get_cohort_priors("ETHUSD", ["k"]))["k"] == (1.0, 4)
+    _pool_cfg(monkeypatch, days=0)
+    assert asyncio.run(sdb.batch_get_cohort_priors("ETHUSD", ["vwap_buy"]))["vwap_buy"] == (None, 0)   # off
+    _pool_cfg(monkeypatch)
+    sdb.degraded = True
+    assert asyncio.run(sdb.batch_get_cohort_priors("ETHUSD", ["vwap_buy"]))["vwap_buy"] == (None, 0)
+    sdb.degraded = False
+
+    def boom(*a, **k):
+        raise RuntimeError("redis down")
+    sdb._redis.pipeline = boom
+    assert asyncio.run(sdb.batch_get_cohort_priors("ETHUSD", ["vwap_buy"]))["vwap_buy"] == (None, 0)   # a failed read never raises
+
+
+def test_pair_class_pool_stays_bounded_and_outside_the_totals_reseed(monkeypatch):
+    _pool_cfg(monkeypatch, days=60)
+    sdb, now = _mini_store(), int(time.time())
+    wk = now // 604800
+    key = "cohort_pool:large_cap:vwap_buy"
+    sdb._redis.d[key] = {f"ETHUSD|w|{wk - 10}": "4", f"ETHUSD|l|{wk - 10}": "2", f"BTCUSD|w|{wk - 10}": "7"}   # 60 days = 9 weeks
+    _pool_write(sdb, "ETHUSD", "vwap_buy", 1, 0, now)
+    h = sdb._redis.d[key]
+    assert f"ETHUSD|w|{wk - 10}" not in h and f"ETHUSD|l|{wk - 10}" not in h    # this pair's week that just left the window is dropped
+    assert h[f"BTCUSD|w|{wk - 10}"] == "7" and h[f"ETHUSD|w|{wk}"] == "1"        # another pair's field is not touched here
+    assert sdb._redis.ttl[key] == 74 * 86400
+    assert not state.RedisKeyPrefix.COHORT_POOL.startswith(state.RedisKeyPrefix.ALERT_STATS)
+    assert not any(k.startswith(state.RedisKeyPrefix.ALERT_STATS) for k in sdb._redis.d)
+
+
+def test_win_rate_filter_helpers_fetch_the_class_prior_and_hand_it_to_the_verdict(monkeypatch):
+    import alerts as alerts_mod
+    calls = []
+
+    class _Sdb:
+        async def batch_get_cohort_priors(self, pair, keys, timeout=3.0):
+            calls.append((pair, list(keys)))
+            return {"vwap_buy": (0.14, 100)}
+
+    for k, v in dict(WIN_RATE_PRIOR_STRENGTH=10.0, WIN_RATE_PRIOR_MIN_POOLED_N=50, COHORT_POOL_WINDOW_DAYS=60,
+                     WIN_RATE_FILTER_MIN_PROB=0.20).items():
+        monkeypatch.setattr(cfg, k, v, raising=False)
+    got = asyncio.run(alerts_mod._fetch_cohort_priors(_Sdb(), "LABUSD", ["vwap_buy", "ppo_sell"]))
+    assert got == {"vwap_buy": (0.14, 100)} and calls == [("LABUSD", ["vwap_buy", "ppo_sell"])]
+    curve = {"vwap_buy": {"buckets": [{"n": 100, "observed": 0.56}]}}          # the key wins 56% overall
+    blocked = alerts_mod._pair_key_verdict("vwap_buy", "LABUSD", 0.40, 20, 0.3933, curve, got)
+    assert blocked is not None and "14% on other low_cap pairs" in blocked[1]     # LABUSD is a low-cap pair
+    assert alerts_mod._pair_key_verdict("vwap_buy", "LABUSD", 0.40, 20, 0.3933, curve, {}) is None   # no class evidence: curve only
+    assert alerts_mod._pair_key_verdict("ppo_sell", "LABUSD", 0.40, 20, 0.3933, curve, got) is None  # another key: its own (empty) prior
+    assert alerts_mod._pair_key_verdict("vwap_buy", "LABUSD", 0.25, 20, 0.3933, curve, {}) is None     # 5/20 rescued by the key's own curve (56%)...
+    assert alerts_mod._pair_key_verdict("ppo_sell", "LABUSD", 0.25, 20, 0.3933, curve, {}) is not None  # ...but not for a key with no curve
+    assert alerts_mod._pair_key_verdict("vwap_buy", "BTCUSD", 0.40, 20, 0.3933, curve, got)[1].count("other large_cap pairs") == 1
+    calls.clear()
+    monkeypatch.setattr(cfg, "COHORT_POOL_WINDOW_DAYS", 0, raising=False)
+    assert asyncio.run(alerts_mod._fetch_cohort_priors(_Sdb(), "LABUSD", ["vwap_buy"])) == {} and not calls     # pool off: no read
+    monkeypatch.setattr(cfg, "COHORT_POOL_WINDOW_DAYS", 60, raising=False)
+    monkeypatch.setattr(cfg, "WIN_RATE_PRIOR_STRENGTH", 0.0, raising=False)
+    assert asyncio.run(alerts_mod._fetch_cohort_priors(_Sdb(), "LABUSD", ["vwap_buy"])) == {} and not calls     # prior off: no read

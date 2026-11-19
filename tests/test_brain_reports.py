@@ -922,3 +922,16 @@ def test_report_shows_the_skipped_signal_block_only_when_there_is_a_study():
     assert "hypothesis veto: n=25, would have lost 80%, would have won 20%" in text
     assert "(thin: under 20)" in text.split("ignored cooldown")[1].splitlines()[0]
     assert "SKIPPED SIGNALS" not in _plain(_report(rows)) 
+
+def test_report_shows_the_pair_class_block_only_when_there_is_a_breakdown():
+    rows = _rows__brain_report_v2(_SPEC)
+    st = {"valid": True, "min_n": 20, "cohorts": {
+        "large_cap": {"n": 90, "wins": 45, "wr": 0.5, "lo": 0.40, "hi": 0.60, "net_ev": 0.4, "pairs": ["BTCUSD", "ETHUSD"]},
+        "low_cap": {"n": 8, "wins": 2, "wr": 0.25, "lo": 0.07, "hi": 0.59, "net_ev": -0.6, "pairs": ["LABUSD"]}}}
+    text = _plain(_report(rows, ai_extra={"cohorts": st}))
+    assert "PAIR CLASSES" in text
+    assert "large cap: n=90, win rate 50% (95% range 40%-60%), net EV +0.40% per trade; 2 pairs" in text
+    assert "(thin: under 20)" in text.split("low cap:")[1].splitlines()[0]
+    assert "(thin: under 20)" not in text.split("large cap:")[1].splitlines()[0]
+    assert text.index("large cap:") < text.index("low cap:")                  # biggest sample first
+    assert "PAIR CLASSES" not in _plain(_report(rows))
