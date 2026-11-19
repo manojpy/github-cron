@@ -1114,6 +1114,8 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
          _data_foundation_lines, (_ai.get("data_foundation"),)),
         ("SKIPPED SIGNALS — what the alerts that were not recorded or were suppressed would have earned",
          _skipped_signal_lines, (_ai.get("skipped_signals"),)),
+        ("PAIR CLASSES — Recorded results by group of pairs",
+         _cohort_lines, (_ai.get("cohorts"),)),
         ("ARCHITECTURE BOUNDARY — research, validation, policy",
          _layer_lines, (_ai.get("layer_audit"), str(getattr(cfg, "LAYER_BOUNDARY_MODE", "report")))),
         ("SELF-GENERATED RULES — proposed, tested, followed forward",
@@ -1567,6 +1569,19 @@ def _skipped_signal_lines(st: Optional[Dict[str, Any]]) -> List[str]:
                 f"  all suppressed: n={t['n']}, would have lost {t['precision']:.0%}, would have won "
                 f"{t['opportunity_loss']:.0%}, net {t['mean_net']:+.2f}% per alert "
                 "(a negative net means the suppression saved money)")
+    return lines
+
+def _cohort_lines(st: Optional[Dict[str, Any]]) -> List[str]:
+    """Plain-text lines for Recorded results by pair class (empty when there is nothing to show)."""
+    if not st or not st.get("valid"):
+        return []
+    min_n = int(st.get("min_n") or 20)
+    lines: List[str] = []
+    for name, s in sorted((st.get("cohorts") or {}).items(), key=lambda kv: -kv[1]["n"]):
+        thin = f" (thin: under {min_n})" if s["n"] < min_n else ""
+        lines.append(
+            f"{name.replace('_', ' ')}: n={s['n']}, win rate {s['wr']:.0%} (95% range {s['lo']:.0%}-{s['hi']:.0%}), "
+            f"net EV {s['net_ev']:+.2f}% per trade{thin}; {len(s['pairs'])} pairs")
     return lines
 
 def _net_ev_audit_lines(a: Optional[Dict[str, Any]]) -> List[str]:

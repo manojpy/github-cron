@@ -356,6 +356,9 @@ class RedisKeyPrefix:
     # CANDIDATE_RESOLVED (a hash per pair); neither is an outcome table.
     CANDIDATE_EVENTS = "candidate_events:"
     CANDIDATE_RESOLVED = "candidate_resolved:"
+    # Recorded outcomes pooled by pair class, in weekly buckets: cohort_pool:<class>:<alert_key>.
+    # Deliberately NOT under "alert_stats:" so the totals reseed cannot count them twice.
+    COHORT_POOL = "cohort_pool:"
     OUTCOME_LOG_STREAM = "outcome_log_stream"
     SHADOW_PENDING = "shadow_pending:"
     SHADOW_STATS = "shadow_stats:"
@@ -1895,7 +1898,7 @@ class RedisStateStore:
             )
             return "failed"
 
-    # ── Vote-count history (OOD gate) ─────────────────────────────────────
+    # ── Vote-count history (OOD gate) ───���─────────────────────────────────
 
     async def record_vote_count(self, alert_key: str, votes: Dict[str, bool]) -> None:
         if self.degraded or not self._redis:
@@ -3051,6 +3054,7 @@ class RedisStateStore:
                         if result.get("outcome_class") == "timeout":
                             write_pipe.hincrby(stats_key, "timeout_wins" if win else "timeouts", 1)
                         write_pipe.expire(stats_key, stats_ttl)
+                        self._cohort_pool_write(write_pipe, pair, str(alert_key), bool(win), entry_ts)
                         if getattr(cfg, "ENABLE_COKEY_STATS_CREDIT", False) and not is_elliott_key(str(alert_key)):
                             # Same candle + same direction = same entry, stop and target = same
                             # result. Credited to a separate hash (see RedisKeyPrefix.ALERT_STATS_CO).
@@ -3562,6 +3566,57 @@ class RedisStateStore:
         except Exception as e:
             logger.warning(f"batch_get_alert_win_rates({pair}) failed for {len(alert_keys)} keys: {e}")
             return {k: (None, 0) for k in alert_keys}
+
+    def _cohort_pool_write(self, pipe: Any, pair: str, alert_key: str, win: bool, entry_ts: Any) -> None:
+        """Queue one Recorded outcome into the pair-class pool (same pipeline as the stats write).
+        One hash per class and alert key; one counter per pair and week, so a read can leave the
+        asking pair out and old weeks fall out of the window. Never touches alert_stats:*."""
+        days = int(getattr(cfg, "COHORT_POOL_WINDOW_DAYS", 0) or 0)
+        if days <= 0:
+            return
+        key = f"{RedisKeyPrefix.COHORT_POOL}{cfg.cohort_of(pair)}:{alert_key}"
+        try:
+            week = int(float(entry_ts)) // 604800 if entry_ts else int(time.time()) // 604800
+        except (TypeError, ValueError):
+            week = int(time.time()) // 604800
+        stale = week - (-(-days // 7)) - 1
+        pipe.hincrby(key, f"{pair}|{'w' if win else 'l'}|{week}", 1)
+        pipe.hdel(key, f"{pair}|w|{stale}", f"{pair}|l|{stale}")
+        pipe.expire(key, (days + 14) * 86400)
+
+    async def batch_get_cohort_priors(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, Tuple[Optional[float], int]]:
+        """Win rate and sample of each alert key on the OTHER pairs of this pair's class, over the
+        pool window. (None, 0) when off, degraded or on a failed read, so callers fall back."""
+        none: Dict[str, Tuple[Optional[float], int]] = {k: (None, 0) for k in alert_keys}
+        days = int(getattr(cfg, "COHORT_POOL_WINDOW_DAYS", 0) or 0)
+        if self.degraded or days <= 0 or not alert_keys:
+            return none
+        try:
+            cohort = cfg.cohort_of(pair)
+            first_week = int(time.time()) // 604800 - (-(-days // 7))
+            async with _rc(self._redis).pipeline(transaction=False) as pipe:
+                for ak in alert_keys:
+                    pipe.hgetall(f"{RedisKeyPrefix.COHORT_POOL}{cohort}:{ak}")
+                raw_all = await asyncio.wait_for(_execute_pipeline(pipe), timeout=timeout)
+            out: Dict[str, Tuple[Optional[float], int]] = {}
+            for ak, data in zip(alert_keys, raw_all):
+                wins = losses = 0
+                for field, val in (data or {}).items():
+                    f = field.decode() if isinstance(field, bytes) else str(field)
+                    p, _, rest = f.partition("|")
+                    kind, _, wk = rest.partition("|")
+                    if p == pair or not wk.lstrip("-").isdigit() or int(wk) < first_week:
+                        continue
+                    if kind == "w":
+                        wins += int(val)
+                    elif kind == "l":
+                        losses += int(val)
+                n = wins + losses
+                out[ak] = (wins / n, n) if n else (None, 0)
+            return out
+        except Exception as e:
+            logger.warning(f"batch_get_cohort_priors({pair}) failed for {len(alert_keys)} keys: {e}")
+            return none
 
     OUTCOME_TOTALS_FIELDS: ClassVar[Tuple[str, ...]] = ("wins", "losses", "timeouts", "timeout_wins")
     OUTCOME_TOTALS_RECONCILE_SEC: ClassVar[int] = 86400

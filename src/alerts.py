@@ -1800,7 +1800,9 @@ _PULLBACK_HOST_KEYS = frozenset({
     "ppohist_buy", "ppohist_sell",
 })
 
-def _posterior_win_rate_verdict(win_rate: float, sample: int, target: float, curve: Optional[Dict[str, Any]]) -> Optional[Tuple[float, str]]:
+def _posterior_win_rate_verdict(win_rate: float, sample: int, target: float, curve: Optional[Dict[str, Any]],
+                                cohort_prior: Optional[Tuple[Optional[float], int]] = None,
+                                cohort_name: str = "") -> Optional[Tuple[float, str]]:
     """Posterior-mode pair+key win-rate filter. Returns (win_rate, note) when the alert should
     be blocked, None when it may go ahead. Blocks only when the stats say the true rate probably
     misses the target, not merely when a noisy 20-sample point estimate does. A thin pair+key
@@ -1808,11 +1810,17 @@ def _posterior_win_rate_verdict(win_rate: float, sample: int, target: float, cur
     calibration curve): a few pseudo-trades centred on that rate, so a noisy 20 trades neither
     condemn a good key nor excuse a bad one (WIN_RATE_PRIOR_STRENGTH, 0 = off)."""
     wins = int(round(win_rate * sample))
-    prior_wr, prior_n = None, 0
-    if cfg.WIN_RATE_PRIOR_STRENGTH > 0 and curve:
-        prior_wr, prior_n = engine.curve_pooled_wr(curve)
-        if prior_n < cfg.WIN_RATE_PRIOR_MIN_POOLED_N:
-            prior_wr = None
+    prior_wr, prior_n, prior_src = None, 0, "overall"
+    if cfg.WIN_RATE_PRIOR_STRENGTH > 0:
+        # Most specific first: this alert on the OTHER pairs of this pair's class, then this
+        # alert on every pair. Each needs WIN_RATE_PRIOR_MIN_POOLED_N outcomes behind it.
+        if cohort_prior and cohort_prior[0] is not None and cohort_prior[1] >= cfg.WIN_RATE_PRIOR_MIN_POOLED_N:
+            prior_wr, prior_n = float(cohort_prior[0]), int(cohort_prior[1])
+            prior_src = f"on other {cohort_name or 'class'} pairs"
+        elif curve:
+            prior_wr, prior_n = engine.curve_pooled_wr(curve)
+            if prior_n < cfg.WIN_RATE_PRIOR_MIN_POOLED_N:
+                prior_wr = None
     p_reach = engine.shrunk_prob_wr_at_least(wins, sample - wins, target, prior_wr, cfg.WIN_RATE_PRIOR_STRENGTH)
     if p_reach >= cfg.WIN_RATE_FILTER_MIN_PROB:
         return None
@@ -1821,8 +1829,24 @@ def _posterior_win_rate_verdict(win_rate: float, sample: int, target: float, cur
         f"true rate reaches {target:.0%} (need >= {cfg.WIN_RATE_FILTER_MIN_PROB:.0%})"
     )
     if prior_wr is not None:
-        note += f"; pulled toward this alert's overall {prior_wr:.0%} (n={prior_n})"
+        _lab = f"overall {prior_wr:.0%}" if prior_src == "overall" else f"{prior_wr:.0%} {prior_src}"
+        note += f"; pulled toward this alert's {_lab} (n={prior_n})"
     return win_rate, note
+
+async def _fetch_cohort_priors(sdb: Any, pair_name: str, alert_keys: List[str]) -> Dict[str, Tuple[Optional[float], int]]:
+    """This alert's win rate on the other pairs of the pair's class, per alert key. Skipped (empty)
+    when the prior is off (WIN_RATE_PRIOR_STRENGTH = 0) or the pool is off (COHORT_POOL_WINDOW_DAYS = 0)."""
+    if cfg.WIN_RATE_PRIOR_STRENGTH > 0 and cfg.COHORT_POOL_WINDOW_DAYS > 0:
+        return await sdb.batch_get_cohort_priors(pair_name, alert_keys, timeout=3.0)
+    return {}
+
+def _pair_key_verdict(alert_key: str, pair_name: str, win_rate: float, sample: int, target: float,
+                      calibration_curves: Optional[Dict[str, Any]],
+                      cohort_priors: Dict[str, Tuple[Optional[float], int]]) -> Optional[Tuple[float, str]]:
+    """Win-rate verdict for one alert key on one pair, with that key's curve and class prior."""
+    return _posterior_win_rate_verdict(
+        win_rate, sample, target, (calibration_curves or {}).get(alert_key),
+        cohort_priors.get(alert_key), cfg.cohort_of(pair_name))
 
 def _fmt_level(n: float) -> str:
     """A price LEVEL with the same precision rule as _format_price (no '$'). `_fmt_num`
@@ -3347,6 +3371,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             win_rate_map = await sdb.batch_get_alert_win_rates(
                 pair_name, alert_keys_to_check, timeout=3.0
             )
+            cohort_prior_map = await _fetch_cohort_priors(sdb, pair_name, alert_keys_to_check)
             current_session = _get_session_from_ts(ts_curr) if getattr(cfg, "ENABLE_SESSION_FILTER", False) else None
             surviving_alerts = []
           
@@ -3359,8 +3384,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     if cfg.WIN_RATE_FILTER_MODE == "posterior":
                         # Block only when the stats say the true rate probably misses the
                         # target, not merely when a noisy 20-sample point estimate does.
-                        _verdict = _posterior_win_rate_verdict(
-                            win_rate, sample, _gate_target, (calibration_curves or {}).get(alert_key))
+                        _verdict = _pair_key_verdict(
+                            alert_key, pair_name, win_rate, sample, _gate_target, calibration_curves, cohort_prior_map)
                         if _verdict is not None:
                             failing_rate, fail_note = _verdict
                     elif win_rate < _gate_target:

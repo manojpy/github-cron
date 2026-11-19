@@ -165,6 +165,15 @@ class BotConfig(BaseModel):
     WIN_RATE_PRIOR_STRENGTH: float = Field(default=10.0, ge=0.0, le=100.0, description="posterior mode: a pair+key sample borrows strength from the SAME alert key on every pair (its calibration-curve win rate), worth this many pseudo-trades. A noisy 20-trade sample then neither condemns a good key nor excuses a bad one. 0 = no borrowing (flat prior, the earlier behaviour)")
     WIN_RATE_PRIOR_MIN_POOLED_N: int = Field(default=50, ge=10, le=2000, description="The overall win rate of an alert key is used as the prior only when its calibration curve rests on at least this many outcomes")
     ACTION_GATE_DRIFT_SCOPE: str = Field(default="per_key", pattern="^(global|per_key)$", description="What a CUSUM edge-decay alarm freezes. global = any alarm closes the action gate for everything (config patches AND re-enables). per_key = when the CUSUM layer is the ONLY failing layer, re-enabling an alert key whose own detector has no alarm may proceed; config patches stay frozen either way (they change settings shared by every key), and every other layer still blocks")
+    PAIR_COHORTS: Dict[str, List[str]] = Field(
+        default_factory=lambda: {
+            "large_cap": ["BTCUSD", "ETHUSD", "BNBUSD", "SOLUSD", "XRPUSD", "ADAUSD", "AVAXUSD", "LINKUSD", "DOTUSD", "LTCUSD", "BCHUSD"],
+            "mid_cap": ["SUIUSD", "AAVEUSD", "ARBUSD", "WLDUSD", "ZECUSD"],
+            "gold_token": ["PAXGUSD", "XAUTUSD"],
+            "low_cap": ["PIPPINUSD", "RIVERUSD", "BLESSUSD", "BASEDUSD", "SKYAIUSD", "HUSD", "EDENUSD", "LABUSD", "KITEUSD", "VVVUSD", "BEATUSD", "BILLUSD"],
+        },
+        description="Pair classes used to pool evidence: pairs in one class behave alike enough that an alert key's results on the OTHER pairs of the class are a fair starting guess for this pair. Any pair not listed falls in class 'other'. Edit freely; the pools are keyed by class name, so renaming or moving a pair starts that pool afresh")
+    COHORT_POOL_WINDOW_DAYS: int = Field(default=60, ge=0, le=365, description="Per-class results of each alert key are kept for this many days (in weekly buckets, so old regimes drop out) and used as the win-rate prior when the pair's own sample is thin. 0 = off (the win-rate prior then comes only from the alert key's overall calibration curve)")
     BRAIN_REWARDABLE_REQUIRE_PROVEN_EDGE: bool = Field(default=True, description="A rewardable override additionally needs the Wilson 95% LOWER bound of the high-confluence shadow win rate to be at or above the cost-aware break-even win rate, so 10 lucky shadow samples cannot override a recorded-trade block")
     LEARNER_STALE_NOTICE_HOURS: float = Field(default=12.0, ge=0.0, le=168.0, description="Send one Telegram notice per this many hours while the learner playbook is older than PLAYBOOK_MAX_AGE_HOURS or missing (both live vetoes fail open then). 0 = off")
     ENABLE_COKEY_STATS_CREDIT: bool = Field(default=False, description="When one alert key is recorded as the trade for a pair and candle (ENABLE_SINGLE_ACTIVE_TRADE), also credit its resolved win or loss to every SAME-DIRECTION key that fired on that candle, in a separate hash (alert_stats_co:). Their entry, stop and target are identical, so the outcome is theirs too. Read by the pair+key win-rate filter only; Recorded totals, the stream and the archive still count the trade once")
@@ -827,6 +836,13 @@ class BotConfig(BaseModel):
         stop_pct = max(float(self.OUTCOME_MAE_LOSS_PCT), 1e-6)
         cost_r = 2.0 * (float(self.BRAIN_FEE_PCT) + float(self.BRAIN_SLIPPAGE_PCT)) * 100.0 / stop_pct
         return min(0.95, max(0.05, (1.0 + cost_r) / (1.0 + float(self.OUTCOME_RR_TARGET))))
+
+    def cohort_of(self, pair: str) -> str:
+        """Name of the pair class a pair belongs to (see PAIR_COHORTS); 'other' when unlisted."""
+        for name, members in self.PAIR_COHORTS.items():
+            if pair in members:
+                return str(name)
+        return "other"
 
     def gate_target_wr(self) -> float:
         """Win-rate target for the live gates (see GATE_TARGET_MODE)."""

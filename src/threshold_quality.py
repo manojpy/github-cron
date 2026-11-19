@@ -1187,6 +1187,25 @@ def trade_quality_score(
 
     return result
 
+def cohort_breakdown(real_rows: List[Row], cohort_of: Any, min_n: int = 20) -> Dict[str, Any]:
+    """Recorded results grouped by pair class (cohort_of maps a pair to its class name): sample,
+    win rate with a Wilson interval, net EV and the pairs seen. Report only; it shows whether
+    the classes you defined actually behave differently."""
+    groups: Dict[str, List[Row]] = {}
+    for r in (real_rows or []):
+        if r.get("win") is None or not r.get("pair"):
+            continue
+        groups.setdefault(str(cohort_of(str(r["pair"]))), []).append(r)
+    out: Dict[str, Any] = {"valid": bool(groups), "min_n": int(min_n), "cohorts": {}}
+    for name, rows in sorted(groups.items()):
+        n = len(rows)
+        wins = sum(1 for r in rows if r.get("win"))
+        ev, _hk, _wr = ev_and_kelly_for(rows)
+        lo, hi, _p = wilson_ci(wins, n)
+        out["cohorts"][name] = {"n": n, "wins": wins, "wr": wins / n, "lo": lo, "hi": hi, "net_ev": ev,
+                                "pairs": sorted({str(r["pair"]) for r in rows})}
+    return out
+
 # Sent-but-not-recorded reasons: the alert reached Telegram, so a follower could have taken it.
 _FOLLOWABLE_REASONS = ("ignored_open_trade", "ignored_cooldown")
 

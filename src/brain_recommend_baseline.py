@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from bot_config import cfg, json_dumps, json_loads, CONFLUENCE_WEIGHTS
 from state import _rc
 import threshold_engine as engine
-from threshold_quality import gate_shadow_comparison, prediction_track_record, future_edge_track_record, skipped_signal_study
+from threshold_quality import gate_shadow_comparison, prediction_track_record, future_edge_track_record, skipped_signal_study, cohort_breakdown
 from feature_store import dataset_coverage
 from plan_replay import volatility_plan_study
 from hypothesis_gen import shadow_pool_rows, update_hypothesis_pool
@@ -1195,6 +1195,17 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                 ai_metrics["skipped_signals"] = _study
     except Exception as e:
         audit.record_analysis_exception("skipped_signals", e)
+
+    # ── Results by pair class (report only). ──
+    try:
+        _coh = cohort_breakdown(
+            list(real_rows), cfg.cohort_of,
+            min_n=int(getattr(cfg, "BRAIN_AUTO_DISABLE_MIN_SAMPLE", 200)) // 10,
+        )
+        if _coh.get("valid"):
+            ai_metrics["cohorts"] = _coh
+    except Exception as e:
+        audit.record_analysis_exception("cohorts", e)
 
     # ── Net-EV audit: does the market-state model beat simple chronological
     # rules in net P&L on newer, unseen trades? Report-only. ──
