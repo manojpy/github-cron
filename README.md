@@ -248,6 +248,7 @@ This line is logged on every run (every 15 minutes) and is also included in the 
 - A new shadow registration does not change the total until it resolves, which can take up to 12 candles. `Pre-scanned N shadow pending outcome(s)` at run start shows how many are still open.
 - With `ENABLE_SINGLE_ACTIVE_SHADOW` (on) there is one open shadow per pair: the strongest blocked key represents the candle and later signals are skipped (and logged as `skipped_active` candidate rows). Recorded and Shadowed rows are still chosen differently (Recorded: highest estimated net EV; Shadowed: highest confluence ratio), so their win rates are not directly comparable.
 - Several shadow gates only activate once enough history exists: the win-rate filter needs `MIN_WIN_RATE_SAMPLE` resolved trades per pair and alert key, calibration needs curves from past outcomes, and the OOD gate needs `OOD_MIN_HISTORY` vote-count samples. Until then the confluence gate is the main source of shadow trades.
+- A thin pair+key win rate is judged against a prior: the same alert key on the OTHER pairs of this pair's class (`PAIR_COHORTS`, results kept in weekly buckets in `cohort_pool:<class>:<alert_key>` for `COHORT_POOL_WINDOW_DAYS`), falling back to the alert key's overall rate on every pair. The Brain report's "PAIR CLASSES" block shows Recorded results per class so you can check the classes behave differently.
 
 ---
 
