@@ -909,3 +909,16 @@ def test_preloads_overlap_collect_reraise_and_fall_back_inline():
         assert await P.take("late", lambda: slow("inline-late")) == "inline-late"
 
     asyncio.run(scenario())
+
+def test_report_shows_the_skipped_signal_block_only_when_there_is_a_study():
+    rows = _rows__brain_report_v2(_SPEC)
+    st = {"valid": True, "min_n": 20,
+          "recorded": {"n": 90, "wins": 36, "wr": 0.4, "lo": 0.31, "hi": 0.50, "net_ev": 0.05},
+          "candidates": {"ignored_cooldown": {"n": 4, "wins": 3, "wr": 0.75, "lo": 0.30, "hi": 0.95, "net_ev": 1.2}},
+          "suppression": {"hypothesis_veto": {"n": 25, "precision": 0.8, "opportunity_loss": 0.2,
+                                              "mean_net": -0.5, "sum_net": -12.5}}}
+    text = _plain(_report(rows, ai_extra={"skipped_signals": st}))
+    assert "SKIPPED SIGNALS" in text
+    assert "hypothesis veto: n=25, would have lost 80%, would have won 20%" in text
+    assert "(thin: under 20)" in text.split("ignored cooldown")[1].splitlines()[0]
+    assert "SKIPPED SIGNALS" not in _plain(_report(rows)) 

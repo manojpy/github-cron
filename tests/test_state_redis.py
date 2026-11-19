@@ -536,6 +536,9 @@ def test_new_key_families_are_audited_and_need_a_ttl():
     # co-key credit hashes and candidate-only rows are expiring families, not orphans
     assert ra.classify_key("alert_stats_co:BTCUSD:vwap_buy") == ("alert_stats_co", "ttl_required")
     assert ra.classify_key("candidate_events:XAUTUSD") == ("candidate_events", "ttl_required")
+    assert ra.classify_key("candidate_resolved:XAUTUSD") == ("candidate_resolved", "ttl_required")
     assert ra.classify_key("alert_stats:BTCUSD:vwap_buy")[0] == "alert_stats"        # longest prefix still wins
     rep = ra.summarize([_rec("candidate_events:XAUTUSD", -1), _rec("alert_stats_co:BTCUSD:k", DAY)])
     assert {(f["kind"], f["family"]) for f in rep["findings"]} == {("NO_TTL_LEAK", "candidate_events")}
+    rep = ra.summarize([_rec("candidate_resolved:XAUTUSD", -1), _rec("candidate_resolved:ETHUSD", 30 * DAY)])
+    assert {(f["kind"], f["family"]) for f in rep["findings"]} == {("NO_TTL_LEAK", "candidate_resolved")}

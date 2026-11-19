@@ -1491,6 +1491,15 @@ class _MiniRedis:
             return int(h[a[1]])
         if name == "hgetall":
             return dict(d.get(a[0], {}))
+        if name == "hset":
+            d.setdefault(a[0], {})[a[1]] = a[2]
+            return 1
+        if name == "hdel":
+            return sum(d.get(a[0], {}).pop(f, None) is not None for f in a[1:])
+        if name == "hkeys":
+            return list(d.get(a[0], {}))
+        if name == "hlen":
+            return len(d.get(a[0], {}))
         raise NotImplementedError(name)
 
     def __getattr__(self, name):
@@ -1638,6 +1647,7 @@ def test_elliott_delivers_a_blocked_alert_labelled_and_does_not_record_it(monkey
     assert any("ETHUSD:elliott_wave3_buy" in k for k in pend)               # free pair: recorded
     rows = _candidates(sdb, "XAUTUSD")
     assert rows and rows[0]["reason"] == "ignored_open_trade" and rows[0]["open_key"] == "pivot_x"
+    assert rows[0]["entry_price"] == 3833.9 and rows[0]["score"] == 93.0 and rows[0]["total"] == 100.0   # gradable later
     assert _candidates(sdb, "ETHUSD") == []
 
 
@@ -1669,6 +1679,7 @@ def test_shadow_overlap_recorded_active_and_skipped_active_rows(monkeypatch):
     res2 = asyncio.run(sdb.record_shadow_pending_outcome("ADAUSD", mkey, "sell", T_OPEN + 1800, 1.0, 5.0, 10.0, None, {}))
     ev = _candidates(sdb, "ADAUSD")
     assert res2 == "skipped_active" and ev and ev[0]["reason"] == "skipped_active"
+    assert ev[0]["entry_price"] == 1.0 and ev[0]["score"] == 5.0 and ev[0]["total"] == 10.0 and ev[0]["votes_on"] == []
     assert not any(k.endswith(str(T_OPEN + 1800)) for k in sdb._redis.d if k.startswith(state.RedisKeyPrefix.SHADOW_PENDING))
     # candidate rows are capped and can be switched off
     monkeypatch.setattr(cfg, "CANDIDATE_LOG_MAX_PER_PAIR", 2, raising=False)
@@ -1816,3 +1827,136 @@ def test_dedup_summary_reports_delivered_but_unscored_alerts():
     assert "not scored" not in A.format_dedup_summary(dict(base))
     line = A.format_dedup_summary({**base, "unscored_open_trade": 2, "unscored_cooldown": 1})
     assert "delivered but not scored: trade open 2, cooldown 1" in line
+
+# ======================================================================
+# graded candidate rows: signals that were sent or seen but never recorded
+# ======================================================================
+def _cand_cfg(monkeypatch):
+    for k, v in dict(ENABLE_BRAIN=True, CANDIDATE_LOG_MAX_PER_PAIR=300, CANDIDATE_RESOLVE_OUTCOMES=True,
+                     OUTCOME_MAE_LOSS_PCT=1.0, OUTCOME_RR_TARGET=2.0, OUTCOME_LOOKAHEAD_CANDLES=12,
+                     OUTCOME_FILL_DELAY_CANDLES=1, BRAIN_FEE_PCT=0.0006, BRAIN_SLIPPAGE_PCT=0.0003,
+                     OUTCOME_COST_MODEL="flat").items():
+        monkeypatch.setattr(cfg, k, v, raising=False)
+
+
+def _cand_candles(n=40, hit_at=8):
+    """Flat market at 100; candle `hit_at` spikes to 102.5 (a buy's +2% target, a sell's +1% stop)."""
+    t0 = int(time.time()) - 3 * 86400
+    ts = np.array([t0 + i * 900 for i in range(n)], dtype=np.int64)
+    high = np.full(n, 100.3)
+    high[hit_at] = 102.5
+    data = PriceData(ts=ts, open=np.full(n, 100.0), high=high, low=np.full(n, 99.8),
+                     close=np.full(n, 100.0), volume=np.ones(n))
+    return data, int(ts[5])
+
+
+def _cand_log(sdb, pair, key, direction, ts, reason, **extra):
+    asyncio.run(sdb.log_candidate_event(pair, key, direction, ts, reason, extra))
+
+
+def _cand_grade(sdb, pair, data, i15):
+    asyncio.run(sdb.resolve_candidate_outcomes(pair, data, i15, LOG))
+
+
+def _cand_store(monkeypatch):
+    _cand_cfg(monkeypatch)
+    data, ets = _cand_candles()
+    sdb = _mini_store()
+    px = dict(entry_price=100.0, score=20.0, total=30.0, votes_on=["a", "b"])
+    _cand_log(sdb, "XAUTUSD", "vwap_buy", "buy", ets, "ignored_open_trade", **px)
+    _cand_log(sdb, "XAUTUSD", "vwap_buy", "buy", ets, "ignored_cooldown", **px)       # same alert logged twice
+    _cand_log(sdb, "XAUTUSD", "ppo_sell", "sell", ets, "ignored_cooldown", **px)
+    _cand_log(sdb, "XAUTUSD", "pullback_watch", "buy", ets, "watch_suppressed_open_trade")   # no entry price
+    return sdb, data, ets
+
+
+def test_candidate_rows_are_graded_once_and_only_after_the_horizon(monkeypatch):
+    sdb, data, ets = _cand_store(monkeypatch)
+    done = f"{state.RedisKeyPrefix.CANDIDATE_RESOLVED}XAUTUSD"
+    _cand_grade(sdb, "XAUTUSD", data, 17)                       # fill candle 6 + 12 = 18: not ready yet
+    assert done not in sdb._redis.d
+    _cand_grade(sdb, "XAUTUSD", data, 18)
+    h = sdb._redis.d[done]
+    assert sorted(h) == [f"ppo_sell|{ets}", f"vwap_buy|{ets}"]  # the duplicate and the WATCH row are not graded
+    buy, sell = json.loads(h[f"vwap_buy|{ets}"]), json.loads(h[f"ppo_sell|{ets}"])
+    assert buy["win"] is True and buy["outcome_reason"] == "target_hit" and buy["net_pnl_pct"] == pytest.approx(1.82)
+    assert sell["win"] is False and sell["outcome_reason"] == "stop_hit" and sell["net_pnl_pct"] == pytest.approx(-1.18)
+    assert buy["reason"] == "ignored_cooldown" and buy["votes_on"] == ["a", "b"] and buy["score"] == 20.0
+    assert sdb._redis.ttl[done] == 30 * 86400
+    h[f"vwap_buy|{ets}"] = "MARKER"                              # a re-grade would overwrite this
+    before = dict(h)
+    _cand_grade(sdb, "XAUTUSD", data, 18)                       # a second pass grades nothing again
+    assert sdb._redis.d[done] == before and sdb._redis.d[done][f"vwap_buy|{ets}"] == "MARKER"
+
+
+def test_candidate_grading_touches_nothing_else_and_can_be_switched_off(monkeypatch):
+    sdb, data, ets = _cand_store(monkeypatch)
+    _cand_log(sdb, "XAUTUSD", "vwap_buy", "buy", ets + 1, "ignored_open_trade", entry_price=100.0)   # not a candle time
+    _cand_grade(sdb, "XAUTUSD", data, 18)
+    assert set(sdb._redis.d) == {f"{state.RedisKeyPrefix.CANDIDATE_EVENTS}XAUTUSD",
+                                 f"{state.RedisKeyPrefix.CANDIDATE_RESOLVED}XAUTUSD"}   # no stream, totals or stats
+    done = f"{state.RedisKeyPrefix.CANDIDATE_RESOLVED}XAUTUSD"
+    assert f"vwap_buy|{ets + 1}" not in sdb._redis.d[done]
+    old = int(time.time()) - 40 * 86400
+    sdb._redis.d[done][f"old_key|{old}"] = "{}"
+    _cand_grade(sdb, "XAUTUSD", data, 18)
+    assert f"old_key|{old}" not in sdb._redis.d[done]            # ids older than 30 days are pruned
+    rows = asyncio.run(sdb.load_candidate_resolved())
+    assert sorted(r["alert_key"] for r in rows) == ["ppo_sell", "vwap_buy"]
+    _cand_log(sdb, "XAUTUSD", "late_buy", "buy", ets + 900, "ignored_cooldown", entry_price=100.0)
+    _cand_grade(sdb, "XAUTUSD", data, 19)                        # one candle later: this one is ready too
+    assert [r["alert_key"] for r in asyncio.run(sdb.load_candidate_resolved(limit=1))] == ["late_buy"]   # newest first
+    sdb.degraded = True
+    assert asyncio.run(sdb.load_candidate_resolved()) is None    # a failed read is never "no data"
+    sdb.degraded = False
+
+    async def _boom(*a, **k):
+        raise RuntimeError("redis down")
+        yield                                                    # pragma: no cover
+    sdb._redis.scan_iter = _boom
+    assert asyncio.run(sdb.load_candidate_resolved()) is None    # an error mid-read is not "no data" either
+    off, data2, _e = _cand_store(monkeypatch)
+    monkeypatch.setattr(cfg, "CANDIDATE_RESOLVE_OUTCOMES", False, raising=False)
+    _cand_grade(off, "XAUTUSD", data2, 18)
+    assert f"{state.RedisKeyPrefix.CANDIDATE_RESOLVED}XAUTUSD" not in off._redis.d
+
+
+def test_candidate_grading_is_capped_per_pass_and_skips_unpriced_rows(monkeypatch):
+    sdb, data, ets = _cand_store(monkeypatch)
+    for i in range(60):
+        _cand_log(sdb, "XAUTUSD", f"k{i}", "buy", ets, "ignored_cooldown", entry_price=100.0)
+    _cand_log(sdb, "XAUTUSD", "free_lunch", "buy", ets, "ignored_cooldown", entry_price=0.0)
+    done = f"{state.RedisKeyPrefix.CANDIDATE_RESOLVED}XAUTUSD"
+    _cand_grade(sdb, "XAUTUSD", data, 18)
+    assert len(sdb._redis.d[done]) == 50                         # at most 50 rows per pass
+    _cand_grade(sdb, "XAUTUSD", data, 18)
+    assert len(sdb._redis.d[done]) == 62                         # the rest (2 + 60 priced rows) follow on the next pass
+    assert f"free_lunch|{ets}" not in sdb._redis.d[done]         # a zero entry price is never graded
+
+
+def test_outcome_resolution_pass_also_grades_candidates(monkeypatch):
+    import gates
+    calls = []
+
+    class _Sdb:
+        async def resolve_pending_outcomes(self, *a):
+            calls.append("real")
+
+        async def resolve_shadow_pending_outcomes(self, *a):
+            calls.append("shadow")
+
+        async def resolve_candidate_outcomes(self, *a):
+            calls.append("candidate")
+
+    for k, v in dict(ENABLE_WIN_RATE_FILTER=True, ENABLE_BRAIN=True, BRAIN_SHADOW_MODE=True).items():
+        monkeypatch.setattr(cfg, k, v, raising=False)
+    asyncio.run(gates._resolve_pair_outcomes("X", None, 5, _Sdb(), LOG))
+    assert calls == ["real", "shadow", "candidate"]
+    calls.clear()
+    monkeypatch.setattr(cfg, "BRAIN_SHADOW_MODE", False, raising=False)
+    asyncio.run(gates._resolve_pair_outcomes("X", None, 5, _Sdb(), LOG))
+    assert calls == ["real", "candidate"]
+    calls.clear()
+    monkeypatch.setattr(cfg, "ENABLE_WIN_RATE_FILTER", False, raising=False)
+    asyncio.run(gates._resolve_pair_outcomes("X", None, 5, _Sdb(), LOG))
+    assert calls == []

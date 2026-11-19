@@ -1303,4 +1303,139 @@ def test_online_model_is_served_only_after_promotion():
     assert m["beta"] == st["beta"] and m["beta"] is not st["beta"]
     assert online_model_for_serving(dict(st, beta=[0.0, 1.0])) is None            # length mismatch: refuse
 
+# ======================================================================
+# win-rate prior, drift scope, skipped-signal study (Part 5)
+# ======================================================================
+def _beta_sf(a, b, t, n=40000):
+    """P(p >= t) for Beta(a, b), by Simpson integration of the density (independent of the code under test)."""
+    import math
+    lg = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+
+    def f(x):
+        return 0.0 if x <= 0 or x >= 1 else math.exp(lg + (a - 1) * math.log(x) + (b - 1) * math.log1p(-x))
+
+    h = (1 - t) / n
+    s = f(t) + f(1 - 1e-12) + sum((4 if i % 2 else 2) * f(t + i * h) for i in range(1, n))
+    return s * h / 3
+
+
+def test_shrunk_posterior_matches_numerical_integration_and_pulls_toward_the_pool():
+    t = 0.3933
+    flat = engine.shrunk_prob_wr_at_least(7, 13, t)
+    assert flat == engine.prob_wr_at_least(7, 13, t) == pytest.approx(_beta_sf(8, 14, t), abs=1e-6)
+    assert engine.shrunk_prob_wr_at_least(7, 13, t, 0.26, 0.0) == flat      # zero strength: no borrowing
+    assert engine.shrunk_prob_wr_at_least(7, 13, t, None, 10.0) == flat     # no pooled rate: no borrowing
+    bad = engine.shrunk_prob_wr_at_least(7, 13, t, 0.26, 10.0)              # 3 wins + 7 losses of pseudo-trades
+    good = engine.shrunk_prob_wr_at_least(7, 13, t, 0.56, 10.0)             # 6 wins + 4 losses
+    assert bad == pytest.approx(_beta_sf(10, 20, t), abs=1e-6) and good == pytest.approx(_beta_sf(13, 17, t), abs=1e-6)
+    assert bad < flat < good
+    # A key that almost never wins (3%): the win pseudo-count rounds to 0 but is floored at 1 (the flat Beta(1, 1)
+    # minimum), so 3 wins + 7 losses become Beta(4, 17). A zero floor would drop one real win from the count.
+    assert engine.shrunk_prob_wr_at_least(3, 7, t, 0.03, 10.0) == pytest.approx(_beta_sf(4, 17, t), abs=1e-6)
+    # The live decision: 8 wins in 20 (40%) passes the 20% bar alone, but not for a key that wins 14% overall.
+    assert engine.shrunk_prob_wr_at_least(8, 12, t) >= 0.20 > engine.shrunk_prob_wr_at_least(8, 12, t, 0.14, 10.0)
+
+
+def test_curve_pooled_wr_reads_the_whole_key_not_one_bucket():
+    assert engine.curve_pooled_wr({"buckets": [{"n": 40, "observed": 0.5}, {"n": 60, "observed": 0.3}]}) == (
+        pytest.approx(0.38), 100)
+    for bad in (None, {}, {"buckets": []}, {"buckets": [{"n": 0, "observed": 0.5}]}, {"buckets": [{"n": "x"}]}):
+        assert engine.curve_pooled_wr(bad) == (None, 0)
+
+
+def test_action_gate_lists_failed_layers_and_per_key_scope_for_reenables(monkeypatch):
+    from brain_recommend_full import drift_scope_allows_reenable as ok
+    assert _gate(monkeypatch)["failed_layers"] == []
+    assert _gate(monkeypatch, active_drift_keys=["a"])["failed_layers"] == ["stability"]
+    assert _gate(monkeypatch, oos=0.5, active_drift_keys=["a"])["failed_layers"] == ["oos_prediction", "stability"]
+    gate = {"failed_layers": ["stability"]}
+    rec = {"pending_action": "enable", "alert": "vwap_buy"}
+    assert ok(rec, gate, ["other_key"], False, "per_key") is True            # drift elsewhere only
+    assert ok(rec, gate, ["vwap_buy"], False, "per_key") is False            # its own alarm still blocks
+    assert ok(rec, gate, ["other_key"], False, "global") is False            # old behaviour
+    assert ok(rec, {"failed_layers": ["stability", "risk"]}, [], False, "per_key") is False   # another layer failed
+    assert ok(rec, {"failed_layers": ["oos_prediction"]}, [], False, "per_key") is False
+    assert ok(rec, gate, ["other_key"], True, "per_key") is False            # CUSUM state unreadable: stay closed
+    assert ok(dict(rec, pending_action="disable"), gate, [], False, "per_key") is False
+    assert ok({"alert": "vwap_buy"}, gate, [], False, "per_key") is False         # no pending action at all
+    assert ok(rec, dict(gate, disabled=True), [], False, "per_key") is False
+    assert ok(rec, gate, None, False, "per_key") is True
+
+
+def _sig(win, reason=None, rej=None):
+    r = {"win": win, "outcome_reason": "target_hit" if win else "stop_hit", "pct_move": 2.0 if win else -1.0}
+    if reason:
+        r["reason"] = reason
+    if rej:
+        r["rejection_reason"] = rej
+    return r
+
+
+def test_skipped_signal_study_precision_opportunity_loss_and_followable_gap(monkeypatch):
+    from threshold_quality import skipped_signal_study
+    _sc_cfg(monkeypatch)                                          # 1% stop, RR 2, 0.18% costs: +1.82 / -1.18
+    real = [_sig(True)] * 3 + [_sig(False)] * 7
+    shadow = [_sig(True, rej="hypothesis_veto")] * 2 + [_sig(False, rej="hypothesis_veto")] * 8
+    cand = [_sig(True, "ignored_cooldown"), _sig(False, "ignored_open_trade"), _sig(True, "skipped_active")]
+    st = skipped_signal_study(real, shadow, cand, min_n=20)
+    sup = st["suppression"]["hypothesis_veto"]
+    assert sup["n"] == 10 and sup["precision"] == pytest.approx(0.8) and sup["opportunity_loss"] == pytest.approx(0.2)
+    assert sup["mean_net"] == pytest.approx((2 * 1.82 - 8 * 1.18) / 10)
+    assert st["suppression_total"]["n"] == 10
+    assert st["recorded"]["net_ev"] == pytest.approx((3 * 1.82 - 7 * 1.18) / 10)
+    fo = st["followable"]                                         # skipped_active is NOT something a follower saw
+    assert fo["n"] == 12 and fo["extra_n"] == 2 and fo["wins"] == 4
+    assert fo["gap_ev"] == pytest.approx((4 * 1.82 - 8 * 1.18) / 12 - (3 * 1.82 - 7 * 1.18) / 10)
+    assert st["candidates"]["skipped_active"]["n"] == 1 and st["candidates"]["ignored_cooldown"]["wins"] == 1
+    assert skipped_signal_study(real, [], [], min_n=20)["valid"] is False
+    assert "followable" not in skipped_signal_study([], [], cand)         # nothing Recorded: no gap to report
+    ungraded = skipped_signal_study(real, [], [{"reason": "ignored_cooldown", "win": None}])
+    assert ungraded["candidates"] == {} and ungraded["valid"] is False   # an ungraded row is not a result
+
+
+def test_skipped_signal_report_lines_flag_thin_samples_and_stay_quiet_without_data(monkeypatch):
+    from brain_report import _skipped_signal_lines
+    from threshold_quality import skipped_signal_study
+    _sc_cfg(monkeypatch)
+    assert _skipped_signal_lines(None) == [] and _skipped_signal_lines({"valid": False}) == []
+    real = [_sig(True)] * 30 + [_sig(False)] * 30
+    shadow = [_sig(False, rej="calibration_gate")] * 25 + [_sig(True, rej="run_cap")] * 3
+    cand = [_sig(True, "ignored_open_trade")] * 4
+    lines = _skipped_signal_lines(skipped_signal_study(real, shadow, cand, min_n=20))
+    text = "\n".join(lines)
+    assert "Recorded trades: n=60" in text and "Followable book" in text and "overstated" in text
+    assert "calibration gate: n=25, would have lost 100%, would have won 0%" in text
+    assert "run cap: n=3" in text and "(thin: under 20)" in text.split("run cap: n=3")[1].splitlines()[0]
+    assert "ignored open trade: n=4" in text and "(thin: under 20)" in text.split("ignored open trade")[1].splitlines()[0]
+    assert "a negative net means the suppression saved money" in text
+
+
+def test_win_rate_filter_verdict_leans_on_the_alert_keys_overall_rate(monkeypatch):
+    import alerts as alerts_mod
+    for k, v in dict(WIN_RATE_PRIOR_STRENGTH=10.0, WIN_RATE_PRIOR_MIN_POOLED_N=50,
+                     WIN_RATE_FILTER_MIN_PROB=0.20).items():
+        monkeypatch.setattr(brain_mod.cfg, k, v, raising=False)
+    verdict, t = alerts_mod._posterior_win_rate_verdict, 0.3933
+
+    def curve(wr, n=100):
+        return {"buckets": [{"n": n, "observed": wr}]}
+
+    assert verdict(0.40, 20, t, None) is None                                # 8/20, no pool: passes (P 0.55)
+    blocked = verdict(0.40, 20, t, curve(0.14))                              # same 8/20, key wins 14% overall
+    assert blocked[0] == 0.40 and "pulled toward this alert's overall 14% (n=100)" in blocked[1]
+    assert "only 13% chance" in blocked[1] and "need >= 20%" in blocked[1]
+    assert verdict(0.40, 20, t, curve(0.14, n=40)) is None                   # curve rests on < 50 outcomes: ignored
+    assert verdict(0.25, 20, t, None) is not None                            # 5/20 alone: blocked (P 0.11)
+    assert verdict(0.25, 20, t, curve(0.56)) is None                         # ...but not for a key that wins 56% overall
+    assert verdict(0.40, 20, t, curve(0.14, n=50)) is not None                # exactly 50 outcomes: the pool counts
+    p = engine.shrunk_prob_wr_at_least(8, 12, t, 0.14, 10.0)
+    monkeypatch.setattr(brain_mod.cfg, "WIN_RATE_FILTER_MIN_PROB", p, raising=False)
+    assert verdict(0.40, 20, t, curve(0.14)) is None                         # exactly on the bar passes (>=)
+    monkeypatch.setattr(brain_mod.cfg, "WIN_RATE_FILTER_MIN_PROB", 0.20, raising=False)
+    monkeypatch.setattr(brain_mod.cfg, "WIN_RATE_PRIOR_STRENGTH", 0.0, raising=False)
+    assert verdict(0.25, 20, t, curve(0.56))[1].count("pulled toward") == 0  # no borrowing, and the note says none
+    assert verdict(0.40, 20, t, curve(0.14)) is None                         # strength 0: the old flat prior
+    assert verdict(0.25, 20, t, curve(0.56)) is not None
+
+
 
