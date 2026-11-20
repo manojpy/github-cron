@@ -1242,7 +1242,7 @@ def to_action_plan(plan_data: Dict[str, Any], recs: Dict[str, Any], cfg, now: Op
     _unknown = {"basis": "not_estimated", "net_ev_delta_pct": None}
     for p in plan_data.get("config_patch") or []:
         _add("config_patch", str(p.get("path")), p.get("current"), p.get("suggested"),
-             str(p.get("reason") or ""), "apply_config_override", p.get("_source_category"), _unknown, None)
+             str(p.get("reason") or ""), "apply-brain", p.get("_source_category"), _unknown, None)
     for w in plan_data.get("weight_adjustments") or []:
         _add("weight", f"weight:{w.get('vote')}", w.get("current"), w.get("suggested"),
              str(w.get("reason") or ""), "dynamic_weights", w.get("category"), _unknown,

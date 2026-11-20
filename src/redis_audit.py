@@ -25,8 +25,7 @@ Usage:
 
 Exit codes: 0 ok, 1 findings (only with --fail-on-findings), 2 cannot connect.
 
-Like apply_config_override.py it needs only the `redis` package, not the
-rest of the bot's dependencies.
+It needs only the `redis` package, not the rest of the bot's dependencies.
 """
 from __future__ import annotations
 

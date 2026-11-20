@@ -41,7 +41,7 @@ LAYER_OF: Dict[str, str] = {
     "playbook": RESEARCH, "threshold_stats": RESEARCH, "threshold_analysis": RESEARCH,
     "threshold_models": RESEARCH, "threshold_quality": RESEARCH, "threshold_repair": RESEARCH,
     "threshold_engine": RESEARCH, "archive_reader": RESEARCH, "scoreboard": RESEARCH,
-    "confluence_tier_report": RESEARCH, "learner": RESEARCH, "autopsy": RESEARCH,
+    "learner": RESEARCH, "autopsy": RESEARCH,
     "brain_recommend_baseline": RESEARCH, "brain_recommend_full": RESEARCH,
     "intelligence": RESEARCH, "autotune": RESEARCH,
     # Elliott Wave engine: pure computation on candles, proposes nothing live
@@ -50,11 +50,11 @@ LAYER_OF: Dict[str, str] = {
     "threshold_validation": VALIDATION, "repair_ledger": VALIDATION, "brain_audit": VALIDATION,
     # ── policy ──
     "brain_enhanced": POLICY, "brain": POLICY, "alerts": POLICY, "gates": POLICY,
-    "macd_unified": POLICY, "apply_config_override": POLICY, "alert_advisor": POLICY,
+    "macd_unified": POLICY, "alert_advisor": POLICY,
     "brain_engine": POLICY,
     # ── infra ──
     "state": INFRA, "bot_config": INFRA, "config_base": INFRA, "fetcher": INFRA,
-    "outcome_storage": INFRA, "cleanup_outcomes": INFRA, "health_server": INFRA,
+    "outcome_storage": INFRA, "cleanup_outcomes": INFRA,
     "redis_audit": INFRA, "aot_bridge": INFRA, "aot_meta": INFRA,
     "numba_functions_shared": INFRA, "indicators": INFRA, "numeric_selftest": INFRA,
     "pathrecon": INFRA, "feedback": INFRA, "brain_layers": INFRA, "alert_registry": INFRA,
