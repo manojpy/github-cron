@@ -416,7 +416,7 @@ class BotConfig(BaseModel):
     ELLIOTT_WAVE_DELIVER_ABC: bool = Field(default=True, description="Telegram delivery switch for ABC completion alerts")
     ELLIOTT_WAVE_MIN_SCORE: float = Field(default=80.0, ge=40.0, le=100.0, description="Quality score (0-100) at or above which a valid, triggered Elliott setup is eligible for Telegram. A research starting value, not an optimised one")
     ELLIOTT_WAVE_WATCH_SCORE: float = Field(default=70.0, ge=0.0, le=100.0, description="Scores from this value up to MIN_SCORE are WATCH: recorded as Shadowed, never delivered")
-    ELLIOTT_WAVE_MAX_ALERTS_PER_RUN: int = Field(default=3, ge=1, le=30, description="Max Elliott Telegram messages per run across all pairs. Separate from MAX_ALERTS_PER_RUN, so Elliott can never displace a legacy alert")
+    ELLIOTT_WAVE_MAX_ALERTS_PER_RUN: int = Field(default=3, ge=1, le=3, description="Max Elliott Telegram messages per run across all pairs. Separate from MAX_ALERTS_PER_RUN, so Elliott can never displace a legacy alert")
     ELLIOTT_WAVE_PIVOT_LENGTH: int = Field(default=3, ge=2, le=8, description="Candles on each side that confirm a swing pivot. A pivot is usable only after these candles have closed")
     ELLIOTT_WAVE_LOOKBACK: int = Field(default=240, ge=60, le=600, description="Structural lookback in closed 15m candles")
     ELLIOTT_WAVE_MIN_SWING_ATR: float = Field(default=1.0, ge=0.3, le=5.0, description="Minimum swing between consecutive pivots, in ATR multiples; smaller moves are noise")
@@ -756,6 +756,21 @@ class BotConfig(BaseModel):
                 f'BRAIN_REENABLE_MIN_WR_LO ({self.BRAIN_REENABLE_MIN_WR_LO}) must be >= '
                 f'BRAIN_ALERT_DISABLE_THRESHOLD_WR ({self.BRAIN_ALERT_DISABLE_THRESHOLD_WR}); '
                 f'otherwise an alert key can be disabled and re-enabled on the same evidence.'
+            )
+        return self
+
+    @model_validator(mode='after')
+    def validate_verdict_thresholds(self) -> 'BotConfig':
+        if self.ALERT_WATCH_MIN_CONVICTION > self.ALERT_TAKE_MIN_CONVICTION:
+            raise ValueError(
+                f'ALERT_WATCH_MIN_CONVICTION ({self.ALERT_WATCH_MIN_CONVICTION}) must be <= '
+                f'ALERT_TAKE_MIN_CONVICTION ({self.ALERT_TAKE_MIN_CONVICTION})'
+            )
+        if self.ALERT_SHADOW_CONVICTION_CAP >= self.ALERT_TAKE_MIN_CONVICTION:
+            raise ValueError(
+                f'ALERT_SHADOW_CONVICTION_CAP ({self.ALERT_SHADOW_CONVICTION_CAP}) must be < '
+                f'ALERT_TAKE_MIN_CONVICTION ({self.ALERT_TAKE_MIN_CONVICTION}); otherwise an alert '
+                f'with only shadow/insufficient evidence could read TAKE'
             )
         return self
 

@@ -54,6 +54,7 @@ _POST_HOC_KEYS = frozenset({
     "tp_first", "outcome_reason", "bonus_win", "rr_achieved", "win_weight",
     "net_pnl_pct", "net_pnl_hold_pct", "outcome_class", "realized_cost_pct",
     "tp_candle", "sl_candle", "mfe_candle", "mae_candle",
+    "overlapped_by_recorded", "overlapped_by_recorded_ts",
 })
 
 def _row_id(r: Row) -> str:

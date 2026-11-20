@@ -269,6 +269,7 @@ def load_archived_outcomes(data_dir: str, window_days: int = 30, shadow: bool = 
         "dropped_before_window": 0,
         "dropped_duplicate_sid": 0,
         "upgraded_early": 0,
+        "dropped_elliott": 0,        # Elliott outcome rows: kept for their own report, not a legacy row
         "kept": 0,
     }
 
@@ -373,6 +374,8 @@ def load_archived_outcomes(data_dir: str, window_days: int = 30, shadow: bool = 
                         stats["kept"] += 1
                         if migrated:
                             stats["migrated_forward"] += 1
+                    elif not include_elliott and is_elliott_key(str(raw.get("alert_key") or "")):
+                        stats["dropped_elliott"] += 1
                     else:
                         # Passed every filter above but still rejected by the row
                         # parser (bad entry_ts, total<=0, ...). Previously uncounted,
@@ -388,6 +391,7 @@ def load_archived_outcomes(data_dir: str, window_days: int = 30, shadow: bool = 
         + stats["dropped_unparseable"]
         + stats["dropped_before_window"]
         + stats["dropped_duplicate_sid"]
+        + stats["dropped_elliott"]
         + stats["lines_malformed"]
     )
     if dropped_total > 0 or stats["migrated_forward"] > 0:

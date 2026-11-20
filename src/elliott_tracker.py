@@ -396,9 +396,13 @@ async def update_all(sdb: RedisStateStore, parsed_cache: Dict[str, Tuple[Any, An
     all_rows: List[Dict[str, Any]] = []
     to_save: List[Tuple[str, Dict[str, Any]]] = []
     to_delete: List[str] = []
+    to_purge: List[str] = []          # orphaned: removed without counting
     to_count: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-
+    now_ts = int(time.time())
     for sid, rec in recs.items():
+        if now_ts - int(rec.get("created") or now_ts) > _REDIS_TTL_SEC:
+            to_purge.append(sid)
+            continue
         pair = str(rec.get("pair"))
         pd_15m = (parsed_cache.get(pair) or (None, None, None))[0]
         end = last_idx.get(pair)
@@ -454,7 +458,7 @@ async def update_all(sdb: RedisStateStore, parsed_cache: Dict[str, Tuple[Any, An
         return stats
     stats["events"] += len(all_rows)
 
-    if sdb.degraded or not sdb._redis or not (to_save or to_delete):
+    if sdb.degraded or not sdb._redis or not (to_save or to_delete or to_purge):
         return stats
 
     client = _rc(sdb._redis)
@@ -466,9 +470,11 @@ async def update_all(sdb: RedisStateStore, parsed_cache: Dict[str, Tuple[Any, An
                 pipe.hset(track_key, sid, json_dumps(rec))
             for sid in to_delete:
                 pipe.hdel(track_key, sid)
+            for sid in to_purge:
+                pipe.hdel(track_key, sid)
             pipe.expire(track_key, _REDIS_TTL_SEC)
             results = await asyncio.wait_for(_execute_pipeline(pipe), timeout=5.0)
-        if not isinstance(results, (list, tuple)) or len(results) != n_save + n_del + 1:
+        if not isinstance(results, (list, tuple)) or len(results) != n_save + n_del + len(to_purge) + 1:
             raise RuntimeError("tracker pipeline returned an unexpected result count")
 
         # at-most-once counting: only structures whose HDEL actually removed the

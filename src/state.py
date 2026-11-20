@@ -1838,6 +1838,11 @@ class RedisStateStore:
             mine = self._shadow_registered_this_run.get(pair)
             if mine is not None and mine[0] == int(entry_ts):
                 if ratio <= mine[1]:
+                    await self.log_candidate_event(
+                        pair, alert_key, direction, entry_ts, "same_candle_weaker",
+                        {"stronger_key": mine[2], "entry_price": entry_price,
+                         "score": confluence_score, "total": confluence_total,
+                         "votes_on": sorted(k for k, v in (confluence_votes or {}).items() if v)})
                     return "skipped_active"        # a stronger key already represents this candle
                 replace_key = mine[2]              # this key is stronger: it takes over
             else:
@@ -1884,6 +1889,19 @@ class RedisStateStore:
                 timeout=2.0,
             )
             if replace_key is not None and replace_key != key:
+                try:
+                    old_raw = await asyncio.wait_for(_rc(self._redis).get(replace_key), timeout=2.0)
+                    if old_raw:
+                        old = json_loads(old_raw)
+                        await self.log_candidate_event(
+                            pair, replace_key.split(":")[-2], str(old.get("direction", "")),
+                            int(old.get("entry_ts", entry_ts)), "same_candle_weaker",
+                            {"stronger_key": key, "entry_price": old.get("entry_price"),
+                             "score": old.get("confluence_score"),
+                             "total": old.get("confluence_total"),
+                             "votes_on": sorted(k for k, v in (old.get("confluence_votes") or {}).items() if v)})
+                except Exception as e:
+                    logger.debug(f"[{pair}] replaced shadow not kept as candidate: {e}")
                 await asyncio.wait_for(_rc(self._redis).delete(replace_key), timeout=2.0)
             self._shadow_registered_this_run[pair] = (int(entry_ts), ratio, key)
             logger.info(
@@ -2586,7 +2604,8 @@ class RedisStateStore:
                 pipe.expire(key, 14 * 86400)
                 await asyncio.wait_for(_execute_pipeline(pipe), timeout=2.0)
         except Exception as e:
-            logger.debug(f"[{pair}] candidate event not logged ({reason}): {e}")
+            self.__dict__["_candidate_log_failed"] = self.__dict__.get("_candidate_log_failed", 0) + 1
+            logger.warning(f"[{pair}] candidate event not logged ({reason}): {e}")
 
     async def resolve_candidate_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
                                          logger_pair: logging.Logger) -> None:
