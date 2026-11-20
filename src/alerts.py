@@ -183,7 +183,10 @@ class TelegramQueue:
         params = dict(params)
         session = await SessionManager.get_session()
         deadline = time.monotonic() + self._send_deadline_sec()
-        for attempt in range(1, cfg.TELEGRAM_RETRIES + 1):
+        attempt = 0
+        plain_fallback_used = False
+        while attempt < cfg.TELEGRAM_RETRIES:
+            attempt += 1
             if shutdown_event.is_set():
                 return None
             if time.monotonic() >= deadline:
@@ -225,7 +228,9 @@ class TelegramQueue:
                             f"chat_id={getattr(self, 'chat_id', '?')}"
                         )
                         if (resp.status == 400 and "parse entities" in str(description).lower()
-                                and params.get("parse_mode")):
+                                and params.get("parse_mode") and not plain_fallback_used):
+                            plain_fallback_used = True
+                            attempt -= 1   # the plain-text resend must not use up a retry
                             # A formatting bug must not lose the alert: resend once as
                             # plain text (escape backslashes removed) instead of parking
                             # a message that can never parse.

@@ -3668,7 +3668,7 @@ class RedisStateStore:
                 for label in labels
             )
             if stale:
-                rows = await self._reseed_outcome_totals(now)
+                rows = await self._reseed_outcome_totals(now, previous=rows)
 
             for label in labels:
                 data = rows.get(label) or {}
@@ -3687,7 +3687,9 @@ class RedisStateStore:
 
         return out
 
-    async def _reseed_outcome_totals(self, now: float) -> Dict[str, Dict[str, Any]]:
+    async def _reseed_outcome_totals(
+        self, now: float, previous: Optional[Dict[str, Dict[str, Any]]] = None
+    ) -> Dict[str, Dict[str, Any]]:
         """Full SCAN + HGETALL over the stats keys (the expensive pass). Stores the
         result in the running-total hashes unless a scan failed, in which case the
         partial result is returned for display but NOT stored."""
@@ -3725,7 +3727,20 @@ class RedisStateStore:
                     for field in self.OUTCOME_TOTALS_FIELDS:
                         bucket[field] += int(data.get(field, 0) or 0)
             result[label] = totals
+
         result["Elliott"] = elliott_totals
+
+        # Monotonic totals: the per-key stats hashes expire after STATE_EXPIRY_DAYS, so a
+        # fresh SCAN only sees the recent window. A reconcile must never lower a total the
+        # resolvers already incremented. force=True passes no `previous`, so an explicit
+        # forced reseed still recomputes from scratch.
+        for _label, _totals in result.items():
+            _prev = (previous or {}).get(_label) or {}
+            for _f in self.OUTCOME_TOTALS_FIELDS:
+                try:
+                    _totals[_f] = max(int(_totals.get(_f, 0) or 0), int(_prev.get(_f, 0) or 0))
+                except (TypeError, ValueError):
+                    pass
 
         if not any(v.get("partial") for v in result.values()):
             stats_ttl = max(cfg.STATE_EXPIRY_DAYS * 86400, 7 * 86400)

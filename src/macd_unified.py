@@ -961,7 +961,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 pair = k[prefix_len:].split(":", 1)[0]
                 pending_by_pair.setdefault(pair, []).append(k)
 
-            state_db._pending_outcome_keys_by_pair = pending_by_pair   # ← 12 spaces (FIXED)
+            state_db._pending_outcome_keys_by_pair = pending_by_pair
             total = sum(len(v) for v in pending_by_pair.values())
             if total:
                 logger_main.info(f"⏳ Pre-scanned {total} pending outcome(s) across {len(pending_by_pair)} pair(s)")
@@ -1112,8 +1112,14 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
                 "ENABLE_TAKE_SKIP_BUTTONS is off: no 'Took' taps can be recorded, so the "
                 "gate has no positions to count (use PORTFOLIO_POSITION_SOURCE='alerts')"
+            )     
+        try:
+            open_positions_run = await preloads.take("heat_positions", _heat_positions)
+        except Exception as e:
+            logger_main.warning(
+                f"Heat-gate positions pre-load failed (fail-open, gate sees no positions): {e}"
             )
-        open_positions_run = await preloads.take("heat_positions", _heat_positions)
+            open_positions_run = [] 
         if open_positions_run:
             logger_main.info(
                 f"Heat gate: {len(open_positions_run)} open position(s) "
@@ -1295,7 +1301,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     bias_context: Optional[BiasContext] = None
     if cfg.ENABLE_BIAS_HEADER:
         try:
-            bias_context = await  compute_bias_context(prepared_tasks, reference_time, parsed_cache)
+            _bias_t0 = time.perf_counter()
+            bias_context = await compute_bias_context(prepared_tasks, reference_time, parsed_cache)
+            logger_main.info(f"⏱️ Bias pre-pass: {time.perf_counter() - _bias_t0:.2f}s for {len(prepared_tasks)} pairs")
             if bias_context:
                 logger_main.info(
                     f"🧭 Bias: up={bias_context.up_count}/{bias_context.total_pairs} "
