@@ -487,7 +487,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("No Redis URL: set REDIS_URL or pass --url", file=sys.stderr)
         return 2
     try:
-        import redis  # local import: only needed when actually running
+        import redis  # type: ignore[import-untyped]  # local import: only needed when actually running
     except ImportError:
         print("Missing dependency: pip install redis", file=sys.stderr)
         return 2
