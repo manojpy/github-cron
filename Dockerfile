@@ -82,8 +82,6 @@ FROM python:3.11-slim-bookworm AS final
 HEALTHCHECK NONE
 
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
-    libtbb12 \
-    libgomp1 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
@@ -118,11 +116,6 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=utf-8 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONOPTIMIZE=2 \
-    NUMBA_CACHE_DIR=/tmp/numba_cache \
-    NUMBA_WARNINGS=0 \
-    NUMBA_THREADING_LAYER=tbb \
-    NUMBA_NUM_THREADS=2 \
-    OMP_NUM_THREADS=2 \
     MEMORY_LIMIT_BYTES=850000000 \
     TZ=Asia/Kolkata
 
