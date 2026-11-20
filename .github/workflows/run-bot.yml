@@ -88,61 +88,76 @@ jobs:
           echo "🐳 Pulling $IMAGE in the background (falls back to :latest if that tag does not exist)"
 
       # PHASE 1: VALIDATION & SETUP
-      - name: 🔥 Checkout repository (for config_macd.json)
-        uses: actions/checkout@v7
-        with:
-          # Only pull the config file — no need to clone the whole repo
-          sparse-checkout: |
-            config_macd.json
-          sparse-checkout-cone-mode: false
+      - name: 📄 Fetch config_macd.json (no checkout action)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The bot's code lives in the image; this repo is needed only for
+          # config_macd.json. One API call replaces the checkout action download
+          # plus the git fetch. Pinned to the dispatched SHA, so the config always
+          # matches the commit and no cache can serve a stale file. The token
+          # header keeps this working if the repo ever becomes private.
+          curl --fail --silent --show-error --location \
+               --retry 3 --retry-delay 1 --max-time 20 \
+               --header "Authorization: Bearer ${GH_TOKEN}" \
+               --header "Accept: application/vnd.github.raw" \
+               --header "X-GitHub-Api-Version: 2022-11-28" \
+               --output config_macd.json \
+               "https://api.github.com/repos/${{ github.repository }}/contents/config_macd.json?ref=${{ github.sha }}"
+          test -s config_macd.json
+          echo "📄 config_macd.json fetched ($(wc -c < config_macd.json) bytes) at ${GITHUB_SHA:0:8}"
 
-      - name: 🔑 Verify Secrets
+      - name: 🔑 Verify secrets + config, decide Brain depth
+        id: brain_depth
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           REDIS_URL: ${{ secrets.REDIS_URL }}
           DELTA_API_BASE: ${{ secrets.DELTA_API_BASE }}
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+          BRAIN_REPORT_INPUT: ${{ inputs.brain_report }}
+          APPLY_BRAIN_PLAN: ${{ inputs.apply_brain_plan }}
         run: |
-          MISSING=()
-          [ -z "$TELEGRAM_BOT_TOKEN" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
-          [ -z "$TELEGRAM_CHAT_ID" ] && MISSING+=("TELEGRAM_CHAT_ID")
-          [ -z "$REDIS_URL" ] && MISSING+=("REDIS_URL")
-          [ -z "$DELTA_API_BASE" ] && MISSING+=("DELTA_API_BASE")
-          [ -z "$DATA_REPO_TOKEN" ] && MISSING+=("DATA_REPO_TOKEN")
-
-          if [ ${#MISSING[@]} -gt 0 ]; then
-            echo "❌ Missing secrets: ${MISSING[*]}"
+          set -euo pipefail
+          # 1) Required secrets — all five, exactly as before.
+          MISSING=""
+          for v in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID REDIS_URL DELTA_API_BASE DATA_REPO_TOKEN; do
+            if [ -z "${!v:-}" ]; then MISSING="$MISSING $v"; fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::Missing required secret(s):$MISSING"
             exit 1
           fi
-
           echo "✅ All required secrets configured"
-
-      - name: 🔨 Verify Config (repo-only)
-        run: |
+          # 2) Config: ONE python call validates the JSON and extracts both values
+          #    the workflow needs (on-demand report switch + staleness limit).
+          #    BRAIN_REPORT_ON_DEMAND is otherwise invisible to this workflow, so a
+          #    report forced inside the bot would run against a shallow archive.
           if [ ! -f config_macd.json ]; then
-            echo "❌ config_macd.json not found in repository root"
+            echo "::error::config_macd.json not found in the workspace"
             exit 1
           fi
-          if ! python3 -c "import json; json.load(open('config_macd.json'))" 2>/dev/null; then
-            echo "❌ config_macd.json is not valid JSON"
+          if ! CFG=$(python3 -c "import json; c=json.load(open('config_macd.json')); od='true' if str(c.get('BRAIN_REPORT_ON_DEMAND', False)).strip().lower() in ('true','1') else 'false'; print(od, int(c.get('MAX_CANDLE_STALENESS_SEC', 1200)))" 2>&1); then
+            echo "::error::config_macd.json is not valid JSON"
+            echo "$CFG"
             exit 1
           fi
+          ON_DEMAND="${CFG%% *}"
+          MAX_STALE="${CFG##* }"
           echo "✅ Config loaded from repository: config_macd.json"
-
-      - name: 🧠 Decide Brain archive depth
-        if: inputs.apply_brain_plan != true
-        id: brain_depth
-        run: |
+          echo "late_limit=$(( MAX_STALE - 900 ))" >> "$GITHUB_OUTPUT"
+          # 3) Archive depth. An apply-brain dispatch skips both the archive
+          #    checkout and the bot run, so these outputs are not consumed there.
+          if [ "$APPLY_BRAIN_PLAN" = "true" ]; then
+            echo "brain_full=false" >> "$GITHUB_OUTPUT"
+            echo "archive_days=3"   >> "$GITHUB_OUTPUT"
+            echo "🧠 Apply-brain dispatch: archive depth decision skipped"
+            exit 0
+          fi
           NOW=$(date -u +%s)
-          # BRAIN_REPORT_ON_DEMAND is a separate force-report switch read
-          # inside the bot itself (macd_unified.py, run_once). This workflow
-          # step has no visibility into it otherwise, so a report forced that
-          # way runs against a shallow 3-day checkout instead of the full
-          # archive it actually needs. Parse it here so both triggers agree.
-          ON_DEMAND=$(python3 -c "import json; v=json.load(open('config_macd.json')).get('BRAIN_REPORT_ON_DEMAND', False); print('true' if str(v).strip().lower() in ('true', '1') else 'false')" 2>/dev/null || echo "false")
           # 900 s = one 15-minute slot; 48 slots = 12 hours (00:00/12:00 UTC).
-          if [ "${{ inputs.brain_report }}" = "true" ] || [ "$ON_DEMAND" = "true" ]|| [ $(( (NOW / 900) % 48 )) -eq 0 ]; then
+          if [ "$BRAIN_REPORT_INPUT" = "true" ] || [ "$ON_DEMAND" = "true" ] || [ $(( (NOW / 900) % 48 )) -eq 0 ]; then
             echo "brain_full=true"  >> "$GITHUB_OUTPUT"
             echo "archive_days=185" >> "$GITHUB_OUTPUT"
             echo "🧠 Brain-report run: full 185-day archive"
@@ -150,7 +165,7 @@ jobs:
             echo "brain_full=false" >> "$GITHUB_OUTPUT"
             echo "archive_days=3"   >> "$GITHUB_OUTPUT"
             echo "⚡ Alert-only run: 3-day archive"
-          fi
+          fi     
 
       - name: 📦 Checkout outcome-data archive
         if: inputs.apply_brain_plan != true
@@ -413,8 +428,9 @@ jobs:
           START_TIME=$(date +%s)
           echo "🕐 TRIGGER_TIMESTAMP=$START_TIME ($(TZ=Asia/Kolkata date -d @$START_TIME '+%Y-%m-%d %H:%M:%S IST'))"
           # The bot rejects every pair once TRIGGER_TIMESTAMP is more than
-          # (MAX_CANDLE_STALENESS_SEC - 900)s after the 15m close. Report it where it is visible.
-          LATE_LIMIT=$(( $(python3 -c "import json; print(json.load(open('config_macd.json')).get('MAX_CANDLE_STALENESS_SEC', 1200))" 2>/dev/null || echo 1200) - 900 ))
+          # (MAX_CANDLE_STALENESS_SEC - 900)s after the 15m close. Computed once in
+          # the verify/depth step from the same config parse. 300 = 1200 - 900 default.
+          LATE_LIMIT="${{ steps.brain_depth.outputs.late_limit || '300' }}"
           AGE_AT_START=$(( START_TIME - (START_TIME / 900) * 900 ))
           echo "⏱️ Bot starts ${AGE_AT_START}s after the 15m close (limit ${LATE_LIMIT}s)"
           if [ "$AGE_AT_START" -gt "$LATE_LIMIT" ]; then
