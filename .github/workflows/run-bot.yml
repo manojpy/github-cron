@@ -49,7 +49,7 @@ env:
 jobs:
   run-bot:
     runs-on: ubuntu-24.04
-    timeout-minutes: 16
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: read
