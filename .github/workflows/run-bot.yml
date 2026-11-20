@@ -69,22 +69,23 @@ jobs:
           # The sha-<commit> tag only exists for commits that triggered build.yml
           # (src/, requirements, Dockerfile...). After a config/README/workflow-only
           # commit it is missing, so the :latest fallback must start HERE, inside the
-          # background job. Doing it later in the wait step meant a second, serial pull
-          # on the critical path of every run.
+          # background job.
           cat > /tmp/pull-image.sh <<'EOF'
           #!/bin/sh
           SHA_IMAGE="$1"; LATEST_IMAGE="$2"
+          # Prefer the exact SHA tag. Fall back to :latest only if the SHA tag does not exist.
           if docker pull --quiet --platform linux/amd64 "$SHA_IMAGE" > /tmp/image-pull.log 2>&1; then
-            echo "$SHA_IMAGE" > /tmp/image-pull.used
-            echo 0 > /tmp/image-pull.rc
+            printf '%s\n' "$SHA_IMAGE" > /tmp/image-pull.used
+            printf '0\n' > /tmp/image-pull.rc.tmp && mv /tmp/image-pull.rc.tmp /tmp/image-pull.rc
           elif docker pull --quiet --platform linux/amd64 "$LATEST_IMAGE" >> /tmp/image-pull.log 2>&1; then
-            echo "$LATEST_IMAGE" > /tmp/image-pull.used
-            echo 0 > /tmp/image-pull.rc
+            printf '%s\n' "$LATEST_IMAGE" > /tmp/image-pull.used
+            printf '0\n' > /tmp/image-pull.rc.tmp && mv /tmp/image-pull.rc.tmp /tmp/image-pull.rc
           else
-            echo 1 > /tmp/image-pull.rc
+            printf '1\n' > /tmp/image-pull.rc.tmp && mv /tmp/image-pull.rc.tmp /tmp/image-pull.rc
           fi
           EOF
-          nohup sh /tmp/pull-image.sh "$IMAGE" "${BASE}:latest" > /dev/null 2>&1 &
+          chmod +x /tmp/pull-image.sh
+          nohup /tmp/pull-image.sh "$IMAGE" "${BASE}:latest" > /dev/null 2>&1 &
           echo "🐳 Pulling $IMAGE in the background (falls back to :latest if that tag does not exist)"
 
       # PHASE 1: VALIDATION & SETUP
@@ -213,19 +214,21 @@ jobs:
             exit 1
           fi
           git sparse-checkout init --no-cone
-          {
-            # Track .gitkeep so wiped-but-tracked directories materialise
-            echo "outcomes/.gitkeep"
-            echo "shadow/.gitkeep"
-            echo "reports/.gitkeep"
-            for i in $(seq 0 $(( ARCHIVE_DAYS - 1 ))); do
-              D=$(date -u -d "-${i} days" +%Y-%m-%d)
-              echo "outcomes/${D}.jsonl"
-              echo "outcomes/${D}.jsonl.gz"
-              echo "shadow/${D}.jsonl"
-              echo "shadow/${D}.jsonl.gz"
-            done
-          } > .git/info/sparse-checkout
+          python3 - "$ARCHIVE_DAYS" > .git/info/sparse-checkout <<'PY'
+          import datetime, sys
+
+          days = int(sys.argv[1])
+          today = datetime.datetime.now(datetime.timezone.utc).date()
+          print("outcomes/.gitkeep")
+          print("shadow/.gitkeep")
+          print("reports/.gitkeep")
+          for i in range(days):
+              d = (today - datetime.timedelta(days=i)).isoformat()
+              print(f"outcomes/{d}.jsonl")
+              print(f"outcomes/{d}.jsonl.gz")
+              print(f"shadow/{d}.jsonl")
+              print(f"shadow/{d}.jsonl.gz")
+          PY
           git checkout main
           cd -
 
@@ -264,10 +267,12 @@ jobs:
           STRICT_IMAGE_PROVENANCE: "false"
         run: |
           WAIT_START=$(date +%s)
-          # 0.2 s polling (was 1 s): the pull usually finishes between two polls
-          for _ in $(seq 1 1200); do
+          # 0.2 s polling, max ~120 s (600 * 0.2 s) so slow registry hiccups don't false-fail
+          i=1
+          while [ "$i" -le 600 ]; do
             [ -f /tmp/image-pull.rc ] && break
             sleep 0.2
+            i=$((i + 1))
           done
           if [ "$(cat /tmp/image-pull.rc 2>/dev/null || echo 1)" != "0" ]; then
             echo "::error::Neither sha-${GITHUB_SHA} nor :latest is available in the registry"
@@ -358,8 +363,6 @@ jobs:
             -e TZ=Asia/Kolkata \
             -e PYTHONPATH=/app/src \
             -e PYTHONUNBUFFERED=1 \
-            -e NUMBA_NUM_THREADS=2 \
-            -e OMP_NUM_THREADS=2 \
             -e OUTCOME_DATA_DIR=/tmp/data-repo \
             -v "/tmp/data-repo:/tmp/data-repo:rw" \
             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \
