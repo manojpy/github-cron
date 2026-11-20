@@ -377,7 +377,7 @@ class RedisKeyPrefix:
 class RedisStateStore:
     POOL_MAX_AGE_SECONDS = 3600
     SCRIPT_RELOAD_LOCK_TIMEOUT = 2.0
-    PREWARM_CONNECTIONS = 4
+    PREWARM_CONNECTIONS = 12
     _global_pools: ClassVar[Dict[str, Optional[redis.Redis]]] = {}
     _pool_healthy: ClassVar[Dict[str, bool]] = {}
     _pool_created_at: ClassVar[Dict[str, float]] = {}
