@@ -206,7 +206,6 @@ jobs:
           fi
           git sparse-checkout init --no-cone
           {
-            echo "brain_state.json"
             # Track .gitkeep so wiped-but-tracked directories materialise
             echo "outcomes/.gitkeep"
             echo "shadow/.gitkeep"
@@ -223,7 +222,10 @@ jobs:
           cd -
 
           mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
-          chmod -R 777 /tmp/data-repo
+          # a+rwX: the container user (uid 1000) can write, but files do not gain the
+          # exec bit, so git sees no mode changes. .git is not touched.
+          chmod a+rwx /tmp/data-repo
+          chmod -R a+rwX /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
 
           # ── AUDIT: prove what actually landed on disk ──
           echo "=== /tmp/data-repo top level ==="
@@ -327,8 +329,10 @@ jobs:
           # The archive checkout is skipped for apply runs; create the folder the
           # image probes for writability at import time.
           mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
-          chmod -R 777 /tmp/data-repo
-
+          # a+rwX: the container user (uid 1000) can write, but files do not gain the
+          # exec bit, so git sees no mode changes. .git is not touched.
+          chmod a+rwx /tmp/data-repo
+          chmod -R a+rwX /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
           set +e
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
@@ -455,6 +459,7 @@ jobs:
             --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m \
             --env-file "$ENV_FILE" \
             -e TZ=Asia/Kolkata \
+            -e REQUIRE_AOT=true \
             -e PYTHONPATH=/app/src \
             -e PYTHONUNBUFFERED=1 \
             -e NUMBA_NUM_THREADS=2 \
@@ -507,9 +512,14 @@ jobs:
             SUMMARY_LINE=$(grep "RUN COMPLETE" "$LOG_FILE" | tail -1)
             DURATION=$(grep -oP "Duration:\s*\K[\d.]+(?=s)" <<< "$SUMMARY_LINE" | head -1 || echo "N/A")
             ALERTS=$(grep -oP "Alerts:\s*\K\d+" <<< "$SUMMARY_LINE" | head -1 || echo "0")
+            ELLIOTT=$(grep -oP "\(\+\K\d+(?= Elliott\))" <<< "$SUMMARY_LINE" | head -1 || echo "0")
+            ALERTS=$(( ${ALERTS:-0} + ${ELLIOTT:-0} ))
             PAIRS=$(grep -oP "Pairs:\s*\K[\d/]+" <<< "$SUMMARY_LINE" | head -1 || echo "N/A")
             MEMORY=$(grep -oP "Memory:\s*\K\d+MB" <<< "$SUMMARY_LINE" | head -1 || echo "N/A")
             REDIS_STATUS=$(grep -oP "Redis:\s*\K\w+" <<< "$SUMMARY_LINE" | head -1 || echo "UNKNOWN")
+          elif grep -q "Could not take the run lock" "$LOG_FILE"; then
+            STATUS="Skipped"
+            ERROR_MSG="Run lock held by another instance - run skipped"
           else
             STATUS="Failed"
             ERROR_MSG=$(grep -E "FATAL ERROR|Bot run failed|Error|ERROR" "$LOG_FILE" | head -1 | cut -c1-120 || echo "Unknown error")
@@ -531,11 +541,13 @@ jobs:
           echo "## 🤖 MACD Bot Execution Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          if [ "${{ steps.results.outputs.status }}" != "Success" ]; then
+          if [ "${{ steps.results.outputs.status }}" != "Failed" ]; then
             echo "### ❌ Error Details" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
             echo "$ERROR_MSG" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.results.outputs.status }}" = "Skipped" ]; then
+            echo "### ⏭️ Run skipped (run lock held by another instance)" >> $GITHUB_STEP_SUMMARY
           else
             echo "### ✅ Run Completed Successfully" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
@@ -685,10 +697,6 @@ jobs:
           # list, and a plain `git add` silently refuses paths outside it.
           git add --sparse -f reports 2>/dev/null || true
 
-          if [ -f brain_state.json ]; then
-            git add -f brain_state.json
-          fi
-
           # ── AUDIT: always print what's staged, even on no-op ──
           echo "=== git status ==="
           git status --short
@@ -738,7 +746,6 @@ jobs:
         with:
           name: unpushed-outcomes-${{ github.run_id }}
           path: |
-            /tmp/data-repo/brain_state.json
             /tmp/data-repo/outcomes/*.jsonl
             /tmp/data-repo/shadow/*.jsonl
             /tmp/data-repo/reports/*.md

@@ -37,7 +37,7 @@ jobs:
           # `-e` for the command substitution so RC is actually captured.
           for attempt in 1 2 3; do
             : > "$ERR_FILE"
-            if RESPONSE=$(timeout 20 gh api "repos/${REPO}/actions/artifacts?per_page=100" 2>"$ERR_FILE"); then
+            if RESPONSE=$(timeout 60 gh api --paginate "repos/${REPO}/actions/artifacts?per_page=100" 2>"$ERR_FILE"); then
               RC=0
             else
               RC=$?
@@ -56,7 +56,7 @@ jobs:
             echo "has_candidates=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          IDS=$(echo "$RESPONSE" | jq -r '.artifacts | map(select((.name | startswith("unpushed-outcomes-")) and (.expired | not))) | sort_by(.created_at) | .[].id')
+          IDS=$(echo "$RESPONSE" | jq -r -s '[.[].artifacts[]] | map(select((.name | startswith("unpushed-outcomes-")) and (.expired | not))) | sort_by(.created_at) | .[].id')
           if [ -z "$IDS" ]; then
             echo "No un-pushed outcome artifacts to replay"
             echo "has_candidates=false" >> "$GITHUB_OUTPUT"
@@ -233,6 +233,23 @@ jobs:
               && echo "Retired artifact ${ID}" \
               || echo "::warning::Could not delete artifact ${ID}"
           done < "$RUNNER_TEMP/replayed_ids"
+
+      - name: 📨 Notify Telegram when replay did not complete
+        if: always() && steps.list.outputs.has_candidates == 'true' && steps.push.outcome != 'success'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MSG="🟠 MACD Bot: replay of un-pushed outcomes did NOT complete"$'\n'"Artifacts expire after 7 days. Re-run or replay by hand."$'\n'"Run: ${RUN_URL}"
+          RESP=$(curl -sS --max-time 20 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" || true)
+          if echo "$RESP" | grep -q '"ok":true'; then
+            echo "Telegram notify delivered"
+          else
+            echo "::warning::Replay-failure notice NOT delivered: ${RESP:0:200}"
+          fi
 
       - name: 📋 Summary
         if: always()

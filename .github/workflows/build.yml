@@ -268,23 +268,18 @@ jobs:
           exit-code: '1'
 
       # PHASE 3b: PUBLISH (only reached when every gate above passed)
-      - name: 🚀 Push verified image
+      - name: 🚀 Push verified image (the exact tested candidate)
         if: github.event_name != 'pull_request'
         id: push
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64
-          outputs: type=image,compression=zstd,force-compression=true,push=true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            CYTHON_STRICT=1
-          cache-from: |
-            type=gha,scope=macd-aot-build
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          provenance: false
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r TAG; do
+            [ -n "$TAG" ] || continue
+            docker tag "$CANDIDATE_IMAGE" "$TAG"
+            docker push "$TAG"
+          done <<< "$TAGS"
 
       # PHASE 4: BUILD SUMMARY
       - name: 📋 Generate Build Summary
