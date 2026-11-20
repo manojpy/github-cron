@@ -135,8 +135,13 @@ jobs:
                           raw = fh.read()
                       needs_nl = bool(raw) and not raw.endswith(b"\n")
                       have = {ln.strip() for ln in raw.decode("utf-8").splitlines() if ln.strip()}
+                  new = []
                   with open(src, encoding="utf-8") as fh:
-                      new = [ln.strip() for ln in fh if ln.strip() and ln.strip() not in have]
+                      for ln in fh:
+                          ln = ln.strip()
+                          if ln and ln not in have:
+                              have.add(ln)
+                              new.append(ln)
                   if not new:
                       continue
                   os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -166,10 +171,21 @@ jobs:
           cd /tmp/data-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f outcomes shadow reports 2>/dev/null || true
+
+          # One missing path makes `git add` fail as a whole and stage nothing,
+          # so stage each directory on its own.
+          for d in outcomes shadow reports; do
+            if [ -e "$d" ]; then
+              git add -f -- "$d"
+            fi
+          done
 
           if git diff --cached --quiet; then
-            echo "::warning::Replay produced no data changes to push"
+            if [ -n "$(git status --porcelain -- outcomes shadow reports)" ]; then
+              echo "::error::Replay changed files but nothing could be staged - artifacts NOT retired"
+              exit 1
+            fi
+            echo "::warning::Replay produced no data changes to push (all rows already present)"
             exit 0
           fi
           git commit -m "chore: replay un-pushed outcomes $(date -u +%Y-%m-%dT%H:%M:%SZ)"
