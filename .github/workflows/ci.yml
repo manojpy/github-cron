@@ -29,6 +29,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install linters
         run: pip install pyflakes==3.2.0 mypy==1.11.0

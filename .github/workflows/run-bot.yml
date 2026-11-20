@@ -58,13 +58,6 @@ jobs:
       # PHASE 0: START THE IMAGE PULL FIRST
       # The pull is the slowest step. It runs in the background while checkout,
       # config checks and the archive checkout proceed, and a later step waits for it.
-      - name: 🐳 Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: 🔥 Start image pull (background)
         run: |
           BASE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
@@ -462,8 +455,6 @@ jobs:
             -e REQUIRE_AOT=true \
             -e PYTHONPATH=/app/src \
             -e PYTHONUNBUFFERED=1 \
-            -e NUMBA_NUM_THREADS=2 \
-            -e OMP_NUM_THREADS=2 \
             -e OUTCOME_DATA_DIR=/tmp/data-repo \
             -v "/tmp/data-repo:/tmp/data-repo:rw" \
             -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \
