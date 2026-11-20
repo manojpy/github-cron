@@ -541,7 +541,7 @@ jobs:
           echo "## 🤖 MACD Bot Execution Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          if [ "${{ steps.results.outputs.status }}" != "Failed" ]; then
+          if [ "${{ steps.results.outputs.status }}" = "Failed" ]; then
             echo "### ❌ Error Details" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
             echo "$ERROR_MSG" >> $GITHUB_STEP_SUMMARY
