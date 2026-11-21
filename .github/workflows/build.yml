@@ -131,9 +131,12 @@ jobs:
           build-args: |
             CYTHON_STRICT=1
           cache-from: |
+            type=gha,scope=macd-aot-build-${{ env.PYTHON_VERSION }}
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+          cache-to: |
+            type=gha,scope=macd-aot-build-${{ env.PYTHON_VERSION }},mode=max,ignore-error=true
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
           provenance: false
 
       - name: ✅ Smoke Test - Verify AOT/JIT Configuration
