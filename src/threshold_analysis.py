@@ -1041,8 +1041,8 @@ def recommend_threshold(rows: List[Row], target_winrate: float = 0.55, min_sampl
             continue
         _ev_point, _hk, _wr_point = ev_and_kelly_for(subset)
         if _ev_point > 0:
-            if _cheap_positive_cap is None or cap < _cheap_positive_cap:
-                _cheap_positive_cap = cap
+            _cheap_positive_cap = cap   # caps_data is ascending: the first positive cap is the lowest
+            break
 
     if _cheap_positive_cap is not None:
         _final_subset = [r for r in rows if r["score"] >= _cheap_positive_cap]

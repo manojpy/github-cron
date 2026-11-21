@@ -329,8 +329,11 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
     for repair in repairs:
         if repair.get("category") != "config_regression_pinpoint":
             continue
+
         if (repair.get("delta_wr") or 0) >= 0:
             continue  # only regressions warrant a revert
+        if repair.get("p_value") is None or repair["p_value"] > 0.10:
+            continue  # a break this size is common in noise: no revert proposal
         version_before = repair.get("version_before")
         version_after = repair.get("version_after")
         if not version_before or version_before == version_after:
@@ -968,11 +971,11 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
             ablation = engine.actionable_condition_ablation(
                 real_rows,
                 min_sample=min_sample,
-                n_permutations=_perm_n,
+                n_permutations=200,
                 noise_threshold=getattr(cfg, "ABLATION_NOISE_THRESHOLD", 0.01),
                 edge_threshold=getattr(cfg, "ABLATION_EDGE_THRESHOLD", 0.03),
             )
-            noise_votes = [a for a in ablation if a["action"] == "reduce_weight"]
+            noise_votes = [a for a in ablation if a["action"] == "reduce_weight" and a["direction"] == "harmful"]
             if noise_votes:
                 parts = [
                     f"{a['vote']}(imp={a['importance']:+.3f}→×{a['suggested_weight_factor']})"

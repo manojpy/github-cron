@@ -459,7 +459,7 @@ def actionable_condition_ablation(rows: List[Row], min_sample: int = 40, n_permu
                     f"condition adds almost no information once others are present"
                 ),
             })
-        elif imp >= edge_threshold and p_val <= 0.10 and item.get("direction") == "negative":
+        elif imp >= edge_threshold and p_val <= 0.10 / max(1, len(raw)) and item.get("direction") == "negative":
             # Informative but in the WRONG direction: WR is lower when this vote fires.
             out.append({
                 "vote": vote,

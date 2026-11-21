@@ -614,8 +614,9 @@ class BrainEngineV2(BrainCore):
                         reinstate_alerts.append(ak)
 
                 elif rec_type == "repair_shop" and rec.get("category") == "root_cause":
-                    if not action_gate_passed:
+                    if not action_gate_passed or rec.get("fdr_passed") is False:
                         continue
+
                     adj = self._root_cause_to_weight_adjustment(rec)
                     if adj:
                         adj["_repair_id"] = rec.get("_repair_id")

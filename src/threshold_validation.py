@@ -441,6 +441,33 @@ def detect_feature_drift(rows: List[Row], recent_n: int = 100, psi_threshold: fl
     drifted.sort(key=lambda d: -d["psi"])
     return {"valid": True, "drifted_features": drifted, "n_recent": recent_n}
 
+_CP_PERMUTATIONS = 200
+
+def _best_split(flags: List[int], min_side: int) -> Optional[Dict[str, Any]]:
+    """Strongest single cut of a 0/1 win sequence: the split that maximises
+    |win-rate change| * (1 - two-proportion p-value). O(n) via prefix sums."""
+    n = len(flags)
+    pref = [0] * (n + 1)
+    for i, f in enumerate(flags):
+        pref[i + 1] = pref[i] + f
+    best: Optional[Dict[str, Any]] = None
+    for i in range(min_side, n - min_side):
+        wl = pref[i]
+        wr_ = pref[n] - pref[i]
+        p = two_proportion_p_value(wl, i, wr_, n - i)
+        delta = wr_ / (n - i) - wl / i
+        score = abs(delta) * (1.0 - p)
+        if best is None or score > best["score"]:
+            best = {
+                "score": score,
+                "index": i,
+                "wr_before": wl / i,
+                "wr_after": wr_ / (n - i),
+                "delta": delta,
+                "p_value": p,
+            }
+    return best
+
 def find_wr_change_point(rows: List[Row], min_side: int = 25, min_delta: float = 0.08) -> Dict[str, Any]:
     """Locate the timestamp where win rate shifted most, via an O(n)
     two-sample scan using prefix sums. Returns change point + before/after
@@ -454,30 +481,26 @@ def find_wr_change_point(rows: List[Row], min_side: int = 25, min_delta: float =
     if n < min_side * 2:
         return {"valid": False, "error": "insufficient_data"}
 
-    pref = [0] * (n + 1)
-    for i, r in enumerate(ordered):
-        pref[i + 1] = pref[i] + (1 if r["win"] else 0)
-
-    best: Optional[Dict[str, Any]] = None
-    for i in range(min_side, n - min_side):
-        wl = pref[i]
-        wr_ = pref[n] - pref[i]
-        p = two_proportion_p_value(wl, i, wr_, n - i)
-        delta = wr_ / (n - i) - wl / i
-        score = abs(delta) * (1.0 - p)
-        if best is None or score > best["score"]:
-            best = {
-                "score": score,
-                "index": i,
-                "change_ts": ordered[i]["entry_ts"],
-                "wr_before": wl / i,
-                "wr_after": wr_ / (n - i),
-                "delta": delta,
-                "p_value": p,
-            }
-
+    flags = [1 if r["win"] else 0 for r in ordered]
+    best = _best_split(flags, min_side)
     if best is None or abs(best["delta"]) < min_delta:
         return {"valid": False, "error": "no_significant_change_point"}
+    best["change_ts"] = ordered[best["index"]]["entry_ts"]
+
+    # best["p_value"] is the best of ~n candidate cut points, so on its own it is far
+    # too small. Re-run the same search on shuffled win/loss labels (fixed seed, so the
+    # result is repeatable) and report how often pure noise gives a split at least this
+    # strong.
+    best["p_value_unadjusted"] = best["p_value"]
+    rng = random.Random(n * 1_000_003 + sum(flags))
+    at_least = 0
+    for _ in range(_CP_PERMUTATIONS):
+        shuffled = flags[:]
+        rng.shuffle(shuffled)
+        b = _best_split(shuffled, min_side)
+        if b is not None and b["score"] >= best["score"]:
+            at_least += 1
+    best["p_value"] = (1 + at_least) / (_CP_PERMUTATIONS + 1)
 
     def _dominant_version(chunk: List[Row]) -> Optional[str]:
         counts: Dict[str, int] = defaultdict(int)

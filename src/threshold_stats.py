@@ -749,12 +749,16 @@ def bootstrap_ev_ci(rows: List[Row], n_sims: int = 1000, block_size: int = 20, s
     if len(blocks) < 5:
         return {"valid": False, "error": "insufficient_blocks"}
 
+    # Net P&L of every row is computed ONCE here; each simulation then only
+    # re-averages the resampled blocks (same maths as ev_and_kelly_for's EV).
+    _fee, _slip = _resolve_costs(None, None)
+    _total_cost = ((_fee * 2) + (_slip * 2)) * 100
+    block_pnls = [[row_net_pnl_pct(r, _total_cost) for r in blk] for blk in blocks]
     ev_samples: List[float] = []
     for _ in range(n_sims):
-        sampled = rng.choices(blocks, k=len(blocks))
-        flat = [r for blk in sampled for r in blk]
-        ev, _hk, _wr = ev_and_kelly_for(flat)
-        ev_samples.append(ev)
+        sampled = rng.choices(block_pnls, k=len(block_pnls))
+        n_rows = sum(len(blk) for blk in sampled)
+        ev_samples.append(math.fsum(v for blk in sampled for v in blk) / n_rows)
 
     ev_samples.sort()
     n = len(ev_samples)

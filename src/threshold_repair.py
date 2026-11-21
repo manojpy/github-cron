@@ -524,6 +524,7 @@ def diagnose_root_cause(rows: List[Row], target_wr: float = 0.55, min_segment: i
 
     overall_wins = sum(r["win"] for r in rows)
     overall_wr = overall_wins / n
+    n_splits_tested = 0
 
     feats_per_row = [_flatten_row_features(r) for r in rows]
     feature_names = sorted({f for d in feats_per_row for f in d})
@@ -551,6 +552,7 @@ def diagnose_root_cause(rows: List[Row], target_wr: float = 0.55, min_segment: i
                 seg_n = len(side_vals)
                 if seg_n < min_segment or seg_n > len(pairs) - min_segment:
                     continue
+                n_splits_tested += 1
                 seg_wins = sum(w for _, w in side_vals)
                 seg_wr = seg_wins / seg_n
                 lo, hi, _ = wilson_ci(seg_wins, seg_n)
@@ -576,6 +578,10 @@ def diagnose_root_cause(rows: List[Row], target_wr: float = 0.55, min_segment: i
                     "confident": hi < target_wr,
                     "p_value": p,
                 })
+
+    for c in candidates:
+        c["p_value_unadjusted"] = c["p_value"]
+        c["p_value"] = min(1.0, c["p_value"] * max(1, n_splits_tested))   # Bonferroni
 
     candidates.sort(key=lambda c: -c["isolation_score"])
     seen: Set[str] = set()
