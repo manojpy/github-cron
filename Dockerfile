@@ -3,12 +3,12 @@
 # =============================================================================
 
 # ---------- STAGE 1: UV INSTALLER ----------
-FROM python:3.11-slim-bookworm AS uv-installer
+FROM python:3.13-slim-bookworm AS uv-installer
 
 RUN pip install --no-cache-dir uv==0.13.8
 
 # ---------- STAGE 2: DEPENDENCIES BUILDER ----------
-FROM python:3.11-slim-bookworm AS deps-builder
+FROM python:3.13-slim-bookworm AS deps-builder
 
 COPY --from=uv-installer /usr/local/bin/uv /usr/local/bin/uv
 
@@ -28,7 +28,8 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 ENV UV_CACHE_DIR='/tmp/uv_cache'
 COPY requirements.txt .
 RUN --mount=type=cache,target=/tmp/uv_cache \
-    uv pip install -r requirements.txt
+    uv pip install -r requirements.txt && \
+    python -m compileall -q -o 2 $VIRTUAL_ENV
 
 # ---------- STAGE 3: CYTHON COMPILER ----------
 FROM deps-builder AS cython-builder
@@ -55,26 +56,28 @@ RUN set -e; \
 # shrinks the image the runner has to pull on every 15-minute run.
 FROM deps-builder AS runtime-venv
 
+# KEEP_JIT_FALLBACK=1 keeps numba + llvmlite + tbb (about 165 MB) so the slow
+# Numba JIT can take over if the compiled Cython module ever fails to load.
+# The build already refuses to produce an image without Cython (CYTHON_STRICT)
+# and the smoke test in build.yml requires AOT, so the default drops them.
 ARG KEEP_JIT_FALLBACK=0
 
-# Re-compile after pruning so bytecode matches the final runtime package set
 RUN set -e; \
-    SP="$VIRTUAL_ENV/lib/python3.11/site-packages"; \
-    uv pip uninstall -y cython setuptools wheel py-cpuinfo; \
+    SP="$VIRTUAL_ENV/lib/python3.13/site-packages"; \
+    uv pip uninstall cython setuptools wheel py-cpuinfo; \
     if [ "$KEEP_JIT_FALLBACK" != "1" ]; then \
-        uv pip uninstall -y numba llvmlite tbb; \
+        uv pip uninstall numba llvmlite tbb; \
     fi; \
     rm -rf "$SP"/Cython "$SP"/cython* "$SP"/pyximport "$SP"/setuptools* "$SP"/pkg_resources \
            "$SP"/_distutils_hack "$SP"/wheel* "$SP"/cpuinfo "$SP"/py_cpuinfo*; \
     if [ "$KEEP_JIT_FALLBACK" != "1" ]; then \
         rm -rf "$SP"/numba* "$SP"/llvmlite* "$SP"/tbb* "$SP"/TBB*; \
     fi; \
-    find "$SP" -type d -name tests -prune -exec rm -rf {} +; \
-    python -m compileall -q -o 2 "$VIRTUAL_ENV"; \
+    find "$SP/numpy" -type d -name tests -prune -exec rm -rf {} +; \
     echo "runtime venv: $(du -sm "$VIRTUAL_ENV" | cut -f1) MB"
 
 # ---------- STAGE 4: FINAL RUNTIME ----------
-FROM python:3.11-slim-bookworm AS final
+FROM python:3.13-slim-bookworm AS final
 
 HEALTHCHECK NONE
 

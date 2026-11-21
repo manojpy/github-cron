@@ -1,5 +1,5 @@
 # =============================================================================
-# Core Dependencies - Optimized for Python 3.11+
+# Core Dependencies - Optimized for Python 3.13
 # =============================================================================
 
 # Async Networking & Performance
@@ -9,7 +9,7 @@ aiodns==4.0.4
 Brotli==1.2.1
 
 # High-Performance Computation
-numpy==2.4.6
+numpy==2.5.5
 numba==0.68.1
 cython==3.3.1
 
