@@ -35,7 +35,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
-  PYTHON_VERSION: "3.13"
+  PYTHON_VERSION: "3.15"
   CANDIDATE_IMAGE: macd-candidate:test
 
 jobs:
