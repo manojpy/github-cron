@@ -136,7 +136,7 @@ jobs:
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           cache-to: |
             type=gha,scope=macd-aot-build-${{ env.PYTHON_VERSION }},mode=max,ignore-error=true
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max,ignore-error=true
           provenance: false
 
       - name: ✅ Smoke Test - Verify AOT/JIT Configuration
@@ -257,7 +257,7 @@ jobs:
       # PHASE 3: SECURITY SCANNING
       - name: 🚦 Trivy gate (block on fixable CRITICAL findings)
         if: ${{ inputs.skip_trivy != 'true' }}
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.CANDIDATE_IMAGE }}
           format: 'table'
