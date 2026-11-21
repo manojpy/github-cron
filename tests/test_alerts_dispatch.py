@@ -1832,7 +1832,7 @@ def test_dedup_summary_reports_delivered_but_unscored_alerts():
 # graded candidate rows: signals that were sent or seen but never recorded
 # ======================================================================
 def _cand_cfg(monkeypatch):
-    for k, v in dict(ENABLE_BRAIN=True, CANDIDATE_LOG_MAX_PER_PAIR=300, CANDIDATE_RESOLVE_OUTCOMES=True,
+    for k, v in dict(ENABLE_BRAIN=True, BRAIN_USE_FILE_STORAGE=False, CANDIDATE_LOG_MAX_PER_PAIR=300, CANDIDATE_RESOLVE_OUTCOMES=True,
                      OUTCOME_MAE_LOSS_PCT=1.0, OUTCOME_RR_TARGET=2.0, OUTCOME_LOOKAHEAD_CANDLES=12,
                      OUTCOME_FILL_DELAY_CANDLES=1, BRAIN_FEE_PCT=0.0006, BRAIN_SLIPPAGE_PCT=0.0003,
                      OUTCOME_COST_MODEL="flat").items():
@@ -1894,7 +1894,8 @@ def test_candidate_grading_touches_nothing_else_and_can_be_switched_off(monkeypa
     _cand_log(sdb, "XAUTUSD", "vwap_buy", "buy", ets + 1, "ignored_open_trade", entry_price=100.0)   # not a candle time
     _cand_grade(sdb, "XAUTUSD", data, 18)
     assert set(sdb._redis.d) == {f"{state.RedisKeyPrefix.CANDIDATE_EVENTS}XAUTUSD",
-                                 f"{state.RedisKeyPrefix.CANDIDATE_RESOLVED}XAUTUSD"}   # no stream, totals or stats
+                                 f"{state.RedisKeyPrefix.CANDIDATE_RESOLVED}XAUTUSD",
+                                 f"{state.RedisKeyPrefix.CANDIDATE_STATS}{time.strftime('%Y-%m-%d', time.gmtime())}"}   # no stream, totals or win-rate stats
     done = f"{state.RedisKeyPrefix.CANDIDATE_RESOLVED}XAUTUSD"
     assert f"vwap_buy|{ets + 1}" not in sdb._redis.d[done]
     old = int(time.time()) - 40 * 86400
