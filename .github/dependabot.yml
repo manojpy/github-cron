@@ -10,14 +10,16 @@ updates:
     schedule:
       interval: "weekly"
     ignore:
-      # rebuilds every Sunday.
+      # Move the Python version on purpose, never by PR. Patch releases still arrive:
+      # the tag floats and build.yml rebuilds every Sunday.
       - dependency-name: "python"
-        update-types: ["version-update:semver-major"]
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
       interval: "weekly"
     ignore:
+      # numpy 2.6 is blocked by numba 0.68.1 (needs numpy < 2.6). Take it with a numba bump.
       - dependency-name: "numpy"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
