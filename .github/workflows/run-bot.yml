@@ -158,7 +158,50 @@ jobs:
           fi
           NOW=$(date -u +%s)
           # 900 s = one 15-minute slot; 48 slots = 12 hours (00:00/12:00 UTC).
-          if [ "$BRAIN_REPORT_INPUT" = "true" ] || [ "$ON_DEMAND" = "true" ] || [ $(( (NOW / 900) % 48 )) -eq 0 ]; then
+          SCHEDULED=false
+          if [ $(( (NOW / 900) % 48 )) -eq 0 ]; then SCHEDULED=true; fi
+
+          # Catch-up: a dispatch that never ran (or a run that was cancelled) at
+          # 00:00/12:00 used to cost the whole 12 h report. Read the newest archived
+          # report name (reports/YYYY-MM-DD_HH-MM.md, UTC). If the last one is older
+          # than 12.5 h, run the full archive on the next whole-hour slot. Hourly, not
+          # every 15 min, so a report that keeps failing cannot turn every run into a
+          # heavy one; and not once the last report is over 36 h old (a persistent
+          # fault needs a person, not an hourly retry). Any lookup failure means
+          # "no catch-up", which is exactly the behaviour without this block.
+          CATCHUP=false
+          if [ "$SCHEDULED" != "true" ] && [ $(( (NOW / 900) % 4 )) -eq 0 ]; then
+            LAST_TS=$(curl -fsS --max-time 10 \
+                -H "Authorization: Bearer $DATA_REPO_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/manojpy/outcome-data/contents/reports?ref=main" 2>/dev/null \
+              | python3 -c "
+          import sys, json, re
+          from datetime import datetime, timezone
+          try:
+              names = [e['name'] for e in json.load(sys.stdin) if isinstance(e, dict)]
+          except Exception:
+              sys.exit(0)
+          best = 0
+          for n in names:
+              m = re.fullmatch(r'(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})\.md', n)
+              if m:
+                  t = datetime.strptime(m.group(1) + ' ' + m.group(2) + ':' + m.group(3), '%Y-%m-%d %H:%M')
+                  best = max(best, int(t.replace(tzinfo=timezone.utc).timestamp()))
+          print(best or '')
+          " 2>/dev/null || true)
+            if [ -n "$LAST_TS" ]; then
+              AGE=$(( NOW - LAST_TS ))
+              if [ "$AGE" -ge 45000 ] && [ "$AGE" -le 129600 ]; then
+                CATCHUP=true
+                echo "🧠 Last Brain report is $(( AGE / 3600 )) h old — catch-up run"
+              fi
+            else
+              echo "ℹ️ Could not read the last report time — no catch-up check this run"
+            fi
+          fi
+
+          if [ "$BRAIN_REPORT_INPUT" = "true" ] || [ "$ON_DEMAND" = "true" ] || [ "$SCHEDULED" = "true" ] || [ "$CATCHUP" = "true" ]; then
             echo "brain_full=true"  >> "$GITHUB_OUTPUT"
             echo "archive_days=185" >> "$GITHUB_OUTPUT"
             echo "🧠 Brain-report run: full 185-day archive"
@@ -166,7 +209,7 @@ jobs:
             echo "brain_full=false" >> "$GITHUB_OUTPUT"
             echo "archive_days=3"   >> "$GITHUB_OUTPUT"
             echo "⚡ Alert-only run: 3-day archive"
-          fi     
+          fi
 
       - name: 📦 Checkout outcome-data archive
         if: inputs.apply_brain_plan != true
@@ -222,21 +265,24 @@ jobs:
           print("outcomes/.gitkeep")
           print("shadow/.gitkeep")
           print("reports/.gitkeep")
+          print("candidates/.gitkeep")
           for i in range(days):
               d = (today - datetime.timedelta(days=i)).isoformat()
               print(f"outcomes/{d}.jsonl")
               print(f"outcomes/{d}.jsonl.gz")
               print(f"shadow/{d}.jsonl")
               print(f"shadow/{d}.jsonl.gz")
+              print(f"candidates/{d}.jsonl")
+              print(f"candidates/{d}.jsonl.gz")
           PY
           git checkout main
           cd -
 
-          mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
+          mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports /tmp/data-repo/candidates
           # a+rwX: the container user (uid 1000) can write, but files do not gain the
           # exec bit, so git sees no mode changes. .git is not touched.
           chmod a+rwx /tmp/data-repo
-          chmod -R a+rwX /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
+          chmod -R a+rwX /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports /tmp/data-repo/candidates
 
           # ── AUDIT: prove what actually landed on disk ──
           echo "=== /tmp/data-repo top level ==="
@@ -267,9 +313,10 @@ jobs:
           STRICT_IMAGE_PROVENANCE: "false"
         run: |
           WAIT_START=$(date +%s)
-          # 0.2 s polling, max ~120 s (600 * 0.2 s) so slow registry hiccups don't false-fail
+          # 0.2 s polling, max ~240 s (1200 * 0.2 s): the SHA pull can fail first and
+          # the :latest fallback then starts, so the budget covers two pulls.
           i=1
-          while [ "$i" -le 600 ]; do
+          while [ "$i" -le 1200 ]; do
             [ -f /tmp/image-pull.rc ] && break
             sleep 0.2
             i=$((i + 1))
@@ -341,11 +388,11 @@ jobs:
 
           # The archive checkout is skipped for apply runs; create the folder the
           # image probes for writability at import time.
-          mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
+          mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports /tmp/data-repo/candidates
           # a+rwX: the container user (uid 1000) can write, but files do not gain the
           # exec bit, so git sees no mode changes. .git is not touched.
           chmod a+rwx /tmp/data-repo
-          chmod -R a+rwX /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports
+          chmod -R a+rwX /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports /tmp/data-repo/candidates
           set +e
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
@@ -653,6 +700,7 @@ jobs:
       - name: 📤 Persist outcomes to data repo
         id: persist
         if: always()
+        timeout-minutes: 4
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
@@ -691,8 +739,8 @@ jobs:
           # `git add -f` forces staging even when the file is new and the
           # clone was made with --no-checkout. `--sparse` can silently
           # refuse a file that has no prior index entry.
-          for f in "outcomes/${TODAY}.jsonl" "shadow/${TODAY}.jsonl" \
-                   "outcomes/${YESTERDAY}.jsonl" "shadow/${YESTERDAY}.jsonl"; do
+          for f in "outcomes/${TODAY}.jsonl" "shadow/${TODAY}.jsonl" "candidates/${TODAY}.jsonl" \
+                   "outcomes/${YESTERDAY}.jsonl" "shadow/${YESTERDAY}.jsonl" "candidates/${YESTERDAY}.jsonl"; do
             if [ -f "$f" ]; then
               git add -f "$f"
             fi
@@ -706,6 +754,10 @@ jobs:
           # --sparse is REQUIRED: report file names are not in the sparse-checkout
           # list, and a plain `git add` silently refuses paths outside it.
           git add --sparse -f reports 2>/dev/null || true
+
+          # Candidate ledger (skipped-signal rows). Not an outcome table: no reader of
+          # outcomes/ or shadow/ opens it. --sparse for the same reason as reports above.
+          git add --sparse -f candidates 2>/dev/null || true
 
           # ── AUDIT: always print what's staged, even on no-op ──
           echo "=== git status ==="
@@ -758,6 +810,7 @@ jobs:
           path: |
             /tmp/data-repo/outcomes/*.jsonl
             /tmp/data-repo/shadow/*.jsonl
+            /tmp/data-repo/candidates/*.jsonl
             /tmp/data-repo/reports/*.md
           retention-days: 7
           if-no-files-found: ignore

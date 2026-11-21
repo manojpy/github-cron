@@ -187,6 +187,10 @@ jobs:
 
           export GIT_ASKPASS="$ASKPASS"
           export GIT_TERMINAL_PROMPT=0
+          # Remember what main was when this job cloned it. If a bot run pushes
+          # after that, the force-push below is refused instead of silently
+          # deleting that run's outcomes.
+          BASE=$(git rev-parse HEAD)
 
           git checkout --orphan squashed
           git add -A
@@ -194,4 +198,4 @@ jobs:
 
           # Use the token-free origin URL. This operation intentionally
           # force-pushes main and must remain manual-only.
-          git push --force origin squashed:main
+          git push --force-with-lease=main:"$BASE" origin squashed:main

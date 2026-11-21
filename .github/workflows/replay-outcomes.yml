@@ -124,7 +124,7 @@ jobs:
           # rewrites it in full each report cycle, so an old artifact's copy
           # could regress the live state if a newer report already landed.
           # This matches the previous in-run replay behaviour exactly.
-          for kind in ("outcomes", "shadow"):
+          for kind in ("outcomes", "shadow", "candidates"):
               for src in sorted(glob.glob(f"{SRC}/{kind}/*.jsonl")):
                   rel = f"{kind}/{os.path.basename(src)}"
                   dst = f"{DST}/{rel}"
@@ -174,12 +174,11 @@ jobs:
 
           # One missing path makes `git add` fail as a whole and stage nothing,
           # so stage each directory on its own.
-          for d in outcomes shadow reports; do
+          for d in outcomes shadow candidates reports; do
             if [ -e "$d" ]; then
               git add -f -- "$d"
             fi
           done
-
           if git diff --cached --quiet; then
             if [ -n "$(git status --porcelain -- outcomes shadow reports)" ]; then
               echo "::error::Replay changed files but nothing could be staged - artifacts NOT retired"
@@ -221,7 +220,9 @@ jobs:
               echo "✅ Replay pushed (attempt ${attempt})"
               exit 0
             fi
-
+            if [ "$attempt" -eq 5 ]; then
+              break    # no 6th push follows: a sleep + rebase now would only delay the failure
+            fi
             echo "::warning::Push rejected (attempt ${attempt}/5) — rebasing onto latest main"
             sleep $(( attempt * 2 + RANDOM % 3 ))
 
