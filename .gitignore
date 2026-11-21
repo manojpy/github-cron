@@ -17,7 +17,8 @@ env/
 
 # Bot Logs and Secrets
 *.log
-config_macd.json
+# config_macd.json must be tracked in this repo (fetched by SHA in workflows).
+# Do not add it to .gitignore, or fresh clones will fail the config fetch step.
 .env
 
 # Runtime outcome data (JSONL archives, brain reports)
