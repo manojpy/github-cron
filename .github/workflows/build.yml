@@ -35,7 +35,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
-  PYTHON_VERSION: "3.11"
+  PYTHON_VERSION: "3.13"
   CANDIDATE_IMAGE: macd-candidate:test
 
 jobs:
@@ -256,8 +256,7 @@ jobs:
       # PHASE 3: SECURITY SCANNING
       - name: 🚦 Trivy gate (block on fixable CRITICAL findings)
         if: inputs.skip_trivy != 'true'
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
-        with:
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
           image-ref: ${{ env.CANDIDATE_IMAGE }}
           format: 'table'
           severity: 'CRITICAL'

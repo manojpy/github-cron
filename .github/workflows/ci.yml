@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.13"
           cache: "pip"
 
       - name: Install linters
@@ -90,8 +90,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
-          cache: "pip"
+          python-version: "3.13"
 
       - name: Install dependencies
         run: pip install -r requirements.txt pytest
@@ -133,8 +132,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
-          cache: "pip"
+          python-version: "3.13"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -170,18 +168,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Cache actionlint
-        id: cache-actionlint
-        uses: actions/cache@v4
-        with:
-          path: actionlint
-          key: actionlint-1.7.7-${{ runner.os }}-${{ runner.arch }}
-
-      - name: Download actionlint
-        if: steps.cache-actionlint.outputs.cache-hit != 'true'
+      - name: Run actionlint
         run: |
           bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
-          chmod +x ./actionlint
-
-      - name: Run actionlint
-        run: ./actionlint -color
+          ./actionlint -color

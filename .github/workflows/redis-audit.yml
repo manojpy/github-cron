@@ -45,7 +45,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.13"
 
       - name: Install redis client
         run: pip install --quiet "redis==8.1.0"
