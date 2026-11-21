@@ -91,7 +91,6 @@ jobs:
         uses: docker/setup-buildx-action@v4
         with:
           driver-opts: |
-
             image=moby/buildkit:v0.12.5
           buildkitd-flags: --allow-insecure-entitlement network.host
 
@@ -111,7 +110,6 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=sha,prefix=sha-,format=long
-
             type=schedule,pattern={{date 'YYYYMMDD-HHmm'}},enable=true
           labels: |
             org.opencontainers.image.title=MACD Unified Bot
@@ -130,7 +128,7 @@ jobs:
           load: true
           tags: ${{ env.CANDIDATE_IMAGE }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |        
+          build-args: |
             CYTHON_STRICT=1
           cache-from: |
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
@@ -255,8 +253,8 @@ jobs:
 
       # PHASE 3: SECURITY SCANNING
       - name: 🚦 Trivy gate (block on fixable CRITICAL findings)
-        if: inputs.skip_trivy != 'true'
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        if: ${{ inputs.skip_trivy != 'true' }}
+        uses: aquasecurity/trivy-action@0.36.0
         with:
           image-ref: ${{ env.CANDIDATE_IMAGE }}
           format: 'table'
