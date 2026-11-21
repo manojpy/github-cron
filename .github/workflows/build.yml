@@ -57,7 +57,6 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: "pip"
 
       - name: 🔎 Type Check (mypy, informational)
         id: mypy
@@ -92,7 +91,8 @@ jobs:
         uses: docker/setup-buildx-action@v4
         with:
           driver-opts: |
-            image=moby/buildkit:latest
+
+            image=moby/buildkit:v0.12.5
           buildkitd-flags: --allow-insecure-entitlement network.host
 
       - name: 🔐 Log in to GitHub Container Registry

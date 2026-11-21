@@ -182,6 +182,9 @@ jobs:
             --platform linux/amd64 \
             --security-opt=no-new-privileges \
             --read-only \
+            --cap-drop=ALL \
+            --pids-limit=256 \
+            --memory=2g \
             --tmpfs /tmp:rw,noexec,nosuid,size=64m \
             --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m \
             --env-file "$ENV_FILE" \
