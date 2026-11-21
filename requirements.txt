@@ -1,5 +1,5 @@
 # =============================================================================
-# Core Dependencies - Optimized for Python 3.13
+# Core Dependencies - Optimized for Python 3.15
 # =============================================================================
 
 # Async Networking & Performance
