@@ -256,7 +256,7 @@ def dockerfile_text() -> str:
 def check_python(df: str, base_lines: List[str]) -> Tuple[List[str], int, str]:
     m = re.search(r"^FROM\s+python:(\d+)\.(\d+)", df, re.M)
     if not m:
-        return ["No `FROM python:X.Y` line found in the Dockerfile."], 0, "3.11"
+        return ["No `FROM python:X.Y` line found in the Dockerfile."], 0, "3.15"
     cur_cycle = f"{m.group(1)}.{m.group(2)}"
     cycles = http_json("https://endoflife.date/api/python.json") or []
     today = date.today()
@@ -287,7 +287,7 @@ def check_python(df: str, base_lines: List[str]) -> Tuple[List[str], int, str]:
         out.append(f"Newest Python at least {MIN_AGE_DAYS} days old: **{best['cycle']}** "
                    f"(released {best.get('releaseDate')}). {verdict}.")
         out.append(f"To move: change `FROM python:{cur_cycle}-…` to `python:{best['cycle']}-…` in all three stages, "
-                   f"and `python3.11` in the `SP=` path of the runtime-venv stage.")
+                   f"and `python{cur_cycle}` to `python{best['cycle']}` in the `SP=` path of the runtime-venv stage.")
         count += 1
     else:
         out.append(f"No newer stable Python that is at least {MIN_AGE_DAYS} days old.")
@@ -299,7 +299,7 @@ def check_uv(df: str) -> Tuple[List[str], int]:
     if not m:
         return ["No `uv==` pin found in the Dockerfile."], 0
     cur = Version(m.group(1))
-    latest = latest_stable("uv", "3.11")
+    latest = latest_stable("uv", "3.15")
     if latest and latest > cur:
         return [f"`uv` pinned at {cur}, newest stable **{latest}** ({bump_kind(cur, latest)}). "
                 f"Change `uv=={cur}` to `uv=={latest}` in the `uv-installer` stage."], 1
@@ -327,7 +327,7 @@ def check_debian(df: str) -> Tuple[List[str], int]:
     if newest and str(newest["codename"]).lower() != cur_name:
         out.append(f"Newer stable Debian at least {MIN_AGE_DAYS} days old: **{str(newest['codename']).lower()}** "
                    f"(released {newest['releaseDate']}). Not urgent while {cur_name} is supported. "
-                   f"To move, change `-slim-{cur_name}` in the Dockerfile and check that `libtbb12` / `libgomp1` still install.")
+                   f"To move, change `-slim-{cur_name}` in the Dockerfile and check that `ca-certificates` still installs.")
         count += 1
     else:
         out.append("✅ Debian base is the newest stable.")
@@ -388,7 +388,7 @@ def main() -> int:
 
     df = dockerfile_text()
     mpy = re.search(r"^FROM\s+python:(\d+\.\d+)", df, re.M)
-    py_version = mpy.group(1) if mpy else "3.11"
+    py_version = mpy.group(1) if mpy else "3.15"
     req_path = ROOT / "requirements.txt"
     base_lines = [r["raw"].split("#", 1)[0].strip() for r in read_requirements(req_path)] if req_path.exists() else []
 
