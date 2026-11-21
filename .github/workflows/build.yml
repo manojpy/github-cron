@@ -133,9 +133,9 @@ jobs:
           build-args: |        
             CYTHON_STRICT=1
           cache-from: |
-            type=gha,scope=macd-aot-build
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          cache-to: type=gha,mode=max,scope=macd-aot-build
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
           provenance: false
 
       - name: ✅ Smoke Test - Verify AOT/JIT Configuration
