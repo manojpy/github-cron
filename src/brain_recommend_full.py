@@ -158,7 +158,7 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
                                 f"↩️ Auto-rolled back plan {_ev['plan_id']}: WR "
                                 f"{_e['wr_pre']:.0%}→{_e['wr_post']:.0%} after apply "
                                 f"(p={_e['p_value']}, n={_e['n_post']}/{_e['n_pre']})."
-                                + (" Config overrides need a restart to take effect."
+                                + (" Config overrides apply from the next run."
                                    if _ev.get("needs_restart") else "")
                             ),
                         })

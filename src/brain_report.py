@@ -1114,6 +1114,8 @@ def _sec_gate(F: Dict[str, Any], cfg) -> List[_Piece]:
          _data_foundation_lines, (_ai.get("data_foundation"),)),
         ("SKIPPED SIGNALS — what the alerts that were not recorded or were suppressed would have earned",
          _skipped_signal_lines, (_ai.get("skipped_signals"),)),
+        ("CANDIDATE LEDGER — is the skipped-signal record complete?",
+         _candidate_health_lines, (_ai.get("candidate_health"),)),
         ("PAIR CLASSES — Recorded results by group of pairs",
          _cohort_lines, (_ai.get("cohorts"),)),
         ("ARCHITECTURE BOUNDARY — research, validation, policy",
@@ -1569,6 +1571,34 @@ def _skipped_signal_lines(st: Optional[Dict[str, Any]]) -> List[str]:
                 f"  all suppressed: n={t['n']}, would have lost {t['precision']:.0%}, would have won "
                 f"{t['opportunity_loss']:.0%}, net {t['mean_net']:+.2f}% per alert "
                 "(a negative net means the suppression saved money)")
+    return lines
+
+def _candidate_health_lines(h: Optional[Dict[str, Any]]) -> List[str]:
+    """Plain-text lines for the candidate ledger counters and backlog (empty when unknown)."""
+    if not h:
+        return []
+    d = int(h.get("window_days") or 7)
+    lines = [
+        f"Last {d} days: {h.get('attempted', 0)} rows attempted, {h.get('stored', 0)} stored, "
+        f"{h.get('failed', 0)} lost (Redis write failed), {h.get('graded', 0)} graded, "
+        f"{h.get('file_failed', 0)} not written to the archive file."
+    ]
+    lines.append(
+        f"Now: {h.get('events_now', 0)} rows held across {h.get('pairs', 0)} pairs; "
+        f"{h.get('gradable_now', 0)} carry a price, of which {h.get('waiting', 0)} are waiting for their "
+        f"horizon and {h.get('overdue', 0)} are overdue"
+        + (f" (oldest {h['oldest_overdue_h']} h)" if h.get("overdue") else "") + "."
+    )
+    if h.get("failed"):
+        lines.append("Warning: some skipped signals were never stored; the skipped-signal numbers above are incomplete.")
+    if h.get("file_failed"):
+        lines.append("Warning: some rows were not archived to file and will expire from Redis (14 / 30 days) without a copy.")
+    if h.get("overdue"):
+        lines.append("Overdue rows are past their horizon but ungraded: their candle left the fetched window or could not be graded.")
+    if h.get("pairs_at_cap"):
+        lines.append(
+            f"{h['pairs_at_cap']} pair(s) are at the {h.get('cap')}-row cap, so older rows are being pushed out of Redis "
+            "(they remain in the archive file).")
     return lines
 
 def _cohort_lines(st: Optional[Dict[str, Any]]) -> List[str]:

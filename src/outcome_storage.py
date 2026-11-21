@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import glob
 import re
@@ -145,6 +146,29 @@ def append_outcome_batch(records: List[Dict[str, Any]], shadow: bool = False) ->
         with open(path, "a", encoding="utf-8") as f:
             for record in records:
                 f.write(json.dumps(_stamp_schema(record), default=str) + "\n")
+
+def append_candidate_batch(records: List[Dict[str, Any]]) -> bool:
+    """Append candidate-ledger rows (events and graded results) to
+    candidates/<UTC day>.jsonl. Returns True when every row was written.
+
+    Candidate rows are NOT outcomes: they live in their own directory, which
+    archive_reader and load_recent_outcomes never open, so no report, total
+    or win-rate statistic can count them. The directory is created here on
+    first use rather than in the import-time probe above: an unwritable
+    candidates/ must never stop the bot from starting. Never raises."""
+    if not records:
+        return True
+    try:
+        os.makedirs(os.path.join(_OUTCOME_DIR, "candidates"), exist_ok=True)
+        path = _today_file("candidates")
+        with _get_lock("candidates"):
+            with open(path, "a", encoding="utf-8") as f:
+                for record in records:
+                    f.write(json.dumps(_stamp_schema(record), default=str) + "\n")
+        return True
+    except Exception as e:
+        logging.getLogger("macd_bot").warning(f"candidate archive write failed: {e}")
+        return False
 
 def load_recent_outcomes(days: int = 30, shadow: bool = False, hours: Optional[int] = None) -> List[Dict[str, Any]]:
     """Read last N days (or N hours) of RESOLVED outcome lines (newest first).

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 
 from collections import defaultdict, Counter
@@ -23,6 +24,16 @@ import threshold_engine as engine
 
 # Sentinel: the GET succeeded and the key is genuinely absent (vs. timeout/error -> None).
 _BLOB_ABSENT = "__blob_absent__"
+
+
+def _p_wr_beats_breakeven(wr: float, n_eff: float, breakeven: float) -> float:
+    """Chance that a true win rate estimated as `wr` from `n_eff` effective trades is above the
+    bracket's break-even win rate (normal approximation). Same meaning as p_ev_positive."""
+    wr = min(0.999, max(0.001, wr))
+    se = math.sqrt(wr * (1.0 - wr) / max(n_eff, 1.0))
+    return 0.5 * math.erfc(-((wr - breakeven) / se) / math.sqrt(2.0))
+
+
 from threshold_engine import CUSUMDetector, StabilityGate
 from brain_audit import get_audit, HealthStatus
 import brain_recommend_baseline as _baseline
@@ -1043,14 +1054,17 @@ class BrainCore:
 
         if leaf:
             ev_model_result["net_ev"] = leaf["shrunk_net_ev"]
-            # optional: also bias p if you store shrunk_wr on leaves
+            # Also pull p_ev_positive toward what this pair/regime leaf says. p_ev_positive is
+            # the chance the edge is real (P(EV > 0)), so the leaf side must be the same kind
+            # of number: the chance its shrunk win rate beats the bracket's break-even rate.
+            # Blending the raw win rate in instead (0.45 vs a 0.95 model p) dragged every
+            # verdict below the 0.65 MEDIUM line whenever a leaf had 10+ trades.
             if "shrunk_wr" in leaf and leaf.get("n", 0) >= 10:
-                # mild blend toward hierarchical WR without discarding model p
                 p_model = float(ev_model_result.get("p_ev_positive", 0.5) or 0.5)
-                p_hier = float(leaf["shrunk_wr"])
                 n = float(leaf["n"])
                 k = float(getattr(cfg, "HIERARCHICAL_SHRINKAGE_K", 20.0))
-                w = n / (n + k)      
+                p_hier = _p_wr_beats_breakeven(float(leaf["shrunk_wr"]), n + k, cfg.breakeven_wr())
+                w = n / (n + k)
                 ev_model_result["p_ev_positive"] = (1.0 - w) * p_model + w * p_hier
             if "shrunk_wr" in leaf:
                 ev_model_result["hierarchical_wr"] = float(leaf["shrunk_wr"])

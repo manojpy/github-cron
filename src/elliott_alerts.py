@@ -73,7 +73,7 @@ from fetcher import (
     detect_reversal_candle_pattern_with_context, get_last_closed_index_from_array,
 )
 from gates import LEGACY_COMMON_SNAPSHOT
-from state import RedisKeyPrefix, RedisStateStore, _execute_pipeline, _rc
+from state import RedisKeyPrefix, RedisStateStore, _execute_pipeline, _rc, candidate_snapshot
 
 __all__ = ["params_from_cfg", "scan_pair", "legacy_gate", "run_elliott_scan",
            "format_elliott_message", "alert_key_of", "deliver_enabled"]
@@ -329,6 +329,22 @@ def _snapshot(s: WaveSetup, disposition: str) -> Dict[str, Any]:
     }
     return _jsonable(snap)
 
+def _candidate_snap(s: WaveSetup) -> Dict[str, Any]:
+    """Signal-time snapshot for a candidate row that was not recorded. The Elliott path does
+    not compute the MACD regime fields (adx / atr rank), so the row keeps the wave's own
+    geometry and the legacy-gate state instead. Never raises."""
+    try:
+        snap: Dict[str, Any] = dict(candidate_snapshot(s.features, ts=int(s.signal_ts)))
+        snap.update({
+            "elliott_rr": round(float(s.rr), 3), "elliott_atr": float(f"{float(s.atr):.6g}"),
+            "elliott_stop": float(f"{float(s.stop):.8g}"),
+            "elliott_trigger_level": float(f"{float(s.trigger_level):.8g}"),
+            "elliott_status": str(s.status),
+            "elliott_legacy_gate": str(s.features.get("elliott_legacy_gate", "n/a")),
+        })
+        return snap
+    except Exception:
+        return {}
 
 def _outcome_kwargs(pair: str, s: WaveSetup, disposition: str) -> Dict[str, Any]:
     return {
@@ -1015,7 +1031,8 @@ async def _deliver(selected: List[Tuple[str, WaveSetup]], reference_time: int,
                 "ignored_open_trade" if st == "IGNORED" else "ignored_cooldown",
                 {"open_key": (det or {}).get("alert_key"), "open_direction": (det or {}).get("direction"),
                  "hit_ts": (det or {}).get("hit_ts"),
-                 "entry_price": float(s.entry_price), "score": float(s.score), "total": 100.0})
+                 "entry_price": float(s.entry_price), "score": float(s.score), "total": 100.0,
+                 "snap": _candidate_snap(s)})
         stats["delivered"] += len(selected)
         return {s.event_id for _, s in selected}
     queued = await queue_failed_alert(

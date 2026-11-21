@@ -1756,6 +1756,72 @@ async def run_once() -> Optional[bool]:
             except Exception as e:
                 logger_run.warning(f"Failed to load dynamic weights: {e} — using static CONFLUENCE_WEIGHTS")
 
+        # Take the run lock BEFORE any destructive or state-changing start-up step
+        # (Redis purge, daily reset, kill-switch clear): a second instance must not
+        # touch shared state. The `finally` at the end of run_once releases it.
+        if telegram_queue is None:
+            telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+        if sdb.degraded:
+            logger_run.warning(
+                "⚠️ Redis degraded — skipping distributed lock; "
+                "no duplicate-run protection. Alerts remain fail-closed "
+                "(dedup cannot claim keys)"
+            )
+            lock = None
+            lock_acquired = False
+        else:
+            lock = RedisLock(sdb._redis, "macd_bot_run", owner=sdb)
+            lock_acquired = await lock.acquire(timeout=5.0)
+            if not lock_acquired and lock.error:
+                await asyncio.sleep(1.0)
+                lock_acquired = await lock.acquire(timeout=5.0)   # one retry on a Redis error only
+            if not lock_acquired:
+                logger_run.warning(
+                    "⚠️ Could not take the run lock "
+                    + ("(Redis error)" if lock.error else "(another instance is running)")
+                    + " - exiting gracefully"
+                )
+                return None
+
+        async def extend_lock_periodically(lock_obj: RedisLock, telegram_queue: TelegramQueue):
+            while not shutdown_event.is_set():
+                try:
+                    if lock_obj.should_extend():
+                        success = await lock_obj.extend(timeout=3.0)
+                        if success:
+                            logger_run.debug("🔒 Lock extended successfully")
+                        else:
+                            logger_run.critical("✘ Lock extension failed...")
+                            try:
+                                await telegram_queue.send(escape_markdown_v2(
+                                    f"⚠️ Lock extension failed for {lock_obj.lock_key}"
+                                ))
+                            except Exception as e:
+                                logger_run.error(f"Failed to send lock failure alert: {e}")
+                            shutdown_event.set()
+                            return
+
+                    time_since_extend = time.monotonic() - lock_obj.last_extend_time
+                    time_until_threshold = max(0, lock_obj.get_lock_extend_interval() - time_since_extend)
+                    sleep_time = max(30, min(180, int(time_until_threshold * 0.75)))
+
+                    try:
+                        await asyncio.wait_for(shutdown_event.wait(), timeout=sleep_time)
+                    except asyncio.TimeoutError:
+                        pass
+            
+                except asyncio.CancelledError:
+                    break
+
+                except Exception as e:
+                    logger_run.error(f"Lock extension task error: {e}")
+                    await asyncio.sleep(60)
+
+        lock_extension_task = (
+            asyncio.create_task(extend_lock_periodically(lock, telegram_queue))
+            if lock is not None else None
+        )
+
         if os.getenv("CLEAR_REDIS", "false").lower() == "true":
             if sdb and not sdb.degraded:
                 logger_run.warning("🚨 CLEAR_REDIS requested — purging ALL Redis states...")
@@ -1923,68 +1989,6 @@ async def run_once() -> Optional[bool]:
             ))
             sdb.degraded_alerted = True
 
-        if telegram_queue is None:
-            telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
-        if sdb.degraded:
-            logger_run.warning(
-                "⚠️ Redis degraded — skipping distributed lock; "
-                "no duplicate-run protection. Alerts remain fail-closed "
-                "(dedup cannot claim keys)"
-            )
-            lock = None
-            lock_acquired = False
-        else:
-            lock = RedisLock(sdb._redis, "macd_bot_run", owner=sdb)
-            lock_acquired = await lock.acquire(timeout=5.0)
-            if not lock_acquired and lock.error:
-                await asyncio.sleep(1.0)
-                lock_acquired = await lock.acquire(timeout=5.0)   # one retry on a Redis error only
-            if not lock_acquired:
-                logger_run.warning(
-                    "⚠️ Could not take the run lock "
-                    + ("(Redis error)" if lock.error else "(another instance is running)")
-                    + " - exiting gracefully"
-                )
-                return None
-
-        async def extend_lock_periodically(lock_obj: RedisLock, telegram_queue: TelegramQueue):
-            while not shutdown_event.is_set():
-                try:
-                    if lock_obj.should_extend():
-                        success = await lock_obj.extend(timeout=3.0)
-                        if success:
-                            logger_run.debug("🔒 Lock extended successfully")
-                        else:
-                            logger_run.critical("✘ Lock extension failed...")
-                            try:
-                                await telegram_queue.send(escape_markdown_v2(
-                                    f"⚠️ Lock extension failed for {lock_obj.lock_key}"
-                                ))
-                            except Exception as e:
-                                logger_run.error(f"Failed to send lock failure alert: {e}")
-                            shutdown_event.set()
-                            return
-
-                    time_since_extend = time.monotonic() - lock_obj.last_extend_time
-                    time_until_threshold = max(0, lock_obj.get_lock_extend_interval() - time_since_extend)
-                    sleep_time = max(30, min(180, int(time_until_threshold * 0.75)))
-
-                    try:
-                        await asyncio.wait_for(shutdown_event.wait(), timeout=sleep_time)
-                    except asyncio.TimeoutError:
-                        pass
-            
-                except asyncio.CancelledError:
-                    break
-
-                except Exception as e:
-                    logger_run.error(f"Lock extension task error: {e}")
-                    await asyncio.sleep(60)
-
-        lock_extension_task = (
-            asyncio.create_task(extend_lock_periodically(lock, telegram_queue))
-            if lock is not None else None
-        )
         if cfg.SEND_TEST_MESSAGE:
             await telegram_queue.send(escape_markdown_v2(
                 f"🔥 {cfg.BOT_NAME} - Run Started\n"

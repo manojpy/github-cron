@@ -60,8 +60,7 @@ from fetcher import (
     detect_reversal_candle_pattern,
     detect_reversal_candle_pattern_with_context,
 )
-
-from state import RedisStateStore, TokenBucket, _rc
+from state import RedisStateStore, TokenBucket, _rc, candidate_snapshot
 from brain_helpers import KILL_SWITCH_KEY, kill_switch_mode, evidence_block_lines, baseline_proof_ok
 from gates import GateResult, IndicatorCache
 import threshold_engine as engine
@@ -2028,7 +2027,8 @@ async def send_pullback_watch(context: Dict[str, Any], gr: GateResult, sdb: Redi
         if _bad:
             logger_pair.warning(f"[{gr.pair_name}] pullback {side.upper()} WATCH not sent: {_bad}")
             await sdb.log_candidate_event(
-                gr.pair_name, "pullback_watch", side, int(gr.ts_curr), "watch_bad_levels", {"detail": _bad})
+                gr.pair_name, "pullback_watch", side, int(gr.ts_curr), "watch_bad_levels",
+                {"detail": _bad, "snap": candidate_snapshot(context, gr, ts=int(gr.ts_curr))})
             continue
         dedup_key = f"pbwatch_{side}_{info.get('low_ts')}"
         claim = await sdb.claim_recent_alert(
@@ -2075,7 +2075,7 @@ async def _log_watch_suppressed(sdb: RedisStateStore, pair: str, context: Dict[s
         await sdb.log_candidate_event(
             pair, "pullback_watch", s, ts, "watch_suppressed_open_trade",
             {"open_direction": open_trade.get("direction"), "open_key": open_trade.get("alert_key"),
-             "same_direction": bool(same)})
+             "same_direction": bool(same), "snap": candidate_snapshot(context, ts=ts)})
 
 async def flush_pullback_watch(sdb: RedisStateStore, telegram_queue: "TelegramQueue", logger_run: logging.Logger, suppress: bool = False) -> int:
     """Send the queued WATCH entries as one (or, if long, a few) messages. A failed
@@ -3803,7 +3803,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             {"hit_ts": (record_active or {}).get("hit_ts"),
                              "entry_price": float(close_curr) if close_curr else None,
                              "score": _cs, "total": _ct,
-                             "votes_on": sorted(k for k, v in (_cv or {}).items() if v)})
+                             "votes_on": sorted(k for k, v in (_cv or {}).items() if v),
+                             "snap": candidate_snapshot(context, gr, ts=int(ts_curr))})
 
                 return
 
@@ -3825,7 +3826,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                  "open_entry_ts": (record_active or {}).get("entry_ts"),
                                  "entry_price": float(close_curr) if close_curr else None,
                                  "score": _cs, "total": _ct,
-                                 "votes_on": sorted(k for k, v in (_cv or {}).items() if v)})
+                                 "votes_on": sorted(k for k, v in (_cv or {}).items() if v),
+                                 "snap": candidate_snapshot(context, gr, ts=int(ts_curr))})
 
                     return
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 import time
 import asyncio
 import logging
+import math
 import uuid
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, TYPE_CHECKING, Set, Sequence, Awaitable, Union, cast
 import hashlib
@@ -74,6 +75,54 @@ async def _execute_pipeline(pipe: Any) -> Any:
     """
     result = cast("Awaitable[Any]", pipe.execute())
     return await result
+
+# Signal-time features kept on a candidate row, so that a skipped signal can later be
+# explained: trend strength (adx_val against its adaptive threshold), volatility and
+# volume rank (atr_pctl, volume_pctl, adx_pctl), oscillator state, cloud position and
+# the cloud / trend votes. The same names the shadow and live feature dicts already use.
+_CAND_SNAP_KEYS: Tuple[str, ...] = (
+    "rsi_curr", "ppo_curr", "adx_val", "adx_adaptive_threshold", "adx_pctl", "atr_pctl",
+    "volume_pctl", "buy_wick_ratio", "sell_wick_ratio", "ppo_gate_curr",
+    "rsi_guard_smooth_curr", "rsi_guard_ema_curr", "rma_cloud_fast_curr",
+    "tk_conversion_curr", "tk_base_curr", "equilibrium_curr",
+    "cloud_upper_curr", "cloud_lower_curr", "cloud_up", "cloud_down",
+    "trend_gate_ok_buy", "trend_gate_ok_sell", "cloud_group_ok_buy", "cloud_group_ok_sell",
+    "gaussian_gate_ok_buy", "gaussian_gate_ok_sell", "momentum_count", "rvol_ok",
+)
+
+def candidate_snapshot(*sources: Any, ts: Optional[int] = None) -> Dict[str, Any]:
+    """Small dict of signal-time features for a candidate row. Each source is a dict or an
+    object (a GateResult); the first non-None value per key wins. Numbers are rounded to 6
+    significant digits and non-finite values dropped; only bool / number / short-text
+    values are kept. Never raises."""
+    out: Dict[str, Any] = {}
+    try:
+        for k in _CAND_SNAP_KEYS:
+            for src in sources:
+                if src is None:
+                    continue
+                v = src.get(k) if isinstance(src, dict) else getattr(src, k, None)
+                if v is None:
+                    continue
+                if isinstance(v, bool):
+                    out[k] = v
+                elif isinstance(v, (int, float)):
+                    if math.isfinite(float(v)):
+                        out[k] = float(f"{float(v):.6g}")
+                else:
+                    try:
+                        f = float(v)           # numpy scalars
+                        if math.isfinite(f):
+                            out[k] = float(f"{f:.6g}")
+                    except (TypeError, ValueError):
+                        pass
+                if k in out:
+                    break
+        if ts is not None:
+            out["session"] = _get_session_from_ts(int(ts))
+    except Exception:
+        pass
+    return out
 
 async def _blanket_reset_pair(sdb: RedisStateStore, pair_name: str, logger_pair: logging.Logger) -> int:
     from alert_registry import ALERT_KEYS
@@ -356,6 +405,9 @@ class RedisKeyPrefix:
     # CANDIDATE_RESOLVED (a hash per pair); neither is an outcome table.
     CANDIDATE_EVENTS = "candidate_events:"
     CANDIDATE_RESOLVED = "candidate_resolved:"
+    # Counters for the candidate ledger, one hash per UTC day (candidate_stats:YYYY-MM-DD,
+    # fields stored / failed / file_failed / graded, 9-day TTL). Read by the Brain report.
+    CANDIDATE_STATS = "candidate_stats:"
     # Recorded outcomes pooled by pair class, in weekly buckets: cohort_pool:<class>:<alert_key>.
     # Deliberately NOT under "alert_stats:" so the totals reseed cannot count them twice.
     COHORT_POOL = "cohort_pool:"
@@ -1842,8 +1894,9 @@ class RedisStateStore:
                         pair, alert_key, direction, entry_ts, "same_candle_weaker",
                         {"stronger_key": mine[2], "entry_price": entry_price,
                          "score": confluence_score, "total": confluence_total,
-                         "votes_on": sorted(k for k, v in (confluence_votes or {}).items() if v)})
-                    return "skipped_active"        # a stronger key already represents this candle
+                         "votes_on": sorted(k for k, v in (confluence_votes or {}).items() if v),
+                         "snap": candidate_snapshot(context, ts=entry_ts)})
+                    return "skipped_active"
                 replace_key = mine[2]              # this key is stronger: it takes over
             else:
                 active = await self.get_active_shadow_trade(pair)
@@ -1856,7 +1909,8 @@ class RedisStateStore:
                         pair, alert_key, direction, entry_ts, "skipped_active",
                         {"open_shadow_key": active["alert_key"], "open_shadow_ts": active["entry_ts"],
                          "entry_price": entry_price, "score": confluence_score, "total": confluence_total,
-                         "votes_on": sorted(k for k, v in (confluence_votes or {}).items() if v)})
+                         "votes_on": sorted(k for k, v in (confluence_votes or {}).items() if v),
+                         "snap": candidate_snapshot(context, ts=entry_ts)})
                     return "skipped_active"
         try:
             payload = json_dumps({
@@ -1900,6 +1954,8 @@ class RedisStateStore:
                              "score": old.get("confluence_score"),
                              "total": old.get("confluence_total"),
                              "votes_on": sorted(k for k, v in (old.get("confluence_votes") or {}).items() if v)})
+                             "snap": candidate_snapshot(context, ts=entry_ts)
+
                 except Exception as e:
                     logger.debug(f"[{pair}] replaced shadow not kept as candidate: {e}")
                 await asyncio.wait_for(_rc(self._redis).delete(replace_key), timeout=2.0)
@@ -2589,20 +2645,58 @@ class RedisStateStore:
         list per pair; never an outcome row, so no report or Brain reader counts it.
         Never raises, never blocks."""
         cap = int(getattr(cfg, "CANDIDATE_LOG_MAX_PER_PAIR", 300))
-        if cap <= 0 or self.degraded or not self._redis:
+        if cap <= 0:
             return
+        stats_key = f"{RedisKeyPrefix.CANDIDATE_STATS}{time.strftime('%Y-%m-%d', time.gmtime())}"
         try:
-            row = json_dumps({
+            row_d = {
                 "pair": pair, "alert_key": alert_key, "direction": direction,
                 "entry_ts": int(entry_ts), "reason": reason, "logged_ts": int(time.time()),
                 **(extra or {}),
-            })
+            }
+            row = json_dumps(row_d)
+        except Exception as e:
+            self.__dict__["_candidate_log_failed"] = self.__dict__.get("_candidate_log_failed", 0) + 1
+            logger.warning(f"[{pair}] candidate event not logged ({reason}): {e}")
+            return
+        # File first, so the row survives a Redis outage or its 14-day expiry. Written even
+        # while Redis is degraded. Readers drop repeats by `_cid`.
+        file_failed = 0
+        if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+            try:
+                from outcome_storage import append_candidate_batch
+                _ok = await asyncio.to_thread(
+                    append_candidate_batch,
+                    [{"kind": "event", "_cid": f"{pair}|{alert_key}|{int(entry_ts)}|{reason}", **row_d}])
+            except Exception:
+                _ok = False
+            if not _ok:
+                file_failed = 1
+                self.__dict__["_candidate_file_failed"] = self.__dict__.get("_candidate_file_failed", 0) + 1
+        if self.degraded or not self._redis:
+            self.__dict__["_candidate_log_skipped"] = self.__dict__.get("_candidate_log_skipped", 0) + 1
+            return
+        try:
             key = f"{RedisKeyPrefix.CANDIDATE_EVENTS}{pair}"
             async with _rc(self._redis).pipeline(transaction=False) as pipe:
                 pipe.lpush(key, row)
                 pipe.ltrim(key, 0, cap - 1)
                 pipe.expire(key, 14 * 86400)
+                pipe.hincrby(stats_key, "stored", 1)
+                if file_failed:
+                    pipe.hincrby(stats_key, "file_failed", 1)
+                pipe.expire(stats_key, 9 * 86400)
                 await asyncio.wait_for(_execute_pipeline(pipe), timeout=2.0)
+        except Exception as e:
+            self.__dict__["_candidate_log_failed"] = self.__dict__.get("_candidate_log_failed", 0) + 1
+            logger.warning(f"[{pair}] candidate event not logged ({reason}): {e}")
+            try:                                   # best effort: count the loss, if Redis answers at all
+                async with _rc(self._redis).pipeline(transaction=False) as pipe:
+                    pipe.hincrby(stats_key, "failed", 1)
+                    pipe.expire(stats_key, 9 * 86400)
+                    await asyncio.wait_for(_execute_pipeline(pipe), timeout=1.0)
+            except Exception:
+                pass
         except Exception as e:
             self.__dict__["_candidate_log_failed"] = self.__dict__.get("_candidate_log_failed", 0) + 1
             logger.warning(f"[{pair}] candidate event not logged ({reason}): {e}")
@@ -2677,18 +2771,42 @@ class RedisStateStore:
                         "outcome_reason": result.get("outcome_reason"), "tp_first": result.get("tp_first"),
                         "mae": result.get("mae"), "mfe": result.get("mfe"),
                         "score": d.get("score"), "total": d.get("total"),
-                        "votes_on": d.get("votes_on"), "resolved_ts": now,
+                        "votes_on": d.get("votes_on"), "snap": d.get("snap"), "resolved_ts": now,
                     })))
                 except Exception as e:
                     logger_pair.debug(f"[{pair}] candidate row not graded: {e}")
             if not graded and not stale:
                 return
+            # Archive BEFORE the Redis write: a graded row is also kept in
+            # candidates/<day>.jsonl, so it survives the 30-day expiry and a failed push
+            # is recovered from the artifact. Readers drop repeats by `_cid`. A failed
+            # file write is counted, not retried: the Redis result still feeds the report.
+            file_failed = 0
+            if graded and getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
+                try:
+                    from outcome_storage import append_candidate_batch
+                    _file_rows = [{"kind": "resolved", "_cid": f"{pair}|{rid}", **json_loads(blob)}
+                                  for rid, blob in graded]
+                    if not await asyncio.to_thread(append_candidate_batch, _file_rows):
+                        file_failed = len(graded)
+                except Exception as e:
+                    file_failed = len(graded)
+                    logger_pair.warning(f"[{pair}] candidate archive not written: {e}")
+                if file_failed:
+                    self.__dict__["_candidate_file_failed"] = (
+                        self.__dict__.get("_candidate_file_failed", 0) + file_failed)
             async with _rc(self._redis).pipeline(transaction=False) as pipe:
                 for rid, blob in graded:
                     pipe.hset(done_key, rid, blob)
                 if stale:
                     pipe.hdel(done_key, *stale)
                 pipe.expire(done_key, keep_sec)
+                if graded:
+                    _sk = f"{RedisKeyPrefix.CANDIDATE_STATS}{time.strftime('%Y-%m-%d', time.gmtime())}"
+                    pipe.hincrby(_sk, "graded", len(graded))
+                    if file_failed:
+                        pipe.hincrby(_sk, "file_failed", file_failed)
+                    pipe.expire(_sk, 9 * 86400)
                 await asyncio.wait_for(_execute_pipeline(pipe), timeout=2.0)
             if graded:
                 logger_pair.info(f"[{pair}] Candidate outcomes graded: {len(graded)}")
@@ -2719,6 +2837,71 @@ class RedisStateStore:
             return rows[: max(1, int(limit))]
         except Exception as e:
             logger.warning(f"Candidate outcome load failed: {e}")
+            return None
+
+    async def candidate_ledger_health(self, days: int = 7) -> Optional[Dict[str, Any]]:
+        """Is the skipped-signal record complete? Counters of the last `days` UTC days
+        (rows stored / lost / graded / not archived to file) plus the backlog now: rows that
+        carry a price and are not graded yet, split into waiting (horizon not reached) and
+        overdue (horizon passed, still ungraded: the candle left the fetched window or the
+        grader skipped it). None means the read failed. Read-only; never raises."""
+        if self.degraded or not self._redis:
+            return None
+        try:
+            now = int(time.time())
+            r = _rc(self._redis)
+            day_keys = [f"{RedisKeyPrefix.CANDIDATE_STATS}{time.strftime('%Y-%m-%d', time.gmtime(now - i * 86400))}"
+                        for i in range(max(1, int(days)))]
+            ev_keys = sorted([k.decode() if isinstance(k, bytes) else str(k) async for k in r.scan_iter(
+                match=f"{RedisKeyPrefix.CANDIDATE_EVENTS}*", count=500)])
+            async with r.pipeline(transaction=False) as pipe:
+                for k in day_keys:
+                    pipe.hgetall(k)
+                for k in ev_keys:
+                    pipe.lrange(k, 0, -1)
+                    pipe.hkeys(f"{RedisKeyPrefix.CANDIDATE_RESOLVED}{k[len(RedisKeyPrefix.CANDIDATE_EVENTS):]}")
+                res = await asyncio.wait_for(_execute_pipeline(pipe), timeout=10.0)
+            tot = {"stored": 0, "failed": 0, "file_failed": 0, "graded": 0}
+            for h in res[:len(day_keys)]:
+                for f, v in (h or {}).items():
+                    name = f.decode() if isinstance(f, bytes) else str(f)
+                    if name in tot:
+                        tot[name] += int(v)
+            horizon = (int(getattr(cfg, "OUTCOME_LOOKAHEAD_CANDLES", 12)) + 1) * 900
+            cap = int(getattr(cfg, "CANDIDATE_LOG_MAX_PER_PAIR", 300))
+            events = gradable = waiting = overdue = at_cap = 0
+            oldest_overdue = 0
+            for i in range(len(ev_keys)):
+                rows, done_ids = res[len(day_keys) + 2 * i], res[len(day_keys) + 2 * i + 1]
+                done = {x.decode() if isinstance(x, bytes) else str(x) for x in (done_ids or [])}
+                events += len(rows or [])
+                if cap > 0 and len(rows or []) >= cap:
+                    at_cap += 1
+                for raw in rows or []:
+                    try:
+                        d = json_loads(raw)
+                        px = d.get("entry_price")
+                        if not isinstance(px, (int, float)) or px <= 0:
+                            continue
+                        gradable += 1
+                        et = int(d["entry_ts"])
+                        if f"{d['alert_key']}|{et}" in done:
+                            continue
+                        if now - et < horizon:
+                            waiting += 1
+                        else:
+                            overdue += 1
+                            oldest_overdue = max(oldest_overdue, now - et)
+                    except Exception:
+                        continue
+            return {
+                "window_days": int(days), "attempted": tot["stored"] + tot["failed"], **tot,
+                "events_now": events, "gradable_now": gradable, "waiting": waiting,
+                "overdue": overdue, "oldest_overdue_h": round(oldest_overdue / 3600.0, 1),
+                "pairs_at_cap": at_cap, "pairs": len(ev_keys), "cap": cap,
+            }
+        except Exception as e:
+            logger.warning(f"Candidate ledger health read failed: {e}")
             return None
 
     async def mark_shadow_overlap(self, pair: str, entry_ts: int) -> None:

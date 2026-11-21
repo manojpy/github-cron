@@ -1515,7 +1515,7 @@ class BrainEngineV2(BrainCore):
                         logger_run.debug(f"Repair ledger toggle record failed (non-fatal): {e}")
                 trailer = ""
                 if applied_config:
-                    trailer += "\nConfig overrides require a restart."
+                    trailer += "\nConfig overrides apply from the next run."
                 if applied_live:
                     trailer += "\nWeight/alert changes take effect on the next dispatch."
 

@@ -60,8 +60,8 @@ def cleanup_by_age(data_dir: Path, max_age_days: int, dry_run: bool = False, rep
     shorter reports_max_age_days)."""
     removed = 0
     now = datetime.now(timezone.utc)
-
-    for label, pattern in (("outcomes", "*.jsonl*"), ("shadow", "*.jsonl*"), ("reports", "*.md")):
+    for label, pattern in (("outcomes", "*.jsonl*"), ("shadow", "*.jsonl*"),
+                           ("candidates", "*.jsonl*"), ("reports", "*.md")):
         label_dir = data_dir / label
         if not label_dir.exists():
             continue
@@ -85,8 +85,7 @@ def compress_large_files(data_dir: Path, max_size_mb: int, dry_run: bool = False
     compressed = 0
     max_size_bytes = max_size_mb * 1024 * 1024
     cutoff = datetime.now(timezone.utc) - timedelta(days=no_compress_within_days)
-
-    for label in ["outcomes", "shadow"]:
+    for label in ["outcomes", "shadow", "candidates"]:
         label_dir = data_dir / label
         if not label_dir.exists():
             continue     
@@ -213,7 +212,7 @@ def main():
         print("=" * 60)
         print("  🚨 OUTCOME DATA WIPE — outcomes/ + shadow/ + reports/" + ("  [DRY RUN]" if args.dry_run else ""))
         print("=" * 60)
-        removed = wipe_labels(data_dir, ["outcomes", "shadow", "reports"], dry_run=args.dry_run)
+        removed = wipe_labels(data_dir, ["outcomes", "shadow", "candidates", "reports"], dry_run=args.dry_run)
         verb = "Would remove" if args.dry_run else "removed"
         print(f"\n✅ Wipe {'preview' if args.dry_run else 'complete'} — {verb} {removed} file(s)")
         return
@@ -256,9 +255,11 @@ def main():
         print("Performing aggressive cleanup..." if not args.dry_run else "Previewing aggressive cleanup...")
         
         simulated_size = new_size
-        # Cheapest-to-lose first: reports are regenerated, shadow rows are the
-        # lowest-value data, real outcomes are the last thing to give up.
-        for label, pattern in (("reports", "*.md"), ("shadow", "*.jsonl*"), ("outcomes", "*.jsonl*")):
+        # Cheapest-to-lose first: reports are regenerated, candidate rows (skipped
+        # signals) are research-only, shadow rows are the lowest-value outcome data,
+        # real outcomes are the last thing to give up.
+        for label, pattern in (("reports", "*.md"), ("candidates", "*.jsonl*"),
+                               ("shadow", "*.jsonl*"), ("outcomes", "*.jsonl*")):
             label_dir = data_dir / label
             if not label_dir.exists():
                 continue
@@ -272,7 +273,10 @@ def main():
                     print(f"🔎 [DRY RUN] Would remove {month_file.name} to stay under limit")
                     simulated_size -= month_file.stat().st_size
                 else:
-                    print(f"🗑️ Removing {month_file.name} to stay under limit")
+                    msg = f"Size cap ({args.max_total_mb} MB) reached: removed {label}/{month_file.name}"
+                    print(f"🗑️ {msg}")
+                    if label != "reports":
+                        print(f"::warning::{msg}")   # visible on the run page: data was dropped to fit the cap
                     month_file.unlink()
     
     final_size = get_dir_size(data_dir)

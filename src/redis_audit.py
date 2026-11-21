@@ -51,6 +51,7 @@ FAMILIES: List[Tuple[str, str, str]] = [
     ("alert_stats_co", "alert_stats_co:", "ttl_required"),
     ("candidate_events", "candidate_events:", "ttl_required"),
     ("candidate_resolved", "candidate_resolved:", "ttl_required"),
+    ("candidate_stats", "candidate_stats:", "ttl_required"),
     ("cohort_pool", "cohort_pool:", "ttl_required"),
     ("shadow_pending", "shadow_pending:", "ttl_required"),
     ("shadow_stats", "shadow_stats:", "ttl_required"),

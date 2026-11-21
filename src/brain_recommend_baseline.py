@@ -1196,6 +1196,16 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
     except Exception as e:
         audit.record_analysis_exception("skipped_signals", e)
 
+    # ── Candidate ledger health: how many skipped-signal rows were stored, lost or left
+    # ungraded. Report only. A failed Redis read leaves the block out; it is never read as zero. ──
+    try:
+        if int(getattr(cfg, "CANDIDATE_LOG_MAX_PER_PAIR", 300)) > 0:
+            _ch = await self.sdb.candidate_ledger_health()
+            if _ch is not None:
+                ai_metrics["candidate_health"] = _ch
+    except Exception as e:
+        audit.record_analysis_exception("candidate_health", e)
+
     # ── Results by pair class (report only). ──
     try:
         _coh = cohort_breakdown(
