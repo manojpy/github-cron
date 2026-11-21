@@ -2358,18 +2358,35 @@ async def run_once() -> Optional[bool]:
             logger_run.debug(f"GC error: {e}")
 
         logger_run.debug("🧹 Resource cleanup finished")
+
+_UVLOOP_AVAILABLE = False
 try:
     import uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    _UVLOOP_AVAILABLE = True
     try:
         import hiredis
         _hiredis_status = f"hiredis {hiredis.__version__} enabled"
     except ImportError:
         _hiredis_status = "hiredis NOT found (redis-py using pure-python parser)"
-    logger.info(f"🌎 uvloop enabled | orjson enabled | {_hiredis_status}")
+    logger.info(f"🌎 uvloop ready (loop_factory) | orjson enabled | {_hiredis_status}")
+
 except ImportError:
     logger.info(f"❌ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
+
+def run_async(coro):
+    """asyncio.run() using uvloop's loop factory instead of a global policy.
+
+    asyncio.set_event_loop_policy() is deprecated in Python 3.15 and removed in
+    3.16. loop_factory= is the supported replacement (Python 3.12+). On older
+    interpreters we fall back to uvloop.run(), and to plain asyncio.run() when
+    uvloop is not installed at all.
+    """
+    if not _UVLOOP_AVAILABLE:
+        return asyncio.run(coro)
+    if sys.version_info >= (3, 12):
+        return asyncio.run(coro, loop_factory=uvloop.new_event_loop)
+    return uvloop.run(coro)
 
 if __name__ == "__main__":
     aot_bridge.ensure_initialized()
@@ -2445,7 +2462,7 @@ if __name__ == "__main__":
             finally:
                 await sdb.close()
 
-        success = asyncio.run(apply_brain_and_exit())
+        success = run_async(apply_brain_and_exit())
         sys.exit(0 if success else 1)
 
     if args.alert_only:
@@ -2487,7 +2504,7 @@ if __name__ == "__main__":
         finally:
             watcher.cancel()
     try:
-        success = asyncio.run(main_with_cleanup())
+        success = run_async(main_with_cleanup())
         if success is None:
             logger.info(" Run skipped (another instance already running) — not a failure")
             sys.exit(0)
