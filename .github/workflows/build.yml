@@ -254,7 +254,7 @@ jobs:
       # PHASE 3: SECURITY SCANNING
       - name: 🚦 Trivy gate (block on fixable CRITICAL findings)
         if: ${{ inputs.skip_trivy != 'true' }}
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.CANDIDATE_IMAGE }}
           format: 'table'
