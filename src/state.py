@@ -1954,7 +1954,6 @@ class RedisStateStore:
                              "score": old.get("confluence_score"),
                              "total": old.get("confluence_total"),
                              "votes_on": sorted(k for k, v in (old.get("confluence_votes") or {}).items() if v)})
-                             "snap": candidate_snapshot(context, ts=entry_ts)
 
                 except Exception as e:
                     logger.debug(f"[{pair}] replaced shadow not kept as candidate: {e}")
