@@ -2,7 +2,7 @@
 
 High-performance cryptocurrency trading alert bot with AOT/Cython/Numba compilation, Redis state management, outcome tracking, and Telegram notifications. Runs on GitHub Actions, triggered every 15 minutes by an external scheduler (Cloudflare/Cronjobs.org).
 
-**Version**: 1.8.x | **Python**: 3.11 | **Last audited**: 2026-10-10
+**Version**: 1.8.x | **Python**: 3.11 | **Last audited**: 2026-11-21
 
 ---
 
@@ -185,7 +185,7 @@ Full option list lives in `config_macd.json` and is validated at startup by `bot
 | Component | Technology | Purpose |
 |-----------|------------|---------|
 | Language | Python 3.11 | Core logic |
-| Compilation | Numba (JIT + AOT) + Cython | Fast indicator path |
+| Compilation | Numba AOT + Cython (JIT fallback only if built with `KEEP_JIT_FALLBACK=1`) | Fast indicator path |
 | Async | asyncio + aiohttp | Concurrent fetches & evaluation |
 | State | Redis / Valkey | Dedup, locks, stats, overrides |
 | Outcomes | JSONL files in separate repo | Brain analysis archive |
@@ -371,7 +371,7 @@ github-cron/
 │   ├── learner.yml              # Playbook learner (dispatched every 6 h)
 │   ├── redis-audit.yml          # Key / TTL audit (chained after learner)
 │   ├── cleanup-outcomes.yml     # Daily archive pruning (dispatched 02:00)
-│   ├── replay-outcomes.yml      # Recovers un-pushed outcomes (chained after bot run)
+│   ���── replay-outcomes.yml      # Recovers un-pushed outcomes (chained after bot run)
 │   └── ci.yml                   # Syntax & basic tests
 ├── config_macd.json
 ├── Dockerfile                   # Multi-stage, non-root, 900 MB limit
