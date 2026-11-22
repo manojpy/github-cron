@@ -571,7 +571,7 @@ jobs:
 
       # PHASE 3: RESULTS ANALYSIS
       - name: 📊 Parse Execution Results
-        if: always()
+        if: always() && inputs.apply_brain_plan != true
         id: results
         run: |
           LOG_FILE="logs/bot_output.log"
@@ -609,7 +609,7 @@ jobs:
           echo "error_msg=${ERROR_MSG:-None}" >> $GITHUB_OUTPUT
 
       - name: 📋 Generate Summary Report
-        if: always()
+        if: always() && inputs.apply_brain_plan != true
         env:
           ERROR_MSG: ${{ steps.results.outputs.error_msg }}
         run: |

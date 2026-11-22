@@ -48,7 +48,7 @@ jobs:
           python-version: "3.15"
 
       - name: Install redis client
-        run: pip install --quiet "redis==8.1.0"
+        run: pip install --quiet "redis==$(grep -oP '^redis\[hiredis\]==\K[\d.]+' requirements.txt)"
 
       - name: Run audit
         env:
