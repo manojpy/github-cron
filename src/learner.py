@@ -18,6 +18,7 @@ Usage (inside the bot image, OUTCOME_DATA_DIR = clone of the outcome-data repo):
     python learner.py --digest           # print the research ledger tail
     python learner.py --scoreboard       # print the last stored scoreboard
     python learner.py --intel            # print the last stored intelligence report
+    python learner.py --advisor          # print the config adviser's stored recommendations and watchlist
     python learner.py --data-dir PATH    # override OUTCOME_DATA_DIR
 Exit codes: 0 ok, 1 learner error, 2 cannot reach Redis / no data dir.
 """
@@ -39,6 +40,10 @@ from bot_config import _get_session_from_ts
 from brain_helpers import HYPOTHESIS_POOL_KEY
 from autotune import FIELD as AT_FIELD, KEY_AUTOTUNE
 from autotune import committed as at_committed, evaluate_pending as at_evaluate, observe as at_observe, propose as at_propose
+from config_advisor import (
+    KEY_ADVISOR, advise as adv_run, current_values as adv_current, digest_due as adv_digest_due,
+    format_state as adv_format_state, mark_digest as adv_mark_digest, mark_sent as adv_mark_sent,
+)
 from hypothesis_gen import compact_rules, shadow_pool_rows, update_hypothesis_pool
 from intelligence import (
     KEY_FIREWALL, KEY_INTEL, KEY_ISSUES, KEY_PROMO_LEDGER, KEY_VETO_MON, KEY_WIN_POOL,
@@ -95,6 +100,26 @@ def criteria_from_cfg() -> Dict[str, Any]:
         "max_dd_r": float(cfg.PLAYBOOK_MAX_DD_R),
     }
 
+def advisor_params_from_cfg(overridden: Tuple[str, ...] = ()) -> Dict[str, Any]:
+    return {
+        "min_blocks": int(cfg.CONFIG_ADVISOR_MIN_BLOCKS),
+        "promote_cycles": int(cfg.CONFIG_ADVISOR_PROMOTE_CYCLES),
+        "demote_cycles": int(cfg.CONFIG_ADVISOR_DEMOTE_CYCLES),
+        "send_tier": str(cfg.CONFIG_ADVISOR_SEND_TIER),
+        "expiry_days": float(cfg.CONFIG_ADVISOR_EXPIRY_DAYS),
+        "cooldown_hours": float(cfg.CONFIG_ADVISOR_COOLDOWN_HOURS),
+        "max_per_day": int(cfg.CONFIG_ADVISOR_MAX_PER_DAY),
+        "verify_days": float(cfg.CONFIG_ADVISOR_VERIFY_DAYS),
+        "digest_hours": float(cfg.CONFIG_ADVISOR_DIGEST_HOURS),
+        "mute": tuple(x.strip() for x in str(cfg.CONFIG_ADVISOR_MUTE).split(",") if x.strip()),
+        "max_age_h": float(cfg.PLAYBOOK_MAX_AGE_HOURS),
+        "step_pct": float(cfg.AUTOTUNE_STEP_PCT),
+        "ceiling_pct": float(cfg.AUTOTUNE_CEILING_PCT),
+        "macro_live": bool(cfg.MACRO_CONTEXT_LIVE),
+        "min_cats": int(cfg.EXHAUSTION_MIN_CATEGORIES),
+        "veto_score": int(cfg.EXHAUSTION_VETO_SCORE),
+        "overridden": tuple(overridden),
+    }
 
 def typical_cost_by_pair(rows: List[Dict[str, Any]], min_rows: int = 5) -> Dict[str, float]:
     """Median realized round-trip cost per pair (spreads / slippage differ by pair)."""
@@ -333,10 +358,14 @@ async def run(args: argparse.Namespace) -> int:
             sbj = _jl(await sdb.get_metadata(KEY_SCORE, timeout=5.0), {})
             _say(format_scoreboard(sbj) if sbj else "[learner] no scoreboard stored yet")
             return 0
-
         if args.autopsy:
             apj = _jl(await sdb.get_metadata(KEY_AUTOPSY, timeout=5.0), {})
             _say(format_intelligence(apj, name_fn=pretty_alert) if apj else "[learner] no autopsy stored yet")
+            return 0
+
+        if args.advisor:
+            adj = _jl(await sdb.get_metadata(KEY_ADVISOR, timeout=5.0), {})
+            _say(adv_format_state(adj) if adj else "[learner] no config advisor state stored yet")
             return 0
 
         if args.intel:
@@ -646,10 +675,42 @@ async def run(args: argparse.Namespace) -> int:
                 intel_blob, veto_res, veto_state_new, fw_state_new, win_pool_new, issues_new = None, None, None, None, None, None
                 intel_failed = True
 
+        # ── Configuration adviser (read-only) ──
+        # Re-tests every whitelisted gate / value on the trades itself (it does not trust another module's verdict)
+        # and recommends at most a few exact changes. It never edits config; you make the change in config_macd.json.
+        adv_mode = str(cfg.CONFIG_ADVISOR_MODE)
+        adv_out: Optional[Dict[str, Any]] = None
+        if adv_mode != "off":
+            try:
+                adv_prev = _jl(await _strict_get(sdb, KEY_ADVISOR), {})
+                adv_override = await sdb.get_config_override_checked()
+                if adv_override is None:
+                    raise RuntimeError("the stored config override could not be read")
+                adv_out = adv_run(
+                    now_ts=now_ts, rows=rows, blob=blob, sb=sb, trend=(intel_blob or {}).get("trend"), veto_res=veto_res,
+                    at_report=(intel_blob or {}).get("autotune"), at_streak=int((at_state_new or {}).get("streak") or 0),
+                    hyp_rules=blob.get("hyp_rules") or [], current=adv_current(lambda f: getattr(cfg, f), adv_override),
+                    fixed=fixed, cost_pct=cost_pct, data_ok=bool(data_ok and not intel_failed), newest_ts=newest_ts,
+                    n_rows=len(rows), n_path=n_path, prev_state=adv_prev, params=advisor_params_from_cfg(tuple(adv_override)),
+                    family_fn=alert_family_of, drop_verdicts=tuple(x.strip() for x in str(cfg.ALERT_FIREWALL_DROP).split(",") if x.strip()),
+                )
+                _say(f"[learner] config advisor [{adv_mode}]: {len(adv_out['suggestions'])} candidate(s) evaluated, "
+                     f"{len(adv_out['to_send'])} to send, data {'healthy' if adv_out['flags']['healthy'] else 'NOT healthy'}")
+                for s in adv_out["suggestions"]:
+                    _say(f"[learner]   {s['field']} {s['from']} -> {s['to']}: {s['tier']} streak {s['streak']}/{s['need']}"
+                         + (f" failing: {', '.join(s['failed'])}" if s["failed"] else ""))
+                for n in adv_out["notes"]:
+                    _say(f"[learner]   {n}")
+            except Exception as e:
+                _say(f"[learner] config advisor skipped: {e!r}")
+                adv_out = None
+
         if args.dry_run:
+            if adv_out is not None:
+                for a in adv_out["to_send"]:
+                    _say("[learner] config advisor WOULD SEND:\n" + a["text"])
             _say("[learner] --dry-run: nothing written")
             return 0
-
         cur = await _strict_get(sdb, KEY_CURRENT)
         cur_state = await _strict_get(sdb, KEY_STATE)
         if intel_failed:
@@ -687,9 +748,10 @@ async def run(args: argparse.Namespace) -> int:
             writes.append((KEY_ISSUES, json_dumps(issues_new)))
         if events:
             writes.append((KEY_PROMO_LEDGER, json_dumps(ledger_append(_jl(await _strict_get(sdb, KEY_PROMO_LEDGER), []), events))))
+        if adv_out is not None:
+            writes.append((KEY_ADVISOR, json_dumps(adv_out["state"])))
         await _strict_set_many(sdb, writes, _TTL)
         _say(f"[learner] playbook {blob['label']} written ({len(blob['entries'])} entries, {len(changes)} change(s))")
-
         mode = str(cfg.PLAYBOOK_NOTIFY)
         if mode == "always" or (mode == "changes" and changes):
             await notify(text)
@@ -707,6 +769,34 @@ async def run(args: argparse.Namespace) -> int:
                 await notify((head + "\n\n" if head else "") + intel_text)
             elif head:
                 await notify(head)
+        if adv_out is not None:
+            # Sent AFTER the state is stored; a recommendation is marked sent only once Telegram accepted it,
+            # so a failed send is retried next cycle instead of being lost.
+            try:
+                adv_state = adv_out["state"]
+                adv_tq = tq or TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+                sent_ids: List[str] = []
+                for a in adv_out["to_send"]:
+                    if adv_mode == "shadow":
+                        if a["type"] == "RECOMMEND":
+                            sent_ids.append(a["id"])
+                        continue
+                    if all([await adv_tq.send(chunk) for chunk in _tg_chunks(a["text"])]):
+                        if a["type"] == "RECOMMEND":
+                            sent_ids.append(a["id"])
+                    else:
+                        _say(f"[learner] config advisor message {a['id']} was not delivered; it is retried next cycle")
+                if sent_ids:
+                    adv_state = adv_mark_sent(adv_state, sent_ids, now_ts, shadow=(adv_mode == "shadow"))
+                due, dh = adv_digest_due(adv_state, adv_out["digest"], now_ts, float(cfg.CONFIG_ADVISOR_DIGEST_HOURS))
+                if adv_out["digest"]:
+                    _say("[learner] config advisor digest:\n" + str(adv_out["digest"]))
+                if due and adv_mode == "on" and all([await adv_tq.send(chunk) for chunk in _tg_chunks(str(adv_out["digest"]))]):
+                    adv_state = adv_mark_digest(adv_state, dh, now_ts)
+                if adv_state is not adv_out["state"]:
+                    await _strict_set_many(sdb, [(KEY_ADVISOR, json_dumps(adv_state))], _TTL)
+            except Exception as e:
+                _say(f"[learner] config advisor delivery failed: {e!r}")
         return 0
     finally:
         try:
@@ -740,6 +830,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--scoreboard", action="store_true", help="print the last stored scoreboard")
     ap.add_argument("--autopsy", action="store_true", help="print the last stored autopsy / Trust Meter")
     ap.add_argument("--intel", action="store_true", help="print the last stored intelligence report")
+    ap.add_argument("--advisor", action="store_true", help="print the config adviser's stored recommendations and watchlist")
     ap.add_argument("--data-dir", default="")
     args = ap.parse_args(argv)
     try:
