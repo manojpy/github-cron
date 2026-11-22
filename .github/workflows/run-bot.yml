@@ -576,11 +576,10 @@ jobs:
         run: |
           LOG_FILE="logs/bot_output.log"
           if [ ! -f "$LOG_FILE" ]; then
-            echo "status=error" >> $GITHUB_OUTPUT
-            echo "message=Log file not found" >> $GITHUB_OUTPUT
+            echo "status=Failed" >> $GITHUB_OUTPUT
+            echo "error_msg=No bot log — run failed before the bot started" >> $GITHUB_OUTPUT
             exit 0
           fi
-
           if grep -q "RUN COMPLETE" "$LOG_FILE"; then
             STATUS="Success"
             # Read the figures from the RUN COMPLETE line only: the startup banner
