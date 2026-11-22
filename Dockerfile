@@ -32,8 +32,7 @@ ENV UV_CACHE_DIR='/tmp/uv_cache'
 ENV UV_LINK_MODE=copy
 COPY requirements.txt .
 RUN --mount=type=cache,target=/tmp/uv_cache \
-    uv pip install -r requirements.txt && \
-    python -m compileall -q -o 2 $VIRTUAL_ENV
+    uv pip install -r requirements.txt
 
 # ---------- STAGE 3: CYTHON COMPILER ----------
 FROM deps-builder AS cython-builder
@@ -42,11 +41,6 @@ WORKDIR /build
 
 COPY setup.py ./
 COPY src/cython_functions.pyx ./src/
-
-# Advisory only: a Cython failure is ALWAYS fatal here. The final stage does
-# `COPY /build/cython_functions*.so`, which cannot match a file that was never
-# produced, so a "lenient" mode could not yield a working image anyway.
-ARG CYTHON_STRICT=1
 
 RUN set -e; \
     echo "🔨 Starting Cython compilation (CYTHON_STRICT=${CYTHON_STRICT}, failure is fatal)..."; \
@@ -65,22 +59,23 @@ FROM deps-builder AS runtime-venv
 
 # KEEP_JIT_FALLBACK=1 keeps numba + llvmlite + tbb (about 165 MB) so the slow
 # Numba JIT can take over if the compiled Cython module ever fails to load.
-# The build already refuses to produce an image without Cython (CYTHON_STRICT)
+# The build already refuses to produce an image without Cython (the Cython step exits 1)
 # and the smoke test in build.yml requires AOT, so the default drops them.
 ARG KEEP_JIT_FALLBACK=0
 
 RUN set -e; \
     SP="$VIRTUAL_ENV/lib/python3.15/site-packages"; \
-    uv pip uninstall cython setuptools wheel py-cpuinfo; \
+    uv pip uninstall cython setuptools; \
     if [ "$KEEP_JIT_FALLBACK" != "1" ]; then \
         uv pip uninstall numba llvmlite tbb; \
     fi; \
     rm -rf "$SP"/Cython "$SP"/cython* "$SP"/pyximport "$SP"/setuptools* "$SP"/pkg_resources \
-           "$SP"/_distutils_hack "$SP"/wheel* "$SP"/cpuinfo "$SP"/py_cpuinfo*; \
+           "$SP"/_distutils_hack; \
     if [ "$KEEP_JIT_FALLBACK" != "1" ]; then \
         rm -rf "$SP"/numba* "$SP"/llvmlite* "$SP"/tbb* "$SP"/TBB*; \
     fi; \
     find "$SP/numpy" -type d -name tests -prune -exec rm -rf {} +; \
+    python -m compileall -q -o 2 "$VIRTUAL_ENV"; \
     echo "runtime venv: $(du -sm "$VIRTUAL_ENV" | cut -f1) MB"
 
 # ---------- STAGE 4: FINAL RUNTIME ----------

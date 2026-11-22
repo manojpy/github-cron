@@ -43,12 +43,3 @@ docs/
 
 # Runtime outcome data (mounted as volume at runtime, not baked into image)
 outcome-data/
-
-# But DON'T ignore these (required for build):
-!requirements.txt
-!Dockerfile
-!compile_numba_aot.py
-!src/
-!src/__pycache__
-!wrapper.py
-!config_macd.json
