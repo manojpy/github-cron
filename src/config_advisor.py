@@ -61,6 +61,9 @@ NEVER_TOUCH = frozenset({
     "ENABLE_CALIBRATION_GATE", "ENABLE_CONFLUENCE_GATE", "DRY_RUN_MODE", "OUTCOME_MAE_LOSS_PCT",
     "OUTCOME_RR_TARGET", "OUTCOME_LOOKAHEAD_CANDLES", "OUTCOME_COST_MODEL", "BRAIN_FEE_PCT",
     "BRAIN_SLIPPAGE_PCT", "MIN_WIN_RATE", "LAYER_BOUNDARY_MODE", "RUN_TIMEOUT_SECONDS",
+    # The Brain's shadow-rejection evidence comes from this filter. Switching it off
+    # removes the main quality gate AND starves every gate test in this module.
+    "ENABLE_WIN_RATE_FILTER",
 })
 
 
@@ -505,9 +508,13 @@ def _confluence_value(rows: Sequence[Row], current: Mapping[str, Any], P: Mappin
 def _agreement_candidates(current: Mapping[str, Any], P: Mapping[str, Any], cand: Mapping[str, Any], data_ok: bool,
                           sb: Optional[Mapping[str, Any]], trend: Optional[Mapping[str, Any]], blob: Mapping[str, Any],
                           veto_res: Optional[Mapping[str, Any]], at_report: Optional[Mapping[str, Any]],
-                          at_streak: int) -> List[Dict[str, Any]]:
+                          at_streak: int, newest_ts: Optional[float] = None) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     need = int(P["promote_cycles"])
+    # A streak must mean "passed again on NEWER trades", exactly as for the gate tests.
+    # Without newest_ts in stats, _update_candidates treats every cycle as a refresh and
+    # three idle learner runs would reach E4 on unchanged evidence.
+    _stamp: Dict[str, Any] = {"newest_ts": int(newest_ts) if newest_ts is not None else None}
 
     # PLAYBOOK_MODE shadow -> live: the pre-committed scoreboard is READY and nothing contradicts it.
     f = "PLAYBOOK_MODE"
@@ -526,7 +533,7 @@ def _agreement_candidates(current: Mapping[str, Any], P: Mapping[str, Any], cand
                  f"delivered trend: {(trend or {}).get('verdict')}"]
         out.append(_sugg(field=f, cur="shadow", new="live", kind="shadow_to_live", cid=cid, group=f, direction="PROMOTE",
                          title=f"Turn the playbook overlay on: {f} shadow -> live", tier="E2",
-                         passed=ps, checks=checks, stats={}, lines=lines,
+                         passed=ps, checks=checks, stats=_stamp, lines=lines,
                          risks=["Restrict-only: the playbook can only mark an alert AVOID/WATCH or add a skip rule, never add or upgrade one."],
                          alternatives=[], gain=0.0, need=need, streak=int((cand.get(cid) or {}).get("streak") or 0)))
 
@@ -540,7 +547,7 @@ def _agreement_candidates(current: Mapping[str, Any], P: Mapping[str, Any], cand
         ev = at_report.get("evidence") or {}
         out.append(_sugg(field=f, cur="shadow", new="live", kind="shadow_to_live", cid=cid, group="CONFLUENCE", direction="PROMOTE",
                          title=f"Let autotune apply its bounded tightening: {f} shadow -> live",
-                         tier="E2", passed=ps, checks=checks, stats={},
+                         tier="E2", passed=ps, checks=checks, stats=_stamp,
                          lines=["Autotune's own proposal (CONFLUENCE_MIN_PCT, tighten-only, one small step) cleared all its readiness checks.",
                                 str(at_report.get("text") or ""), f"evidence: removed band {ev.get('removed')}"],
                          risks=["Autotune judges every change after AUTOTUNE_EVAL_HOURS and rolls it back on clear harm; it cannot relax the field."],
@@ -556,7 +563,7 @@ def _agreement_candidates(current: Mapping[str, Any], P: Mapping[str, Any], cand
         need_d = int(P["demote_cycles"])
         out.append(_sugg(field=f, cur=current[f], new="live", kind="shadow_to_live", cid=cid, group="ALERT_VETO_MODE", direction="DEMOTE",
                          title=f"Let the monitor suspend a harmful veto rule: {f} {current[f]} -> live",
-                         tier="E2", passed=ps, checks=checks, stats={}, prio=1,
+                         tier="E2", passed=ps, checks=checks, stats=_stamp, prio=1,
                          lines=["The veto monitor judged these live veto rule(s) HARMFUL on consecutive cycles but is not allowed to suspend them:"]
                          + [f"{k}: {g.get('reason') or 'see monitor'}" for k, g in harmful.items()],
                          risks=["The monitor suspends ONE rule's veto (it logs but still sends) and resumes it only after proven benefit again."],
@@ -670,7 +677,8 @@ def advise(*, now_ts: float, rows: Sequence[Row], blob: Mapping[str, Any], sb: O
     ev_s, ev_notes = _exhaustion_value(ctx, current, P, cand, healthy, z_prom)
     cf_s, cf_notes = _confluence_value(rows, current, P, cand, fixed, cost_pct, now_ts, healthy, z_prom)
     suggs += ev_s + cf_s
-    suggs += _agreement_candidates(current, P, cand, healthy, sb, trend, blob, veto_res, at_report, at_streak)
+    suggs += _agreement_candidates(current, P, cand, healthy, sb, trend, blob, veto_res, at_report, at_streak,
+                                   newest_ts=newest_ts)
     suggs = [s for s in suggs if s["field"] not in NEVER_TOUCH and s["field"] not in set(P["mute"])]
     if ev_notes and not ev_s:
         notes.append("EXHAUSTION_VETO_SCORE: no change - " + "; ".join(ev_notes))
