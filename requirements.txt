@@ -25,5 +25,3 @@ tbb==2023.2.0
 tzdata==2026.6
 typing-extensions==4.16.0
 setuptools==84.2.1
-wheel==0.48.0
-py-cpuinfo==9.0.0
