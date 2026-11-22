@@ -129,8 +129,6 @@ jobs:
           load: true
           tags: ${{ env.CANDIDATE_IMAGE }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            CYTHON_STRICT=1
           cache-from: |
             type=gha,scope=macd-aot-build-${{ env.PYTHON_VERSION }}
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
