@@ -10,8 +10,9 @@ RUN pip install --no-cache-dir uv==0.13.8
 # ---------- STAGE 2: DEPENDENCIES BUILDER ----------
 FROM python:3.15-slim-trixie AS deps-builder
 
-COPY --from=uv-installer /usr/local/bin/uv /usr/local/bin/uv
+ENV DEBIAN_FRONTEND=noninteractive
 
+COPY --from=uv-installer /usr/local/bin/uv /usr/local/bin/uv
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     build-essential \
     git \
@@ -26,6 +27,9 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 # Enable BuildKit caching by removing --no-cache
 ENV UV_CACHE_DIR='/tmp/uv_cache'
+# The BuildKit cache mount and /opt/venv are on different filesystems, so
+# hardlinking always fails and uv falls back to copying anyway. Say so.
+ENV UV_LINK_MODE=copy
 COPY requirements.txt .
 RUN --mount=type=cache,target=/tmp/uv_cache \
     uv pip install -r requirements.txt && \
@@ -39,10 +43,13 @@ WORKDIR /build
 COPY setup.py ./
 COPY src/cython_functions.pyx ./src/
 
+# Advisory only: a Cython failure is ALWAYS fatal here. The final stage does
+# `COPY /build/cython_functions*.so`, which cannot match a file that was never
+# produced, so a "lenient" mode could not yield a working image anyway.
 ARG CYTHON_STRICT=1
 
 RUN set -e; \
-    echo "🔨 Starting Cython compilation..."; \
+    echo "🔨 Starting Cython compilation (CYTHON_STRICT=${CYTHON_STRICT}, failure is fatal)..."; \
     if python setup.py build_ext --inplace; then \
         echo "✅ Cython build successful"; \
     else \
@@ -79,10 +86,12 @@ RUN set -e; \
 # ---------- STAGE 4: FINAL RUNTIME ----------
 FROM python:3.15-slim-trixie AS final
 
-HEALTHCHECK NONE
+ENV DEBIAN_FRONTEND=noninteractive
 
+HEALTHCHECK NONE
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     ca-certificates \
+    && apt-get upgrade -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Security - Non-root user
@@ -97,7 +106,7 @@ COPY --from=runtime-venv /opt/venv /opt/venv
 
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy compiled Cython extension (filename carries the ABI tag, e.g. .cpython-311-x86_64-linux-gnu.so)
+# Copy compiled Cython extension (filename carries the ABI tag, e.g. .cpython-315-x86_64-linux-gnu.so)
 COPY --from=cython-builder --chown=appuser:appuser /build/cython_functions*.so ./
 
 # All application modules in ONE layer (was ~40 separate layers: every layer
