@@ -719,6 +719,11 @@ def advise(*, now_ts: float, rows: Sequence[Row], blob: Mapping[str, Any], sb: O
                     if _TIER_ORDER[cur["tier"]] > _TIER_ORDER[rec["tier"]]:
                         _log(state, now_ts, "ESCALATED", rec, f"{rec['tier']} -> {cur['tier']}")
                     rec.update({"tier": cur["tier"], "lines": cur["lines"], "stats": cur["stats"], "checks": cur["checks"], "last_eval_ts": int(now_ts)})
+                elif not healthy:
+                    # E0 means the DATA is not trustworthy this cycle, not that the
+                    # evidence went away. Hold the recommendation and judge it again
+                    # on the next healthy cycle; never withdraw on a data outage.
+                    rec["held_ts"] = int(now_ts)
                 else:
                     rec["miss"] = int(rec.get("miss") or 0) + 1
                     if rec["miss"] >= int(P["revoke_cycles"]):
@@ -735,7 +740,8 @@ def advise(*, now_ts: float, rows: Sequence[Row], blob: Mapping[str, Any], sb: O
             elif where == "other":
                 rec["state"] = "STALE"
                 _log(state, now_ts, "STALE", rec, "config changed again during verification")
-            elif now_ts - float(rec["applied_ts"]) >= float(P["verify_days"]) * _DAY:
+
+            elif healthy and now_ts - float(rec["applied_ts"]) >= float(P["verify_days"]) * _DAY:
                 v = before_after(rows, float(rec["applied_ts"]), now_ts, fixed, cost_pct, int(P["verify_min_blocks"]))
                 rec["verify"] = v
                 if v.get("verdict"):
