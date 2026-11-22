@@ -90,8 +90,9 @@ jobs:
       - name: 🐳 Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
         with:
-          driver-opts: |
-            image=moby/buildkit:v0.12.5
+          # No BuildKit pin: v0.12.5 (Dec 2023) predates GitHub's current Actions
+          # cache service, which is why type=gha kept returning an HTML 400 from
+          # the edge. Let the action use the BuildKit it is tested against.
           buildkitd-flags: --allow-insecure-entitlement network.host
 
       - name: 🔐 Log in to GitHub Container Registry
@@ -255,7 +256,18 @@ jobs:
               done
             '
 
-      # PHASE 3: SECURITY SCANNING
+      - name: ✅ Verify advisor + learner import cleanly
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -e PYTHONPATH=/app/src \
+            -e TELEGRAM_BOT_TOKEN="1:AA" \
+            -e TELEGRAM_CHAT_ID="1" \
+            -e REDIS_URL="redis://127.0.0.1:6379" \
+            -e DELTA_API_BASE="https://api.india.delta.exchange" \
+            ${{ env.CANDIDATE_IMAGE }} \
+            python -c "import config_advisor, learner; print('✅ advisor + learner import OK')"
+
+      # PHASE 3: SECURITY SCANNING 
       - name: 🚦 Trivy gate (block on fixable CRITICAL findings)
         if: ${{ inputs.skip_trivy != 'true' }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
