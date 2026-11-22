@@ -89,25 +89,44 @@ jobs:
           echo "🐳 Pulling $IMAGE in the background (falls back to :latest if that tag does not exist)"
 
       # PHASE 1: VALIDATION & SETUP
-      - name: 📄 Fetch config_macd.json (no checkout action)
+      - name: 📄 Fetch config_macd.json (raw first, API fallback)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # The bot's code lives in the image; this repo is needed only for
-          # config_macd.json. One API call replaces the checkout action download
-          # plus the git fetch. Pinned to the dispatched SHA, so the config always
-          # matches the commit and no cache can serve a stale file. The token
-          # header keeps this working if the repo ever becomes private.
-          curl --fail --silent --show-error --location \
-               --retry 3 --retry-delay 1 --max-time 20 \
-               --header "Authorization: Bearer ${GH_TOKEN}" \
-               --header "Accept: application/vnd.github.raw" \
-               --header "X-GitHub-Api-Version: 2022-11-28" \
-               --output config_macd.json \
-               "https://api.github.com/repos/${{ github.repository }}/contents/config_macd.json?ref=${{ github.sha }}"
-          test -s config_macd.json
-          echo "📄 config_macd.json fetched ($(wc -c < config_macd.json) bytes) at ${GITHUB_SHA:0:8}"
+          OUT=config_macd.json
+          rm -f "$OUT" "$OUT.tmp"
+
+          fetch() {
+            curl -4 --fail --silent --show-error --location \
+                 --connect-timeout 5 --max-time 15 \
+                 --retry 2 --retry-delay 1 \
+                 --header "Authorization: Bearer ${GH_TOKEN}" \
+                 "$@" --output "$OUT.tmp" || return 1
+            python3 - "$OUT.tmp" <<'PY' || return 1
+          import json, sys
+          raw = open(sys.argv[1]).read()
+          c = json.loads(raw)                                  # rejects HTML / truncated bodies
+          assert len(raw) > 100, "suspiciously small"          # your check, kept
+          assert isinstance(c, dict) and isinstance(c.get("PAIRS"), list) and c["PAIRS"], "no PAIRS list"
+          PY
+            mv -f "$OUT.tmp" "$OUT"
+          }
+          # 1) raw — different edge than api.github.com, SHA-pinned (immutable).
+          #    Token is harmless on a public repo and keeps working if it goes private.
+          if fetch "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/config_macd.json"; then
+            SRC=raw
+          # 2) Contents API — the old behaviour, now only the fallback.
+          elif fetch "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/config_macd.json?ref=${GITHUB_SHA}" \
+                 --header "Accept: application/vnd.github.raw" \
+                 --header "X-GitHub-Api-Version: 2022-11-28"; then
+            SRC=api
+          else
+            echo "::error::config_macd.json unreachable via raw AND API at ${GITHUB_SHA:0:8}"
+            exit 1
+          fi
+          test -s "$OUT"
+          echo "📄 config_macd.json fetched via ${SRC} ($(wc -c < "$OUT") bytes) at ${GITHUB_SHA:0:8}"
 
       - name: 🔑 Verify secrets + config, decide Brain depth
         id: brain_depth
