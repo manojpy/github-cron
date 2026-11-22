@@ -20,9 +20,13 @@ What it can recommend (a strict whitelist, see GATES / the value sweeps below):
 Evidence standard for a "proven loser" (promotion) - ALL of:
   fresh data, outcome coverage, enough independent 3h blocks, upper bound < 0 at a
   Bonferroni-adjusted z, worse than the REST of the book (session/direction stratified),
-  both halves of time negative, the latest 40% negative on its own (out-of-sample),
-  not one pair's doing (top-pair share + leave-top-pair-out), bounded share of the book,
-  and the same verdict on `promote_cycles` consecutive evidence refreshes.
+  both halves of time negative, the latest 40% negative on its own (a recency check: a gate is
+  the user's own fixed rule and nothing is fitted, so this tests stability, it is not a holdout),
+  not one pair's doing (top-pair share + leave-top-pair-out) and at least `min_pairs` pairs,
+  bounded share of the book, and the same verdict on `promote_cycles` consecutive evidence
+  refreshes (persistence on refreshed, overlapping data: NOT independent replication).
+The two value sweeps (CONFLUENCE_MIN_PCT, EXHAUSTION_VETO_SCORE) choose a candidate using only the
+older 60% of the book and then test the ONE chosen candidate once on the newest 40% (a real holdout).
 A "proven earner" (demotion) mirrors it, with a lower bar (`demote_cycles`) because
 removing a restriction is the safer direction.  A tier is attached:
   E0 data not trustworthy   E1 too little data   E2 data enough, a check fails (watch)
@@ -36,6 +40,8 @@ HARMFUL verdict produces a rollback recommendation).
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -50,7 +56,11 @@ KEY_ADVISOR = "config_advisor"
 Items = List[Tuple[Row, float, float]]
 _DAY = 86400
 _TIER_ORDER = {"E0": 0, "E1": 1, "E2": 2, "E3": 3, "E4": 4}
-_LIVE_STATES = ("NEW", "SENT")                      # recommendations that are still open
+_LIVE_STATES = ("NEW", "SHADOW", "SENT")            # open: NEW = not delivered yet, SHADOW = tracked in shadow mode only, SENT = delivered
+POLICY_VERSION = 2                                  # bump when the evidence rules change: streaks from an older policy start again
+_POLICY_KEYS = ("min_blocks", "min_n", "min_pairs", "alpha", "z_floor", "z_demote", "z_oos", "min_half", "oos_frac",
+                "oos_min_blocks", "max_share", "max_pair_share", "min_cell", "lookback_days", "step_pct", "max_steps",
+                "ceiling_pct", "veto_scores", "min_cats")
 _LOG_CAP = 200
 _IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -69,7 +79,7 @@ NEVER_TOUCH = frozenset({
 
 def default_params() -> Dict[str, Any]:
     return {
-        "min_blocks": 30, "min_n": 30, "alpha": 0.05, "z_floor": 2.33, "z_demote": 1.96, "z_oos": 1.645,
+        "min_blocks": 30, "min_n": 30, "min_pairs": 5, "alpha": 0.05, "z_floor": 2.33, "z_demote": 1.96, "z_oos": 1.645,
         "min_half": 8, "oos_frac": 0.4, "oos_min_blocks": 8, "max_share": 0.35, "max_pair_share": 0.5,
         "promote_cycles": 3, "demote_cycles": 2, "send_tier": "E4", "expiry_days": 7, "cooldown_hours": 72.0,
         "max_per_cycle": 2, "max_per_day": 3, "verify_days": 7, "verify_min_blocks": 8, "max_age_h": 36.0,
@@ -83,6 +93,15 @@ def default_params() -> Dict[str, Any]:
 
 def _rnd(v: Any, nd: int = 3) -> Optional[float]:
     return None if v is None else round(float(v), nd)
+
+
+def _f(v: Any) -> Optional[float]:
+    """Full precision for every number a decision reads; numbers are rounded only when text is built."""
+    return None if v is None else float(v)
+
+
+def _pct(v: Any) -> str:
+    return "n/a" if v is None else f"{v:+.2f}%"
 
 
 def _ts_str(ts: float) -> str:
@@ -99,6 +118,26 @@ def _fmt_val(v: Any) -> str:
 
 def _fp(field: str, cur: Any, new: Any) -> str:
     return hashlib.sha1(f"{field}|{_fmt_val(cur)}|{_fmt_val(new)}".encode()).hexdigest()[:10]
+
+
+def _policy_params(P: Mapping[str, Any]) -> Dict[str, Any]:
+    return {k: (list(P[k]) if isinstance(P[k], (tuple, list)) else P[k]) for k in _POLICY_KEYS if k in P}
+
+
+def _policy_hash(P: Mapping[str, Any]) -> str:
+    """Fingerprint of every setting that changes what counts as evidence, plus the code's POLICY_VERSION."""
+    return hashlib.sha1(f"{POLICY_VERSION}|{json.dumps(_policy_params(P), sort_keys=True, default=str)}".encode()).hexdigest()[:10]
+
+
+def _provenance(rows: Sequence[Row], fixed: Mapping[str, float], cost_pct: float, P: Mapping[str, Any], n_rows: int,
+                n_path: int, newest_ts: Optional[float], policy: str) -> Dict[str, Any]:
+    """What a recommendation was computed from, so it can be reconstructed months later."""
+    live = sorted((str(r.get("pair")), int(r["entry_ts"])) for r in rows if r.get("source") == "LIVE" and r.get("entry_ts") is not None)
+    return {"policy": policy, "policy_version": POLICY_VERSION, "params": _policy_params(P),
+            "fixed": {k: fixed[k] for k in ("sl", "tp", "h") if k in fixed}, "cost_pct": _rnd(cost_pct, 6),
+            "n_rows": int(n_rows), "n_with_path": int(n_path), "rows_without_path": int(n_rows) - int(n_path),
+            "newest_ts": None if newest_ts is None else int(newest_ts), "live_rows": len(live),
+            "live_oldest_ts": live[0][1] if live else None, "live_fingerprint": hashlib.sha1(repr(live).encode()).hexdigest()[:12]}
 
 
 def _ctx(r: Mapping[str, Any]) -> Dict[str, Any]:
@@ -156,30 +195,30 @@ def restriction_stats(F: Items, R: Items, P: Mapping[str, Any], z: float) -> Dic
     rest_nets = [it[1] for it in F if str(it[0].get("pair") or "?") != top_pair]
     total = len(F) + len(R)
     return {
-        "n": pf["n"], "n_blocks": pf["n_blocks"], "ev": _rnd(ev), "se": _rnd(se),
-        "lcb": _rnd(ev - z * se) if ok else None, "ucb": _rnd(ev + z * se) if ok else None,
-        "n_rest": pr["n"], "rest_ev": _rnd(pr["ev"]),
-        "gap": _rnd(gap), "gap_ucb": _rnd(gap + z * gse) if gap is not None and gse is not None else None,
-        "gap_lcb": _rnd(gap - z * gse) if gap is not None and gse is not None else None, "cells": cells,
-        "half_a": _rnd(sum(ha) / len(ha)) if ha else None, "half_b": _rnd(sum(hb) / len(hb)) if hb else None, "halves_ok": half_ok,
-        "oos_n": oos["n"], "oos_blocks": oos["n_blocks"], "oos_ev": _rnd(oos["ev"]),
-        "oos_ucb": _rnd(oos["ev"] + float(P["z_oos"]) * oos["se"]) if oos["ev"] is not None and oos["se"] is not None else None,
-        "oos_lcb": _rnd(oos["ev"] - float(P["z_oos"]) * oos["se"]) if oos["ev"] is not None and oos["se"] is not None else None,
-        "n_pairs": len(pairs), "top_pair": top_pair, "top_pair_share": _rnd(top_n / len(F)) if F else None,
-        "ev_without_top_pair": _rnd(sum(rest_nets) / len(rest_nets)) if rest_nets else None,
-        "share": _rnd(len(F) / total) if total else None, "agg_f": _rnd(sum(it[1] for it in F), 2),
+        "n": pf["n"], "n_blocks": pf["n_blocks"], "ev": _f(ev), "se": _f(se),
+        "lcb": _f(ev - z * se) if ok else None, "ucb": _f(ev + z * se) if ok else None,
+        "n_rest": pr["n"], "rest_ev": _f(pr["ev"]),
+        "gap": _f(gap), "gap_ucb": _f(gap + z * gse) if gap is not None and gse is not None else None,
+        "gap_lcb": _f(gap - z * gse) if gap is not None and gse is not None else None, "cells": cells,
+        "half_a": _f(sum(ha) / len(ha)) if ha else None, "half_b": _f(sum(hb) / len(hb)) if hb else None, "halves_ok": half_ok,
+        "oos_n": oos["n"], "oos_blocks": oos["n_blocks"], "oos_ev": _f(oos["ev"]),
+        "oos_ucb": _f(oos["ev"] + float(P["z_oos"]) * oos["se"]) if oos["ev"] is not None and oos["se"] is not None else None,
+        "oos_lcb": _f(oos["ev"] - float(P["z_oos"]) * oos["se"]) if oos["ev"] is not None and oos["se"] is not None else None,
+        "n_pairs": len(pairs), "top_pair": top_pair, "top_pair_share": _f(top_n / len(F)) if F else None,
+        "ev_without_top_pair": _f(sum(rest_nets) / len(rest_nets)) if rest_nets else None,
+        "share": _f(len(F) / total) if total else None, "agg_f": _f(sum(it[1] for it in F)),
         "newest_ts": int(max(it[0]["entry_ts"] for it in F)) if F else None, "z": round(z, 2), "oos_frac": float(P["oos_frac"]),
     }
-
 
 def loser_checks(st: Mapping[str, Any], P: Mapping[str, Any]) -> Dict[str, bool]:
     """Promotion standard: the restricted set is a proven loser and the evidence is not a fluke."""
     return {
         "enough_blocks": bool(st["n_blocks"] >= int(P["min_blocks"]) and st["n"] >= int(P["min_n"])),
+        "enough_pairs": bool(st["n_pairs"] >= int(P["min_pairs"])),
         "proven_loser": bool(st["ucb"] is not None and st["ucb"] < 0),
         "worse_than_rest": bool(st["gap_ucb"] is not None and st["gap_ucb"] < 0),
         "stable_both_halves": bool(st["halves_ok"] and st["half_a"] is not None and st["half_b"] is not None and st["half_a"] < 0 and st["half_b"] < 0),
-        "out_of_sample_loser": bool(st["oos_blocks"] >= int(P["oos_min_blocks"]) and st["oos_ucb"] is not None and st["oos_ucb"] < 0),
+        "recent_loser": bool(st["oos_blocks"] >= int(P["oos_min_blocks"]) and st["oos_ucb"] is not None and st["oos_ucb"] < 0),
         "not_one_pair": bool(st["top_pair_share"] is not None and st["top_pair_share"] <= float(P["max_pair_share"])
                              and st["ev_without_top_pair"] is not None and st["ev_without_top_pair"] < 0),
         "bounded_opportunity_cost": bool(st["share"] is not None and st["share"] <= float(P["max_share"])),
@@ -190,9 +229,10 @@ def earner_checks(st: Mapping[str, Any], P: Mapping[str, Any]) -> Dict[str, bool
     """Demotion standard: what the gate blocks is a proven earner (the gate is costing money)."""
     return {
         "enough_blocks": bool(st["n_blocks"] >= int(P["min_blocks"]) and st["n"] >= int(P["min_n"])),
+        "enough_pairs": bool(st["n_pairs"] >= int(P["min_pairs"])),
         "proven_earner": bool(st["lcb"] is not None and st["lcb"] > 0),
         "stable_both_halves": bool(st["halves_ok"] and st["half_a"] is not None and st["half_b"] is not None and st["half_a"] > 0 and st["half_b"] > 0),
-        "out_of_sample_earner": bool(st["oos_blocks"] >= int(P["oos_min_blocks"]) and st["oos_lcb"] is not None and st["oos_lcb"] > 0),
+        "recent_earner": bool(st["oos_blocks"] >= int(P["oos_min_blocks"]) and st["oos_lcb"] is not None and st["oos_lcb"] > 0),
         "not_one_pair": bool(st["top_pair_share"] is not None and st["top_pair_share"] <= float(P["max_pair_share"])
                              and st["ev_without_top_pair"] is not None and st["ev_without_top_pair"] > 0),
     }
@@ -426,35 +466,83 @@ def _gate_candidates(c: Ctx, current: Mapping[str, Any], P: Mapping[str, Any], c
     return out
 
 
+def _sweep_eval(cands: Sequence[Tuple[Any, Items, Items]], P: Mapping[str, Any], z: float) -> Dict[Any, Dict[str, Any]]:
+    """Select on the older part of the book, confirm on the newest part.
+    cands = [(label, restricted set F, rest R)].  Every candidate is drawn from the SAME book (F + R is identical for
+    all labels), so one time cut serves them all.  Selection looks ONLY at trades before the cut; the newest
+    `oos_frac` of the book (the holdout) is looked at afterwards, once, for the candidate that was chosen.
+    The size minimums are scaled to the older part, so the total data needed stays about the same."""
+    out: Dict[Any, Dict[str, Any]] = {}
+    if not cands:
+        return out
+    book = sorted(float(it[0]["entry_ts"]) for it in list(cands[0][1]) + list(cands[0][2]))
+    if len(book) < 4:
+        return out
+    frac = 1.0 - float(P["oos_frac"])
+    cut = book[min(len(book) - 1, int(len(book) * frac))]
+    Pt = dict(P)
+    Pt["min_blocks"] = max(1, int(math.ceil(int(P["min_blocks"]) * frac)))
+    Pt["min_n"] = max(1, int(math.ceil(int(P["min_n"]) * frac)))
+    z_oos = float(P["z_oos"])
+    for label, F, R in cands:
+        Ft = [it for it in F if float(it[0]["entry_ts"]) < cut]
+        Rt = [it for it in R if float(it[0]["entry_ts"]) < cut]
+        Fh = [it for it in F if float(it[0]["entry_ts"]) >= cut]
+        if not Ft:
+            continue
+        train = restriction_stats(Ft, Rt, Pt, z)
+        checks = {k: v for k, v in loser_checks(train, Pt).items() if k != "recent_loser"}   # the holdout replaces the recency check
+        hp = _fwd_pool(Fh)
+        hev, hse = hp["ev"], hp["se"]
+        hold = {"n": hp["n"], "blocks": hp["n_blocks"], "ev": _f(hev), "z": z_oos,
+                "ucb": _f(hev + z_oos * hse) if hev is not None and hse is not None else None}
+        hold_ok = bool(hold["blocks"] >= int(P["oos_min_blocks"]) and hold["ucb"] is not None and hold["ucb"] < 0)
+        out[label] = {"train": train, "checks": checks, "hold": hold, "hold_ok": hold_ok, "cut": cut,
+                      "full": restriction_stats(F, R, P, z)}
+    return out
+
+
+def _holdout_line(e: Mapping[str, Any], P: Mapping[str, Any]) -> str:
+    h = e["hold"]
+    return (f"untouched holdout (newest {int(round(100 * float(P['oos_frac'])))}% of the book by time, tested once after the choice): "
+            f"n={h['n']} in {h['blocks']} blocks, average {_pct(h['ev'])} (upper {_pct(h['ucb'])} at z={h['z']})")
+
+
 def _exhaustion_value(c: Ctx, current: Mapping[str, Any], P: Mapping[str, Any], cand: Mapping[str, Any],
                       data_ok: bool, z_prom: float) -> Tuple[List[Dict[str, Any]], List[str]]:
     field = "EXHAUSTION_VETO_SCORE"
     if field in NEVER_TOUCH or field not in current or str(current.get("EXHAUSTION_MODE")) == "off":
         return [], []
     cur = int(current[field])
-    per: Dict[int, Tuple[Dict[str, Any], Dict[str, bool]]] = {}
+    cands: List[Tuple[Any, Items, Items]] = []
     for t in sorted({int(x) for x in P["veto_scores"]} | {cur}):
         F, R = pop_exhaustion(c, t)
-        if not F:
-            continue
-        st = restriction_stats(F, R, P, z_prom)
-        per[t] = (st, loser_checks(st, P))
-    notes = [f"score {t}: {'passes every check' if all(ck.values()) else 'fails ' + ', '.join(_failed(ck))} (blocks {st['n']}, avg {st['ev']:+.2f}%)"
-             for t, (st, ck) in sorted(per.items())]
-    if cur not in per or all(per[cur][1].values()):
+        if F:
+            cands.append((t, F, R))
+    per = _sweep_eval(cands, P, z_prom)
+    notes = [f"score {t}: {'passes selection' if all(e['checks'].values()) else 'fails ' + ', '.join(_failed(e['checks']))} "
+             f"(blocks {e['full']['n']}, avg {_pct(e['full']['ev'])})" for t, e in sorted(per.items())]
+    if cur not in per or all(per[cur]["checks"].values()):
         return [], notes                        # the configured score is already a proven-loser cut (or has no data): nothing to change
-    passing = [t for t, (_s, ck) in per.items() if all(ck.values()) and t != cur]
+    passing = [t for t, e in per.items() if all(e["checks"].values()) and t != cur]
     if not passing:
         return [], notes
     new = min(passing, key=lambda t: (abs(t - cur), -t))
-    st, checks = per[new]
+    e = per[new]
+    if not e["hold_ok"]:
+        return [], notes + [f"score {new} was chosen on the older data but failed the untouched holdout ({_holdout_line(e, P)}): not recommended"]
+    st = dict(e["full"])
+    st["holdout"], st["train_end_ts"] = e["hold"], int(e["cut"])
+    checks = {**e["checks"], "holdout_loser": True}
     cid = f"{field}:{new}"
     streak = int((cand.get(cid) or {}).get("streak") or 0)
     need = int(P["promote_cycles"])
     tier = tier_of(checks, streak, need, data_ok)
-    alts = [f"Not {t}: {'fails ' + ', '.join(_failed(ck))}" for t, (_s, ck) in sorted(per.items()) if t not in (new, cur)]
-    alts.append(f"Keep {cur}: fails {', '.join(_failed(per[cur][1])) or 'nothing'}")
-    lines = [f"A veto at score {new} would block a proven-losing set; the configured score {cur} would not."] + _stat_lines(st, f"trades with exhaustion score >= {new}")
+    alts = [f"Not {t}: {'fails ' + ', '.join(_failed(x['checks']))}" for t, x in sorted(per.items()) if t not in (new, cur)]
+    alts.append(f"Keep {cur}: fails {', '.join(_failed(per[cur]['checks'])) or 'nothing'}")
+    lines = ([f"A veto at score {new} would block a set that was a proven loser on the older data AND on the untouched newest data; "
+              f"the configured score {cur} would not."]
+             + _stat_lines(st, f"trades with exhaustion score >= {new}") + [_holdout_line(e, P)])
     return [_sugg(field=field, cur=cur, new=new, kind="value_delta", cid=cid, group="EXHAUSTION", direction="VALUE",
                   title=f"Change the exhaustion veto score: {field} {cur} -> {new}", tier=tier, passed=all(checks.values()),
                   checks=checks, stats=st, lines=lines,
@@ -470,7 +558,7 @@ def _confluence_value(rows: Sequence[Row], current: Mapping[str, Any], P: Mappin
         return [], []                           # autotune owns this field while it is live: observe, never fight it
     cur = float(current[field])
     since = now_ts - int(P["lookback_days"]) * _DAY
-    results: List[Tuple[float, Dict[str, Any], Dict[str, bool], Items]] = []
+    cands: List[Tuple[Any, Items, Items]] = []
     for k in range(1, int(P["max_steps"]) + 1):
         cand_pct = round(cur + k * float(P["step_pct"]), 4)
         if cand_pct > float(P["ceiling_pct"]):
@@ -478,24 +566,29 @@ def _confluence_value(rows: Sequence[Row], current: Mapping[str, Any], P: Mappin
         removed, live = removed_band(rows, new_pct=cand_pct, macro_live=bool(P["macro_live"]), fixed=fixed, cost_pct=cost_pct, since_ts=since)
         rid = {id(it) for it in removed}
         kept = [it for it in live if id(it) not in rid]
-        if not removed:
-            continue
-        st = restriction_stats(removed, kept, P, z_prom)
-        results.append((cand_pct, st, loser_checks(st, P), removed))
-    notes = [f"{cp:g}: {'passes every check' if all(ck.values()) else 'fails ' + ', '.join(_failed(ck))} (removes {st['n']}, avg {st['ev']:+.2f}%)"
-             for cp, st, ck, _r in results]
-    passing = [x for x in results if all(x[2].values())]
-    pick = passing[0] if passing else None      # smallest passing step: a larger one must not be "better" by assumption
-    if pick is None:
+        if removed:
+            cands.append((cand_pct, removed, kept))
+    per = _sweep_eval(cands, P, z_prom)
+    notes = [f"{cp:g}: {'passes selection' if all(e['checks'].values()) else 'fails ' + ', '.join(_failed(e['checks']))} "
+             f"(removes {e['full']['n']}, avg {_pct(e['full']['ev'])})" for cp, e in sorted(per.items())]
+    passing = [cp for cp in sorted(per) if all(per[cp]["checks"].values())]
+    if not passing:
         return [], notes
-    new, st, checks, _removed = pick
+    new = passing[0]                            # smallest passing step: a larger one must not be "better" by assumption
+    e = per[new]
+    if not e["hold_ok"]:
+        return [], notes + [f"{new:g} was chosen on the older data but failed the untouched holdout ({_holdout_line(e, P)}): not recommended"]
+    st = dict(e["full"])
+    st["holdout"], st["train_end_ts"] = e["hold"], int(e["cut"])
+    checks = {**e["checks"], "holdout_loser": True}
     cid = f"{field}:{new:g}"
     streak = int((cand.get(cid) or {}).get("streak") or 0)
     need = int(P["promote_cycles"])
     tier = tier_of(checks, streak, need, data_ok)
-    alts = [f"Not {cp:g}: {'a larger step is not required - the smallest step that passes is preferred' if all(ck.values()) else 'fails ' + ', '.join(_failed(ck))}"
-            for cp, _s, ck, _r in results if cp != new]
-    lines = [f"Raising the confluence floor by {new - cur:g} point(s) would have removed a proven-losing band of delivered alerts."] + _stat_lines(st, f"alerts below {new:g}%")
+    alts = [f"Not {cp:g}: {'a larger step is not required - the smallest step that passes is preferred' if all(x['checks'].values()) else 'fails ' + ', '.join(_failed(x['checks']))}"
+            for cp, x in sorted(per.items()) if cp != new]
+    lines = ([f"Raising the confluence floor by {new - cur:g} point(s) would have removed a band of delivered alerts that was a proven loser "
+              f"on the older data AND on the untouched newest data."] + _stat_lines(st, f"alerts below {new:g}%") + [_holdout_line(e, P)])
     return [_sugg(field=field, cur=cur, new=new, kind="value_delta", cid=cid, group="CONFLUENCE", direction="VALUE",
                   title=f"Raise the confluence floor: {field} {cur:g} -> {new:g}", tier=tier, passed=True, checks=checks, stats=st,
                   lines=lines, risks=["Fewer alerts: the removed band is a share of what you receive today (see 'share of the book').",
@@ -612,7 +705,7 @@ def _match_current(rec: Mapping[str, Any], cur_value: Any) -> str:
 
 
 def _new_state() -> Dict[str, Any]:
-    return {"version": 1, "recs": {}, "cand": {}, "log": [], "last_digest_ts": 0, "last_digest_hash": "", "cycles": 0}
+    return {"version": 1, "recs": {}, "cand": {}, "log": [], "last_digest_ts": 0, "last_digest_hash": "", "cycles": 0, "policy": ""}
 
 
 def _log(state: Dict[str, Any], now_ts: float, event: str, rec: Mapping[str, Any], extra: str = "") -> None:
@@ -649,9 +742,12 @@ def advise(*, now_ts: float, rows: Sequence[Row], blob: Mapping[str, Any], sb: O
            at_streak: int, hyp_rules: Sequence[Mapping[str, Any]], current: Mapping[str, Any], fixed: Mapping[str, float],
            cost_pct: float, data_ok: bool, newest_ts: Optional[float], n_rows: int, n_path: int,
            prev_state: Optional[Mapping[str, Any]], params: Optional[Mapping[str, Any]] = None,
-           family_fn: Optional[Callable[[str], str]] = None, drop_verdicts: Sequence[str] = ("AVOID",)) -> Dict[str, Any]:
+           family_fn: Optional[Callable[[str], str]] = None, drop_verdicts: Sequence[str] = ("AVOID",),
+           deliver: bool = True) -> Dict[str, Any]:
     """One evaluation.  Returns {"state", "to_send": [alert dicts], "digest": text|None, "suggestions": [...], "notes": [...], "flags": {...}}.
-    Nothing is written anywhere: the caller sends the alerts and then calls `mark_sent`."""
+    Nothing is written anywhere: the caller sends the alerts and then calls `mark_sent`.
+    deliver=False is shadow mode: a recommendation is evaluated and tracked but never re-offered (state SHADOW).
+    deliver=True re-arms the SHADOW ones that still pass this cycle, so switching shadow -> on really delivers them."""
     P = default_params()
     P.update(params or {})
     state = _new_state()
@@ -661,13 +757,30 @@ def advise(*, now_ts: float, rows: Sequence[Row], blob: Mapping[str, Any], sb: O
     state["log"] = list(state.get("log") or [])
     state["cycles"] = int(state.get("cycles") or 0) + 1
 
+    # An earlier version stored shadow-mode recommendations as SENT although nothing was delivered. Repair them once:
+    # they must not read as "sent" (no WITHDRAWN notice for something you never saw, and they are re-offered when you switch on).
+    _real = {e.get("id") for e in state["log"] if e.get("event") == "SENT"}
+    _shadowed = {e.get("id") for e in state["log"] if e.get("event") == "SENT_SHADOW"}
+    for _rec in state["recs"].values():
+        if _rec.get("state") == "SENT" and _rec.get("id") in _shadowed and _rec.get("id") not in _real:
+            _rec.update({"state": "SHADOW", "sent_ts": None})
+    # Streaks belong to the evidence rules that produced them: when the policy changes they start again.
+    policy = _policy_hash(P)
+    if state.get("policy") != policy:
+        state["cand"] = {k: {**v, "streak": 0} for k, v in state["cand"].items()}
+        if state.get("policy"):
+            _log(state, now_ts, "POLICY_CHANGED", {"id": None, "field": None}, f"{state.get('policy')} -> {policy}: streaks restart")
+        state["policy"] = policy
+
     fresh = newest_ts is not None and (now_ts - float(newest_ts)) <= float(P["max_age_h"]) * 3600.0
     coverage = n_rows > 0 and n_path / n_rows >= float(P["min_path_share"])
     healthy = bool(data_ok and fresh and coverage)
     flags = {"fresh": bool(fresh), "coverage": bool(coverage), "healthy": healthy}
 
     # evaluated gates this cycle -> Bonferroni z for the promotion tests
-    m = sum(1 for f, sp in GATES.items() if f in current and _is_on(sp, current[f]) is False and sp["promote"]) + 2
+    # Every promotion-type test of this cycle counts: each gate that is only measuring, plus every candidate of the two sweeps.
+    m = (sum(1 for f, sp in GATES.items() if f in current and _is_on(sp, current[f]) is False and sp["promote"])
+         + len({int(x) for x in P["veto_scores"]} | {int(current.get("EXHAUSTION_VETO_SCORE", P["veto_score"]))}) + int(P["max_steps"]))
     z_prom = max(float(P["z_floor"]), _z(float(P["alpha"]), m))
     ctx = Ctx(rows, blob, fixed, cost_pct, family_fn, hyp_rules, drop_verdicts, int(current.get("EXHAUSTION_VETO_SCORE", P["veto_score"])), int(P["min_cats"]))
     cand = state["cand"]
@@ -775,8 +888,12 @@ def advise(*, now_ts: float, rows: Sequence[Row], blob: Mapping[str, Any], sb: O
                    "rollback": s["rollback"], "title": s["title"], "alternatives": s["alternatives"], "risks": s["risks"],
                    "tier": s["tier"], "lines": s["lines"], "stats": s["stats"], "checks": s["checks"], "group": s["group"],
                    "expired_n": int((rec or {}).get("expired_n") or 0), "snooze_until": (rec or {}).get("snooze_until")}
+            rec["prov"] = _provenance(rows, fixed, cost_pct, P, n_rows, n_path, newest_ts, policy)
             recs[rid] = rec
             _log(state, now_ts, "NEW", rec)
+        if rec["state"] == "SHADOW" and deliver:          # shadow -> on: offer it again, but only because it passes THIS cycle
+            rec["state"] = "NEW"
+            _log(state, now_ts, "REARMED", rec, "tracked in shadow mode, still valid now that delivery is on")
         if rec["state"] != "NEW":
             continue
         if _TIER_ORDER[s["tier"]] >= send_rank and budget > 0 and s["group"] not in used_groups:
@@ -796,15 +913,20 @@ def advise(*, now_ts: float, rows: Sequence[Row], blob: Mapping[str, Any], sb: O
 
 def mark_sent(state: Mapping[str, Any], ids: Sequence[str], now_ts: float, shadow: bool = False) -> Dict[str, Any]:
     """Call ONLY after Telegram accepted the message: until then a recommendation stays NEW and is retried next cycle.
-    shadow=True (CONFIG_ADVISOR_MODE=shadow) records it as 'would have been sent' so the track record builds without messages."""
+    shadow=True (CONFIG_ADVISOR_MODE=shadow) records "would have been sent": the state becomes SHADOW, not SENT, because
+    nothing was delivered. A SHADOW recommendation is offered for real when delivery is switched on and it still passes."""
     st = dict(state)
     recs = {k: dict(v) for k, v in (st.get("recs") or {}).items()}
     st["log"] = list(st.get("log") or [])
     for rid in ids:
         rec = recs.get(rid)
         if rec is not None and rec["state"] == "NEW":
-            rec.update({"state": "SENT", "sent_ts": int(now_ts)})
-            _log(st, now_ts, "SENT_SHADOW" if shadow else "SENT", rec)
+            if shadow:
+                rec.update({"state": "SHADOW", "shadow_ts": int(now_ts)})
+                _log(st, now_ts, "SENT_SHADOW", rec)
+            else:
+                rec.update({"state": "SENT", "sent_ts": int(now_ts)})
+                _log(st, now_ts, "SENT", rec)
     st["recs"] = recs
     return st
 
@@ -855,7 +977,9 @@ def format_withdrawn(rec: Mapping[str, Any], why: str) -> str:
 def format_rollback(rec: Mapping[str, Any], v: Mapping[str, Any]) -> str:
     return (f"🔴 CONFIG ADVISOR · ROLLBACK RECOMMENDED\n{rec['field']} was changed {json_val(rec['from'])} -> {json_val(rec['to'])} "
             f"and delivered trades got clearly worse: {v['post']['ev']:+.2f}%/trade after (n={v['post']['n']}) vs {v['pre']['ev']:+.2f}% before (n={v['pre']['n']}).\n"
-            f"Rollback: set \"{rec['field']}\" back to {json_val(rec['from'])} in config_macd.json and commit.")
+            f"Rollback: set \"{rec['field']}\" back to {json_val(rec['from'])} in config_macd.json and commit.\n"
+            f"Caution: this compares delivered trades before vs after the change, and the market changed too. "
+            f"Treat it as a warning to review, not proof the change caused it.")
 
 
 def _digest(state: Mapping[str, Any], notes: Sequence[str], P: Mapping[str, Any], now_ts: float, healthy: bool,

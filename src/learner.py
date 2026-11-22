@@ -693,6 +693,7 @@ async def run(args: argparse.Namespace) -> int:
                     fixed=fixed, cost_pct=cost_pct, data_ok=bool(data_ok and not intel_failed), newest_ts=newest_ts,
                     n_rows=len(rows), n_path=n_path, prev_state=adv_prev, params=advisor_params_from_cfg(tuple(adv_override)),
                     family_fn=alert_family_of, drop_verdicts=tuple(x.strip() for x in str(cfg.ALERT_FIREWALL_DROP).split(",") if x.strip()),
+                    deliver=(adv_mode == "on"),
                 )
                 _say(f"[learner] config advisor [{adv_mode}]: {len(adv_out['suggestions'])} candidate(s) evaluated, "
                      f"{len(adv_out['to_send'])} to send, data {'healthy' if adv_out['flags']['healthy'] else 'NOT healthy'}")
