@@ -3,12 +3,12 @@
 # =============================================================================
 
 # ---------- STAGE 1: UV INSTALLER ----------
-FROM python:3.15-slim-bookworm AS uv-installer
+FROM python:3.15-slim-trixie AS uv-installer
 
 RUN pip install --no-cache-dir uv==0.13.8
 
 # ---------- STAGE 2: DEPENDENCIES BUILDER ----------
-FROM python:3.15-slim-bookworm AS deps-builder
+FROM python:3.15-slim-trixie AS deps-builder
 
 COPY --from=uv-installer /usr/local/bin/uv /usr/local/bin/uv
 
@@ -77,7 +77,7 @@ RUN set -e; \
     echo "runtime venv: $(du -sm "$VIRTUAL_ENV" | cut -f1) MB"
 
 # ---------- STAGE 4: FINAL RUNTIME ----------
-FROM python:3.15-slim-bookworm AS final
+FROM python:3.15-slim-trixie AS final
 
 HEALTHCHECK NONE
 
