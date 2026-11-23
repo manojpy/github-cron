@@ -3216,7 +3216,10 @@ class RedisStateStore:
         except Exception as e:
             logger_pair.warning(f"Failed to batch-fetch pending outcomes for {pair}: {e}")
             return
-
+        # Run-level cache so end-of-run early-closed totals do not MGET again.
+        _pending_cache = self.__dict__.setdefault("_pending_raw_cache", {})
+        for _k, _v in zip(keys, raw_values):
+            _pending_cache[_k] = _v
         resolved_count = 0
         not_ready_count = 0
         ts_mismatch_count = 0
@@ -3540,6 +3543,10 @@ class RedisStateStore:
             logger_pair.warning(
                 f"Failed to batch-fetch shadow pending outcomes for {pair}: {e}"
             )
+            return
+        _pending_cache = self.__dict__.setdefault("_pending_raw_cache", {})
+        for _k, _v in zip(keys, raw_values):
+            _pending_cache[_k] = _v
             return
 
         resolved_count = 0
@@ -4031,6 +4038,7 @@ class RedisStateStore:
             RedisKeyPrefix.OUTCOME_PENDING: "_pending_outcome_keys_by_pair",
             RedisKeyPrefix.SHADOW_PENDING: "_shadow_pending_outcome_keys_by_pair",
         }
+        cache = self.__dict__.setdefault("_pending_raw_cache", {})
 
         for prefix, label in pending_map.items():
             try:
@@ -4047,8 +4055,23 @@ class RedisStateStore:
             if not pending_keys:
                 continue
 
-            pending_rows = await asyncio.wait_for(_rc(self._redis).mget(pending_keys), timeout=5.0)
-            for pkey, raw in zip(pending_keys, pending_rows):
+            missing = [k for k in pending_keys if k not in cache]
+            if missing:
+                try:
+                    fetched = await asyncio.wait_for(
+                        _rc(self._redis).mget(missing), timeout=5.0
+                    )
+                    for k, v in zip(missing, fetched or []):
+                        cache[k] = v
+                except Exception as e:
+                    logger.warning(
+                        f"get_cumulative_outcome_stats: pending MGET for {label} failed ({e}) — totals are PARTIAL"
+                    )
+                    out[label]["partial"] = 1
+                    continue
+
+            for pkey in pending_keys:
+                raw = cache.get(pkey)
                 if not raw:
                     continue
                 # pending key = <prefix><pair>:<alert_key>:<entry_ts>
@@ -4069,7 +4092,7 @@ class RedisStateStore:
                 elif closed_reason in ("stop", "both"):
                     # "both" means TP and SL were touched inside the same candle.
                     out[bucket_label]["losses"] += 1
-    
+
     async def batch_get_all_alert_states(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, bool]:
         if not self._redis or self.degraded or not alert_keys:
             return {k: False for k in alert_keys}

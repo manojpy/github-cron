@@ -682,15 +682,20 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             _pending_scan["all"] = asyncio.ensure_future(_walk())
         return [k for k in await _pending_scan["all"] if k.startswith(prefix)]
 
+
     async def _calibration_blob() -> Any:
+        from brain import CALIBRATION_CURVES_KEY
         try:
             _calib_brain = BrainEngine(state_db)
-            await _calib_brain.maybe_refresh_calibration(logger_main)
+            # maybe_refresh returns the final raw payload when it already has it,
+            # so we do not pay a second GET on the common path.
+            raw = await _calib_brain.maybe_refresh_calibration(logger_main)
+            if raw is not None:
+                return raw
         except Exception as e:
             logger_main.warning(
                 f"Calibration refresh step failed (continuing with existing curve): {e}"
             )
-        from brain import CALIBRATION_CURVES_KEY
         return await state_db._safe_redis_op(
             lambda: _rc(state_db._redis).get(CALIBRATION_CURVES_KEY),
             2.0, "calibration_curves_runload",
@@ -743,7 +748,14 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             preloads.start("shadow_scan", lambda: _scan_prefix(RedisKeyPrefix.SHADOW_PENDING))
         if cfg.ENABLE_CALIBRATION_GATE and cfg.ENABLE_BRAIN:
             preloads.start("calibration", _calibration_blob)
-        if getattr(cfg, "ENABLE_ML_EV_SHADOW", False) or getattr(cfg, "ENABLE_ML_EV_GATE", False):
+        # ml_blobs only when Brain warm is OFF. warm_dispatch_caches already
+        # MGETs MARKET_STATE_MODEL_KEY and ML_CALIBRATION_KEY onto the shared
+        # engine; a parallel _ml_blobs task would double those GETs.
+        _need_ml = (
+            getattr(cfg, "ENABLE_ML_EV_SHADOW", False)
+            or getattr(cfg, "ENABLE_ML_EV_GATE", False)
+        )
+        if _need_ml and not cfg.ENABLE_BRAIN:
             preloads.start("ml_blobs", _ml_blobs)
         preloads.start("disabled_keys", state_db.get_disabled_alert_keys)
         if cfg.ENABLE_PAIR_THRESHOLDS:
@@ -1050,32 +1062,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     # ML-EV: market-state model + ML calibration curve, also loaded
     # ONCE per run. Both blobs are immutable within a run, so per-pair
     # re-loads (30 pairs × 2 GETs × JSON parses) are pure waste.
-    ml_market_state_model: Optional[Dict[str, Any]] = None
-    ml_calibration_curve: Optional[Dict[str, Any]] = None
-    if (
-        (getattr(cfg, "ENABLE_ML_EV_SHADOW", False)
-         or getattr(cfg, "ENABLE_ML_EV_GATE", False))
-        and state_db and not state_db.degraded and state_db._redis
-    ):
-        try:
-            raw_model, raw_curve = await preloads.take("ml_blobs", _ml_blobs)
-            if raw_model:
-                _m = json_loads(raw_model)
-                if _m.get("valid"):
-                    ml_market_state_model = _m
-            if raw_curve:
-                ml_calibration_curve = json_loads(raw_curve)
-            logger_main.info(
-                f"🤖 ML-EV pre-loaded: "
-                f"model={'yes' if ml_market_state_model else 'no'}, "
-                f"calibration={'yes' if ml_calibration_curve else 'no'}"
-            )
-        except Exception as e:
-            logger_main.warning(f"ML-EV pre-load failed (fail-open): {e}")
-
-            ml_market_state_model = None
-            ml_calibration_curve = None
-
+    # Shared Brain engine first so its warm caches can supply ML-EV blobs.
     brain_engine_shared: Optional[Any] = None
     if cfg.ENABLE_BRAIN and state_db and not state_db.degraded:
         try:
@@ -1085,6 +1072,42 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 f"Shared brain engine init failed (fail-open): {e}"
             )
             brain_engine_shared = None
+
+    # ML-EV: market-state model + ML calibration curve, loaded ONCE per run.
+    # When Brain is on, warm_dispatch_caches already filled the shared engine
+    # caches; reuse those. Otherwise fall back to the dedicated _ml_blobs preload.
+    ml_market_state_model: Optional[Dict[str, Any]] = None
+    ml_calibration_curve: Optional[Dict[str, Any]] = None
+    if (
+        (getattr(cfg, "ENABLE_ML_EV_SHADOW", False)
+         or getattr(cfg, "ENABLE_ML_EV_GATE", False))
+        and state_db and not state_db.degraded and state_db._redis
+    ):
+        try:
+            if brain_engine_shared is not None:
+                ml_market_state_model = getattr(
+                    brain_engine_shared, "_market_model_cache", None
+                )
+                ml_calibration_curve = getattr(
+                    brain_engine_shared, "_ml_calib_cache", None
+                )
+            else:
+                raw_model, raw_curve = await preloads.take("ml_blobs", _ml_blobs)
+                if raw_model:
+                    _m = json_loads(raw_model)
+                    if _m.get("valid"):
+                        ml_market_state_model = _m
+                if raw_curve:
+                    ml_calibration_curve = json_loads(raw_curve)
+            logger_main.info(
+                f"🤖 ML-EV pre-loaded: "
+                f"model={'yes' if ml_market_state_model else 'no'}, "
+                f"calibration={'yes' if ml_calibration_curve else 'no'}"
+            )
+        except Exception as e:
+            logger_main.warning(f"ML-EV pre-load failed (fail-open): {e}")
+            ml_market_state_model = None
+            ml_calibration_curve = None
 
     # ── Disabled-alert-keys, pair-thresholds, open-positions: loaded ONCE
     disabled_alert_keys_run: Set[str] = set()
@@ -1626,6 +1649,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         f"🎯🧠 Evaluation: {completed} completed, {errored} errored, "
         f"{len(deferred_pairs)} deferred ({total} total)"
     )
+    if state_db is not None:
+        state_db.__dict__.pop("_pending_raw_cache", None)
+
     return valid_results, deferred_pairs
 
 async def run_once() -> Optional[bool]:

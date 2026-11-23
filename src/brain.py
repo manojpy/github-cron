@@ -282,7 +282,7 @@ class BrainCore:
             f"total online updates={calib['online_updates']})"
         )
 
-    async def maybe_refresh_calibration(self, logger_run: logging.Logger) -> None:
+    async def maybe_refresh_calibration(self, logger_run: logging.Logger) -> Optional[str]:
         """Keep the live calibration curve fresh, independent of the Brain report.
 
         1. Curve exists and is younger than CALIBRATION_REFRESH_MAX_AGE_HOURS:
@@ -290,16 +290,19 @@ class BrainCore:
            existing buckets (no stream scan, history kept).
         2. Curve missing or older than that: full rebuild from the Redis
            outcome streams and stamp fresh stream cursors.
+
+        Returns the final raw Redis payload (str) when known so the caller can
+        avoid a second GET; None when the key is unavailable or the path failed.
         """
         if not getattr(cfg, "ENABLE_CALIBRATION_GATE", False):
-            return
+            return None
         if not getattr(cfg, "ENABLE_BRAIN", True):
-            return
+            return None
         if getattr(cfg, "DRY_RUN_MODE", False):
-            return
+            return None
         if self.sdb.degraded or not self.sdb._redis:
             logger_run.debug("Calibration refresh skipped: Redis unavailable or degraded")
-            return
+            return None
 
         max_age_hr = float(getattr(cfg, "CALIBRATION_REFRESH_MAX_AGE_HOURS", 2.0))
 
@@ -323,16 +326,24 @@ class BrainCore:
                                 await self._fold_new_outcomes_into_calibration(
                                     existing, logger_run,
                                 )
+                                # Fold may have re-persisted; one GET only when we
+                                # actually wrote, otherwise reuse the age-check payload.
+                                raw_after = await self.sdb._safe_redis_op(
+                                    lambda: _rc(self.sdb._redis).get(CALIBRATION_CURVES_KEY),
+                                    2.0, "calibration_after_fold",
+                                )
+                                return raw_after if raw_after is not None else raw
                             except Exception as fold_exc:
                                 logger_run.warning(
                                     f"Online calibration fold failed "
                                     f"(curve unchanged this run): {fold_exc}"
                                 )
+                                return raw
                         else:
                             logger_run.debug(
                                 f"Calibration curves fresh ({age_hr:.1f}h) — skip refresh"
                             )
-                        return
+                            return raw
         except Exception as e:
             logger_run.warning(
                 f"Calibration age check failed (will attempt rebuild): {e}"
@@ -365,7 +376,7 @@ class BrainCore:
                     "Calibration refresh skipped: an outcome stream could not be read, "
                     "so the stored curve is kept instead of being rebuilt from partial rows"
                 )
-                return
+                return None
             n_real, n_shadow = len(real_rows), len(shadow_rows)
             logger_run.info(
                 f"🎯 Calibration refresh input: {n_real} real, {n_shadow} shadow rows"
@@ -404,13 +415,13 @@ class BrainCore:
                         f"Existing stale calibration was replaced with "
                         f"an explicit empty calibration payload."
                     )
+                    return json_dumps(calib)
                 else:
                     logger_run.error(
                         "❌ Could not persist empty calibration payload; "
                         "previous calibration may remain live."
                     )
-
-                return
+                    return None
 
             if stream_tips:
                 calib["stream_cursors"] = stream_tips
@@ -423,18 +434,21 @@ class BrainCore:
                     f"✅ Calibration curves rebuilt & persisted "
                     f"({n_keys} alert_key(s), mean-per-alert ECE={ece})"
                 )
+                return json_dumps(calib)
             else:
                 logger_run.error(
                     f"❌ Calibration curves built but NOT persisted "
                     f"({n_keys} alert_key(s), ECE={ece}) — "
                     f"previous curve (if any) remains live"
                 )
+                return None
         except Exception as e:
             logger_run.warning(
                 f"Calibration refresh failed "
                 f"(gate continues on previous curve if present): {e}"
             )
-    
+            return None
+
     # ── Shared 5-minute JSON-blob cache (calibration / market model / ML
     # calibration / quality inputs) ───────────────────────────────────────
     # Before: only HITS were cached and concurrent callers each issued their
