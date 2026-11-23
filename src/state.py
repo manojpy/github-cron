@@ -1123,10 +1123,10 @@ class RedisStateStore:
         else:
             current.discard(alert_key)
         try:
-        if not await self.set_metadata(BRAIN_DISABLED_KEYS_METADATA_KEY, json_dumps(sorted(current))):
-            logger.warning(f"Failed to update disabled-key set for '{alert_key}': Redis write did not complete")
-            return False
-        self.__dict__["_disabled_keys_cache"] = set(current)   # write-through
+            if not await self.set_metadata(BRAIN_DISABLED_KEYS_METADATA_KEY, json_dumps(sorted(current))):
+                logger.warning(f"Failed to update disabled-key set for '{alert_key}': Redis write did not complete")
+                return False
+            self.__dict__["_disabled_keys_cache"] = set(current)   # write-through
         except Exception as e:
             logger.warning(f"Failed to update disabled-key set for '{alert_key}': {e}")
             return False
