@@ -16,7 +16,7 @@ cython==3.3.1
 # Redis & Data Handling
 redis[hiredis]==8.1.0
 hiredis==3.5.0
-pydantic==2.14.3
+pydantic==2.14.4
 orjson==3.13.0
 
 # System & Utilities
