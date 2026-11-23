@@ -2,8 +2,6 @@ name: 🚨 MACD Bot Watchdog
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '17 */6 * * *'   # backstop only: alerts if Cronjobs.org has stopped dispatching
 
 permissions:
   actions: read
