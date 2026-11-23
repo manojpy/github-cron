@@ -1,5 +1,7 @@
 from __future__ import annotations
+
 import time
+import zlib
 import asyncio
 import logging
 from dataclasses import dataclass
@@ -406,6 +408,19 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, flo
 
     return score, total, votes
 
+def _candidate_resolve_due(pair_name, data_15m, i15) -> bool:
+    """True when this pair's candidate rows should be graded on this run. Each pair gets
+    one of CANDIDATE_RESOLVE_EVERY_N_RUNS slots, chosen from its name, and the slot comes
+    round once per N closed 15m candles. N=1 means every run."""
+    every = int(getattr(cfg, "CANDIDATE_RESOLVE_EVERY_N_RUNS", 1))
+    if every <= 1:
+        return True
+    try:
+        slot = (int(data_15m.ts[i15]) // 900) % every
+    except Exception:
+        return True
+    return slot == (zlib.crc32(str(pair_name).encode()) % every)
+
 async def _resolve_pair_outcomes(pair_name, data_15m, i15, sdb, logger_pair, data_5m=None):
     """Run pending-outcome resolution for a pair. Split out of _eval_gate so the
     cluster pre-pass can skip it (resolve_outcomes=False) and Phase 3 can re-run
@@ -416,8 +431,11 @@ async def _resolve_pair_outcomes(pair_name, data_15m, i15, sdb, logger_pair, dat
 
     if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
         await sdb.resolve_shadow_pending_outcomes(pair_name, data_15m, i15, logger_pair, data_5m)
-    # Signals that were sent or seen but never became a trade: graded into their own hash.
-    await sdb.resolve_candidate_outcomes(pair_name, data_15m, i15, logger_pair, data_5m)
+
+    # Signals that were sent or seen but never became a trade: graded into their own hash,
+    # once every CANDIDATE_RESOLVE_EVERY_N_RUNS runs (see _candidate_resolve_due).
+    if _candidate_resolve_due(pair_name, data_15m, i15):
+        await sdb.resolve_candidate_outcomes(pair_name, data_15m, i15, logger_pair, data_5m)
 
 async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, correlation_id: str, reference_time: int, pair_oi: Optional[Dict[str, Any]] = None, resolve_outcomes: bool = True) -> Union[GateResult, Tuple[str, Dict[str, Any]], None]:
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
