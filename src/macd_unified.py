@@ -1064,9 +1064,12 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     # re-loads (30 pairs × 2 GETs × JSON parses) are pure waste.
     # Shared Brain engine first so its warm caches can supply ML-EV blobs.
     brain_engine_shared: Optional[Any] = None
+
     if cfg.ENABLE_BRAIN and state_db and not state_db.degraded:
         try:
             brain_engine_shared = await preloads.take("brain_warm", _make_brain_engine)
+            if brain_engine_shared is not None and calibration_curves:
+                brain_engine_shared.seed_calibration_cache(calibration_curves)
         except Exception as e:
             logger_main.warning(
                 f"Shared brain engine init failed (fail-open): {e}"
@@ -1084,14 +1087,17 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         and state_db and not state_db.degraded and state_db._redis
     ):
         try:
-            if brain_engine_shared is not None:
-                ml_market_state_model = getattr(
-                    brain_engine_shared, "_market_model_cache", None
-                )
-                ml_calibration_curve = getattr(
-                    brain_engine_shared, "_ml_calib_cache", None
-                )
-            else:
+            ml_market_state_model = (
+                getattr(brain_engine_shared, "_market_model_cache", None)
+                if brain_engine_shared is not None else None
+            )
+            ml_calibration_curve = (
+                getattr(brain_engine_shared, "_ml_calib_cache", None)
+                if brain_engine_shared is not None else None
+            )
+            if ml_market_state_model is None and ml_calibration_curve is None:
+                # Warm engine exists but its caches are cold (warm MGET failed) —
+                # don't silently drop ML-EV for the run; load via the preload path.
                 raw_model, raw_curve = await preloads.take("ml_blobs", _ml_blobs)
                 if raw_model:
                     _m = json_loads(raw_model)

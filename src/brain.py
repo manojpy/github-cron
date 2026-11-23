@@ -572,7 +572,10 @@ class BrainCore:
         path finds warm caches. Never raises."""
         try:
             await self._prefetch_blobs([
-                CALIBRATION_CURVES_KEY, MARKET_STATE_MODEL_KEY, ML_CALIBRATION_KEY,
+                # CALIBRATION_CURVES_KEY excluded: macd_unified's calibration
+                # preload already fetched + parsed it this run; the parsed dict
+                # is seeded into _calib_cache below via seed_calibration_cache().
+                MARKET_STATE_MODEL_KEY, ML_CALIBRATION_KEY,
                 QUALITY_INPUTS_KEY, EVIDENCE_CARDS_KEY,
                 *([f"{self.sdb.meta_prefix}{PLAYBOOK_KEY}"] if getattr(cfg, "PLAYBOOK_MODE", "off") != "off" else []),
             ])
@@ -587,6 +590,12 @@ class BrainCore:
             )
         except Exception as e:
             logging.getLogger("macd_bot").debug(f"brain cache warm-up failed (non-fatal): {e!r}")
+
+    def seed_calibration_cache(self, curves: Dict[str, Any]) -> None:
+        """Adopt the run-level calibration payload already fetched by the
+        calibration preload, so warm_dispatch_caches skips its GET/parse."""
+        self._calib_cache = curves or {}
+        self._calib_cache_ts = time.time()
 
     async def _load_calibration_curve(self, alert_key: str) -> Optional[Dict[str, Any]]:
         curves = await self._load_json_cached(
