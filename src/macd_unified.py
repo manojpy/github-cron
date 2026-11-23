@@ -162,7 +162,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     i15_for_resolve = get_last_closed_index_from_array(data_15m.ts, 15, reference_time, pair_name)
     if i15_for_resolve is not None and i15_for_resolve >= Constants.MIN_CLOSED_CANDLES_15M:
         LAST_CANDLE_OK_THIS_RUN[pair_name] = int(data_15m.ts[i15_for_resolve])
-        await _resolve_pair_outcomes(pair_name, data_15m, i15_for_resolve, sdb, logger_pair)
+        await _resolve_pair_outcomes(pair_name, data_15m, i15_for_resolve, sdb, logger_pair, data_5m)
+
     gr: GateResult
     if cached is not _CLUSTER_CACHE_MISS:
         if isinstance(cached, tuple):

@@ -172,7 +172,51 @@ async def _redis_key_inventory(sdb: "RedisStateStore", max_keys: int = 20000) ->
         if scanned >= max_keys:
             break
     await _flush()
+
     return inventory
+
+def _tie_first_5m(data_5m: Optional["PriceData"], candle_ts: int, is_buy: bool, tp_level: float, sl_level: float) -> Optional[bool]:
+    """Order of events inside ONE 15m candle that touched both the target and the stop.
+
+    Walks the three 5m candles of that 15m candle in time order and returns True when the
+    target was touched first, False when the stop was, None when it cannot be told: the 5m
+    data for that candle is missing or incomplete, ONE 5m candle touched both levels, or the
+    5m candles show no touch at all. None always means the old pessimistic grade (stop)."""
+    try:
+        if data_5m is None or len(data_5m.ts) < 3:
+            return None
+        ts = data_5m.ts
+        lo = int(np.searchsorted(ts, candle_ts))
+        if lo + 2 >= len(ts):
+            return None
+        if int(ts[lo]) != candle_ts or int(ts[lo + 1]) != candle_ts + 300 or int(ts[lo + 2]) != candle_ts + 600:
+            return None
+        for j in (lo, lo + 1, lo + 2):
+            hi, lw = float(data_5m.high[j]), float(data_5m.low[j])
+            tp = hi >= tp_level if is_buy else lw <= tp_level
+            sl = lw <= sl_level if is_buy else hi >= sl_level
+            if tp and sl:
+                return None
+            if tp:
+                return True
+            if sl:
+                return False
+        return None
+    except Exception:
+        return None
+
+
+def _resolve_tie(data: Dict[str, Any], candle_ts: int, is_buy: bool, tp_level: float, sl_level: float, data_5m: Optional["PriceData"]) -> Optional[bool]:
+    """True = target first, False = stop first, None = still ambiguous (grade as a stop).
+    A decision already stored on the pending row for THIS candle wins, so a later run
+    (or the horizon grading) can never flip it if the 5m data is not available then."""
+    stored = data.get("tie_first")
+    stored_ts = data.get("tie_candle_ts")
+    if stored in ("tp", "sl") and stored_ts is not None and int(stored_ts) == int(candle_ts):
+        return stored == "tp"
+    if not getattr(cfg, "OUTCOME_TIE_USE_5M", True):
+        return None
+    return _tie_first_5m(data_5m, int(candle_ts), is_buy, tp_level, sl_level)
 
 async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger: logging.Logger, *, clear_active_states: bool = True, clear_dedups: bool = True, clear_pending_outcomes: bool = True, clear_shadow_pending: bool = True, clear_alert_stats: bool = False, clear_shadow_stats: bool = False, clear_outcome_streams: bool = False, clear_daily_cache: bool = False, clear_brain_derived: bool = False) -> Tuple[int, int, int, int, int, int, int, int, int]:
     if sdb.degraded or not sdb._redis:
@@ -2033,7 +2077,7 @@ class RedisStateStore:
             logger_pair.debug(f"Failed to scan {label} outcomes for {pair}: {e}")
             return []
 
-    def _parse_pending_outcome_row(self, key: str, raw: Optional[str], data_15m: "PriceData", i15: int, end_idx: Optional[int] = None) -> Tuple[Optional[Dict[str, Any]], str]:
+    def _parse_pending_outcome_row(self, key: str, raw: Optional[str], data_15m: "PriceData", i15: int, end_idx: Optional[int] = None, data_5m: Optional["PriceData"] = None) -> Tuple[Optional[Dict[str, Any]], str]:
         if raw is None:
             return None, "raced"
         data = json_loads(raw)
@@ -2151,6 +2195,7 @@ class RedisStateStore:
         tp_hit_idx: Optional[int] = None
         sl_hit_idx: Optional[int] = None
         ambiguous_same_candle = False          # ← initialized BEFORE the loop
+        tie_tp_candle: Optional[int] = None    # candle index where a same-candle tie was settled for the TARGET by the 5m candles
         if len(path_low) and len(path_high):
             tp_level = anchor_price * (1 + target_pct) if is_buy else anchor_price * (1 - target_pct)
             sl_level = anchor_price * (1 - risk_pct) if is_buy else anchor_price * (1 + risk_pct)
@@ -2176,8 +2221,16 @@ class RedisStateStore:
                     elif sl_hit_idx < tp_hit_idx:
                         tp_first = False
                     else:
-                        tp_first = False
-                        ambiguous_same_candle = True
+                        # One 15m candle touched both levels. Ask the three 5m candles inside
+                        # it which level came first; if that cannot be told it stays a stop.
+                        _tf = _resolve_tie(data, int(data_15m.ts[idx]), is_buy, tp_level, sl_level, data_5m)
+                        if _tf is None:
+                            tp_first = False
+                            ambiguous_same_candle = True
+                        else:
+                            tp_first = _tf
+                            if _tf:
+                                tie_tp_candle = tp_hit_idx
                     break
                 elif tp_hit_idx is not None:
                     tp_first = True   # Only TP hit
@@ -2307,6 +2360,7 @@ class RedisStateStore:
             "outcome_class": outcome_class,
             "tp_candle": tp_hit_idx,
             "sl_candle": sl_hit_idx,
+            "tie_tp_candle": tie_tp_candle,
             "mfe_candle": mfe_candle,
             "mae_candle": mae_candle,
             "plan_sl_pct": round(risk_pct * 100.0, 4),
@@ -2324,7 +2378,7 @@ class RedisStateStore:
             "gate_passed": data.get("gate_passed"),
         }, ""
 
-    def _early_close_payload(self, raw: str, data_15m: "PriceData", i15: int) -> Optional[str]:
+    def _early_close_payload(self, raw: str, data_15m: "PriceData", i15: int, data_5m: Optional["PriceData"] = None) -> Optional[str]:
         """If this pending trade's stop or target has already been touched on a
         closed candle, return its JSON with closed_ts/closed_reason added; else None.
         Uses the same fill candle and R:R levels as the horizon resolution, so
@@ -2380,7 +2434,19 @@ class RedisStateStore:
             elif sl_idx < tp_idx:
                 reason, hit_idx = "stop", sl_idx
             else:
-                reason, hit_idx = "both", tp_idx  # both touched inside the same candle
+                hit_idx = tp_idx                  # both touched inside the same 15m candle
+                _tie_ts = int(data_15m.ts[path_start + hit_idx])
+                if is_buy:
+                    _tp_lvl, _sl_lvl = anchor * (1 + target), anchor * (1 - risk)
+                else:
+                    _tp_lvl, _sl_lvl = anchor * (1 - target), anchor * (1 + risk)
+                _tf = _resolve_tie(data, _tie_ts, is_buy, _tp_lvl, _sl_lvl, data_5m)
+                if _tf is None:
+                    reason = "both"               # the 5m candles cannot tell: still graded as a stop
+                else:
+                    reason = "target" if _tf else "stop"
+                    data["tie_first"] = "tp" if _tf else "sl"   # stored so the horizon grading repeats this decision
+                    data["tie_candle_ts"] = _tie_ts
             data["closed_ts"] = int(time.time())
             data["closed_reason"] = reason
             data["closed_candle_ts"] = int(data_15m.ts[path_start + hit_idx])
@@ -2388,7 +2454,7 @@ class RedisStateStore:
         except Exception:
             return None
 
-    def _early_close_result(self, key: str, closed_json: str, data_15m: "PriceData", i15: int) -> Optional[Dict[str, Any]]:
+    def _early_close_result(self, key: str, closed_json: str, data_15m: "PriceData", i15: int, data_5m: Optional["PriceData"] = None) -> Optional[Dict[str, Any]]:
         """Final outcome of a trade whose target/stop has already been touched,
         graded on the path up to the hit candle only (same rules as the full
         12-candle grading, which cannot change a win/loss that is already
@@ -2401,7 +2467,7 @@ class RedisStateStore:
             if hits.size == 0:
                 return None
             result, skip_reason = self._parse_pending_outcome_row(
-                key, closed_json, data_15m, i15, end_idx=int(hits[-1]),
+                key, closed_json, data_15m, i15, end_idx=int(hits[-1]), data_5m=data_5m,
             )
             return result if not skip_reason else None
         except Exception:
@@ -2523,7 +2589,7 @@ class RedisStateStore:
         except Exception:
             return None
 
-    def _early_finalize_plan(self, raw: Optional[str], data_15m: "PriceData", i15: int) -> Tuple[Optional[int], Optional[str], bool]:
+    def _early_finalize_plan(self, raw: Optional[str], data_15m: "PriceData", i15: int, data_5m: Optional["PriceData"] = None) -> Tuple[Optional[int], Optional[str], bool]:
         """Decide whether a pending trade is already finished.
 
         Returns (end_idx, closed_json, newly_closed):
@@ -2538,7 +2604,7 @@ class RedisStateStore:
             return None, None, False
         try:
             already = json_loads(raw).get("closed_ts") is not None
-            closed_json = raw if already else self._early_close_payload(raw, data_15m, i15)
+            closed_json = raw if already else self._early_close_payload(raw, data_15m, i15, data_5m)
             if closed_json is None:
                 return None, None, False
             closed = json_loads(closed_json)
@@ -2701,7 +2767,7 @@ class RedisStateStore:
             logger.warning(f"[{pair}] candidate event not logged ({reason}): {e}")
 
     async def resolve_candidate_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
-                                         logger_pair: logging.Logger) -> None:
+                                         logger_pair: logging.Logger, data_5m: Optional["PriceData"] = None) -> None:
         """Grade this pair's candidate-only rows (alerts sent or seen but not recorded or
         shadowed) that carry an entry price, once their horizon has passed. Same grader and
         same stop / target / horizon / cost rules as a Recorded trade, but the result goes
@@ -2757,7 +2823,7 @@ class RedisStateStore:
                         "context": {},
                     })
                     result, _skip = self._parse_pending_outcome_row(
-                        f"candidate_pending:{pair}:{ak}:{et}", payload, data_15m, i15)
+                        f"candidate_pending:{pair}:{ak}:{et}", payload, data_15m, i15, data_5m=data_5m)
                     if result is None:
                         continue              # not_ready yet, or the candle is outside the fetched window
                     seen.add(rid)
@@ -3135,7 +3201,7 @@ class RedisStateStore:
             out.append(ck)
         return out
 
-    async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int, logger_pair: logging.Logger) -> None:
+    async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int, logger_pair: logging.Logger, data_5m: Optional["PriceData"] = None) -> None:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not self._redis:
             return
 
@@ -3167,10 +3233,10 @@ class RedisStateStore:
 
                 for key, raw in zip(keys, raw_values):
                     try:
-                        _fin_idx, _fin_json, _fin_new = self._early_finalize_plan(raw, data_15m, i15)
+                        _fin_idx, _fin_json, _fin_new = self._early_finalize_plan(raw, data_15m, i15, data_5m)
                         _early_final = _fin_idx is not None
                         result, skip_reason = self._parse_pending_outcome_row(
-                            key, raw, data_15m, i15, end_idx=_fin_idx,
+                            key, raw, data_15m, i15, end_idx=_fin_idx, data_5m=data_5m,
                         )
                         if skip_reason == "raced":
                             continue
@@ -3204,7 +3270,7 @@ class RedisStateStore:
                                     write_pipe.set(key, _closed, xx=True, keepttl=True)
                                     pending_writes += 1
                                     if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
-                                        _er = self._early_close_result(key, _closed, data_15m, i15)
+                                        _er = self._early_close_result(key, _closed, data_15m, i15, data_5m)
                                         _erow = (
                                             self._early_archive_row(pair, _er, _closed, False)
                                             if _er else None
@@ -3444,7 +3510,7 @@ class RedisStateStore:
                 "payload and were dropped this run (see prior debug lines for keys)"
             )
 
-    async def resolve_shadow_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int, logger_pair: logging.Logger) -> None:
+    async def resolve_shadow_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int, logger_pair: logging.Logger, data_5m: Optional["PriceData"] = None) -> None:
         """Twin of resolve_pending_outcomes for shadow (rejected) alerts. Same grading logic,
         writes to SHADOW_STATS/SHADOW_LOG_STREAM instead, and additionally pools outcomes whose
         confluence was in the 'rewardable' bucket into SHADOW_HICONF_STATS for override checks."""
@@ -3490,12 +3556,12 @@ class RedisStateStore:
                 for key, raw in zip(keys, raw_values):
                     try:
                         _fin_idx, _fin_json, _fin_new = (
-                            self._early_finalize_plan(raw, data_15m, i15)
+                            self._early_finalize_plan(raw, data_15m, i15, data_5m)
                             if cfg.ENABLE_TRADE_CLOSE_NOTICE else (None, None, False)
                         )
                         _early_final = _fin_idx is not None
                         result, skip_reason = self._parse_pending_outcome_row(
-                            key, raw, data_15m, i15, end_idx=_fin_idx,
+                            key, raw, data_15m, i15, end_idx=_fin_idx, data_5m=data_5m,
                         )
                         if skip_reason:
                             if skip_reason == "not_ready" and raw and cfg.ENABLE_TRADE_CLOSE_NOTICE:
@@ -3504,7 +3570,7 @@ class RedisStateStore:
                                     write_pipe.set(key, _closed, xx=True, keepttl=True)
                                     pending_writes += 1
                                     if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
-                                        _er = self._early_close_result(key, _closed, data_15m, i15)
+                                        _er = self._early_close_result(key, _closed, data_15m, i15, data_5m)
                                         _erow = (
                                             self._early_archive_row(pair, _er, _closed, True)
                                             if _er else None

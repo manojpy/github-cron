@@ -185,6 +185,7 @@ class BotConfig(BaseModel):
     OUTCOME_MAE_LOSS_PCT: float = Field(default=0.5, ge=0.01, le=10.0)   
     OUTCOME_PRIMARY_METRIC: str = Field(default="mfe", pattern="^(mfe|net_pnl_pct|close)$")
     OUTCOME_RR_TARGET: float = Field(default=2.0, ge=1.0, le=5.0) 
+    OUTCOME_TIE_USE_5M: bool = Field(default=True, description="When ONE 15m candle touched both the target and the stop, walk its three 5m candles in time order and grade the trade by whichever level was touched first. If the 5m data is missing or incomplete, or a single 5m candle touched both, the trade is still graded as a stop (the old pessimistic rule). Affects only trades graded after the change; earlier rows keep their label")
     OUTCOME_BONUS_RR: float = Field(default=3.0, ge=2.0, le=10.0) 
     OUTCOME_BONUS_WEIGHT: float = Field(default=1.5, ge=1.0, le=3.0) 
     OUTCOME_TIMEOUT_WIN_WEIGHT: float = Field(default=0.5, ge=0.0, le=1.0, description="Weight of a timed-out win (neither target nor stop hit; closed on the right side of the fill) in weighted win rate and model training. A real target win weighs 1.0 or more.") 

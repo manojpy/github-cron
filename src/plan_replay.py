@@ -49,6 +49,7 @@ def outcome_path_fields(result: Mapping[str, Any], *, stream: bool) -> Dict[str,
         "outcome_class": result.get("outcome_class"),
         "tp_candle": result.get("tp_candle"),
         "sl_candle": result.get("sl_candle"),
+        "tie_tp_candle": result.get("tie_tp_candle"),
         "mfe_candle": result.get("mfe_candle"),
         "mae_candle": result.get("mae_candle"),
         "net_pnl_hold_pct": result.get("net_pnl_hold_pct"),
@@ -110,6 +111,7 @@ def coerce_path_fields(raw: Mapping[str, Any]) -> Dict[str, Any]:
         "outcome_class": oc if oc in ("tp", "sl", "timeout") else None,
         "tp_candle": _opt_int(raw.get("tp_candle")),
         "sl_candle": _opt_int(raw.get("sl_candle")),
+        "tie_tp_candle": _opt_int(raw.get("tie_tp_candle")),
         "mfe_candle": _opt_int(raw.get("mfe_candle")),
         "mae_candle": _opt_int(raw.get("mae_candle")),
         "net_pnl_hold_pct": _opt_float(raw.get("net_pnl_hold_pct")),
@@ -213,9 +215,18 @@ def replay_plan(row: Mapping[str, Any], sl_pct: float, tp_pct: float, horizon: i
     if be > 0 or trail > 0:
         res = replay_exit(fav, adv, cls, sl_pct, tp_pct, horizon, be, trail, allow_prefix=allow_prefix)
         return None if res is None else (res[0], res[1] - cost)
+    # A same-candle tie the live grader settled for the TARGET (by the 5m candles) is honoured
+    # only when the plan being replayed IS the plan the trade was graded under.
+    tie_tp = row.get("tie_tp_candle")
+    if tie_tp is not None:
+        ps, pt = row.get("plan_sl_pct"), row.get("plan_tp_pct")
+        if ps is None or pt is None or abs(float(ps) - sl_pct) > 1e-6 or abs(float(pt) - tp_pct) > 1e-6:
+            tie_tp = None
     for i in range(min(horizon + 1, n)):
         hit_sl = adv[i] >= sl_pct
         hit_tp = fav[i] >= tp_pct
+        if hit_sl and hit_tp and tie_tp is not None and i == int(tie_tp):
+            return "tp", tp_pct - cost
         if hit_sl:                      # same-candle tie -> stop (pessimistic)
             return "sl", -sl_pct - cost
         if hit_tp:
