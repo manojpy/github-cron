@@ -1056,18 +1056,10 @@ class RedisStateStore:
         return keys if keys is not None else set()
 
     async def get_disabled_alert_keys_checked(self) -> Optional[Set[str]]:
-        """None when the stored set could not be read; an empty set means nothing is disabled.
-        Run-level cache: the set changes only via set_alert_key_disabled(), which
-        updates the cache write-through, so full-Brain phases stop re-reading it."""
-        _cache = self.__dict__.get("_disabled_keys_cache")
-        if _cache is not None:
-            return set(_cache)
+        """None when the stored set could not be read; an empty set means nothing is disabled."""
         _ok, raw = await self.read_metadata_checked(BRAIN_DISABLED_KEYS_METADATA_KEY, timeout=3.0, durable=True)
         if not _ok:
-            # Back off before the single retry — an immediate identical read
-            # against a slow/hung Valkey just doubles the stall.
-            await asyncio.sleep(0.5)
-            _ok, raw = await self.read_metadata_checked(BRAIN_DISABLED_KEYS_METADATA_KEY, timeout=5.0, durable=True)
+            _ok, raw = await self.read_metadata_checked(BRAIN_DISABLED_KEYS_METADATA_KEY, timeout=3.0, durable=True)
         if not _ok:
             if not self.degraded:
                 logger.error("Disabled alert-key set could NOT be read: Brain-disabled keys are not enforced this run")
@@ -1126,7 +1118,6 @@ class RedisStateStore:
             if not await self.set_metadata(BRAIN_DISABLED_KEYS_METADATA_KEY, json_dumps(sorted(current))):
                 logger.warning(f"Failed to update disabled-key set for '{alert_key}': Redis write did not complete")
                 return False
-            self.__dict__["_disabled_keys_cache"] = set(current)   # write-through
         except Exception as e:
             logger.warning(f"Failed to update disabled-key set for '{alert_key}': {e}")
             return False
@@ -3225,10 +3216,7 @@ class RedisStateStore:
         except Exception as e:
             logger_pair.warning(f"Failed to batch-fetch pending outcomes for {pair}: {e}")
             return
-        # Run-level cache so end-of-run early-closed totals do not MGET again.
-        _pending_cache = self.__dict__.setdefault("_pending_raw_cache", {})
-        for _k, _v in zip(keys, raw_values):
-            _pending_cache[_k] = _v
+
         resolved_count = 0
         not_ready_count = 0
         ts_mismatch_count = 0
@@ -3552,10 +3540,6 @@ class RedisStateStore:
             logger_pair.warning(
                 f"Failed to batch-fetch shadow pending outcomes for {pair}: {e}"
             )
-            return
-        _pending_cache = self.__dict__.setdefault("_pending_raw_cache", {})
-        for _k, _v in zip(keys, raw_values):
-            _pending_cache[_k] = _v
             return
 
         resolved_count = 0
@@ -4047,7 +4031,6 @@ class RedisStateStore:
             RedisKeyPrefix.OUTCOME_PENDING: "_pending_outcome_keys_by_pair",
             RedisKeyPrefix.SHADOW_PENDING: "_shadow_pending_outcome_keys_by_pair",
         }
-        cache = self.__dict__.setdefault("_pending_raw_cache", {})
 
         for prefix, label in pending_map.items():
             try:
@@ -4064,23 +4047,8 @@ class RedisStateStore:
             if not pending_keys:
                 continue
 
-            missing = [k for k in pending_keys if k not in cache]
-            if missing:
-                try:
-                    fetched = await asyncio.wait_for(
-                        _rc(self._redis).mget(missing), timeout=5.0
-                    )
-                    for k, v in zip(missing, fetched or []):
-                        cache[k] = v
-                except Exception as e:
-                    logger.warning(
-                        f"get_cumulative_outcome_stats: pending MGET for {label} failed ({e}) — totals are PARTIAL"
-                    )
-                    out[label]["partial"] = 1
-                    continue
-
-            for pkey in pending_keys:
-                raw = cache.get(pkey)
+            pending_rows = await asyncio.wait_for(_rc(self._redis).mget(pending_keys), timeout=5.0)
+            for pkey, raw in zip(pending_keys, pending_rows):
                 if not raw:
                     continue
                 # pending key = <prefix><pair>:<alert_key>:<entry_ts>
@@ -4101,7 +4069,7 @@ class RedisStateStore:
                 elif closed_reason in ("stop", "both"):
                     # "both" means TP and SL were touched inside the same candle.
                     out[bucket_label]["losses"] += 1
-
+    
     async def batch_get_all_alert_states(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, bool]:
         if not self._redis or self.degraded or not alert_keys:
             return {k: False for k in alert_keys}

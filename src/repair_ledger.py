@@ -100,46 +100,33 @@ def _repair_id(rec: Dict[str, Any], ts: int) -> str:
     return hashlib.md5(payload.encode()).hexdigest()[:12]
 
 async def _load_ledger(sdb) -> List[dict]:
-    cached = getattr(sdb, "_repair_ledger_cache", None)
-    if cached is not None:
-        return list(cached)
     raw = await sdb.get_metadata(LEDGER_KEY)
     if not raw:
-        entries: List[dict] = []
-    else:
-        try:
-            data = json_loads(raw)
-            entries = data if isinstance(data, list) else []
-        except Exception:
-            entries = []
-    setattr(sdb, "_repair_ledger_cache", entries)
-    return list(entries)
+        return []
+    try:
+        data = json_loads(raw)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
 
 async def _load_ledger_strict(sdb) -> List[dict]:
     """Like _load_ledger, but raises when Redis can't be read or the payload
     is corrupt, so a writer never overwrites real history with an empty list."""
-    cached = getattr(sdb, "_repair_ledger_cache", None)
-    if cached is not None:
-        return list(cached)
     rc = sdb._redis
     if rc is None or sdb.degraded:
         raise RuntimeError("repair ledger: Redis unavailable")
     raw = await asyncio.wait_for(rc.get(f"{sdb.meta_prefix}{LEDGER_KEY}"), timeout=5.0)
     if not raw:
-        entries: List[dict] = []
-    else:
-        data = json_loads(raw)
-        if not isinstance(data, list):
-            raise ValueError("repair ledger: payload is not a list")
-        entries = data
-    setattr(sdb, "_repair_ledger_cache", entries)
-    return list(entries)
+        return []
+    data = json_loads(raw)
+    if not isinstance(data, list):
+        raise ValueError("repair ledger: payload is not a list")
+    return data
 
 async def _save_ledger(sdb, entries: List[dict]) -> None:
     entries = entries[:LEDGER_MAX]
     await sdb.set_metadata(LEDGER_KEY, json_dumps(entries),
                             ttl=LEDGER_TTL_DAYS * 86400)
-    setattr(sdb, "_repair_ledger_cache", list(entries))
 
 async def record_repair_issued(sdb, rec: Dict[str, Any], snapshot: Dict[str, Any], real_rows: Optional[List[dict]] = None) -> Optional[str]:
     """Call once per emitted repair. snapshot carries the pre-repair metrics
