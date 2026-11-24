@@ -4320,7 +4320,7 @@ class RedisStateStore:
             await self._record_redis_failure("atomic_batch_update", e)
             return False
 
-    # ── CUSUM state persistence ───────────────────���────────────────
+    # ── CUSUM state persistence ───────────────────────────────────
     async def load_cusum_bulk(self, alert_keys: List[str]) -> Optional[Dict[str, Tuple[int, Optional[Dict[str, Any]]]]]:
         """(watermark, persisted_state) for every alert_key in ONE pipelined
         round-trip. Returns None when the read fails or Redis is degraded:
