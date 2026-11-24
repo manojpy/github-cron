@@ -1576,7 +1576,7 @@ class BrainEngineV2(BrainCore):
             # handler below falls back to the base technical report.
             recs["_plan_lifecycle"] = await self._load_plan_lifecycle()
             try:
-                _cum = await self.sdb.get_cumulative_outcome_stats()
+                _cum = await self.sdb.get_cumulative_outcome_stats(reuse_prescan=True)
                 # Redis keeps these counters only while a pair/alert key stays active
                 # (STATE_EXPIRY_DAYS), so they can sit below the archive the rest of the
                 # report is built from. The archive is the durable record: when it holds
@@ -1598,7 +1598,7 @@ class BrainEngineV2(BrainCore):
                 recs["_outcome_totals"] = _cum
             except Exception as e:
                 logger_run.debug(f"Outcome totals unavailable for Brain report: {e}")
-            _facts = _collect_report_facts(recs, cfg)                 # computed once, shared by both reports
+            _facts = await asyncio.to_thread(_collect_report_facts, recs, cfg)   # off-loop: plan lab grids are CPU-heavy
             sections, stamp = build_brain_report_sections(recs, cfg, _facts)
             self._archive_report(sections, stamp, logger_run)         # the full report is always archived
             plan_messages: List[str] = []

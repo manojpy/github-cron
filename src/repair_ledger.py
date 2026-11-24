@@ -462,10 +462,11 @@ async def evaluate_pending_repairs(sdb, current_rows: List[dict], horizon_hours:
         await _save_ledger(sdb, entries)
     return fresh_verdicts
 
-async def repair_success_rates(sdb) -> Dict[str, Dict[str, float]]:
+async def repair_success_rates(sdb, entries: Optional[List[dict]] = None) -> Dict[str, Dict[str, float]]:
     """Aggregate verdicts → per-category help/hurt rates.
     Neutral counts half-credit: the repair didn't hurt, but it didn't help."""
-    entries = await _load_ledger(sdb)
+    if entries is None:
+        entries = await _load_ledger(sdb)
     stats: Dict[str, Dict[str, int]] = defaultdict(
         lambda: {"helped": 0, "hurt": 0, "neutral": 0, "n": 0}
     )
@@ -554,9 +555,10 @@ def family_accountability(entries: List[dict], now: int, window_days: int = 60, 
         }
     return out
 
-async def ledger_stats(sdb) -> Dict[str, Any]:
+async def ledger_stats(sdb, entries: Optional[List[dict]] = None) -> Dict[str, Any]:
     """For the report header: how many repairs issued/applied/verdict'd."""
-    entries = await _load_ledger(sdb)
+    if entries is None:
+        entries = await _load_ledger(sdb)
     return {
         "issued": len(entries),
         "applied": sum(1 for e in entries if e["applied_at"] is not None),

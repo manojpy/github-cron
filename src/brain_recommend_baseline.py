@@ -1243,7 +1243,8 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
     # label is untouched and nothing is applied. ──
     try:
         _vsl = float(getattr(cfg, "OUTCOME_MAE_LOSS_PCT", 0.5))
-        ai_metrics["vol_horizon_study"] = volatility_plan_study(
+        ai_metrics["vol_horizon_study"] = await asyncio.to_thread(
+            volatility_plan_study,
             list(real_rows),
             (float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100,
             _vsl, _vsl * float(getattr(cfg, "OUTCOME_RR_TARGET", 2.0)),

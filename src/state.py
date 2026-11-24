@@ -2762,10 +2762,7 @@ class RedisStateStore:
                     await asyncio.wait_for(_execute_pipeline(pipe), timeout=1.0)
             except Exception:
                 pass
-        except Exception as e:
-            self.__dict__["_candidate_log_failed"] = self.__dict__.get("_candidate_log_failed", 0) + 1
-            logger.warning(f"[{pair}] candidate event not logged ({reason}): {e}")
-
+        
     async def resolve_candidate_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
                                          logger_pair: logging.Logger, data_5m: Optional["PriceData"] = None) -> None:
         """Grade this pair's candidate-only rows (alerts sent or seen but not recorded or
@@ -3227,6 +3224,10 @@ class RedisStateStore:
         resolved_for_file: List[Dict[str, Any]] = []
         early_for_file: List[Dict[str, Any]] = []
         close_events: List[Dict[str, Any]] = []
+        # key -> row as it stands AFTER this resolver (None = deleted). Merged into
+        # the run-level cache only if the write pipeline commits, so the totals
+        # step can skip re-MGETting rows we already hold.
+        row_updates: Dict[str, Optional[str]] = {k: r for k, r in zip(keys, raw_values)}
         try:
             async with self._redis.pipeline() as write_pipe:
                 pending_writes = 0
@@ -3268,7 +3269,9 @@ class RedisStateStore:
 
                                 if _closed is not None:
                                     write_pipe.set(key, _closed, xx=True, keepttl=True)
+                                    row_updates[key] = _closed
                                     pending_writes += 1
+
                                     if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                                         _er = self._early_close_result(key, _closed, data_15m, i15, data_5m)
                                         _erow = (
@@ -3397,8 +3400,10 @@ class RedisStateStore:
                                 approximate=True,
                             )
                         write_pipe.delete(key)
+                        row_updates[key] = None
                         pending_writes += 1
                         resolved_count += 1
+
                         if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                             if conf_score is None or conf_total is None:
                                 logger_pair.warning(
@@ -3484,6 +3489,8 @@ class RedisStateStore:
                         _execute_pipeline(write_pipe),
                         timeout=2.0,
                     )
+                    self.__dict__.setdefault("_pending_rows_seen", {}).update(row_updates)
+
         except Exception as e:
             dup_risk = " — resolved_for_file was already archived, so a retry next run may re-append duplicate row(s)" if resolved_for_file else ""
             logger_pair.warning(
@@ -3566,8 +3573,10 @@ class RedisStateStore:
                         if skip_reason:
                             if skip_reason == "not_ready" and raw and cfg.ENABLE_TRADE_CLOSE_NOTICE:
                                 _closed = _fin_json if _fin_new else None
+
                                 if _closed is not None:
                                     write_pipe.set(key, _closed, xx=True, keepttl=True)
+                                    row_updates[key] = _closed
                                     pending_writes += 1
                                     if getattr(cfg, "BRAIN_USE_FILE_STORAGE", False):
                                         _er = self._early_close_result(key, _closed, data_15m, i15, data_5m)
@@ -3683,8 +3692,8 @@ class RedisStateStore:
                                     1,
                                 )
                                 write_pipe.expire(hiconf_key, stats_ttl)
-
                         write_pipe.delete(key)
+                        row_updates[key] = None
                         pending_writes += 1
                         resolved_count += 1
 
@@ -4043,11 +4052,18 @@ class RedisStateStore:
                 logger.warning(f"get_cumulative_outcome_stats: pending scan for {label} failed ({e}) — totals are PARTIAL")
                 out[label]["partial"] = 1
                 continue
-
-            if not pending_keys:
+if not pending_keys:
                 continue
 
-            pending_rows = await asyncio.wait_for(_rc(self._redis).mget(pending_keys), timeout=5.0)
+            seen = self.__dict__.get("_pending_rows_seen", {})
+            cached = {k: seen[k] for k in pending_keys if k in seen}
+            missing = [k for k in pending_keys if k not in seen]
+            fetched = (
+                await asyncio.wait_for(_rc(self._redis).mget(missing), timeout=5.0)
+                if missing else []
+            )
+            pending_rows = [cached[k] if k in cached else fetched[missing.index(k)]
+                            for k in pending_keys]
             for pkey, raw in zip(pending_keys, pending_rows):
                 if not raw:
                     continue

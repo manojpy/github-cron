@@ -89,8 +89,10 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
     star_wr = getattr(cfg, "BRAIN_STAR_ALERT_WR", 0.70)
     max_weight_delta = getattr(cfg, "BRAIN_WEIGHT_OPTIMIZER_MAX_DELTA", 2.0)
     wf_weight_opt = getattr(cfg, "BRAIN_WEIGHT_OPTIMIZER_WALK_FORWARD", True)
-
     # ── Repair Ledger: close the loop on past repairs ────────────────
+    # Bound before the try so the ML section below can always read it, even
+    # when the shared ledger read fails and the except path runs.
+    _ledger_entries: List[dict] = []
     try:
         fresh: List[Dict[str, Any]] = []
         try:
@@ -193,9 +195,13 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
             except Exception as e:
                 logger.warning(f"Challenger promotion check failed: {e}")
 
-        self._repair_success_rates = await repair_success_rates(self.sdb)
-        self._ledger_stats = await ledger_stats(self.sdb)
+        # One fresh read AFTER evaluate_pending_repairs (which may have saved
+        # verdicts); the three read-only consumers share it instead of re-GETting.
+        _ledger_entries = await load_ledger_entries(self.sdb)
+        self._repair_success_rates = await repair_success_rates(self.sdb, entries=_ledger_entries)
+        self._ledger_stats = await ledger_stats(self.sdb, entries=_ledger_entries)
         ai_metrics["repair_ledger"] = dict(self._ledger_stats)
+
     except Exception as e:
         audit.record_analysis_exception("repair_ledger", e)
         self._repair_success_rates = {}
@@ -206,7 +212,7 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
     # Learns P(repair helps | system state) from resolved ledger entries,
     # then annotates each new repair with that probability below.
     try:
-        ledger_entries = await load_ledger_entries(self.sdb)
+        ledger_entries = _ledger_entries
         # Which recommendation families have repeatedly hurt when acted on?
         # (Enforcement happens when the plan is stored; mode off/shadow/live.)
         if str(getattr(cfg, "FAMILY_ACCOUNTABILITY_MODE", "shadow")) != "off":

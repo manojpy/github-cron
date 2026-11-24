@@ -683,19 +683,20 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         return [k for k in await _pending_scan["all"] if k.startswith(prefix)]
 
     async def _calibration_blob() -> Any:
+        from brain import CALIBRATION_CURVES_KEY
         try:
             _calib_brain = BrainEngine(state_db)
-            await _calib_brain.maybe_refresh_calibration(logger_main)
+            _refreshed = await _calib_brain.maybe_refresh_calibration(logger_main)
+            if _refreshed is not None:
+                return _refreshed   # the refresh already read/wrote it: no second GET
         except Exception as e:
             logger_main.warning(
                 f"Calibration refresh step failed (continuing with existing curve): {e}"
             )
-        from brain import CALIBRATION_CURVES_KEY
         return await state_db._safe_redis_op(
             lambda: _rc(state_db._redis).get(CALIBRATION_CURVES_KEY),
             2.0, "calibration_curves_runload",
         )
-
     async def _ml_blobs() -> Tuple[Any, Any]:
         from brain import MARKET_STATE_MODEL_KEY, ML_CALIBRATION_KEY
         return await asyncio.gather(
@@ -729,8 +730,14 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         return [f"oi_hist:{p}" for p in pairs_to_process if products_map.get(p)]
 
     async def _make_warm_brain_engine() -> Any:
+        from brain import CALIBRATION_CURVES_KEY, MARKET_STATE_MODEL_KEY, ML_CALIBRATION_KEY
+        _skip = []
+        if cfg.ENABLE_CALIBRATION_GATE and cfg.ENABLE_BRAIN:
+            _skip.append(CALIBRATION_CURVES_KEY)
+        if getattr(cfg, "ENABLE_ML_EV_SHADOW", False) or getattr(cfg, "ENABLE_ML_EV_GATE", False):
+            _skip.extend([MARKET_STATE_MODEL_KEY, ML_CALIBRATION_KEY])
         _eng = BrainEngine(state_db)
-        await _eng.warm_dispatch_caches()
+        await _eng.warm_dispatch_caches(skip=_skip)
         return _eng
 
     async def _make_brain_engine() -> Any:
@@ -1085,6 +1092,21 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 f"Shared brain engine init failed (fail-open): {e}"
             )
             brain_engine_shared = None
+
+    # Seed the shared engine's per-alert caches from the run-level blobs so the
+    # alert path never re-GETs calibration / market-state / ML calibration. This
+    # also pins the POST-refresh curve, removing the warm-vs-refresh race.
+    if brain_engine_shared is not None:
+        _now = time.time()
+        if cfg.ENABLE_CALIBRATION_GATE and cfg.ENABLE_BRAIN:
+            brain_engine_shared._calib_cache = calibration_curves
+            brain_engine_shared._calib_cache_ts = _now
+        if ml_market_state_model is not None:
+            brain_engine_shared._market_model_cache = ml_market_state_model
+            brain_engine_shared._market_model_cache_ts = _now
+        if ml_calibration_curve is not None:
+            brain_engine_shared._ml_calib_cache = ml_calibration_curve
+            brain_engine_shared._ml_calib_cache_ts = _now
 
     # ── Disabled-alert-keys, pair-thresholds, open-positions: loaded ONCE
     disabled_alert_keys_run: Set[str] = set()

@@ -12,7 +12,7 @@ import math
 import time
 
 from collections import defaultdict, Counter
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Sequence
 from alerts import escape_markdown_v2
 from alert_registry import is_elliott_key
 
@@ -282,7 +282,7 @@ class BrainCore:
             f"total online updates={calib['online_updates']})"
         )
 
-    async def maybe_refresh_calibration(self, logger_run: logging.Logger) -> None:
+    async def maybe_refresh_calibration(self, logger_run: logging.Logger) -> Optional[str]:
         """Keep the live calibration curve fresh, independent of the Brain report.
 
         1. Curve exists and is younger than CALIBRATION_REFRESH_MAX_AGE_HOURS:
@@ -323,16 +323,20 @@ class BrainCore:
                                 await self._fold_new_outcomes_into_calibration(
                                     existing, logger_run,
                                 )
+                                # Fold persisted `existing`; hand the caller exactly
+                                # what is now in Redis so it does not re-GET it.
+                                return json_dumps(existing)
                             except Exception as fold_exc:
                                 logger_run.warning(
                                     f"Online calibration fold failed "
                                     f"(curve unchanged this run): {fold_exc}"
                                 )
+                                return raw
                         else:
                             logger_run.debug(
                                 f"Calibration curves fresh ({age_hr:.1f}h) — skip refresh"
                             )
-                        return
+                        return raw
         except Exception as e:
             logger_run.warning(
                 f"Calibration age check failed (will attempt rebuild): {e}"
@@ -395,7 +399,6 @@ class BrainCore:
                 )
 
                 ok = await self._persist_calibration_curves(calib)
-
                 if ok:
                     logger_run.info(
                         f"🎯 Calibration gate disabled for this run: "
@@ -404,16 +407,18 @@ class BrainCore:
                         f"Existing stale calibration was replaced with "
                         f"an explicit empty calibration payload."
                     )
+                    return json_dumps(calib)
                 else:
                     logger_run.error(
                         "❌ Could not persist empty calibration payload; "
                         "previous calibration may remain live."
                     )
 
-                return
+                return None
 
             if stream_tips:
                 calib["stream_cursors"] = stream_tips
+
             ok = await self._persist_calibration_curves(calib)
             n_keys = len(calib["curves"])
             _e = calib.get("ece_mean")
@@ -423,12 +428,14 @@ class BrainCore:
                     f"✅ Calibration curves rebuilt & persisted "
                     f"({n_keys} alert_key(s), mean-per-alert ECE={ece})"
                 )
+                return json_dumps(calib)
             else:
                 logger_run.error(
                     f"❌ Calibration curves built but NOT persisted "
                     f"({n_keys} alert_key(s), ECE={ece}) — "
                     f"previous curve (if any) remains live"
                 )
+                return None
         except Exception as e:
             logger_run.warning(
                 f"Calibration refresh failed "
@@ -552,25 +559,31 @@ class BrainCore:
             misses.pop(key, None)
             return value
 
-    async def warm_dispatch_caches(self) -> None:
+    async def warm_dispatch_caches(self, skip: Sequence[str] = ()) -> None:
         """Load every per-alert Brain blob concurrently (one RTT, not five in
         series). Called while candles are still being fetched so the alert
-        path finds warm caches. Never raises."""
+        path finds warm caches. Never raises. `skip` lists keys the run-level
+        preloads already fetch; those caches are seeded by the caller instead."""
         try:
-            await self._prefetch_blobs([
+            _skip = set(skip)
+            _keys = [
                 CALIBRATION_CURVES_KEY, MARKET_STATE_MODEL_KEY, ML_CALIBRATION_KEY,
                 QUALITY_INPUTS_KEY, EVIDENCE_CARDS_KEY,
                 *([f"{self.sdb.meta_prefix}{PLAYBOOK_KEY}"] if getattr(cfg, "PLAYBOOK_MODE", "off") != "off" else []),
-            ])
-            await asyncio.gather(
-                self._load_calibration_curve("__warm__"),
-                self._load_batch_market_state_model(),
-                self._load_ml_calibration_curve(),
-                self._load_quality_inputs(),
-                self._load_evidence_cards(),
-                *([self._load_playbook_blob()] if getattr(cfg, "PLAYBOOK_MODE", "off") != "off" else []),
-                return_exceptions=True,
-            )
+            ]
+            await self._prefetch_blobs([k for k in _keys if k not in _skip])
+            _loaders = []
+            if CALIBRATION_CURVES_KEY not in _skip:
+                _loaders.append(self._load_calibration_curve("__warm__"))
+            if MARKET_STATE_MODEL_KEY not in _skip:
+                _loaders.append(self._load_batch_market_state_model())
+            if ML_CALIBRATION_KEY not in _skip:
+                _loaders.append(self._load_ml_calibration_curve())
+            _loaders.append(self._load_quality_inputs())
+            _loaders.append(self._load_evidence_cards())
+            if getattr(cfg, "PLAYBOOK_MODE", "off") != "off":
+                _loaders.append(self._load_playbook_blob())
+            await asyncio.gather(*_loaders, return_exceptions=True)
         except Exception as e:
             logging.getLogger("macd_bot").debug(f"brain cache warm-up failed (non-fatal): {e!r}")
 
