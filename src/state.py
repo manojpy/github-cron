@@ -3558,6 +3558,11 @@ class RedisStateStore:
                         timeout=2.0,
                     )
                     self.__dict__.setdefault("_pending_rows_seen", {}).update(row_updates)
+                else:
+                    # Nothing was queued, so Redis still holds exactly the rows just read.
+                    # This is the usual case (open trades, nothing resolved), so it is the one
+                    # that lets the totals step skip its own read of the same rows.
+                    self.__dict__.setdefault("_pending_rows_seen", {}).update(row_updates)
 
         except Exception as e:
             dup_risk = " — resolved_for_file was already archived, so a retry next run may re-append duplicate row(s)" if resolved_for_file else ""
@@ -3846,7 +3851,9 @@ class RedisStateStore:
                             return
                     await asyncio.wait_for(_execute_pipeline(write_pipe), timeout=2.0)
                     self.__dict__.setdefault("_pending_rows_seen", {}).update(row_updates)
-
+                else:
+                    # Nothing queued: Redis still holds the rows just read (see the recorded resolver).
+                    self.__dict__.setdefault("_pending_rows_seen", {}).update(row_updates)
         except Exception as e:
             dup_risk = " — resolved_for_file was already archived, so a retry next run may re-append duplicate row(s)" if resolved_for_file else ""
             logger_pair.warning(
@@ -4124,16 +4131,14 @@ class RedisStateStore:
                 continue
             if not pending_keys:
                 continue
-
             seen = self.__dict__.get("_pending_rows_seen", {})
-            cached = {k: seen[k] for k in pending_keys if k in seen}
             missing = [k for k in pending_keys if k not in seen]
-            fetched = (
+            fetched = dict(zip(
+                missing,
                 await asyncio.wait_for(_rc(self._redis).mget(missing), timeout=5.0)
-                if missing else []
-            )
-            pending_rows = [cached[k] if k in cached else fetched[missing.index(k)]
-                            for k in pending_keys]
+                if missing else [],
+            ))
+            pending_rows = [seen[k] if k in seen else fetched.get(k) for k in pending_keys]
             for pkey, raw in zip(pending_keys, pending_rows):
                 if not raw:
                     continue
@@ -4315,7 +4320,7 @@ class RedisStateStore:
             await self._record_redis_failure("atomic_batch_update", e)
             return False
 
-    # ── CUSUM state persistence ────────────────────────────────────
+    # ── CUSUM state persistence ───────────────────���────────────────
     async def load_cusum_bulk(self, alert_keys: List[str]) -> Optional[Dict[str, Tuple[int, Optional[Dict[str, Any]]]]]:
         """(watermark, persisted_state) for every alert_key in ONE pipelined
         round-trip. Returns None when the read fails or Redis is degraded:
