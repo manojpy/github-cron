@@ -43,7 +43,7 @@ COPY setup.py ./
 COPY src/cython_functions.pyx ./src/
 
 RUN set -e; \
-    echo "🔨 Starting Cython compilation (CYTHON_STRICT=${CYTHON_STRICT}, failure is fatal)..."; \
+    echo "🔨 Starting Cython compilation (failure is fatal)..."; \
     if python setup.py build_ext --inplace; then \
         echo "✅ Cython build successful"; \
     else \
