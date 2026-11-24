@@ -414,6 +414,7 @@ jobs:
           chmod -R a+rwX /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports /tmp/data-repo/candidates
           set +e
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
+            --init \
             --rm \
             --pull=never \
             --name "macd_bot_apply_${{ github.run_id }}" \
@@ -524,6 +525,7 @@ jobs:
 
           set +e
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
+            --init \
             --rm \
             --pull=never \
             --name "macd_bot_${{ github.run_id }}" \
