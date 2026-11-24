@@ -1451,21 +1451,29 @@ async def send_open_trades_notice(
     trades = await sdb.get_all_open_recorded_trades()
     if not trades:
         return 0
-        
-    # Limit to max recorded pairs shown in one alert to prevent spam
-    max_trades = getattr(cfg, "OPEN_TRADES_NOTICE_MAX", 5)
-    if len(trades) > max_trades:
-        trades = trades[:max_trades]
+
+    enriched_trades.sort(key=sort_key)
+
+    # Cap AFTER sorting, so the trades shown are the bias-first /
+    # first-recorded-first-served ones, not whichever SCAN returned first.
+    max_trades = int(getattr(cfg, "OPEN_TRADES_NOTICE_MAX", 5))
+    if max_trades > 0 and len(enriched_trades) > max_trades:
+        enriched_trades = enriched_trades[:max_trades]
 
     # Fetch win rates for all trades
     pair_to_keys: Dict[str, List[str]] = {}
     for t in trades:
         pair_to_keys.setdefault(t["pair"], []).append(t["alert_key"])
         
+    _pairs = list(pair_to_keys)
+    _wr = await asyncio.gather(
+        *(sdb.batch_get_alert_win_rates(p, pair_to_keys[p]) for p in _pairs),
+        return_exceptions=True,
+    )
     win_rates: Dict[str, Dict[str, Tuple[Optional[float], int]]] = {}
-    for pair, keys in pair_to_keys.items():
-        win_rates[pair] = await sdb.batch_get_alert_win_rates(pair, keys)
-        
+    for p, r in zip(_pairs, _wr):
+        win_rates[p] = r if isinstance(r, dict) else {}
+
     # Enrich trades with win rate info
     enriched_trades = []
     for t in trades:

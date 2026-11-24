@@ -3033,25 +3033,31 @@ class RedisStateStore:
         """
         if self.degraded or not self._redis:
             return []
-        
         trades = []
         try:
-            cursor = 0
-            keys_to_fetch = []
-            while True:
-                cursor, keys = await asyncio.wait_for(
-                    _rc(self._redis).scan(cursor, match=f"{RedisKeyPrefix.OUTCOME_PENDING}*", count=100),
-                    timeout=2.0
-                )
-                keys_to_fetch.extend(keys)
-                if cursor == 0:
-                    break
-            
+            # Reuse the run-level pending-key pre-scan (one count=2000 walk already
+            # done in process_pairs_with_workers). A second SCAN here at count=100
+            # costs many extra round trips for keys we already hold.
+            prescan = self.__dict__.get("_pending_outcome_keys_by_pair")
+            if prescan is not None:
+                keys_to_fetch = [k for keys in prescan.values() for k in keys]
+            else:
+                keys_to_fetch = [
+                    k async for k in _rc(self._redis).scan_iter(
+                        match=f"{RedisKeyPrefix.OUTCOME_PENDING}*", count=2000)
+                ]
             if not keys_to_fetch:
                 return []
-                
-            raws = await asyncio.wait_for(_rc(self._redis).mget(keys_to_fetch), timeout=2.0)
-            
+            # Rows the resolver already read this run: don't MGET them again.
+            seen = self.__dict__.get("_pending_rows_seen", {})
+            missing = [k for k in keys_to_fetch if k not in seen]
+            fetched = (
+                await asyncio.wait_for(_rc(self._redis).mget(missing), timeout=2.0)
+                if missing else []
+            )
+            row_map = dict(zip(missing, fetched))
+            row_map.update({k: seen[k] for k in keys_to_fetch if k in seen})
+            raws = [row_map.get(k) for k in keys_to_fetch]  
             for k, raw in zip(keys_to_fetch, raws):
                 if not raw:
                     continue
