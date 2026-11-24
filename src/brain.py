@@ -292,15 +292,14 @@ class BrainCore:
            outcome streams and stamp fresh stream cursors.
         """
         if not getattr(cfg, "ENABLE_CALIBRATION_GATE", False):
-            return
+            return None
         if not getattr(cfg, "ENABLE_BRAIN", True):
-            return
+            return None
         if getattr(cfg, "DRY_RUN_MODE", False):
-            return
+            return None
         if self.sdb.degraded or not self.sdb._redis:
             logger_run.debug("Calibration refresh skipped: Redis unavailable or degraded")
-            return
-
+            return None
         max_age_hr = float(getattr(cfg, "CALIBRATION_REFRESH_MAX_AGE_HOURS", 2.0))
 
         # ── Fresh curve: online fold only ──
@@ -369,7 +368,7 @@ class BrainCore:
                     "Calibration refresh skipped: an outcome stream could not be read, "
                     "so the stored curve is kept instead of being rebuilt from partial rows"
                 )
-                return
+                return None
             n_real, n_shadow = len(real_rows), len(shadow_rows)
             logger_run.info(
                 f"🎯 Calibration refresh input: {n_real} real, {n_shadow} shadow rows"
@@ -441,7 +440,8 @@ class BrainCore:
                 f"Calibration refresh failed "
                 f"(gate continues on previous curve if present): {e}"
             )
-    
+            return None
+
     # ── Shared 5-minute JSON-blob cache (calibration / market model / ML
     # calibration / quality inputs) ───────────────────────────────────────
     # Before: only HITS were cached and concurrent callers each issued their
