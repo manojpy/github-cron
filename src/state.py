@@ -3026,6 +3026,74 @@ class RedisStateStore:
             logger.warning(f"get_active_shadow_trade failed for {pair}: {e}")
             return None
 
+    async def get_all_open_recorded_trades(self) -> List[Dict[str, Any]]:
+        """Return all open recorded trades across all pairs.
+        Filters out trades that have already hit target or stop loss (closed_ts is set).
+        Returns a list of dicts with keys: pair, alert_key, direction, entry_ts, entry_price, confluence_score, confluence_total.
+        """
+        if self.degraded or not self._redis:
+            return []
+        
+        trades = []
+        try:
+            cursor = 0
+            keys_to_fetch = []
+            while True:
+                cursor, keys = await asyncio.wait_for(
+                    _rc(self._redis).scan(cursor, match=f"{RedisKeyPrefix.OUTCOME_PENDING}*", count=100),
+                    timeout=2.0
+                )
+                keys_to_fetch.extend(keys)
+                if cursor == 0:
+                    break
+            
+            if not keys_to_fetch:
+                return []
+                
+            raws = await asyncio.wait_for(_rc(self._redis).mget(keys_to_fetch), timeout=2.0)
+            
+            for k, raw in zip(keys_to_fetch, raws):
+                if not raw:
+                    continue
+                d = json_loads(raw)
+                
+                # Filter out trades that have already hit target or stop loss
+                if d.get("closed_ts") is not None:
+                    continue
+                
+                # Parse key: outcome:pending:PAIR:ALERT_KEY:ENTRY_TS
+                # Use rsplit to safely handle pair names that might contain colons
+                parts = str(k).rsplit(":", 2)
+                if len(parts) == 3:
+                    prefix_and_pair = parts[0]
+                    alert_key = parts[1]
+                    try:
+                        entry_ts = int(parts[2])
+                    except ValueError:
+                        continue
+                        
+                    if prefix_and_pair.startswith(f"{RedisKeyPrefix.OUTCOME_PENDING}"):
+                        pair = prefix_and_pair[len(RedisKeyPrefix.OUTCOME_PENDING):]
+                    else:
+                        continue
+                else:
+                    continue
+                    
+                trades.append({
+                    "pair": pair,
+                    "alert_key": alert_key,
+                    "direction": str(d.get("direction", "")).lower(),
+                    "entry_ts": entry_ts,
+                    "entry_price": float(d.get("entry_price", 0.0)) if d.get("entry_price") else 0.0,
+                    "confluence_score": float(d.get("confluence_score", 0.0)) if d.get("confluence_score") else 0.0,
+                    "confluence_total": float(d.get("confluence_total", 0.0)) if d.get("confluence_total") else 0.0,
+                })
+                
+        except Exception as e:
+            logger.warning(f"get_all_open_recorded_trades failed: {e}")
+            
+        return trades
+
     @staticmethod
     def _cooldown_key(pair: str, source: str = "Recorded") -> str:
         """Recorded and Shadowed trades keep separate cooldowns, so a shadow

@@ -1436,6 +1436,120 @@ async def send_trade_close_notices(sdb: RedisStateStore, telegram_queue: Telegra
         sdb.trade_close_events.clear()
     return 0
 
+async def send_open_trades_notice(
+    sdb: RedisStateStore,
+    telegram_queue: TelegramQueue,
+    bias_context: Optional[BiasContext],
+    logger_run: logging.Logger,
+) -> int:
+    """Send a notice of all open recorded trades if no other alerts fired.
+    Returns the number of trades announced."""  
+    if not getattr(cfg, "ENABLE_OPEN_TRADES_NOTICE", True):
+        return 0    
+    if not getattr(cfg, "ENABLE_WIN_RATE_FILTER", True):
+        return 0      
+    trades = await sdb.get_all_open_recorded_trades()
+    if not trades:
+        return 0
+        
+    # Limit to max recorded pairs shown in one alert to prevent spam
+    max_trades = getattr(cfg, "OPEN_TRADES_NOTICE_MAX", 5)
+    if len(trades) > max_trades:
+        trades = trades[:max_trades]
+
+    # Fetch win rates for all trades
+    pair_to_keys: Dict[str, List[str]] = {}
+    for t in trades:
+        pair_to_keys.setdefault(t["pair"], []).append(t["alert_key"])
+        
+    win_rates: Dict[str, Dict[str, Tuple[Optional[float], int]]] = {}
+    for pair, keys in pair_to_keys.items():
+        win_rates[pair] = await sdb.batch_get_alert_win_rates(pair, keys)
+        
+    # Enrich trades with win rate info
+    enriched_trades = []
+    for t in trades:
+        wr_data = win_rates.get(t["pair"], {}).get(t["alert_key"], (None, 0))
+        wr, total = wr_data
+        enriched_trades.append({
+            **t,
+            "win_rate": wr,
+            "total_samples": total,
+        })
+        
+    # Sort trades:
+    # 1. Depending on bias: if downtrend (down_pct > up_pct), SELL first, then BUY.
+    #    if uptrend (up_pct > down_pct) or neutral, BUY first, then SELL.
+    # 2. Within each group, sort by entry_ts ascending (first recorded, first served).
+    
+    dominant_sell = (
+        bias_context is not None and bias_context.down_pct > bias_context.up_pct
+    )
+    
+    def sort_key(t: Dict[str, Any]) -> Tuple[int, int]:
+        direction = t["direction"]
+        is_sell = 0 if (direction == "sell" or direction == "short") else 1
+        if not dominant_sell:
+            # Uptrend or neutral: BUY first (0), then SELL (1)
+            is_sell = 0 if (direction == "buy" or direction == "long") else 1
+        return (is_sell, t["entry_ts"])
+        
+    enriched_trades.sort(key=sort_key)
+    
+    # Build message
+    lines = ["🎯 Open(Recorded)Trades"]
+    for t in enriched_trades:
+        side = "SELL" if t["direction"] in ("sell", "short") else "BUY"
+        icon = "🔴" if side == "SELL" else "🟢"
+        
+        price = t["entry_price"]
+        if price >= 1000:
+            price_str = f"${price:.0f}"
+        elif price >= 1:
+            price_str = f"${price:.2f}"
+        else:
+            price_str = f"${price:.4f}"
+            
+        # Calculate wins (supports fractional wins like 22.5 if present, else clean integer)
+        wins = t["win_rate"] * t["total_samples"] if t["win_rate"] is not None else 0
+        wins_rounded = round(wins, 1)
+        wins_str = f"{wins_rounded:.1f}" if wins_rounded != int(wins_rounded) else f"{int(wins_rounded)}"
+        total_str = str(t["total_samples"])
+        wr_pct = f"{t['win_rate'] * 100:.0f}%" if t["win_rate"] is not None else "N/A"
+        
+        lines.append(f"{icon} {t['pair']} — {side} | {price_str} - ({wins_str}/{total_str}) {wr_pct}")
+        lines.append(f"Trade open since {format_ist_time(t['entry_ts'], '%H:%M')} IST")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        
+    # Bias footer
+    if cfg.ENABLE_BIAS_HEADER and bias_context is not None:
+        lines.append(_format_bias_header(bias_context))
+        
+    # Date/Time footer
+    now = int(time.time())
+    date_str = format_ist_time(now, "%d-%m-%Y")
+    time_str = format_ist_time(now, "%H:%M IST")
+    lines.append(f"📆  {date_str}                        ⏰ {time_str}")
+    
+    text = "\n".join(lines)
+    
+    if cfg.DRY_RUN_MODE:
+        logger_run.info(f"[DRY RUN] Would send open trades notice:\n{text}")
+        return len(enriched_trades)
+        
+    message = escape_markdown_v2(text)
+    try:
+        ok = await telegram_queue.send(message)
+    except Exception as e:
+        logger_run.error(f"Open trades notice failed to send: {e}")
+        ok = False
+        
+    if ok:
+        return len(enriched_trades)
+        
+    logger_run.error("Open trades notice was not delivered (Telegram send failed)")
+    return 0
+
 async def dispatch_combined_alerts(payloads: List[AlertPayload], telegram_queue: TelegramQueue, bias_context: Optional[BiasContext], sdb: RedisStateStore, alerts_sent_ref: List[int], alerts_sent_lock: asyncio.Lock, max_alerts_per_run: int, logger_run: logging.Logger) -> int:
     """Assemble payloads into one (or split) combined message(s), send, and
     handle fallback to individual messages on failure."""

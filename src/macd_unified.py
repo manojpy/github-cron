@@ -1535,6 +1535,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         batched_payloads = []
 
     # ── Run-level combined dispatch ──
+    sent = 0
     if batched_payloads:
         from alerts import dispatch_combined_alerts
         sent = await dispatch_combined_alerts(
@@ -1549,6 +1550,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         )
         if sent:
             logger_main.info(f"🎯 Batch dispatch delivered {sent} alert(s)")
+
     # Pullback WATCH entries go out AFTER the real alerts, in one message.
     if cfg.ENABLE_PULLBACK_CONTINUATION:
         _w = await flush_pullback_watch(
@@ -1579,6 +1581,17 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             logger_main.info(f"🎯 Trade-update notice sent for {announced} closed trade(s)")
     except Exception as e:
         logger_main.warning(f"Trade-update notice failed (non-fatal): {e}")
+
+    # ── Open Trades Notice ──
+    # Send ONLY when there are no other alerts firing in this 15 min run
+    if not sent:
+        try:
+            from alerts import send_open_trades_notice
+            open_announced = await send_open_trades_notice(state_db, telegram_queue, bias_context, logger_main)
+            if open_announced:
+                logger_main.info(f"🎯 Open trades notice sent for {open_announced} trade(s)")
+        except Exception as e:
+            logger_main.warning(f"Open trades notice failed (non-fatal): {e}")
 
     # Elliott Wave module: independent of every legacy alert above, runs last and
     # once per run. It bypasses the legacy one-open-trade / cooldown logic BY DESIGN
