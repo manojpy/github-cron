@@ -1447,18 +1447,11 @@ async def send_open_trades_notice(
     if not getattr(cfg, "ENABLE_OPEN_TRADES_NOTICE", True):
         return 0    
     if not getattr(cfg, "ENABLE_WIN_RATE_FILTER", True):
-        return 0      
+        return 0     
+
     trades = await sdb.get_all_open_recorded_trades()
     if not trades:
         return 0
-
-    enriched_trades.sort(key=sort_key)
-
-    # Cap AFTER sorting, so the trades shown are the bias-first /
-    # first-recorded-first-served ones, not whichever SCAN returned first.
-    max_trades = int(getattr(cfg, "OPEN_TRADES_NOTICE_MAX", 5))
-    if max_trades > 0 and len(enriched_trades) > max_trades:
-        enriched_trades = enriched_trades[:max_trades]
 
     # Fetch win rates for all trades
     pair_to_keys: Dict[str, List[str]] = {}
@@ -1501,9 +1494,15 @@ async def send_open_trades_notice(
             # Uptrend or neutral: BUY first (0), then SELL (1)
             is_sell = 0 if (direction == "buy" or direction == "long") else 1
         return (is_sell, t["entry_ts"])
-        
+
     enriched_trades.sort(key=sort_key)
-    
+
+    # Cap AFTER sorting, so the trades shown are the bias-first /
+    # first-recorded-first-served ones, not whichever SCAN returned first.
+    max_trades = int(getattr(cfg, "OPEN_TRADES_NOTICE_MAX", 5))
+    if max_trades > 0 and len(enriched_trades) > max_trades:
+        enriched_trades = enriched_trades[:max_trades]
+
     # Build message
     lines = ["🎯 Open(Recorded)Trades"]
     for t in enriched_trades:
