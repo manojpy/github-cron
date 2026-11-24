@@ -1,5 +1,6 @@
 """Baseline recommendation builder for the Brain core (moved verbatim out of BrainEngine.generate_recommendations; the method now delegates here)."""
 from __future__ import annotations
+import asyncio
 import logging
 import statistics
 import time

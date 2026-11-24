@@ -3548,7 +3548,6 @@ class RedisStateStore:
                 f"Failed to batch-fetch shadow pending outcomes for {pair}: {e}"
             )
             return
-
         resolved_count = 0
         hiconf_pct = getattr(cfg, "BRAIN_REWARDABLE_MIN_CONFLUENCE_PCT", 80.0)
 
@@ -3556,6 +3555,8 @@ class RedisStateStore:
         resolved_for_file: List[Dict[str, Any]] = []
         early_for_file: List[Dict[str, Any]] = []
         close_events: List[Dict[str, Any]] = []
+        # Twin of the recorded path: post-resolution row state for the totals step.
+        row_updates: Dict[str, Optional[str]] = {k: r for k, r in zip(keys, raw_values)}
 
         try:
             async with self._redis.pipeline() as write_pipe:
@@ -3776,6 +3777,7 @@ class RedisStateStore:
                             )
                             return
                     await asyncio.wait_for(_execute_pipeline(write_pipe), timeout=2.0)
+                    self.__dict__.setdefault("_pending_rows_seen", {}).update(row_updates)
 
         except Exception as e:
             dup_risk = " — resolved_for_file was already archived, so a retry next run may re-append duplicate row(s)" if resolved_for_file else ""
