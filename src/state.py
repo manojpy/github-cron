@@ -4052,7 +4052,7 @@ class RedisStateStore:
                 logger.warning(f"get_cumulative_outcome_stats: pending scan for {label} failed ({e}) — totals are PARTIAL")
                 out[label]["partial"] = 1
                 continue
-if not pending_keys:
+            if not pending_keys:
                 continue
 
             seen = self.__dict__.get("_pending_rows_seen", {})
