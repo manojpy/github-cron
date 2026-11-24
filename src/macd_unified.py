@@ -1552,13 +1552,15 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             logger_main.info(f"🎯 Batch dispatch delivered {sent} alert(s)")
 
     # Pullback WATCH entries go out AFTER the real alerts, in one message.
+    pullback_sent = 0
     if cfg.ENABLE_PULLBACK_CONTINUATION:
-        _w = await flush_pullback_watch(
+        pullback_sent = await flush_pullback_watch(
             state_db, telegram_queue, logger_main,
             suppress=bool(kill_switch_active_run or kill_switch_tripped_this_run),
         )
-        if _w:
-            logger_main.info(f"👀 Pullback WATCH: {_w} setup(s) sent in one message")
+        if pullback_sent:
+            logger_main.info(f"👀 Pullback WATCH: {pullback_sent} setup(s) sent in one message")
+            
     # A Recorded trade that hit target/stop is no longer an open position: free its
     # heat-gate slot now instead of holding it for the full PORTFOLIO_POSITION_MAX_AGE_MIN.
     # Must run BEFORE send_trade_close_notices, which clears trade_close_events.
@@ -1575,16 +1577,19 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             )
             if _freed:
                 logger_main.info(f"🔓 Heat gate: freed {_freed} closed position(s)")
+                
+    trade_close_sent = 0
     try:
-        announced = await send_trade_close_notices(state_db, telegram_queue, logger_main)
-        if announced:
-            logger_main.info(f"🎯 Trade-update notice sent for {announced} closed trade(s)")
+        trade_close_sent = await send_trade_close_notices(state_db, telegram_queue, logger_main)
+        if trade_close_sent:
+            logger_main.info(f"🎯 Trade-update notice sent for {trade_close_sent} closed trade(s)")
     except Exception as e:
         logger_main.warning(f"Trade-update notice failed (non-fatal): {e}")
 
     # ── Open Trades Notice ──
     # Send ONLY when there are no other alerts firing in this 15 min run
-    if not sent:
+    any_notification_sent = (sent > 0) or (pullback_sent > 0) or (trade_close_sent > 0)
+    if not any_notification_sent:
         try:
             from alerts import send_open_trades_notice
             open_announced = await send_open_trades_notice(state_db, telegram_queue, bias_context, logger_main)
