@@ -79,10 +79,9 @@ jobs:
           fi
 
           # Alert on first detection (40-69 min), then about every 2 hours instead of every 30 min.
-          # That thinning assumes a check every 30 min (the Cronjobs.org dispatch). The 6-hourly
-          # GitHub schedule is a multiple of 120 min, so the same test would give the same answer on
-          # every scheduled run and most outages would never alert: a scheduled run always alerts.
-          if [ "$AGE_MIN" -ge "${MAX_SILENCE_MIN}" ] && { [ "$EVENT_NAME" = "schedule" ] || [ "$AGE_MIN" -lt 70 ] || [ $(( AGE_MIN / 30 % 4 )) -eq 0 ]; }; then
+          # This assumes a check every 30 min (the Cronjobs.org dispatch); the workflow has no
+          # GitHub schedule trigger, so every run is a dispatch.
+          if [ "$AGE_MIN" -ge "${MAX_SILENCE_MIN}" ] && { [ "$AGE_MIN" -lt 70 ] || [ $(( AGE_MIN / 30 % 4 )) -eq 0 ]; }; then
             SILENCE="🚨 No successful MACD Bot run in ${AGE_MIN} min (expected every ~15 min)"$'\n'"Last success: ${LAST_SUCCESS:-never recorded}"$'\n'"Latest run seen: ${LATEST_URL} (status=${LATEST_STATUS}, conclusion=${LATEST_CONCLUSION})"
             if [ -n "$ALERT" ]; then
               ALERT="${ALERT}"$'\n\n'"${SILENCE}"

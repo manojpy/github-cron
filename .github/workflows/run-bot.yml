@@ -230,6 +230,19 @@ jobs:
             echo "⚡ Alert-only run: 3-day archive"
           fi
 
+      - name: 🛠️ Create data-directory helper
+        run: |
+          cat > /tmp/prepare-data-dirs.sh <<'EOF'
+          #!/bin/sh
+          set -eu
+          mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports /tmp/data-repo/candidates
+          # a+rwX: container user (uid 1000) can write without adding exec bits to files,
+          # so git sees no mode changes. .git is not touched.
+          chmod a+rwx /tmp/data-repo
+          chmod -R a+rwX /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports /tmp/data-repo/candidates
+          EOF
+          chmod +x /tmp/prepare-data-dirs.sh
+
       - name: 📦 Checkout outcome-data archive
         if: inputs.apply_brain_plan != true
         env:
@@ -297,11 +310,7 @@ jobs:
           git checkout main
           cd -
 
-          mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports /tmp/data-repo/candidates
-          # a+rwX: the container user (uid 1000) can write, but files do not gain the
-          # exec bit, so git sees no mode changes. .git is not touched.
-          chmod a+rwx /tmp/data-repo
-          chmod -R a+rwX /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports /tmp/data-repo/candidates
+          /tmp/prepare-data-dirs.sh
 
           # ── AUDIT: prove what actually landed on disk ──
           echo "=== /tmp/data-repo top level ==="
@@ -405,13 +414,9 @@ jobs:
             printf 'DELTA_API_BASE=%s\n' "$DELTA_API_BASE"
           } > "$ENV_FILE"
 
-          # The archive checkout is skipped for apply runs; create the folder the
+          # The archive checkout is skipped for apply runs; prepare the folders the
           # image probes for writability at import time.
-          mkdir -p /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports /tmp/data-repo/candidates
-          # a+rwX: the container user (uid 1000) can write, but files do not gain the
-          # exec bit, so git sees no mode changes. .git is not touched.
-          chmod a+rwx /tmp/data-repo
-          chmod -R a+rwX /tmp/data-repo/outcomes /tmp/data-repo/shadow /tmp/data-repo/reports /tmp/data-repo/candidates
+          /tmp/prepare-data-dirs.sh
           set +e
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --init \

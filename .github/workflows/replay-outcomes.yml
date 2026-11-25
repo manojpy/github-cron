@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   replay:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion != 'success'
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -111,13 +111,16 @@ jobs:
 
           while read -r ID; do
             [ -n "$ID" ] || continue
-            rm -rf /tmp/dead-letter && mkdir -p /tmp/dead-letter
-            if ! gh api "repos/${REPO}/actions/artifacts/${ID}/zip" > /tmp/dead-letter.zip; then
-              echo "::warning::Could not download artifact ${ID} — skipping"
+            rm -rf /tmp/dead-letter /tmp/dead-letter.zip && mkdir -p /tmp/dead-letter
+            if ! gh api "repos/${REPO}/actions/artifacts/${ID}/zip" > /tmp/dead-letter.zip || ! unzip -tq /tmp/dead-letter.zip >/dev/null 2>&1; then
+              echo "::warning::Could not download or verify artifact ${ID} — skipping"
+              rm -f /tmp/dead-letter.zip
               echo "$ID" >> "$RUNNER_TEMP/skipped_ids"
               continue
             fi
             unzip -oq /tmp/dead-letter.zip -d /tmp/dead-letter
+            rm -f /tmp/dead-letter.zip
+
             python3 - <<'PY'
           import glob, os
           SRC, DST = "/tmp/dead-letter", "/tmp/data-repo"
