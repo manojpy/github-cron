@@ -14,7 +14,7 @@ numba==0.68.1
 cython==3.3.1
 
 # Redis & Data Handling
-redis[hiredis]==8.1.0
+redis[hiredis]==8.2.0
 hiredis==3.5.0
 pydantic==2.14.4
 orjson==3.13.0
