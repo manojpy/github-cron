@@ -15,7 +15,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 COPY --from=uv-installer /usr/local/bin/uv /usr/local/bin/uv
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     build-essential \
-    git \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 WORKDIR /build
