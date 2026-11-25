@@ -73,11 +73,35 @@ jobs:
           cat > /tmp/pull-image.sh <<'EOF'
           #!/bin/sh
           SHA_IMAGE="$1"; LATEST_IMAGE="$2"
+
+          # Pull with retries for TRANSIENT errors only (token timeout, 5xx, reset).
+          # "manifest unknown" is definitive (tag does not exist) — stop immediately,
+          # so a config-only commit still falls back to :latest without burning retries.
+          pull_retry() {
+            img="$1"; tries="$2"; n=1
+            while [ "$n" -le "$tries" ]; do
+              if docker pull --quiet --platform linux/amd64 "$img" > /tmp/image-pull.attempt 2>&1; then
+                cat /tmp/image-pull.attempt >> /tmp/image-pull.log
+                return 0
+              fi
+              cat /tmp/image-pull.attempt >> /tmp/image-pull.log
+              if grep -q "manifest unknown" /tmp/image-pull.attempt; then
+                return 1
+              fi
+              n=$((n + 1))
+              if [ "$n" -le "$tries" ]; then
+                echo "pull attempt $((n - 1)) failed (transient?) — retrying in $((n * 5))s" >> /tmp/image-pull.log
+                sleep $((n * 5))
+              fi
+            done
+            return 1
+          }
+
           # Prefer the exact SHA tag. Fall back to :latest only if the SHA tag does not exist.
-          if docker pull --quiet --platform linux/amd64 "$SHA_IMAGE" > /tmp/image-pull.log 2>&1; then
+          if pull_retry "$SHA_IMAGE" 2; then
             printf '%s\n' "$SHA_IMAGE" > /tmp/image-pull.used
             printf '0\n' > /tmp/image-pull.rc.tmp && mv /tmp/image-pull.rc.tmp /tmp/image-pull.rc
-          elif docker pull --quiet --platform linux/amd64 "$LATEST_IMAGE" >> /tmp/image-pull.log 2>&1; then
+          elif pull_retry "$LATEST_IMAGE" 3; then
             printf '%s\n' "$LATEST_IMAGE" > /tmp/image-pull.used
             printf '0\n' > /tmp/image-pull.rc.tmp && mv /tmp/image-pull.rc.tmp /tmp/image-pull.rc
           else
