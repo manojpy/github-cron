@@ -87,7 +87,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 HEALTHCHECK NONE
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     ca-certificates \
-    && apt-get upgrade -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Security - Non-root user
