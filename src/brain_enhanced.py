@@ -582,12 +582,15 @@ class BrainEngineV2(BrainCore):
             # check each report planned a no-op "reinstate" for keys that were never
             # disabled. If the disabled set cannot be read, plan no reinstates
             # (re-enabling is the risk-increasing direction).
-            try:
-                _disabled_now = set(await self.sdb.get_disabled_alert_keys())
-            except Exception as _e:
-                logging.getLogger("macd_bot").debug(f"Plan: disabled keys unreadable, no reinstates planned: {_e!r}")
-                _disabled_now = set()
-
+            _dk_live = recs.get("ai_metrics", {}).get("disabled_alert_keys")
+            if isinstance(_dk_live, list):
+                _disabled_now = set(_dk_live)   # already read this run; apply re-checks live
+            else:
+                try:
+                    _disabled_now = set(await self.sdb.get_disabled_alert_keys())
+                except Exception as _e:
+                    logging.getLogger("macd_bot").debug(f"Plan: disabled keys unreadable, no reinstates planned: {_e!r}")
+                    _disabled_now = set()
             for rec in recs.get("recommendations", []):
                 rec_type = rec.get("type")
                 

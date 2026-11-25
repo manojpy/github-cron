@@ -243,7 +243,8 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
     threshold_rec: Dict[str, Any] = {}
     net_ev = half_kelly = kelly_wr = None
     target_floor: Optional[float] = None
-    rec = engine.recommend_threshold(
+    rec = await asyncio.to_thread(
+        engine.recommend_threshold,
         real_rows, target_winrate=target_wr, min_sample=min_sample,
     ) if real_rows else {"valid": False}
 
@@ -415,7 +416,8 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                 ),
                 16,
             ) & 0xFFFFFFFF
-            mc = engine.monte_carlo_walk_forward(
+            mc = await asyncio.to_thread(
+                engine.monte_carlo_walk_forward,
                 real_rows, n_simulations=cfg.BRAIN_MC_SIMULATIONS,
                 min_sample=min_sample, target_winrate=target_wr,
                 seed=_mc_seed,

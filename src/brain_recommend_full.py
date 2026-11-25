@@ -1,5 +1,6 @@
 """Full (prescriptive) recommendation builder for BrainEngineV2 — moved verbatim out of BrainEngineV2._generate_recommendations_full; the method now delegates here. `self` is the engine instance."""
 from __future__ import annotations
+import asyncio
 import logging
 import time
 from collections import defaultdict
@@ -592,7 +593,7 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
 
     _phase_mark("per_alert_breakdown")
 
-    # ── Phase 2: Parameter Autopsy ─────────────────────────────────
+    # ── Phase 2: Parameter Autopsy ─────────────���───────────────────
     if real_rows and any("context" in r for r in real_rows):
         PARAM_ALERT_MAP = {
             "buy_wick_ratio": ["strong_reversal_buy", "hist_rma_buy", "ppohist_buy", "tk_conversion_up", "kijun_cross_up"],
@@ -943,8 +944,9 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
         )
     if _perm_enabled and _perm_ok:
         _perm_n = 15
-        perm_imp = engine.oos_permutation_importance(
-            real_rows, min_sample=min_sample, n_permutations=_perm_n
+        perm_imp = await asyncio.to_thread(
+            engine.oos_permutation_importance,
+            real_rows, min_sample=min_sample, n_permutations=_perm_n,
         )
         if perm_imp:
             top_positive = [p for p in perm_imp if p["direction"] == "positive"][:3]
@@ -1268,6 +1270,9 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
                 f"stays pending for the next Brain run"
             )
             rec["message"] += " [NOT APPLIED — will retry next run]"
+    if _disabled_chk is not None:
+        # Live set after this run's auto-actions; the plan step reuses it instead of re-reading.
+        ai_metrics["disabled_alert_keys"] = sorted(_disabled_now)
 
     _phase_mark("fdr_and_actionability")
 

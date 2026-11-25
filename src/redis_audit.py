@@ -34,6 +34,7 @@ import json
 import os
 import statistics
 import sys
+import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # (name, key prefix, ttl policy). Longest prefix wins.
@@ -276,6 +277,80 @@ def collect(client: Any, max_keys: int = 200_000, scan_count: int = 500, sample_
             pass
     return records, streams, truncated
 
+def latency_stats(samples_ms: List[float]) -> Dict[str, Any]:
+    """Pure: p50 / p95 / max of round-trip times in milliseconds."""
+    if not samples_ms:
+        return {"samples": 0, "p50_ms": None, "p95_ms": None, "max_ms": None}
+    s = sorted(samples_ms)
+    return {
+        "samples": len(s),
+        "p50_ms": statistics.median(s),
+        "p95_ms": s[min(len(s) - 1, int(round(0.95 * (len(s) - 1))))],
+        "max_ms": s[-1],
+    }
+
+def measure_latency(client: Any, samples: int = 20) -> Dict[str, Any]:
+    """Time `samples` PING round trips on the already-open connection."""
+    out: List[float] = []
+    for _ in range(max(0, samples)):
+        t0 = time.perf_counter()
+        try:
+            client.ping()
+        except Exception:
+            break
+        out.append((time.perf_counter() - t0) * 1000.0)
+    return latency_stats(out)
+
+_LEN_COMMANDS = {"list": "llen", "set": "scard", "zset": "zcard", "hash": "hlen", "stream": "xlen"}
+
+def rank_top_keys(records: Iterable[Dict[str, Any]], top_n: int = 10) -> List[Dict[str, Any]]:
+    """Pure: the top_n records that have a measured size, largest first."""
+    sized = [r for r in records if r.get("bytes") is not None]
+    sized.sort(key=lambda r: (-int(r["bytes"]), str(r["key"])))
+    return [
+        {
+            "key": r["key"], "family": classify_key(r["key"])[0], "type": r.get("type", "?"),
+            "bytes": int(r["bytes"]), "ttl": int(r["ttl"]), "length": r.get("length"),
+        }
+        for r in sized[:max(0, top_n)]
+    ]
+
+def collect_top_keys(client: Any, records: List[Dict[str, Any]], top_n: int = 10, max_measure: int = 20_000, batch: int = 500) -> Dict[str, Any]:
+    """Read-only. MEMORY USAGE for every scanned key (pipelined, capped at
+    max_measure), then the element count of the biggest few. Answers 'how big
+    is production data' without touching any value."""
+    todo = records[:max(0, max_measure)]
+    measured: List[Dict[str, Any]] = []
+    for i in range(0, len(todo), batch):
+        chunk = todo[i:i + batch]
+        try:
+            pipe = client.pipeline(transaction=False)
+            for rec in chunk:
+                pipe.memory_usage(rec["key"])
+            res = pipe.execute(raise_on_error=False)
+        except Exception:
+            break  # MEMORY USAGE unsupported on this server
+        for rec, val in zip(chunk, res):
+            if not isinstance(val, BaseException) and val is not None:
+                measured.append({**rec, "bytes": int(val)})
+    top = rank_top_keys(measured, top_n)
+    if top:
+        try:
+            pipe = client.pipeline(transaction=False)
+            for t in top:
+                cmd = _LEN_COMMANDS.get(t["type"])
+                getattr(pipe, cmd or "strlen")(t["key"])
+            res = pipe.execute(raise_on_error=False)
+            for t, val in zip(top, res):
+                t["length"] = None if isinstance(val, BaseException) else int(val)
+                t["length_unit"] = "elements" if t["type"] in _LEN_COMMANDS else "chars"
+        except Exception:
+            pass
+    return {
+        "measured": len(measured), "scanned": len(records),
+        "total_bytes": sum(m["bytes"] for m in measured), "top": top,
+    }
+
 def collect_heal_candidates(client: Any) -> List[Dict[str, Any]]:
     """Look up the TTL of each healable key directly by name (one pipelined
     round trip). Unlike the SCAN this cannot be cut short by --max-keys."""
@@ -424,6 +499,26 @@ def render(report: Dict[str, Any], truncated: bool = False) -> str:
     if report["streams"]:
         lines.append("")
         lines.append("streams: " + ", ".join(f"{k}={v}" for k, v in report["streams"].items()))
+    lat = report.get("latency")
+    if lat and lat.get("samples"):
+        lines.append("")
+        lines.append(
+            f"Redis latency (PING x{lat['samples']}): p50 {lat['p50_ms']:.1f}ms  "
+            f"p95 {lat['p95_ms']:.1f}ms  max {lat['max_ms']:.1f}ms"
+        )
+    tk = report.get("top_keys")
+    if tk and tk.get("top"):
+        lines.append("")
+        lines.append(
+            f"Largest keys (sized {tk['measured']} of {tk['scanned']} scanned, "
+            f"{_fmt_bytes(tk['total_bytes'])} total):"
+        )
+        lines.append(f"  {'size':>9s} {'length':>8s} {'type':8s} {'ttl':>7s}  key")
+        for t in tk["top"]:
+            ln = "-" if t.get("length") is None else str(t["length"])
+            ttl = "none" if t["ttl"] == -1 else _fmt_ttl(t["ttl"])
+            lines.append(f"  {_fmt_bytes(t['bytes']):>9s} {ln:>8s} {t['type']:8s} {ttl:>7s}  {t['key']}")
+
     if report["metadata"]:
         lines.append("")
         lines.append(f"{'metadata entry':34s} {'keys':>6s} {'no-TTL':>7s} {'ttl max':>8s}")
@@ -474,6 +569,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--scan-count", type=int, default=500)
     ap.add_argument("--sample-bytes", type=int, default=25, help="Keys per family sampled for MEMORY USAGE")
     ap.add_argument("--match", default="*", help="SCAN MATCH pattern (default: *)")
+    ap.add_argument("--top-keys", type=int, default=10, help="List the N largest keys with their sizes (0 = off)")
+    ap.add_argument("--latency-samples", type=int, default=20, help="PING round trips to time (0 = off)")
     ap.add_argument("--heal-durable-ttl", action="store_true",
                     help="One-off, opt-in WRITE: raise standing-decision keys still on the old 7d TTL to 90d "
                          "(never lowers a TTL, never touches dynamic_weights / brain_apply_snapshots)")
@@ -499,12 +596,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"Cannot connect to Redis: {e}", file=sys.stderr)
         return 2
 
+    latency = measure_latency(client, args.latency_samples) if args.latency_samples > 0 else None
     records, streams, truncated = collect(
         client, max_keys=args.max_keys, scan_count=args.scan_count,
         sample_bytes=args.sample_bytes, match=args.match,
     )
     report = summarize(records, streams)
     report["truncated"] = truncated
+    if latency is not None:
+        report["latency"] = latency
+    if args.top_keys > 0:
+        try:
+            report["top_keys"] = collect_top_keys(client, records, top_n=args.top_keys)
+        except Exception:
+            pass  # sizing is advisory; never fail the audit over it
     if args.heal_durable_ttl:
         plan = plan_durable_ttl_heal(collect_heal_candidates(client))
         report["heal"] = apply_durable_ttl_heal(client, plan, dry_run=args.dry_run)
