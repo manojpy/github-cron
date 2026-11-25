@@ -107,12 +107,14 @@ jobs:
         run: |
           set -euo pipefail
           : > "$RUNNER_TEMP/replayed_ids"
+          : > "$RUNNER_TEMP/skipped_ids"
 
           while read -r ID; do
             [ -n "$ID" ] || continue
             rm -rf /tmp/dead-letter && mkdir -p /tmp/dead-letter
             if ! gh api "repos/${REPO}/actions/artifacts/${ID}/zip" > /tmp/dead-letter.zip; then
               echo "::warning::Could not download artifact ${ID} — skipping"
+              echo "$ID" >> "$RUNNER_TEMP/skipped_ids"
               continue
             fi
             unzip -oq /tmp/dead-letter.zip -d /tmp/dead-letter
@@ -168,6 +170,19 @@ jobs:
             echo "$ID" >> "$RUNNER_TEMP/replayed_ids"
           done < "$RUNNER_TEMP/candidate_ids"
 
+          FOUND=$(wc -l < "$RUNNER_TEMP/candidate_ids" | tr -d ' ')
+          REPLAYED=$(wc -l < "$RUNNER_TEMP/replayed_ids" | tr -d ' ')
+          SKIPPED=$(wc -l < "$RUNNER_TEMP/skipped_ids" | tr -d ' ')
+          {
+            echo "### Dead-letter replay"
+            echo "- Artifacts found: ${FOUND}"
+            echo "- Merged: ${REPLAYED}"
+            echo "- Skipped (download failed, left pending): ${SKIPPED}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$SKIPPED" -gt 0 ]; then
+            echo "::warning::${SKIPPED} artifact(s) could not be downloaded and stay pending: $(paste -sd' ' "$RUNNER_TEMP/skipped_ids")"
+          fi
+
           cd /tmp/data-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -180,7 +195,7 @@ jobs:
             fi
           done
           if git diff --cached --quiet; then
-            if [ -n "$(git status --porcelain -- outcomes shadow reports)" ]; then
+            if [ -n "$(git status --porcelain -- outcomes shadow candidates reports)" ]; then
               echo "::error::Replay changed files but nothing could be staged - artifacts NOT retired"
               exit 1
             fi

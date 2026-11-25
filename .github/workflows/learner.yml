@@ -102,7 +102,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           # true = fail when the fallback :latest lacks this commit's image-relevant code.
-          STRICT_IMAGE_PROVENANCE: "false"
+          STRICT_IMAGE_PROVENANCE: "true"
         run: |
           set -euo pipefail
 

@@ -724,6 +724,7 @@ jobs:
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
+          set -euo pipefail
           if [ ! -d "/tmp/data-repo/.git" ]; then
             echo "::warning::Data repo not present — outcomes NOT persisted this run"
             exit 0
@@ -773,11 +774,11 @@ jobs:
           # the daily cleanup workflow deletes older ones.
           # --sparse is REQUIRED: report file names are not in the sparse-checkout
           # list, and a plain `git add` silently refuses paths outside it.
-          git add --sparse -f reports 2>/dev/null || true
+          git add --sparse -f reports
 
           # Candidate ledger (skipped-signal rows). Not an outcome table: no reader of
           # outcomes/ or shadow/ opens it. --sparse for the same reason as reports above.
-          git add --sparse -f candidates 2>/dev/null || true
+          git add --sparse -f candidates
 
           # ── AUDIT: always print what's staged, even on no-op ──
           echo "=== git status ==="
