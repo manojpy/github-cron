@@ -64,7 +64,8 @@ FROM deps-builder AS runtime-venv
 ARG KEEP_JIT_FALLBACK=0
 
 RUN set -e; \
-    SP="$VIRTUAL_ENV/lib/python3.15/site-packages"; \
+    SP="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"; \
+    test -d "$SP/numpy" || { echo "site-packages not found at $SP" >&2; exit 1; }; \
     uv pip uninstall cython setuptools; \
     if [ "$KEEP_JIT_FALLBACK" != "1" ]; then \
         uv pip uninstall numba llvmlite tbb; \
