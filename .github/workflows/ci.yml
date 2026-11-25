@@ -64,8 +64,7 @@ jobs:
 
           echo "No undefined-name errors (other findings are advisory)"
 
-      - name: Mypy (advisory until the baseline is clean, then make blocking)
-        continue-on-error: true
+      - name: Mypy (BLOCKING)
         run: |
           python -m mypy --ignore-missing-imports --no-error-summary \
             src/macd_unified.py src/aot_bridge.py src/numeric_selftest.py \
