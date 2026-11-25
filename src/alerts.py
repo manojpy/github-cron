@@ -51,8 +51,8 @@ from alert_registry import (
     REGISTRY as _ALERT_REGISTRY,
     registry_problems as _registry_problems,
     resolve_alert_config_path as _registry_resolve_config_path,
+    is_elliott_key,
 )
-
 from fetcher import (
     PriceData, DataFetcher, SessionManager, compute_backoff, validate_indicator_values,
     CandleSnapshot, cross_check_15m_against_5m,
@@ -1441,61 +1441,45 @@ async def send_open_trades_notice(
     telegram_queue: TelegramQueue,
     bias_context: Optional[BiasContext],
     logger_run: logging.Logger,
+    candle_ts: Optional[int] = None,
 ) -> int:
     """Send a notice of all open recorded trades if no other alerts fired.
-    Returns the number of trades announced."""  
+    The caller decides "no other alerts"; this only builds and sends.
+    candle_ts is the open time of the 15m candle this run alerts on (footer time,
+    same as every other alert); None falls back to the last closed candle.
+    Returns the number of trades announced."""
     if not getattr(cfg, "ENABLE_OPEN_TRADES_NOTICE", True):
-        return 0    
+        return 0
     if not getattr(cfg, "ENABLE_WIN_RATE_FILTER", True):
-        return 0     
+        return 0
 
     trades = await sdb.get_all_open_recorded_trades()
     if not trades:
         return 0
 
-    # Fetch win rates for all trades
-    pair_to_keys: Dict[str, List[str]] = {}
-    for t in trades:
-        pair_to_keys.setdefault(t["pair"], []).append(t["alert_key"])
-        
-    _pairs = list(pair_to_keys)
-    _wr = await asyncio.gather(
-        *(sdb.batch_get_alert_win_rates(p, pair_to_keys[p]) for p in _pairs),
-        return_exceptions=True,
-    )
-    win_rates: Dict[str, Dict[str, Tuple[Optional[float], int]]] = {}
-    for p, r in zip(_pairs, _wr):
-        win_rates[p] = r if isinstance(r, dict) else {}
-
-    # Enrich trades with win rate info
-    enriched_trades = []
-    for t in trades:
-        wr_data = win_rates.get(t["pair"], {}).get(t["alert_key"], (None, 0))
-        wr, total = wr_data
-        enriched_trades.append({
-            **t,
-            "win_rate": wr,
-            "total_samples": total,
-        })
-        
-    # Sort trades:
-    # 1. Depending on bias: if downtrend (down_pct > up_pct), SELL first, then BUY.
-    #    if uptrend (up_pct > down_pct) or neutral, BUY first, then SELL.
-    # 2. Within each group, sort by entry_ts ascending (first recorded, first served).
-    
+    # Sort: dominant bias side first (down > up -> SELL first, otherwise BUY first),
+    # then first recorded, first served (entry_ts ascending) inside each side.
     dominant_sell = (
         bias_context is not None and bias_context.down_pct > bias_context.up_pct
     )
-    
-    def sort_key(t: Dict[str, Any]) -> Tuple[int, int]:
-        direction = t["direction"]
-        is_sell = 0 if (direction == "sell" or direction == "short") else 1
-        if not dominant_sell:
-            # Uptrend or neutral: BUY first (0), then SELL (1)
-            is_sell = 0 if (direction == "buy" or direction == "long") else 1
-        return (is_sell, t["entry_ts"])
 
-    enriched_trades.sort(key=sort_key)
+    def _is_sell(t: Dict[str, Any]) -> bool:
+        return t["direction"] in ("sell", "short")
+
+    def sort_key(t: Dict[str, Any]) -> Tuple[int, int]:
+        first_side_is_sell = dominant_sell
+        return (0 if _is_sell(t) == first_side_is_sell else 1, t["entry_ts"])
+
+    trades.sort(key=sort_key)
+
+    # One line per pair: keep the first-recorded open trade of each pair.
+    _seen_pairs: set = set()
+    enriched_trades = []
+    for t in trades:
+        if t["pair"] in _seen_pairs:
+            continue
+        _seen_pairs.add(t["pair"])
+        enriched_trades.append(t)
 
     # Cap AFTER sorting, so the trades shown are the bias-first /
     # first-recorded-first-served ones, not whichever SCAN returned first.
@@ -1506,9 +1490,9 @@ async def send_open_trades_notice(
     # Build message
     lines = ["🎯 Open(Recorded)Trades"]
     for t in enriched_trades:
-        side = "SELL" if t["direction"] in ("sell", "short") else "BUY"
+        side = "SELL" if _is_sell(t) else "BUY"
         icon = "🔴" if side == "SELL" else "🟢"
-        
+
         price = t["entry_price"]
         if price >= 1000:
             price_str = f"${price:.0f}"
@@ -1516,44 +1500,43 @@ async def send_open_trades_notice(
             price_str = f"${price:.2f}"
         else:
             price_str = f"${price:.4f}"
-            
-        # Calculate wins (supports fractional wins like 22.5 if present, else clean integer)
-        wins = t["win_rate"] * t["total_samples"] if t["win_rate"] is not None else 0
-        wins_rounded = round(wins, 1)
-        wins_str = f"{wins_rounded:.1f}" if wins_rounded != int(wins_rounded) else f"{int(wins_rounded)}"
-        total_str = str(t["total_samples"])
-        wr_pct = f"{t['win_rate'] * 100:.0f}%" if t["win_rate"] is not None else "N/A"
-        
-        lines.append(f"{icon} {t['pair']} — {side} | {price_str} - ({wins_str}/{total_str}) {wr_pct}")
-        lines.append(f"Trade open since {format_ist_time(t['entry_ts'], '%H:%M')} IST")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        
+
+        # Same confluence suffix as the live alerts: " - (22.5/29) 78%".
+        # Rows without a stored total show no suffix rather than "(0)".
+        _tot = t.get("confluence_total") or 0.0
+        score_str = _fmt_score(t.get("confluence_score"), _tot) if _tot > 0 else ""
+        src_str = " · Elliott" if is_elliott_key(str(t["alert_key"])) else ""
+
+        lines.append(f"{icon} {t['pair']} — {side} | {price_str}{score_str}")
+        lines.append(f"Trade open since {format_ist_time(t['entry_ts'], '%H:%M')} IST{src_str}")
+        lines.append(DIVIDER)
+
     # Bias footer
     if cfg.ENABLE_BIAS_HEADER and bias_context is not None:
         lines.append(_format_bias_header(bias_context))
-        
-    # Date/Time footer
-    now = int(time.time())
-    date_str = format_ist_time(now, "%d-%m-%Y")
-    time_str = format_ist_time(now, "%H:%M IST")
+
+    # Date/Time footer: candle open time, like every other alert
+    footer_ts = int(candle_ts) if candle_ts else (int(time.time()) // 900) * 900 - 900
+    date_str = format_ist_time(footer_ts, "%d-%m-%Y")
+    time_str = format_ist_time(footer_ts, "%H:%M IST")
     lines.append(f"📆  {date_str}                        ⏰ {time_str}")
-    
+
     text = "\n".join(lines)
-    
+
     if cfg.DRY_RUN_MODE:
         logger_run.info(f"[DRY RUN] Would send open trades notice:\n{text}")
         return len(enriched_trades)
-        
+
     message = escape_markdown_v2(text)
     try:
         ok = await telegram_queue.send(message)
     except Exception as e:
         logger_run.error(f"Open trades notice failed to send: {e}")
         ok = False
-        
+
     if ok:
         return len(enriched_trades)
-        
+
     logger_run.error("Open trades notice was not delivered (Telegram send failed)")
     return 0
 

@@ -1586,18 +1586,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     except Exception as e:
         logger_main.warning(f"Trade-update notice failed (non-fatal): {e}")
 
-    # ── Open Trades Notice ──
-    # Send ONLY when there are no other alerts firing in this 15 min run
-    any_notification_sent = (sent > 0) or (pullback_sent > 0) or (trade_close_sent > 0)
-    if not any_notification_sent:
-        try:
-            from alerts import send_open_trades_notice
-            open_announced = await send_open_trades_notice(state_db, telegram_queue, bias_context, logger_main)
-            if open_announced:
-                logger_main.info(f"🎯 Open trades notice sent for {open_announced} trade(s)")
-        except Exception as e:
-            logger_main.warning(f"Open trades notice failed (non-fatal): {e}")
-
     # Elliott Wave module: independent of every legacy alert above, runs last and
     # once per run. It bypasses the legacy one-open-trade / cooldown logic BY DESIGN
     # but keeps its own dedup (one claim per wave structure) and per-run cap.
@@ -1610,6 +1598,26 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         )
         ELLIOTT_RUN_STATS.clear()
         ELLIOTT_RUN_STATS.update(_ew_stats or {})
+
+    # ── Open (Recorded) Trades notice ──
+    # Only when NOTHING else was delivered this 15m run: main alerts, pullback WATCH,
+    # trade updates (target / stop / horizon) and Elliott alerts. It must sit after
+    # the Elliott scan, which is the last thing that can send an alert.
+    _ew_delivered = int((_ew_stats or {}).get("delivered", 0)) if cfg.ENABLE_ELLIOTT_WAVE else 0
+    any_notification_sent = (
+        (sent > 0) or (pullback_sent > 0) or (trade_close_sent > 0) or (_ew_delivered > 0)
+    )
+    if not any_notification_sent:
+        try:
+            from alerts import send_open_trades_notice
+            open_announced = await send_open_trades_notice(
+                state_db, telegram_queue, bias_context, logger_main,
+                candle_ts=(int(reference_time) // 900) * 900 - 900,
+            )
+            if open_announced:
+                logger_main.info(f"🎯 Open trades notice sent for {open_announced} trade(s)")
+        except Exception as e:
+            logger_main.warning(f"Open trades notice failed (non-fatal): {e}")
 
     # All-time Recorded / Shadowed totals (from beginning of data collection).
     # Always log on every run so operators see the current win-rate snapshot
