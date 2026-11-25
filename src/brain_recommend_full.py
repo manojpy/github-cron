@@ -593,7 +593,7 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
 
     _phase_mark("per_alert_breakdown")
 
-    # ── Phase 2: Parameter Autopsy ─────────────���───────────────────
+    # ── Phase 2: Parameter Autopsy ───────────────────────────────
     if real_rows and any("context" in r for r in real_rows):
         PARAM_ALERT_MAP = {
             "buy_wick_ratio": ["strong_reversal_buy", "hist_rma_buy", "ppohist_buy", "tk_conversion_up", "kijun_cross_up"],
