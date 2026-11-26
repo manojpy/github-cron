@@ -629,6 +629,11 @@ def format_intelligence(blob: Mapping[str, Any], name_fn: Callable[[str], str] =
                              f"{c['mean_net']:+.2f}%/trade [L{c['level']}]")
     rj = blob.get("rejections") or {}
     shown = [x for x in rj.get("reasons", []) if x["status"] != "COLLECTING"][:4]
+    # EARLY_REVERSAL_MODE shadow rows are small next to the big gates, so they would never reach the
+    # top 4 by count. Always show that reason when it exists, even while it is still collecting.
+    _er_row = next((x for x in rj.get("reasons", []) if x["reason"] == "early_reversal"), None)
+    if _er_row is not None and _er_row not in shown:
+        shown.append(_er_row)
     lines.append("")
     lines.append(f"🛡 SHADOW REJECTIONS (Recorded success {_pct(rj.get('live_success'))}):")
     if not shown:
