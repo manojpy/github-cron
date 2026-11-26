@@ -859,8 +859,8 @@ _ALERT_DEFINITIONS_RAW: List[Dict[str, Any]] = [
     {"key":"vwap_down","title":"🟣▼ VWAP Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_wick",False) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
     {"key":"cloud_cross_up","title":"☁️🟢 Ichimoku Cloud Up Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Upper {ctx.get('cloud_upper_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"cloud_cross_down","title":"☁️🔴 Ichimoku Cloud Down Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Lower {ctx.get('cloud_lower_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"ob_reversal_buy","title":"🟢🏛️ Order Block Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and ctx.get("ob_gate_ok_buy",False) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Demand OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}","requires":[]},
-    {"key":"ob_reversal_sell","title":"🔴🏛 Order Block Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and ctx.get("ob_gate_ok_sell",False) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}","requires":[]},
+    {"key":"ob_reversal_buy","title":"🟢🏛️ Order Block Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:((ctx.get("buy_common_relaxed_wick",False) or ctx.get("buy_early_wick",False)) and ctx.get("ob_gate_ok_buy",False) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Demand OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}","requires":[]},
+    {"key":"ob_reversal_sell","title":"🔴🏛 Order Block Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:((ctx.get("sell_common_relaxed_wick",False) or ctx.get("sell_early_wick",False)) and ctx.get("ob_gate_ok_sell",False) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}","requires":[]},
     {"key":"ppo_zero_up","title":"🟢 PPO cross▲0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_wick",False) and (ppo.get("prev",np.nan)<=0.0) and (ppo.get("curr",np.nan)>0.0) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_alerts"]},
     {"key":"ppo_zero_down","title":"🔴 PPO cross▼0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_wick",False) and (ppo.get("prev",np.nan)>=0.0) and (ppo.get("curr",np.nan)<0.0) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_alerts"]},
     {"key":"ppo_adaptive_up","title":"🟢 PPO cross▲static","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and (ppo.get("prev",np.nan)<=Constants.PPO_CROSS_STATIC) and (ppo.get("curr",np.nan)>Constants.PPO_CROSS_STATIC) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs static {Constants.PPO_CROSS_STATIC:.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_alerts"]},
@@ -1908,6 +1908,15 @@ _PULLBACK_HOST_KEYS = frozenset({
     "ppohist_buy", "ppohist_sell",
 })
 
+# Reversal alerts that may fire EARLY (EARLY_REVERSAL_MODE): structure / price-action triggers.
+# The cross alerts (Dynamic Flow, Gaussian, Cirrus, Momentum) are late by design and are not included.
+_EARLY_REVERSAL_KEYS = frozenset({
+    "strong_reversal_buy", "strong_reversal_sell",
+    "choch_buy", "choch_sell",
+    "fib_reversal_buy", "fib_reversal_sell",
+    "ob_reversal_buy", "ob_reversal_sell",
+})
+
 def _posterior_win_rate_verdict(win_rate: float, sample: int, target: float, curve: Optional[Dict[str, Any]],
                                 cohort_prior: Optional[Tuple[Optional[float], int]] = None,
                                 cohort_name: str = "") -> Optional[Tuple[float, str]]:
@@ -2390,6 +2399,35 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
         buy_common_relaxed_wick = bool(buy_trend_common_relaxed and wick_or_pattern_buy)
         sell_common_relaxed_wick = bool(sell_trend_common_relaxed and wick_or_pattern_sell)
 
+        # EARLY_REVERSAL_MODE: a CONFIRMED pullback-continuation setup (trigger candle closed above the
+        # pullback high) inside a trend whose relaxed gate was ON within the last
+        # EARLY_REVERSAL_TREND_MEMORY_BARS candles lets the reversal alerts fire without waiting for the
+        # clouds / oscillators / Ichimoku to re-align. Only used where the normal relaxed gate is closed.
+        buy_early_ok = sell_early_ok = False
+        if cfg.EARLY_REVERSAL_MODE != "off" and gr.atr_short_arr is not None:
+            try:
+                _er_ppohist = np.asarray(ppo_gate_arr, dtype=float) - np.asarray(ppo_gate_signal_arr, dtype=float)
+                for _er_side, _er_buy, _er_trend, _er_relaxed, _er_rev in (
+                    ("buy", True, gr.early_trend_buy, buy_trend_common_relaxed, reversal_bullish),
+                    ("sell", False, gr.early_trend_sell, sell_trend_common_relaxed, reversal_bearish),
+                ):
+                    if _er_relaxed or not _er_trend:
+                        continue
+                    _er_state, _ = _pullback_continuation_state(
+                        data_15m.open, data_15m.high, data_15m.low, data_15m.close, data_15m.ts,
+                        gr.atr_short_arr, _er_ppohist, smooth_rsi, i15, _er_buy, True, cfg,
+                        reversal_now=bool(_er_rev),
+                    )
+                    if _er_state == "confirmed":
+                        if _er_buy:
+                            buy_early_ok = True
+                        else:
+                            sell_early_ok = True
+            except Exception as _er_err:
+                logger_pair.warning(f"[{pair_name}] early-reversal state failed: {_er_err}", exc_info=cfg.DEBUG_MODE)
+        buy_early_wick = bool(buy_early_ok and wick_or_pattern_buy)
+        sell_early_wick = bool(sell_early_ok and wick_or_pattern_sell)
+
         hist_curr = hist_rma[i15]
         hist_m1 = hist_rma[i15 - 1] if i15 >= 1 else 0.0
         hist_m2 = hist_rma[i15 - 2] if i15 >= 2 else 0.0
@@ -2436,8 +2474,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             ppohist_reversal_sell = (sell_common_wick and ppohist_curr < 0 and ppohist_m3 < ppohist_m2 < ppohist_m1 and ppohist_curr < ppohist_m1)
 
         if cfg.ENABLE_STRONG_REVERSAL_ALERT:
-            strong_reversal_buy = bool(buy_trend_common_relaxed and reversal_bullish and reversal_prior_leg_direction == -1)
-            strong_reversal_sell = bool(sell_trend_common_relaxed and reversal_bearish and reversal_prior_leg_direction == 1)
+            strong_reversal_buy = bool((buy_trend_common_relaxed or buy_early_ok) and reversal_bullish and reversal_prior_leg_direction == -1)
+            strong_reversal_sell = bool((sell_trend_common_relaxed or sell_early_ok) and reversal_bearish and reversal_prior_leg_direction == 1)
         else:
             strong_reversal_buy, strong_reversal_sell = False, False
 
@@ -2451,9 +2489,9 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 choch_reversal_bullish, choch_reversal_bearish, _ = detect_reversal_candle_pattern(data_15m, i15)
             else:
                 choch_reversal_bullish, choch_reversal_bearish = False, False
-         
-            choch_buy = bool(buy_common_relaxed_wick and choch_gate_ok_buy and (ppo_curr < Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi_curr < Constants.RSI_SIGNAL_CROSS_MAX_BUY))
-            choch_sell = bool(sell_common_relaxed_wick and choch_gate_ok_sell and (ppo_curr > Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi_curr > Constants.RSI_SIGNAL_CROSS_MIN_SELL))
+
+            choch_buy = bool((buy_common_relaxed_wick or buy_early_wick) and choch_gate_ok_buy and (ppo_curr < Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi_curr < Constants.RSI_SIGNAL_CROSS_MAX_BUY))
+            choch_sell = bool((sell_common_relaxed_wick or sell_early_wick) and choch_gate_ok_sell and (ppo_curr > Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi_curr > Constants.RSI_SIGNAL_CROSS_MIN_SELL))
         else:
             choch_buy, choch_sell = False, False
 
@@ -2506,7 +2544,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
         fib_reversal_votes_buy = fib_reversal_votes_sell = None
 
         if cfg.ENABLE_FIB_REVERSAL_ALERT:
-            if buy_common_relaxed_wick:
+            if buy_common_relaxed_wick or buy_early_wick:
                 vote_ok_buy, passed_buy, fib_reversal_votes_buy = _fib_reversal_confluence_vote(
                     data_15m.high, data_15m.low, data_15m.close, data_15m.volume, indicators.volume_ema,
                     smooth_rsi, ppo, i15, True, cfg, wick_or_pattern_buy,
@@ -2516,7 +2554,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     passed_names = ", ".join(k for k, v in fib_reversal_votes_buy.items() if v)
                     fib_reversal_reason = f"Fib pivot reversal | {passed_buy}/4 confluence ({passed_names})"
 
-            if sell_common_relaxed_wick:
+            if sell_common_relaxed_wick or sell_early_wick:
                 vote_ok_sell, passed_sell, fib_reversal_votes_sell = _fib_reversal_confluence_vote(
                     data_15m.high, data_15m.low, data_15m.close, data_15m.volume, indicators.volume_ema,
                     smooth_rsi, ppo, i15, False, cfg, wick_or_pattern_sell,
@@ -2584,6 +2622,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "buy_common": buy_common, "sell_common": sell_common,
             "buy_trend_common": buy_trend_common, "sell_trend_common": sell_trend_common,
             "buy_trend_common_relaxed": buy_trend_common_relaxed, "sell_trend_common_relaxed": sell_trend_common_relaxed,
+            "buy_early_ok": buy_early_ok, "sell_early_ok": sell_early_ok,
+            "buy_early_wick": buy_early_wick, "sell_early_wick": sell_early_wick,
             "wick_or_pattern_buy": wick_or_pattern_buy, "wick_or_pattern_sell": wick_or_pattern_sell,
             "buy_common_wick": buy_common_wick, "sell_common_wick": sell_common_wick,
             "buy_common_relaxed_wick": buy_common_relaxed_wick, "sell_common_relaxed_wick": sell_common_relaxed_wick,
@@ -2886,8 +2926,21 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                             )
                         continue
 
+                if alert_key in _EARLY_REVERSAL_KEYS:
+                    _er_s = "buy" if alert_key in BUY_ALERT_KEYS else "sell"
+                    _er_open = context.get("buy_trend_common_relaxed" if _er_s == "buy" else "sell_trend_common_relaxed")
+                    if context.get(f"{_er_s}_early_ok") and not _er_open and cfg.EARLY_REVERSAL_MODE == "shadow":
+                        # Fired only because of the early path and the mode is shadow: never sent,
+                        # shadow-tracked at dispatch as "early_reversal" so its outcomes can be measured.
+                        if not _brain_disabled:
+                            context.setdefault("early_reversal_hits", []).append(
+                                (def_.title, extra, def_.key)
+                            )
+                        continue
+
                 if exhaustion_vetoes(context, alert_key):
                     _ex_side = "buy" if alert_key in BUY_ALERT_KEYS else "sell"
+
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: late-trend exhaustion "
                                           f"{(context.get(f'exhaustion_info_{_ex_side}') or {}).get('reasons')}")
@@ -3073,6 +3126,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     _pb_hits = context.pop("pullback_unconfirmed_hits", None) or []
     _tl_hits = context.pop("trendline_shadow_hits", None) or []
     _ex_hits = context.pop("exhaustion_veto_hits", None) or []
+    _er_hits = context.pop("early_reversal_hits", None) or []
 
     async def _persist_resets_when_blocked() -> None:
         """ACTIVE->INACTIVE resets are edge-triggered (they fire only on the
@@ -3215,6 +3269,16 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             capped_alerts = raw_alerts
 
         alerts_to_send = capped_alerts[:cfg.MAX_ALERTS_PER_PAIR]
+        if _er_hits:
+            # Early-reversal candidates are recorded with their confluence score but NOT filtered by
+            # it, so the Brain can show which score level (if any) separates winners from losers.
+            await _record_counterfactual_block(
+                sdb, pair_name, _er_hits[:cfg.MAX_ALERTS_PER_PAIR], ts_curr, close_curr,
+                block_reason="early_reversal",
+                confluence_scores={ak: _confluence_for(ak) for _, _, ak in _er_hits},
+                gr=gr, context=context,
+                logger_pair=logger_pair,
+            )
         if _disabled_hits or _pb_hits or _tl_hits or _ex_hits:
             _dis_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
             if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):

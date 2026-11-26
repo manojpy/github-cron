@@ -191,10 +191,18 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT
          or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT
          or cfg.ENABLE_TRENDLINE_ALERTS)
-        and (gr.buy_trend_common_relaxed or gr.sell_trend_common_relaxed)
+        and (gr.buy_trend_common_relaxed or gr.sell_trend_common_relaxed
+             or gr.early_trend_buy or gr.early_trend_sell)
     )
     gate_passed = gr.buy_common or gr.sell_common or reversal_eligible
     buy_side = gr.buy_common or gr.buy_trend_common or gr.buy_trend_common_relaxed
+    # EARLY_REVERSAL_MODE: pair is only here because of the early path (no normal gate is open).
+    # Both early sides true is ambiguous (cannot happen for a green/red candle): no early handling then.
+    _early_pair_only = bool(
+        cfg.EARLY_REVERSAL_MODE != "off"
+        and not (gr.buy_common or gr.sell_common or gr.buy_trend_common_relaxed or gr.sell_trend_common_relaxed)
+        and (gr.early_trend_buy != gr.early_trend_sell)
+    )
 
     confluence_score_buy: Optional[float] = None
     confluence_total_buy: Optional[float] = None
@@ -209,6 +217,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         confluence_score_buy, confluence_total_buy, confluence_votes_buy = score_buy, total_buy, votes_buy
         confluence_score_sell, confluence_total_sell, confluence_votes_sell = score_sell, total_sell, votes_sell
 
+        if _early_pair_only:
+            buy_side = bool(gr.early_trend_buy)
         score, total = (score_buy, total_buy) if buy_side else (score_sell, total_sell)
         abs_floor = cfg.CONFLUENCE_MIN_ABS_SCORE
         if getattr(cfg, "ENABLE_PAIR_THRESHOLDS", False):
@@ -220,7 +230,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                 abs_floor = pair_floor
         pct_floor = total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
         required = max(pct_floor, abs_floor)
-        if score < required:
+        # Shadow early-reversal pairs must reach alert evaluation even below the confluence floor,
+        # so the Brain records what those trades would have done (nothing is sent in shadow mode).
+        if score < required and not (_early_pair_only and cfg.EARLY_REVERSAL_MODE == "shadow"):
 
             logger_pair.debug(
                 f"[{pair_name}] Confluence gate blocked: {score:.1f}/{total:.1f} weighted score "

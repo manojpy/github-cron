@@ -184,6 +184,9 @@ class GateResult:
     choch_poi_tap_buy: bool = False
     choch_poi_tap_sell: bool = False
     atr_short_arr: Optional[np.ndarray] = None
+    # -- EARLY_REVERSAL_MODE: relaxed trend gate was ON within EARLY_REVERSAL_TREND_MEMORY_BARS candles --
+    early_trend_buy: bool = False
+    early_trend_sell: bool = False
 
     # -- Auto Trendline events (tl_break / tl_bounce / tl_retest, buy & sell) --
     tl_events: Optional[Dict[str, bool]] = None
@@ -255,6 +258,82 @@ def _cloud_group_decision(cirrus_ok: Optional[bool], gaussian_ok: Optional[bool]
     if Constants.CLOUD_GROUP_GAUSSIAN_VETO and cfg.GAUSSIAN_TREND_ENABLED and gaussian_ok is not True:
         return False
     return sum(1 for v in enabled if v is True) >= need
+
+def _relaxed_trend_memory(gi: Dict[str, Any], d15: Any, d5: Any, i15: int, is_buy: bool, bars: int) -> bool:
+    """True when the RELAXED trend gate (base trend + cloud group + oscillator group +
+    Ichimoku common filter) held on at least one of the last `bars` closed 15m candles up to
+    and including i15. The live relaxed flag also requires effective_cpr_ok; CPR is a daily
+    level that is not rebuilt for past candles, so this helper is deliberately slightly LOOSER:
+    live relaxed True implies this helper True (checked at runtime in evaluate_gate).
+    Used by EARLY_REVERSAL_MODE to tell "pullback inside a trend" from "no trend".
+    A candle whose 5m partner is missing is skipped."""
+    ts15, ts5 = normalize_timestamp_array(d15.ts), normalize_timestamp_array(d5.ts)
+    lo = max(0, i15 - int(bars) + 1)
+    for k in range(i15, lo - 1, -1):
+        want = int(ts15[k]) + 600
+        i5k = int(np.searchsorted(ts5, want))
+        if i5k >= len(ts5) or int(ts5[i5k]) != want:
+            continue
+        c15, c5 = float(d15.close[k]), float(d5.close[i5k])
+        r50, r200 = float(gi["rma50_15"][k]), float(gi["rma200_5"][i5k])
+        if not (np.isfinite(c15) and np.isfinite(c5) and np.isfinite(r50) and np.isfinite(r200)):
+            continue
+        if is_buy:
+            if not (r50 < c15 and r200 < c5):
+                continue
+        elif not (r50 > c15 and r200 > c5):
+            continue
+        # clouds (None = disabled / not ready = does not agree)
+        cirrus = rma = flow = gauss = None
+        if cfg.CIRRUS_CLOUD_ENABLED and bool(gi["cirrus_valid_5m"][i5k]):
+            cirrus = bool(gi["cirrus_trend_up_5m"][i5k] if is_buy else gi["cirrus_trend_dn_5m"][i5k])
+        if cfg.RMA_CLOUD_ENABLED:
+            f, sl = float(gi["rma_cloud_fast_5m"][i5k]), float(gi["rma_cloud_slow_5m"][i5k])
+            if np.isfinite(f) and np.isfinite(sl):
+                rma = bool(f > sl) if is_buy else bool(f < sl)
+        if cfg.DYNAMIC_FLOW_RIBBON_ENABLED:
+            fv = gi["dynamic_flow_trend_15"][k]
+            if not np.isnan(fv):
+                flow = bool(np.isclose(fv, -1.0 if is_buy else 1.0, atol=1e-9))
+        if cfg.GAUSSIAN_TREND_ENABLED and bool(gi["gaussian_valid_15"][k]):
+            gauss = bool(gi["gaussian_trend_dir_15"][k] == (1 if is_buy else -1))
+        if not _cloud_group_decision(cirrus, gauss, flow, rma):
+            continue
+        # oscillator group
+        osc = []
+        if cfg.ENABLE_PPO_GATE:
+            a, b = float(gi["ppo_gate"][k]), float(gi["ppo_gate_signal"][k])
+            if np.isfinite(a) and np.isfinite(b):
+                osc.append(a > b if is_buy else a < b)
+        if cfg.RSI_GUARD_ENABLED:
+            a, b = float(gi["rsi_guard_smooth"][k]), float(gi["rsi_guard_ema"][k])
+            if np.isfinite(a) and np.isfinite(b):
+                osc.append(a > b if is_buy else a < b)
+        if cfg.MOMENTUM_OSCILLATOR_ENABLED:
+            m = float(gi["momentum_osc"][k])
+            if np.isfinite(m):
+                osc.append(m > 0.0 if is_buy else m < 0.0)
+        if osc:
+            osc_ok = sum(osc) >= min(Constants.OSCILLATOR_GROUP_MIN_VOTES, len(osc))
+        else:
+            osc_ok = not (cfg.ENABLE_PPO_GATE or cfg.RSI_GUARD_ENABLED or cfg.MOMENTUM_OSCILLATOR_ENABLED)
+        if not osc_ok:
+            continue
+        # Ichimoku common filter
+        if cfg.ENABLE_ICHIMOKU_COMMON_FILTER and cfg.ICHIMOKU_CLOUD_ENABLED:
+            cu, cl = float(gi["ichimoku_cloud_upper"][k]), float(gi["ichimoku_cloud_lower"][k])
+            if not (np.isfinite(cu) and np.isfinite(cl)):
+                continue
+            fg = gi.get("ichimoku_future_green" if is_buy else "ichimoku_future_red")
+            if fg is None or k >= len(fg):
+                continue
+            if is_buy:
+                if not (c15 > cu and bool(fg[k])):
+                    continue
+            elif not (c15 < cl and bool(fg[k])):
+                continue
+        return True
+    return False
 
 def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, float, Dict[str, bool]]:
     weights = CONFLUENCE_WEIGHTS 
@@ -1218,13 +1297,33 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             "ichimoku_ok_buy": bool(ichimoku_filter_ok_buy), "ichimoku_ok_sell": bool(ichimoku_filter_ok_sell),
             "cpr_ok": bool(effective_cpr_ok),
         }
+        early_trend_buy = early_trend_sell = False
+        if cfg.EARLY_REVERSAL_MODE != "off":
+            _mem = int(cfg.EARLY_REVERSAL_TREND_MEMORY_BARS)
+            # Cheap pre-checks first. The trigger candle of a confirmed pullback closes green (buy) / red
+            # (sell), so the two sides can never both be true. If the OPPOSITE relaxed trend is fully on
+            # right now the trend has flipped, which is not a pullback, so the memory is void.
+            early_trend_buy = bool(is_green) and not sell_trend_common_relaxed and (
+                bool(buy_trend_common_relaxed) or _relaxed_trend_memory(
+                    gate_indicators, data_15m, data_5m, i15, True, _mem))
+            early_trend_sell = bool(is_red) and not buy_trend_common_relaxed and (
+                bool(sell_trend_common_relaxed) or _relaxed_trend_memory(
+                    gate_indicators, data_15m, data_5m, i15, False, _mem))
+            # Drift guard: the helper is a looser copy of the live gate, so live relaxed True must
+            # imply helper True. A violation means the live gate changed and the helper is stale.
+            for _dg_flag, _dg_buy in ((buy_trend_common_relaxed, True), (sell_trend_common_relaxed, False)):
+                if _dg_flag and not _relaxed_trend_memory(
+                        gate_indicators, data_15m, data_5m, i15, _dg_buy, 1):
+                    logger_pair.warning(
+                        f"[{pair_name}] early-reversal helper out of sync with the live relaxed "
+                        f"{'buy' if _dg_buy else 'sell'} gate (helper stale or 5m partner missing)")
         reversal_candidate = (
             (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT
              or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT
              or cfg.ENABLE_MOMENTUM_CROSS_ALERT or cfg.ENABLE_GAUSSIAN_CROSS_ALERT
              or cfg.ENABLE_CIRRUS_CROSS_ALERT
              or cfg.ENABLE_TRENDLINE_ALERTS)
-            and (buy_trend_common_relaxed or sell_trend_common_relaxed)
+            and (buy_trend_common_relaxed or sell_trend_common_relaxed or early_trend_buy or early_trend_sell)
         )
         if not buy_common and not sell_common and not reversal_candidate:
             await _blanket_reset_pair(sdb, pair_name, logger_pair)
@@ -1390,6 +1489,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
             buy_trend_common=buy_trend_common, sell_trend_common=sell_trend_common,
             buy_trend_common_relaxed=buy_trend_common_relaxed, sell_trend_common_relaxed=sell_trend_common_relaxed,
             data_15m=data_15m, close_prev_invalid=close_prev_invalid,
+            early_trend_buy=early_trend_buy, early_trend_sell=early_trend_sell,
             oi_funding_ok_buy=oi_funding_ok_buy, oi_funding_ok_sell=oi_funding_ok_sell,
             oi_funding_reason=oi_funding_reason,
             ob_gate_ok_buy=ob_gate_ok_buy, ob_gate_ok_sell=ob_gate_ok_sell,
