@@ -49,6 +49,7 @@ from alerts import (
     TelegramQueue, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
     DEDUP_STATS, reset_dedup_stats, DLQ_STATS, reset_dlq_stats, replay_telegram_dlq, format_dedup_summary,
     send_trade_close_notices, _record_counterfactual_block, send_pullback_watch, flush_pullback_watch,
+    send_shadow_alert_notice,
 )
 from alert_registry import ALERT_KEYS, BUY_ALERT_KEYS, keys_for, is_elliott_key
 from elliott_alerts import run_elliott_scan
@@ -1631,6 +1632,21 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         except Exception as e:
             logger_main.warning(f"Open trades notice failed (non-fatal): {e}")
 
+    # ── Shadowed alerts notice ──
+    # Informational only. Deliberately NOT part of any_notification_sent above, so it
+    # never suppresses the Open Trades notice. After the Elliott scan, the last place
+    # a shadow trade can be registered.
+    if cfg.ENABLE_SHADOW_ALERT_NOTICE:
+        try:
+            _shadow_announced = await send_shadow_alert_notice(
+                state_db, telegram_queue, bias_context, logger_main,
+                candle_ts=(int(reference_time) // 900) * 900 - 900,
+            )
+            if _shadow_announced:
+                logger_main.info(f"👁 Shadowed alerts notice sent for {_shadow_announced} alert(s)")
+        except Exception as e:
+            logger_main.warning(f"Shadowed alerts notice failed (non-fatal): {e}")
+
     # All-time Recorded / Shadowed totals (from beginning of data collection).
     # Always log on every run so operators see the current win-rate snapshot
     # even when no trade resolved this cycle.
@@ -2455,7 +2471,7 @@ if __name__ == "__main__":
     if not aot_bridge.is_using_aot():
         reason = aot_bridge.get_fallback_reason() or "Unknown"
         logger.warning("❌ AOT not available, using JIT fallback. Reason: %s", reason)
-        logger.warning("⚠ Performance may be degraded. First run may be slow.")
+        logger.warning("��� Performance may be degraded. First run may be slow.")
 
         if os.getenv("REQUIRE_AOT", "false").lower() == "true":
             logger.critical("❌ REQUIRE_AOT=true but AOT unavailable - exiting")

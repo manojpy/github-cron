@@ -507,6 +507,9 @@ class RedisStateStore:
         self._dlq_empty_at_start: bool = False
         self._dlq_pushed_this_run: bool = False
         self.trade_close_events: List[Dict[str, Any]] = []
+        # Shadow trades registered THIS run, for the optional "Shadowed alerts" Telegram notice
+        # (ENABLE_SHADOW_ALERT_NOTICE). Filled only while that switch is on; cleared once sent.
+        self.shadow_notice_events: List[Dict[str, Any]] = []
         self._close_event_ids: Set[Tuple[str, str, str, int]] = set()
         self._run_resolved_total: int = 0
         self._run_archived_total: int = 0
@@ -2002,7 +2005,27 @@ class RedisStateStore:
                 except Exception as e:
                     logger.debug(f"[{pair}] replaced shadow not kept as candidate: {e}")
                 await asyncio.wait_for(_rc(self._redis).delete(replace_key), timeout=2.0)
+
             self._shadow_registered_this_run[pair] = (int(entry_ts), ratio, key)
+            if getattr(cfg, "ENABLE_SHADOW_ALERT_NOTICE", False):
+                try:
+                    _nctx = context or {}
+                    if replace_key is not None:
+                        # A stronger same-candle key took over: drop the weaker key's line.
+                        _old_ak = replace_key.split(":")[-2]
+                        self.shadow_notice_events = [
+                            e for e in self.shadow_notice_events
+                            if not (e["pair"] == pair and e["alert_key"] == _old_ak
+                                    and e["entry_ts"] == int(entry_ts))
+                        ]
+                    self.shadow_notice_events.append({
+                        "pair": pair, "alert_key": alert_key, "direction": direction,
+                        "entry_ts": int(entry_ts), "entry_price": float(entry_price),
+                        "score": confluence_score, "total": confluence_total,
+                        "reason": str(_nctx.get("rejection_reason") or _nctx.get("elliott_disposition") or ""),
+                    })
+                except Exception as _ne:
+                    logger.debug(f"[{pair}] shadow notice event not kept: {_ne}")
             logger.info(
                 f"[{pair}] Shadow pending created: {alert_key} @ {entry_ts} → {key}"
                 + (" (live cooldown active)" if cooldown_active else "")

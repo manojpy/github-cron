@@ -873,8 +873,8 @@ _ALERT_DEFINITIONS_RAW: List[Dict[str, Any]] = [
     {"key":"ppohist_sell","title":"🔴🔥 PPO Rev SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and ctx.get("ppohist_reversal_sell",False) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppohist"]},
     {"key":"tk_conversion_up","title":"🌐🟢 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"tk_conversion_down","title":"🌐🔴 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"kijun_cross_up","title":"⚓🟢 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common_wick",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"kijun_cross_down","title":"⚓🔴 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common_wick",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"kijun_cross_up","title":"⚓🟢 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common_relaxed_wick",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"kijun_cross_down","title":"⚓🔴 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common_relaxed_wick",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"strong_reversal_buy","title":"🟢🔄 Strong Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and ctx.get("strong_reversal_buy",False) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<Constants.RSI_SIGNAL_CROSS_MAX_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed","requires":["strong_reversal"]},
     {"key":"strong_reversal_sell","title":"🔴🔄 Strong Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and ctx.get("strong_reversal_sell",False) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>Constants.RSI_SIGNAL_CROSS_MIN_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed","requires":["strong_reversal"]},
     {"key":"choch_buy","title":"🟢🔀 CHoCH BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("choch_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('choch_reason') or 'Bullish change of character'}","requires":["choch"]},
@@ -895,8 +895,8 @@ _ALERT_DEFINITIONS_RAW: List[Dict[str, Any]] = [
     {"key":"gaussian_cross_sell","title":"〰️🔴 Gaussian Cross SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("gaussian_cross_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('gaussian_cross_reason') or 'Price lost Gaussian line'}","requires":["gaussian_cross"]},
     {"key":"cirrus_cross_buy","title":"☁️🟢 Cirrus Cross BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("cirrus_cross_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('cirrus_cross_reason') or 'Close crossed above the top Cirrus line'}","requires":["cirrus_cross"]},
     {"key":"cirrus_cross_sell","title":"☁️🔴 Cirrus Cross SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("cirrus_cross_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('cirrus_cross_reason') or 'Close crossed below the bottom Cirrus line'}","requires":["cirrus_cross"]},
-    {"key":"equilibrium_cross_up","title":"⚖️🟢 Equilibrium Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_wick",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Equilibrium {ctx.get('equilibrium_curr',0) or 0:.2f} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"equilibrium_cross_down","title":"⚖️🔴 Equilibrium Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_wick",False) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Equilibrium {ctx.get('equilibrium_curr',0) or 0:.2f} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"equilibrium_cross_up","title":"⚖️🟢 Equilibrium Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common_relaxed_wick",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Equilibrium {ctx.get('equilibrium_curr',0) or 0:.2f} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"equilibrium_cross_down","title":"⚖️🔴 Equilibrium Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common_relaxed_wick",False) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Equilibrium {ctx.get('equilibrium_curr',0) or 0:.2f} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
 ]
 
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
@@ -1539,6 +1539,101 @@ async def send_open_trades_notice(
 
     logger_run.error("Open trades notice was not delivered (Telegram send failed)")
     return 0
+
+_SHADOW_REASON_TEXT = {
+    "win_rate_filter": "win-rate filter",
+    "verdict_firewall": "verdict firewall",
+    "run_cap": "run cap",
+    "playbook_veto": "playbook veto",
+    "hypothesis_veto": "hypothesis veto",
+    "brain_disabled": "alert disabled by Brain",
+    "trendline_shadow": "trendline (shadow mode)",
+    "early_reversal": "early reversal (shadow mode)",
+    "exhaustion_veto": "late-trend exhaustion",
+    "confluence_gate": "confluence gate",
+}
+
+async def send_shadow_alert_notice(
+    sdb: RedisStateStore,
+    telegram_queue: TelegramQueue,
+    bias_context: Optional[BiasContext],
+    logger_run: logging.Logger,
+    candle_ts: Optional[int] = None,
+) -> int:
+    """One informational Telegram message listing the alerts that were shadow-tracked
+    (not sent as trade alerts) in this run. Never changes what is sent or recorded.
+    Returns the number of alerts listed. A failed send is not retried: the shadow
+    trades themselves are already stored, this message only lets you see them."""
+    events = list(getattr(sdb, "shadow_notice_events", None) or [])
+    if hasattr(sdb, "shadow_notice_events"):
+        sdb.shadow_notice_events.clear()
+    if not events or not getattr(cfg, "ENABLE_SHADOW_ALERT_NOTICE", False):
+        return 0
+
+    # One line per (pair, alert key, candle).
+    _seen: set = set()
+    uniq: List[Dict[str, Any]] = []
+    for e in events:
+        k = (e["pair"], e["alert_key"], e["entry_ts"])
+        if k in _seen:
+            continue
+        _seen.add(k)
+        uniq.append(e)
+
+    dominant_sell = bias_context is not None and bias_context.down_pct > bias_context.up_pct
+
+    def _is_sell(e: Dict[str, Any]) -> bool:
+        return e["direction"] in ("sell", "short")
+
+    def _ratio(e: Dict[str, Any]) -> float:
+        tot = e.get("total") or 0.0
+        sc = e.get("score")
+        return float(sc) / float(tot) if sc is not None and tot > 0 else -1.0
+
+    # Dominant bias side first, then strongest confluence first.
+    uniq.sort(key=lambda e: (0 if _is_sell(e) == dominant_sell else 1, -_ratio(e), e["pair"]))
+
+    max_rows = int(getattr(cfg, "SHADOW_ALERT_NOTICE_MAX", 10))
+    shown = uniq[:max_rows] if max_rows > 0 else uniq
+
+    lines = ["👁 Shadowed alerts (not sent as trade alerts)"]
+    for e in shown:
+        side = "SELL" if _is_sell(e) else "BUY"
+        icon = "🔴" if side == "SELL" else "🟢"
+        price = e["entry_price"]
+        if price >= 1000:
+            price_str = f"${price:.0f}"
+        elif price >= 1:
+            price_str = f"${price:.2f}"
+        else:
+            price_str = f"${price:.4f}"
+        _tot = e.get("total") or 0.0
+        score_str = _fmt_score(e.get("score"), _tot) if _tot > 0 else ""
+        raw = str(e.get("reason") or "")
+        why = _SHADOW_REASON_TEXT.get(raw) or raw.replace("rejected:", "rejected - ").replace("_", " ") or "shadow-tracked"
+        src_str = " · Elliott" if is_elliott_key(str(e["alert_key"])) else ""
+        lines.append(f"{icon} {e['pair']} — {side} | {price_str}{score_str}")
+        lines.append(f"Why: {why}{src_str} · {format_ist_time(int(e['entry_ts']), '%H:%M')} IST candle")
+        lines.append(DIVIDER)
+    if len(uniq) > len(shown):
+        lines.append(f"… and {len(uniq) - len(shown)} more")
+
+    footer_ts = int(candle_ts) if candle_ts else (int(time.time()) // 900) * 900 - 900
+    lines.append(f"📆  {format_ist_time(footer_ts, '%d-%m-%Y')}                        ⏰ {format_ist_time(footer_ts, '%H:%M IST')}")
+
+    text = "\n".join(lines)
+    if cfg.DRY_RUN_MODE:
+        logger_run.info(f"[DRY RUN] Would send shadowed alerts notice:\n{text}")
+        return len(shown)
+    try:
+        ok = await telegram_queue.send(escape_markdown_v2(text))
+    except Exception as exc:
+        logger_run.error(f"Shadowed alerts notice failed to send: {exc}")
+        return 0
+    if not ok:
+        logger_run.error("Shadowed alerts notice was not delivered (Telegram send failed)")
+        return 0
+    return len(shown)
 
 async def dispatch_combined_alerts(payloads: List[AlertPayload], telegram_queue: TelegramQueue, bias_context: Optional[BiasContext], sdb: RedisStateStore, alerts_sent_ref: List[int], alerts_sent_lock: asyncio.Lock, max_alerts_per_run: int, logger_run: logging.Logger) -> int:
     """Assemble payloads into one (or split) combined message(s), send, and

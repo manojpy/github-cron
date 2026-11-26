@@ -612,7 +612,14 @@ async def _record_shadow_batch(sdb: RedisStateStore,
             if book is not None:
                 book[p] = (ts, ratio, key)
             stats["shadowed"] += 1
+            if getattr(cfg, "ENABLE_SHADOW_ALERT_NOTICE", False) and hasattr(sdb, "shadow_notice_events"):
+                sdb.shadow_notice_events.append({
+                    "pair": pair, "alert_key": alert_key_of(s), "direction": s.direction,
+                    "entry_ts": ts, "entry_price": float(s.entry_price),
+                    "score": float(s.score), "total": 100.0, "reason": str(disp),
+                })
             log.info(f"[{pair}] Shadow pending created: {alert_key_of(s)} @ {ts} → {key}")
+
         # Compare by structure_id, never by tuple equality: WaveSetup.__eq__ can
         # raise on array-bearing fields, and identity is not what we mean here.
         mirrored_ids = {s.structure_id for _, s, _ in mirror}
