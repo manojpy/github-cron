@@ -7,7 +7,7 @@
   
   "BOT_NAME": "Unified Alert Bot",
   "DEBUG_MODE": false,
-  "SEND_TEST_MESSAGE": true,
+  "SEND_TEST_MESSAGE": false,
   "DRY_RUN_MODE": false,
   "LOG_LEVEL": "INFO",
 
