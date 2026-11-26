@@ -230,9 +230,9 @@ class BiasContext:
 class CompiledPatterns:
     VALID_SYMBOL = re.compile(r'^[A-Z0-9_]+$')
     ESCAPE_MARKDOWN = re.compile(r'[_*\[\]()~`>#+\-=|{}.!]') 
-    SECRET_TOKEN = re.compile(r'\b\d{6,}:[A-Za-z0-9_-]{20,}\b')
+    SECRET_TOKEN = re.compile(r'\d{6,}:[A-Za-z0-9_-]{20,}')
     CHAT_ID = re.compile(r'chat_id=\d+')
-    REDIS_CREDS = re.compile(r'(redis://[^@]+@)')
+    REDIS_CREDS = re.compile(r'(rediss?://)[^@\s]+@')
 
 TRACE_ID: ContextVar[str] = ContextVar("trace_id", default="")
 
@@ -252,7 +252,7 @@ class SafeFormatter(logging.Formatter):
     
         text = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED_TOKEN]", text)
         text = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", text)
-        text = CompiledPatterns.REDIS_CREDS.sub("redis://[REDACTED]", text)
+        text = CompiledPatterns.REDIS_CREDS.sub(r"\1[REDACTED]@", text)
         return text
     
     def format(self, record: logging.LogRecord) -> str:
