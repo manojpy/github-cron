@@ -1098,6 +1098,108 @@ def momentum_oscillator_core(double[:] high, double[:] low, double[:] close, int
     return out_vf_np
 
 # ══════════════════════════════════════════════════════════════════════
+# auto_trendline_loop — Auto Trendline [DojiEmoji], Pine-exact twin of the Numba kernel
+#   y_up, y_dn, cross_upper, cross_lower, up_class, dn_class
+# ══════════════════════════════════════════════════════════════════════
+def auto_trendline_loop(double[:] high, double[:] low, double[:] close, int fractal_period):
+    cdef int T = close.shape[0]
+    cdef int n = fractal_period
+    cdef np.ndarray y_up_np = np.full(T, np.nan, dtype=np.float64)
+    cdef np.ndarray y_dn_np = np.full(T, np.nan, dtype=np.float64)
+    cdef np.ndarray cu_np = np.zeros(T, dtype=np.float64)
+    cdef np.ndarray cl_np = np.zeros(T, dtype=np.float64)
+    cdef np.ndarray uc_np = np.zeros(T, dtype=np.float64)
+    cdef np.ndarray dc_np = np.zeros(T, dtype=np.float64)
+    cdef double[:] y_up = y_up_np
+    cdef double[:] y_dn = y_dn_np
+    cdef double[:] cross_upper = cu_np
+    cdef double[:] cross_lower = cl_np
+    cdef double[:] up_class = uc_np
+    cdef double[:] dn_class = dc_np
+    cdef double up1 = np.nan, up2 = np.nan, dn1 = np.nan, dn2 = np.nan
+    cdef int iu1 = -1, iu2 = -1, id1 = -1, id2 = -1
+    cdef int t, k, j
+    cdef double hk, lk, hj, lj, m, c0, c1, yu0, yu1, yd0, yd1
+    cdef bint is_hi, is_lo
+
+    if n < 2 or T < 2 * n + 2:
+        return y_up_np, y_dn_np, cu_np, cl_np, uc_np, dc_np
+
+    for t in range(T):
+        k = t - n - 1
+        if k >= n:
+            hk = high[k]
+            lk = low[k]
+            is_hi = not isnan(hk)
+            is_lo = not isnan(lk)
+            for j in range(k - n, k + n + 1):
+                if j == k:
+                    continue
+                hj = high[j]
+                lj = low[j]
+                if is_hi and (isnan(hj) or not (hk > hj)):
+                    is_hi = False
+                if is_lo and (isnan(lj) or not (lk < lj)):
+                    is_lo = False
+                if (not is_hi) and (not is_lo):
+                    break
+            if is_lo:
+                dn2 = dn1
+                id2 = id1
+                dn1 = lk
+                id1 = k
+                if id2 >= 0:
+                    if dn1 > dn2:
+                        dn_class[t] = 1.0
+                    elif dn1 < dn2:
+                        dn_class[t] = -1.0
+                    else:
+                        dn_class[t] = 2.0
+                else:
+                    dn_class[t] = 2.0
+            if is_hi:
+                up2 = up1
+                iu2 = iu1
+                up1 = hk
+                iu1 = k
+                if iu2 >= 0:
+                    if up1 > up2:
+                        up_class[t] = 1.0
+                    elif up1 < up2:
+                        up_class[t] = -1.0
+                    else:
+                        up_class[t] = 2.0
+                else:
+                    up_class[t] = 2.0
+
+        if iu2 >= 0 and iu1 != iu2:
+            m = (up2 - up1) / (iu2 - iu1)
+            y_up[t] = (m * t) + up1 - (m * iu1)
+        if id2 >= 0 and id1 != id2:
+            m = (dn2 - dn1) / (id2 - id1)
+            y_dn[t] = (m * t) + dn1 - (m * id1)
+
+        if t >= 1:
+            c0 = close[t]
+            c1 = close[t - 1]
+            yu0 = y_up[t]
+            yu1 = y_up[t - 1]
+            if not (isnan(yu0) or isnan(yu1) or isnan(c0) or isnan(c1)):
+                if c0 > yu0 and c1 <= yu1:
+                    cross_upper[t] = 1.0
+                elif c0 < yu0 and c1 >= yu1:
+                    cross_upper[t] = -1.0
+            yd0 = y_dn[t]
+            yd1 = y_dn[t - 1]
+            if not (isnan(yd0) or isnan(yd1) or isnan(c0) or isnan(c1)):
+                if c0 > yd0 and c1 <= yd1:
+                    cross_lower[t] = 1.0
+                elif c0 < yd0 and c1 >= yd1:
+                    cross_lower[t] = -1.0
+
+    return y_up_np, y_dn_np, cu_np, cl_np, uc_np, dc_np
+
+# ══════════════════════════════════════════════════════════════════════
 # EXPORT REGISTRY (replaces Numba EXPORT_CONFIG)
 # ══════════════════════════════════════════════════════════════════════
 EXPORTED_FUNCTION_NAMES = [
@@ -1124,6 +1226,7 @@ EXPORTED_FUNCTION_NAMES = [
     "wma_loop",
     "hma_loop",
     "momentum_oscillator_core",
+    "auto_trendline_loop",
 ]
 
 from aot_meta import (  # noqa: E402
