@@ -5,7 +5,7 @@ import logging
 import statistics
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 from bot_config import cfg, json_dumps, json_loads, CONFLUENCE_WEIGHTS
 from state import _rc
 import threshold_engine as engine
@@ -1184,13 +1184,17 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
     # labels. Counts only; nothing here changes a decision. ──
     _ds: Optional[Dict[str, Any]] = None
     try:
-        _ds, _ds_cache = await self._cached_point_in_time_dataset(
+        _ds_built, _ds_cache = await self._cached_point_in_time_dataset(
             list(real_rows),
             (float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100,
         )
-        ai_metrics["data_foundation"] = {**dataset_coverage(_ds), "cache": _ds_cache}
+        if _ds_built is None:
+            raise RuntimeError("point-in-time dataset builder returned None")
+        _ds = _ds_built
+        ai_metrics["data_foundation"] = {**dataset_coverage(_ds_built), "cache": _ds_cache}
     except Exception as e:
         audit.record_analysis_exception("data_foundation", e)
+
     _bmark("prediction_audits_dataset")
 
     # ── Skipped signals: what the alerts that never became a Recorded trade would have
