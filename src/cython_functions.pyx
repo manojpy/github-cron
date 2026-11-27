@@ -536,9 +536,9 @@ def true_range_numba(double[:] high, double[:] low, double[:] close):
 
     return tr_np
 
-# ══════════════════════════════════════════════════════════════���
+# ════════════════════════════════════════════════════════════
 # 12. calculate_atr_rma
-# ══════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
 
 def calculate_atr_rma(double[:] high, double[:] low, double[:] close, int period):
     cdef int n = close.shape[0]
@@ -808,9 +808,9 @@ def range_filter_loop(double[:] x, double[:] r):
     return out_np
 
 
-# ════════════════════════���═════════════════════════════��═══════════════
+# ════════════════════════════════════════════════════════════════════
 # 18. gaussian_filter_loop — Pine: gaussianFilter(src, length, poleCount)
-# ══════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
 def gaussian_filter_loop(double[:] src, int length, int poles):
     """4-pole cascade Gaussian filter."""
     cdef int n = src.shape[0]
