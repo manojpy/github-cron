@@ -12,15 +12,15 @@ import numpy as np
 import aot_bridge
 
 def _ref_ema_alpha(data: List[float], alpha: float) -> List[float]:
+    """Pine ta.rma: NaN until `period` values exist, the bar `period - 1` is the SMA of
+    the first `period` values, then alpha * x + (1 - alpha) * prev. No back-fill."""
     n = len(data)
-    period = int(1.0 / alpha + 0.5)
-    out: List[float] = [0.0] * n
+    period = max(1, int(1.0 / alpha + 0.5))
+    out: List[float] = [float("nan")] * n
     if n < period:
-        period = n
-    sma_seed = sum(data[:period]) / period
-    for i in range(period):
-        out[i] = sma_seed
-    prev = sma_seed
+        return out
+    prev = sum(data[:period]) / period
+    out[period - 1] = prev
     for i in range(period, n):
         prev = alpha * data[i] + (1.0 - alpha) * prev
         out[i] = prev
