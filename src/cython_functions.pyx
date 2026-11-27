@@ -269,59 +269,46 @@ def ema_loop_pine(double[:] data, double length_float):
 
     return out_np
 
-# ═════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════
 # 6. ema_loop_alpha
-# ═══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════
 def ema_loop_alpha(double[:] data, double alpha):
     cdef int n = data.shape[0]
     cdef np.ndarray out_np = np.full(n, np.nan, dtype=np.float64)
     cdef double[:] out = out_np
-    cdef int first_valid_idx = -1
     cdef int i
-    cdef int period, start_idx
-    cdef double sma_sum, sma_init, prev, curr
-    cdef int valid_count
+    cdef int period, seed_idx = -1, valid_count = 0
+    cdef double sma_sum = 0.0, prev, curr
 
     if alpha <= 0.0 or alpha > 1.0:
         return out_np
 
+    period = <int>(1.0 / alpha + 0.5)
+    if period < 1:
+        period = 1
+
+    # Pine ta.rma seeds with ta.sma(src, period): the FIRST `period` NON-NaN
+    # values (na bars are skipped, not counted), and every bar before that
+    # seed bar stays na. No back-fill.
     for i in range(n):
         if not isnan(data[i]):
-            first_valid_idx = i
-            break
+            sma_sum += data[i]
+            valid_count += 1
+            if valid_count == period:
+                seed_idx = i
+                break
 
-    if first_valid_idx == -1:
+    if seed_idx == -1:
         return out_np
 
-    period = <int>(1.0 / alpha + 0.5)
+    prev = sma_sum / period
+    out[seed_idx] = prev
 
-    if first_valid_idx + period <= n:
-        sma_sum = 0.0
-        valid_count = 0
-        for i in range(first_valid_idx, first_valid_idx + period):
-            if not isnan(data[i]):
-                sma_sum += data[i]
-                valid_count += 1
-        # period >= 1 (guaranteed by alpha guard) and data[first_valid_idx]
-        # is non-NaN, so valid_count >= 1 here. No zero-division possible.
-        sma_init = sma_sum / valid_count
-        for i in range(first_valid_idx, first_valid_idx + period):
-            if not isnan(data[i]):
-                out[i] = sma_init
-        start_idx = first_valid_idx + period
-        prev = sma_init
-    else:
-        out[first_valid_idx] = data[first_valid_idx]
-        start_idx = first_valid_idx + 1
-        prev = data[first_valid_idx]
-
-    for i in range(start_idx, n):
+    for i in range(seed_idx + 1, n):
         curr = data[i]
-        if isnan(curr):
-            out[i] = prev
-        else:
-            out[i] = alpha * curr + (1.0 - alpha) * prev
-        prev = out[i]
+        if not isnan(curr):
+            prev = alpha * curr + (1.0 - alpha) * prev
+        out[i] = prev          # Pine ignores na source values -> carry forward
 
     return out_np
 
@@ -512,6 +499,7 @@ def calculate_rsi_core(double[:] close, int period):
 # ══════════════════════════════════════════════════════════════════════
 # 11. true_range_numba
 # ══════════════════════════════════════════════════════════════════════
+
 def true_range_numba(double[:] high, double[:] low, double[:] close):
     cdef int n = close.shape[0]
     cdef np.ndarray tr_np = np.empty(n, dtype=np.float64)
@@ -521,7 +509,7 @@ def true_range_numba(double[:] high, double[:] low, double[:] close):
 
     if n == 0:
         return np.empty(0, dtype=np.float64)
-        
+
     h = high[0]
     l = low[0]
     if isnan(h) or isnan(l):
@@ -533,22 +521,22 @@ def true_range_numba(double[:] high, double[:] low, double[:] close):
         h = high[i]
         l = low[i]
         c = close[i - 1]
-        
-        # Pine parity: math.max(na, x) == na. Explicitly propagate NaN.
-        if isnan(h) or isnan(l) or isnan(c):
+
+        if isnan(h) or isnan(l):
             tr[i] = np.nan
-            continue
-            
-        tr1 = h - l
-        tr2 = fabs(h - c)
-        tr3 = fabs(l - c)
-        
-        # Safe to use fmax now because NaNs are explicitly filtered out
-        tr[i] = fmax(tr1, fmax(tr2, tr3))
-        
+        elif isnan(c):
+            # Pine ta.tr(true) / ta.atr: na(close[1]) -> high - low
+            tr[i] = h - l
+        else:
+            tr1 = h - l
+            tr2 = fabs(h - c)
+            tr3 = fabs(l - c)
+            # fmax is only safe because NaNs are excluded by the branches above
+            tr[i] = fmax(tr1, fmax(tr2, tr3))
+
     return tr_np
 
-# ═══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════���
 # 12. calculate_atr_rma
 # ══════════════════════════════════════════════════════════════════════
 
@@ -820,7 +808,7 @@ def range_filter_loop(double[:] x, double[:] r):
     return out_np
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ════════════════════════���═════════════════════════════��═══════════════
 # 18. gaussian_filter_loop — Pine: gaussianFilter(src, length, poleCount)
 # ══════════════════════════════════════════════════════════════════════
 def gaussian_filter_loop(double[:] src, int length, int poles):
@@ -874,41 +862,44 @@ def gaussian_filter_loop(double[:] src, int length, int poles):
 # ══════════════════════════════════════════════════════════════════════
 # 19. efficiency_ratio_loop — Pine ER for the Gaussian trend
 # ══════════════════════════════════════════════════════════════════════
+
 def efficiency_ratio_loop(double[:] src, int length):
-    """Pine ER for the Gaussian trend."""
+    """Pine ER: net_move / math.sum(|ta.change(src)|, length).
+    math.sum ignores na and sums the last `length` NON-NaN changes."""
     cdef int n = src.shape[0]
     cdef np.ndarray er_np = np.full(n, np.nan, dtype=np.float64)
     cdef double[:] er = er_np
-    cdef np.ndarray diff_np = np.full(n, np.nan, dtype=np.float64)
-    cdef double[:] diffs = diff_np
+    cdef np.ndarray buf_np = np.zeros(length if length > 0 else 1, dtype=np.float64)
+    cdef double[:] buf = buf_np
     cdef int i
-    cdef double path_sum, net_move
-    cdef int nan_count = 0
+    cdef int filled = 0, pos = 0
+    cdef double path_sum = 0.0, d, net_move
 
     if n == 0 or length < 1:
         return er_np
 
     for i in range(1, n):
         if not isnan(src[i]) and not isnan(src[i - 1]):
-            diffs[i] = fabs(src[i] - src[i - 1])
-
-    path_sum = 0.0
-    for i in range(1, n):
-        if isnan(diffs[i]):
-            nan_count += 1
-        else:
-            path_sum += diffs[i]
-
-        if i - length >= 1:
-            if isnan(diffs[i - length]):
-                nan_count -= 1
+            d = fabs(src[i] - src[i - 1])
+            if filled == length:
+                path_sum -= buf[pos]
+                buf[pos] = d
+                path_sum += d
+                pos = (pos + 1) % length      # non-negative: cdivision-safe
             else:
-                path_sum -= diffs[i - length]
+                buf[filled] = d
+                path_sum += d
+                filled += 1
+                pos = filled % length
 
-        if i >= length and nan_count == 0:
-            if not isnan(src[i]) and not isnan(src[i - length]):
+        if filled == length:
+            if path_sum == 0.0:
+                # Pine ternary tests path_length == 0 FIRST, so this is 0.0
+                # even when net_move is na.
+                er[i] = 0.0
+            elif i >= length and not isnan(src[i]) and not isnan(src[i - length]):
                 net_move = fabs(src[i] - src[i - length])
-                er[i] = 0.0 if path_sum == 0.0 else net_move / path_sum
+                er[i] = net_move / path_sum
 
     return er_np
 

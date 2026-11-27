@@ -485,10 +485,11 @@ def calculate_cirrus_cloud_numpy(close: np.ndarray, x1: int = 22, x2: float = 9.
                                  min_gap_pct: float = 0.0) -> Dict[str, np.ndarray]:
     """Cirrus Cloud — exact port of the Pine indicator (uses close only).
 
-        smoothrngX1(x, t, m) => ta.ema(ta.ema(|x - x[1]|, t), 2t-1) * m
-        filtx1  = rngfiltx1x1(close, smoothrngX1(close, x1, x2))
-        filtx12 = rngfiltx1x1(close, smoothrngX1(close, x3, x4))
-        trend_up = filtx1 < filtx12 ;  trend_dn = filtx1 > filtx12
+    smoothrngX1(x, t, m) => ta.ema(ta.ema(|x - x[1]|, t), 2t-1) * m
+    filtx1  = rngfiltx1x1(close, smoothrngX1(close, x1, x2))
+    filtx12 = rngfiltx1x1(close, smoothrngX1(close, x3, x4))
+    trend_up = filtx1 < filtx12 ;  trend_dn = NOT trend_up (Pine's else branch,
+    so filtx1 == filtx12 is bearish, matching 'trend_up ? bull : bear').
 
     'valid' is True where both filters are finite; trend flags are False
     wherever valid is False, so callers must fail closed on valid == False.
@@ -509,11 +510,17 @@ def calculate_cirrus_cloud_numpy(close: np.ndarray, x1: int = 22, x2: float = 9.
         if min_gap_pct > 0.0:
             with np.errstate(invalid='ignore'):
                 gap_ok = np.abs(filtx1 - filtx12) >= (min_gap_pct / 100.0) * np.abs(c)
+
+        bull = filtx1 < filtx12          # Pine: trend_up = filtx1 < filtx12
+
         return {
             'filtx1': filtx1,
             'filtx12': filtx12,
-            'trend_up': valid & gap_ok & (filtx1 < filtx12),
-            'trend_dn': valid & gap_ok & (filtx1 > filtx12),
+            'trend_up': valid & gap_ok & bull,
+            # Pine paints/uses the complement of trend_up for every bearish
+            # branch, so equality is bearish. NaN comparisons are False, and
+            # `valid` masks warmup/na bars out anyway.
+            'trend_dn': valid & gap_ok & ~bull,
             'valid': valid,
             'smrngx1x': smrngx1x,
             'smrngx1x2': smrngx1x2,
@@ -553,7 +560,6 @@ def calculate_gaussian_trend_numpy(
         n = len(close)
         if n == 0:
             raise ValueError("Empty input array")
-
         if preset == 'Fast Response':
             gaussian_length, gaussian_poles, atr_length = 8, 2, 10
             fixed_multiplier, efficiency_length = 1.2, 7
@@ -562,14 +568,40 @@ def calculate_gaussian_trend_numpy(
             gaussian_length, gaussian_poles, atr_length = 21, 4, 21
             fixed_multiplier, efficiency_length = 2.0, 18
             trend_multiplier, chop_multiplier, efficiency_smooth = 1.0, 3.2, 8
+        elif preset != 'Default':
+            # Pine's input.string only allows the three options; a typo here
+            # would silently run the manual values instead of the preset.
+            logger.warning(
+                "Gaussian Trend: unknown preset %r — using manual inputs", preset
+            )
+
+        # Pine input domain: length minval=2, poles 1..4, atr/smooth >=1,
+        # efficiency minval=2, multipliers minval=0.1. Presets already satisfy
+        # these; the clamps only bite on hand-edited config values.
+        gaussian_length   = max(2, int(gaussian_length))
+        gaussian_poles    = min(4, max(1, int(gaussian_poles)))
+        atr_length        = max(1, int(atr_length))
+        efficiency_length = max(2, int(efficiency_length))
+        efficiency_smooth = max(1, int(efficiency_smooth))
+        fixed_multiplier  = max(0.1, float(fixed_multiplier))
+        trend_multiplier  = max(0.1, float(trend_multiplier))
+        chop_multiplier   = max(0.1, float(chop_multiplier))
 
         h = np.ascontiguousarray(high, dtype=np.float64)
         l = np.ascontiguousarray(low,  dtype=np.float64)
         c = np.ascontiguousarray(close, dtype=np.float64)
         src = c if gaussian_source is None else np.ascontiguousarray(gaussian_source, dtype=np.float64)
 
+        # A source array of a different length would broadcast silently against
+        # the ATR/band arrays. Fail closed instead: the outer try/except turns
+        # this into the all-NaN result dict, so the gate abstains.
+        if len(h) != n or len(l) != n or len(src) != n:
+            raise ValueError(
+                f"Gaussian Trend: length mismatch — close={n}, high={len(h)}, "
+                f"low={len(l)}, source={len(src)}"
+            )
+
         filtered_price = gaussian_filter_loop(src, gaussian_length, gaussian_poles)
-        
         er_raw = efficiency_ratio_loop(src, efficiency_length)
         smoothed_eff = ema_loop_pine(er_raw, float(efficiency_smooth))
         
@@ -987,6 +1019,7 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             )
             results['cirrus_up_15'] = _cirrus_15['trend_up']
             results['cirrus_dn_15'] = _cirrus_15['trend_dn']
+            results['cirrus_valid_15'] = _cirrus_15['valid']
             results['cirrus_top_15'] = np.where(
                 _cirrus_15['valid'], np.maximum(_cirrus_15['filtx1'], _cirrus_15['filtx12']), np.nan)
             results['cirrus_bot_15'] = np.where(
@@ -994,6 +1027,7 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
         else:
             results['cirrus_up_15'] = np.zeros(n_15m, dtype=bool)
             results['cirrus_dn_15'] = np.zeros(n_15m, dtype=bool)
+            results['cirrus_valid_15'] = np.zeros(n_15m, dtype=bool)
             results['cirrus_top_15'] = np.full(n_15m, np.nan, dtype=np.float64)
             results['cirrus_bot_15'] = np.full(n_15m, np.nan, dtype=np.float64)
 

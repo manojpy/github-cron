@@ -243,43 +243,32 @@ def ema_loop_alpha(data, alpha):
     if alpha <= 0.0 or alpha > 1.0:
         return out
 
-    first_valid_idx = -1
+    period = int(1.0 / alpha + 0.5)
+    if period < 1:
+        period = 1
+
+    sma_sum = 0.0
+    valid_count = 0
+    seed_idx = -1
     for i in range(n):
         if not np.isnan(data[i]):
-            first_valid_idx = i
-            break
+            sma_sum += data[i]
+            valid_count += 1
+            if valid_count == period:
+                seed_idx = i
+                break
 
-    if first_valid_idx == -1:
+    if seed_idx == -1:
         return out
 
-    period = int(1.0 / alpha + 0.5)
+    prev = sma_sum / period
+    out[seed_idx] = prev
 
-    # ---- RESTORED ----
-    if first_valid_idx + period <= n:
-        sma_sum = 0.0
-        valid_count = 0
-        for i in range(first_valid_idx, first_valid_idx + period):
-            if not np.isnan(data[i]):
-                sma_sum += data[i]
-                valid_count += 1
-        sma_init = sma_sum / valid_count
-        for i in range(first_valid_idx, first_valid_idx + period):
-            if not np.isnan(data[i]):
-                out[i] = sma_init
-        start_idx = first_valid_idx + period
-        prev = sma_init
-    else:
-        out[first_valid_idx] = data[first_valid_idx]
-        start_idx = first_valid_idx + 1
-        prev = data[first_valid_idx]
-
-    for i in range(start_idx, n):
+    for i in range(seed_idx + 1, n):
         curr = data[i]
-        if np.isnan(curr):
-            out[i] = prev
-        else:
-            out[i] = alpha * curr + (1.0 - alpha) * prev
-        prev = out[i]
+        if not np.isnan(curr):
+            prev = alpha * curr + (1.0 - alpha) * prev
+        out[i] = prev
 
     return out
 
@@ -454,34 +443,31 @@ def true_range_numba(high, low, close):
     n = len(close)
     if n == 0:
         return np.empty(0, dtype=np.float64)
-        
+
     tr = np.empty(n, dtype=np.float64)
-    
-    # Bar 0 has no close[1]
+
+    # Bar 0 has no close[1] -> Pine ta.tr(true) falls back to high - low
     h0, l0 = high[0], low[0]
     if np.isnan(h0) or np.isnan(l0):
         tr[0] = np.nan
     else:
         tr[0] = h0 - l0
-        
+
     for i in range(1, n):
         h = high[i]
         l = low[i]
         c = close[i - 1]
-        
-        # Pine parity: math.max(na, x) == na. Explicitly propagate NaN.
-        if np.isnan(h) or np.isnan(l) or np.isnan(c):
+
+        if np.isnan(h) or np.isnan(l):
+            # math.max(na, x) == na in Pine
             tr[i] = np.nan
-            continue
-            
-        tr1 = h - l
-        tr2 = abs(h - c)
-        tr3 = abs(l - c)
-        
-        # NaNs are filtered above, so standard max() is completely safe 
-        # and won't suffer from backend-specific fmax swallowing.
-        tr[i] = max(tr1, tr2, tr3)
-        
+        elif np.isnan(c):
+            # Pine ta.tr(true): na(close[1]) -> high - low on ANY bar, not just bar 0
+            tr[i] = h - l
+        else:
+            # All three operands are finite: max() ordering cannot matter here
+            tr[i] = max(h - l, abs(h - c), abs(l - c))
+
     return tr
 
 @njit(SIG_ATR_RMA, nogil=True, cache=True)
@@ -741,26 +727,32 @@ def efficiency_ratio_loop(src, length):
     er = np.full(n, np.nan, dtype=np.float64)
     if n == 0 or length < 1:
         return er
-    diffs = np.full(n, np.nan, dtype=np.float64)
+
+    buf = np.zeros(length, dtype=np.float64)
+    filled = 0
+    pos = 0
+    path_sum = 0.0
+
     for i in range(1, n):
         if not np.isnan(src[i]) and not np.isnan(src[i - 1]):
-            diffs[i] = abs(src[i] - src[i - 1])
-    path_sum = 0.0
-    nan_count = 0
-    for i in range(1, n):
-        if np.isnan(diffs[i]):
-            nan_count += 1
-        else:
-            path_sum += diffs[i]
-        if i - length >= 1:
-            if np.isnan(diffs[i - length]):
-                nan_count -= 1
+            d = abs(src[i] - src[i - 1])
+            if filled == length:
+                path_sum -= buf[pos]
+                buf[pos] = d
+                path_sum += d
+                pos = (pos + 1) % length
             else:
-                path_sum -= diffs[i - length]
-        if i >= length and nan_count == 0:
-            if not np.isnan(src[i]) and not np.isnan(src[i - length]):
-                net_move = abs(src[i] - src[i - length])
-                er[i] = 0.0 if path_sum == 0.0 else net_move / path_sum
+                buf[filled] = d
+                path_sum += d
+                filled += 1
+                pos = filled % length
+
+        if filled == length:
+            if path_sum == 0.0:
+                er[i] = 0.0
+            elif i >= length and not np.isnan(src[i]) and not np.isnan(src[i - length]):
+                er[i] = abs(src[i] - src[i - length]) / path_sum
+
     return er
 
 @njit(SIG_GAUSSIAN_TREND_LINE, nogil=True, cache=True)
