@@ -356,17 +356,21 @@ def calculate_ichimoku_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarra
         lead_line2 = (hh_spanb + ll_spanb) / 2.0
 
         # Displace cloud forward (Pine: offset = displacement - 1)
-        lag = displacement - 1
+        lag = max(0, int(displacement) - 1)  # Pine input minval=1
+        # Pine hidden plots are ternaries, not max/min: on a na/false
+        # condition they fall back to leadLine2. np.where reproduces that
+        # exactly; np.maximum/np.minimum would propagate NaN instead.
+        raw_upper = np.where(lead_line1 > lead_line2, lead_line1, lead_line2)
+        raw_lower = np.where(lead_line1 < lead_line2, lead_line1, lead_line2)
         cloud_upper = np.full(n, np.nan, dtype=np.float64)
         cloud_lower = np.full(n, np.nan, dtype=np.float64)
 
         if lag > 0 and n > lag:
-            cloud_upper[lag:] = np.maximum(lead_line1[:-lag], lead_line2[:-lag])
-            cloud_lower[lag:] = np.minimum(lead_line1[:-lag], lead_line2[:-lag])
+            cloud_upper[lag:] = raw_upper[:-lag]
+            cloud_lower[lag:] = raw_lower[:-lag]
         elif lag == 0:
-            cloud_upper[:] = np.maximum(lead_line1, lead_line2)
-            cloud_lower[:] = np.minimum(lead_line1, lead_line2)
-
+            cloud_upper[:] = raw_upper
+            cloud_lower[:] = raw_lower
         return {
             'cloud_upper': cloud_upper,
             'cloud_lower': cloud_lower,
@@ -1996,10 +2000,13 @@ def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray], expected_len: int) ->
         arr = data_15m[key]
         if arr is None or len(arr) == 0:
             return False, f"OHLC '{key}' is None or empty"
-        
+      
         if len(arr) != expected_len:
             return False, f"Length mismatch in '{key}': {len(arr)} != {expected_len}"
-    
+
+        if not np.all(np.isfinite(arr)):
+            return False, f"OHLC '{key}' contains NaN/Inf"
+
     return True, None
 
 def get_atr_percentile_smoothed(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig, ema_period: int = 5) -> Optional[float]:
