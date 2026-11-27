@@ -277,10 +277,12 @@ def calculate_volume_ema_numpy(volume: np.ndarray, length: int) -> np.ndarray:
             default_len = len(volume) if volume is not None else 1
             return np.full(default_len, np.nan, dtype=np.float64)
 
-        vol_ema = ema_loop(volume.astype(np.float64), float(length))
+        # ema_loop_pine: Pine ta.ema() seeds with the first value (not an SMA)
+        vol_ema = ema_loop_pine(volume.astype(np.float64), float(length))
         vol_ema = sanitize_array_numba(vol_ema, np.nan)
 
         return vol_ema
+
     except Exception as e:
         logger.error(f"Volume EMA calculation failed: {e}")
         default_len = len(volume) if volume is not None else 1
@@ -1293,13 +1295,14 @@ def find_pine_ob(h, l, c, threshold_arr, break_idx, pivot_idx, is_bullish_break)
         threshold = threshold_arr[bar_idx] * 2.0
         if np.isnan(threshold) or candle_range >= threshold:
             continue
-
+        # Pine ob_coord: `max == high[i]` / `min == low[i]` is also true on a tie,
+        # and the scan runs newest → oldest, so on equal prices the OLDER candle wins.
         if not is_bullish_break:          # Bearish OB  →  find highest high
-            if h[bar_idx] > best_val:
+            if h[bar_idx] >= best_val:
                 best_val = h[bar_idx]
                 best_idx = bar_idx
         else:                             # Bullish OB  →  find lowest low
-            if l[bar_idx] < best_val:
+            if l[bar_idx] <= best_val:
                 best_val = l[bar_idx]
                 best_idx = bar_idx
 
