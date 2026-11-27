@@ -13,8 +13,18 @@ on:
         required: false
         default: false
         type: boolean
+      clear_redis:
+        description: '🧹 Clear outcomes + Brain-derived Redis state (keeps config, weights, kill switch). Needs CONFIRM'
+        required: false
+        default: false
+        type: boolean
+      clear_kill_switch:
+        description: '🔓 Clear Kill Switch (manual override after review)'
+        required: false
+        default: false
+        type: boolean
       confirm:
-        description: 'Type CONFIRM to allow wipe_all or squash_history (ignored for routine cleanup)'
+        description: 'Type CONFIRM to allow wipe_all, squash_history or clear_redis (ignored otherwise)'
         required: false
         default: ''
         type: string
@@ -199,3 +209,92 @@ jobs:
           # Use the token-free origin URL. This operation intentionally
           # force-pushes main and must remain manual-only.
           git push --force-with-lease=main:"$BASE" origin squashed:main
+
+  # Redis maintenance (moved here from the 15-minute alert workflow). Its own job, so
+  # the routine archive cleanup above is untouched and an alert run never carries it.
+  maintenance:
+    if: inputs.clear_redis == true || inputs.clear_kill_switch == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
+    steps:
+      - name: 🛑 Guard Redis purge
+        env:
+          CLEAR_REDIS: ${{ inputs.clear_redis }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CLEAR_REDIS" = "true" ] && [ "$CONFIRM" != "CONFIRM" ]; then
+            echo "::error::clear_redis needs the 'confirm' input set to exactly CONFIRM"
+            exit 1
+          fi
+          echo "Guard passed"
+
+      - name: 🔥 Checkout config only
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            config_macd.json
+          sparse-checkout-cone-mode: false
+
+      - name: 🐳 Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔥 Pull image
+        run: |
+          set -euo pipefail
+          BASE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          IMAGE="$BASE:sha-${GITHUB_SHA}"
+          if ! docker pull --quiet --platform linux/amd64 "$IMAGE"; then
+            echo "::warning::No image for ${GITHUB_SHA} — falling back to :latest (it must already contain --clear-redis / --clear-kill-switch)"
+            IMAGE="$BASE:latest"
+            docker pull --quiet --platform linux/amd64 "$IMAGE"
+          fi
+          echo "RUN_IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: 🧹 Run maintenance
+        env:
+          CLEAR_REDIS: ${{ inputs.clear_redis }}
+          CLEAR_KILL_SWITCH: ${{ inputs.clear_kill_switch }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          DELTA_API_BASE: ${{ secrets.DELTA_API_BASE }}
+        run: |
+          ENV_FILE="$(pwd)/.bot_env"
+          trap 'rm -f "$ENV_FILE"' EXIT
+          {
+            printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TELEGRAM_BOT_TOKEN"
+            printf 'TELEGRAM_CHAT_ID=%s\n' "$TELEGRAM_CHAT_ID"
+            printf 'REDIS_URL=%s\n' "$REDIS_URL"
+            printf 'DELTA_API_BASE=%s\n' "$DELTA_API_BASE"
+            printf 'OUTCOME_DATA_DIR=%s\n' "/tmp/outcome-data"
+            printf 'NUMERIC_SELFTEST_ENABLED=%s\n' "false"
+          } > "$ENV_FILE"
+
+          ARGS=""
+          [ "$CLEAR_REDIS" = "true" ] && ARGS="$ARGS --clear-redis"
+          [ "$CLEAR_KILL_SWITCH" = "true" ] && ARGS="$ARGS --clear-kill-switch"
+          echo "🧰 Maintenance args:$ARGS"
+          docker run --rm \
+            --platform linux/amd64 \
+            --security-opt=no-new-privileges \
+            --read-only \
+            --cap-drop=ALL \
+            --pids-limit=256 \
+            --memory=512m \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m \
+            --env-file "$ENV_FILE" \
+            -e PYTHONPATH=/app/src \
+            -v "$(pwd)/config_macd.json:/app/src/config_macd.json:ro" \
+            "${{ env.RUN_IMAGE }}" \
+            python macd_unified.py $ARGS 

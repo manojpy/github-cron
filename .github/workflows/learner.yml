@@ -22,6 +22,11 @@ on:
         required: false
         default: false
         type: boolean
+      brain_report:
+        description: '🧠 Also send the Brain report now, whatever the age of the last one'
+        required: false
+        default: false
+        type: boolean
 
 # One learner at a time; never overlaps itself.
 concurrency:
@@ -35,7 +40,7 @@ env:
 jobs:
   learn:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: read
@@ -158,6 +163,7 @@ jobs:
           ROLLBACK: ${{ inputs.rollback }}
           NO_CONTROL: ${{ inputs.no_control }}
           NO_RECON: ${{ inputs.no_recon }}
+          BRAIN_REPORT: ${{ inputs.brain_report }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           REDIS_URL: ${{ secrets.REDIS_URL }}
@@ -177,6 +183,7 @@ jobs:
           [ "$ROLLBACK" = "true" ] && ARGS="$ARGS --rollback"
           [ "$NO_CONTROL" = "true" ] && ARGS="$ARGS --no-control"
           [ "$NO_RECON" = "true" ] && ARGS="$ARGS --no-recon"
+          [ "$BRAIN_REPORT" = "true" ] && ARGS="$ARGS --brain-report"
           set +e
           docker run --rm \
             --platform linux/amd64 \
@@ -203,6 +210,68 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit $RC
+
+      - name: 📤 Persist Brain report to data repo
+        if: always() && inputs.dry_run != true
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ ! -d /tmp/data-repo/.git ]; then
+            echo "No data repo clone - nothing to persist"
+            exit 0
+          fi
+          # The container created the report as uid 1000; take the clone back so
+          # git can add, rebase and push as the runner user.
+          sudo chown -R "$(id -u):$(id -g)" /tmp/data-repo
+          cd /tmp/data-repo
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -- reports
+          if git diff --cached --quiet; then
+            echo "No new Brain report to persist."
+            exit 0
+          fi
+          git commit -m "chore: brain report $(date -u +%Y-%m-%d_%H-%M)"
+          # Only the report is kept; anything else the learner touched in the
+          # throwaway clone must not block the rebase below.
+          git reset --hard -q
+          git clean -fdq
+
+          ASKPASS="$RUNNER_TEMP/git-askpass.sh"
+          trap 'rm -f "$ASKPASS"' EXIT
+          cat > "$ASKPASS" <<'EOF'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$DATA_REPO_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 700 "$ASKPASS"
+          export GIT_ASKPASS="$ASKPASS"
+          export GIT_TERMINAL_PROMPT=0
+
+          # The alert workflow pushes every 15 minutes: rebase onto the latest main and retry.
+          for attempt in 1 2 3 4 5; do
+            if git push origin main; then
+              echo "✅ Brain report pushed (attempt ${attempt})"
+              exit 0
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              break
+            fi
+            echo "::warning::Push rejected (attempt ${attempt}/5) — rebasing onto latest main"
+            sleep $(( attempt * 2 + RANDOM % 3 ))
+            if ! git pull --rebase --no-tags origin main; then
+              echo "::error::Rebase conflict — Brain report NOT pushed"
+              git rebase --abort 2>/dev/null || true
+              exit 1
+            fi
+          done
+          echo "::error::Could not push the Brain report after 5 attempts"
+          exit 1
 
       - name: 📨 Notify Telegram on Learner failure
         if: failure()

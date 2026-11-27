@@ -10,27 +10,12 @@ on:
         options:
           - 'false'
           - 'true'
-      brain_report:
-        description: '🧠 Send Brain Report'
-        required: false
-        default: false
-        type: boolean
       apply_brain_plan:
         description: '✅ Apply last Brain action plan (--apply-brain) and exit'
         required: false
         default: false
         type: boolean
-      clear_redis:
-        description: '🧹 Clear outcomes + Brain-derived state (keeps config, weights, kill switch)'
-        required: false
-        default: false
-        type: boolean
-      clear_kill_switch:
-        description: '🔓 Clear Kill Switch (manual override after review)'
-        required: false
-        default: false
-        type: boolean
-
+      
 # Prevent overlapping runs from cron + manual dispatch
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -40,12 +25,6 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
   BOT_TIMEOUT: 660
-  # BRAIN_REPORT_ON_DEMAND is set per-run inside the bot_run step
-  # via .bot_env (BRAIN_FULL), not here — the workflow's 12-hour
-  # archive-depth decision is the real cadence control.
-  CLEAR_REDIS: ${{ inputs.clear_redis }}
-  CLEAR_KILL_SWITCH: ${{ inputs.clear_kill_switch }}
-
 jobs:
   run-bot:
     runs-on: ubuntu-24.04
@@ -152,7 +131,7 @@ jobs:
           test -s "$OUT"
           echo "📄 config_macd.json fetched via ${SRC} ($(wc -c < "$OUT") bytes) at ${GITHUB_SHA:0:8}"
 
-      - name: 🔑 Verify secrets + config, decide Brain depth
+      - name: 🔑 Verify secrets + config
         id: brain_depth
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -160,8 +139,6 @@ jobs:
           REDIS_URL: ${{ secrets.REDIS_URL }}
           DELTA_API_BASE: ${{ secrets.DELTA_API_BASE }}
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
-          BRAIN_REPORT_INPUT: ${{ inputs.brain_report }}
-          APPLY_BRAIN_PLAN: ${{ inputs.apply_brain_plan }}
         run: |
           set -euo pipefail
           # 1) Required secrets — all five, exactly as before.
@@ -174,85 +151,22 @@ jobs:
             exit 1
           fi
           echo "✅ All required secrets configured"
-          # 2) Config: ONE python call validates the JSON and extracts both values
-          #    the workflow needs (on-demand report switch + staleness limit).
-          #    BRAIN_REPORT_ON_DEMAND is otherwise invisible to this workflow, so a
-          #    report forced inside the bot would run against a shallow archive.
+          # 2) Config: validate the JSON and extract the staleness limit.
           if [ ! -f config_macd.json ]; then
             echo "::error::config_macd.json not found in the workspace"
             exit 1
           fi
-          if ! CFG=$(python3 -c "import json; c=json.load(open('config_macd.json')); od='true' if str(c.get('BRAIN_REPORT_ON_DEMAND', False)).strip().lower() in ('true','1') else 'false'; print(od, int(c.get('MAX_CANDLE_STALENESS_SEC', 1200)))" 2>&1); then
+          if ! MAX_STALE=$(python3 -c "import json; c=json.load(open('config_macd.json')); print(int(c.get('MAX_CANDLE_STALENESS_SEC', 1200)))" 2>&1); then
             echo "::error::config_macd.json is not valid JSON"
-            echo "$CFG"
+            echo "$MAX_STALE"
             exit 1
           fi
-          ON_DEMAND="${CFG%% *}"
-          MAX_STALE="${CFG##* }"
           echo "✅ Config loaded from repository: config_macd.json"
           echo "late_limit=$(( MAX_STALE - 900 ))" >> "$GITHUB_OUTPUT"
-          # 3) Archive depth. An apply-brain dispatch skips both the archive
-          #    checkout and the bot run, so these outputs are not consumed there.
-          if [ "$APPLY_BRAIN_PLAN" = "true" ]; then
-            echo "brain_full=false" >> "$GITHUB_OUTPUT"
-            echo "archive_days=3"   >> "$GITHUB_OUTPUT"
-            echo "🧠 Apply-brain dispatch: archive depth decision skipped"
-            exit 0
-          fi
-          NOW=$(date -u +%s)
-          # 900 s = one 15-minute slot; 48 slots = 12 hours (00:00/12:00 UTC).
-          SCHEDULED=false
-          if [ $(( (NOW / 900) % 48 )) -eq 0 ]; then SCHEDULED=true; fi
-
-          # Catch-up: a dispatch that never ran (or a run that was cancelled) at
-          # 00:00/12:00 used to cost the whole 12 h report. Read the newest archived
-          # report name (reports/YYYY-MM-DD_HH-MM.md, UTC). If the last one is older
-          # than 12.5 h, run the full archive on the next whole-hour slot. Hourly, not
-          # every 15 min, so a report that keeps failing cannot turn every run into a
-          # heavy one; and not once the last report is over 36 h old (a persistent
-          # fault needs a person, not an hourly retry). Any lookup failure means
-          # "no catch-up", which is exactly the behaviour without this block.
-          CATCHUP=false
-          if [ "$SCHEDULED" != "true" ] && [ $(( (NOW / 900) % 4 )) -eq 0 ]; then
-            LAST_TS=$(curl -fsS --max-time 10 \
-                -H "Authorization: Bearer $DATA_REPO_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/manojpy/outcome-data/contents/reports?ref=main" 2>/dev/null \
-              | python3 -c "
-          import sys, json, re
-          from datetime import datetime, timezone
-          try:
-              names = [e['name'] for e in json.load(sys.stdin) if isinstance(e, dict)]
-          except Exception:
-              sys.exit(0)
-          best = 0
-          for n in names:
-              m = re.fullmatch(r'(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})\.md', n)
-              if m:
-                  t = datetime.strptime(m.group(1) + ' ' + m.group(2) + ':' + m.group(3), '%Y-%m-%d %H:%M')
-                  best = max(best, int(t.replace(tzinfo=timezone.utc).timestamp()))
-          print(best or '')
-          " 2>/dev/null || true)
-            if [ -n "$LAST_TS" ]; then
-              AGE=$(( NOW - LAST_TS ))
-              if [ "$AGE" -ge 45000 ] && [ "$AGE" -le 129600 ]; then
-                CATCHUP=true
-                echo "🧠 Last Brain report is $(( AGE / 3600 )) h old — catch-up run"
-              fi
-            else
-              echo "ℹ️ Could not read the last report time — no catch-up check this run"
-            fi
-          fi
-
-          if [ "$BRAIN_REPORT_INPUT" = "true" ] || [ "$ON_DEMAND" = "true" ] || [ "$SCHEDULED" = "true" ] || [ "$CATCHUP" = "true" ]; then
-            echo "brain_full=true"  >> "$GITHUB_OUTPUT"
-            echo "archive_days=185" >> "$GITHUB_OUTPUT"
-            echo "🧠 Brain-report run: full 185-day archive"
-          else
-            echo "brain_full=false" >> "$GITHUB_OUTPUT"
-            echo "archive_days=3"   >> "$GITHUB_OUTPUT"
-            echo "⚡ Alert-only run: 3-day archive"
-          fi
+          # 3) Every bot run checks out only the last 3 days of the archive. The Brain
+          #    report (full 185-day archive) now runs in the learner workflow.
+          echo "archive_days=3" >> "$GITHUB_OUTPUT"
+          echo "⚡ Alert run: 3-day archive"
 
       - name: 🛠️ Create data-directory helper
         run: |
@@ -517,11 +431,6 @@ jobs:
           echo "🕐 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
           echo "🏷️ Image: ${{ env.RUN_IMAGE }}"
           echo "🧪 Dry Run: $DRY_RUN"
-          echo "🧹 Clear Redis: $CLEAR_REDIS"
-          BRAIN_FULL="${{ steps.brain_depth.outputs.brain_full }}"
-          if [ "$BRAIN_FULL" = "true" ]; then BRAIN_SHALLOW=false; else BRAIN_SHALLOW=true; fi
-          echo "🧠 Brain Report: $BRAIN_FULL (shallow archive: $BRAIN_SHALLOW)"
-          echo "🔓 Clear Kill Switch: $CLEAR_KILL_SWITCH"
           echo "::endgroup::"
 
           START_TIME=$(date +%s)
@@ -546,10 +455,7 @@ jobs:
             printf 'DELTA_API_BASE=%s\n' "$DELTA_API_BASE"
             printf 'DRY_RUN_MODE=%s\n' "$DRY_RUN"
             printf 'TRIGGER_TIMESTAMP=%s\n' "$START_TIME"
-            printf 'CLEAR_REDIS=%s\n' "$CLEAR_REDIS"
-            printf 'BRAIN_REPORT_ON_DEMAND=%s\n' "$BRAIN_FULL"
-            printf 'BRAIN_ARCHIVE_SHALLOW=%s\n' "$BRAIN_SHALLOW"
-            printf 'CLEAR_KILL_SWITCH=%s\n' "$CLEAR_KILL_SWITCH"
+            printf 'BRAIN_ARCHIVE_SHALLOW=true\n'
           } > "$ENV_FILE"
 
           set +e
