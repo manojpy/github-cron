@@ -15,7 +15,7 @@ from aot_bridge import (
     calculate_adx_core, percentile_rank_numba, dynamic_flow_direction_loop,
     smoothrng_loop, range_filter_loop,
     gaussian_filter_loop, efficiency_ratio_loop, gaussian_trend_line_loop,
-    momentum_oscillator_core,
+    momentum_oscillator_core, auto_trendline_loop,
 )
 
 def validate_indicator_array(arr: Optional[np.ndarray], name: str, min_valid_values: int = 1) -> Tuple[bool, Optional[str]]:
@@ -751,7 +751,7 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.efficiency_ratio_loop(test_data, 10)
         _ = aot_bridge.gaussian_trend_line_loop(test_data, test_data * 1.01, test_data * 0.99)
         _ = aot_bridge.momentum_oscillator_core(test_data, test_data * 0.8, test_data, 10)
-
+        _ = aot_bridge.auto_trendline_loop(test_data, test_data * 0.8, test_data * 0.9, 5)
 
         warmup_elapsed = time.time() - warmup_start
         logger.info(f"✅ JIT warmup complete ({warmup_elapsed:.2f}s)")
@@ -2614,6 +2614,41 @@ _TL_EVENT_KEYS = (
     "tl_retest_buy", "tl_retest_sell",
 )
 
+def calculate_auto_trendline_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray,
+                                   fractal_period: int) -> Dict[str, np.ndarray]:
+    """Pine-exact replica of "Auto Trendline [DojiEmoji]" (full history, no filters).
+
+    fractals : ta.pivothigh(n, n)[1] / ta.pivotlow(n, n)[1]  (strict > / <)
+    lines    : through the two newest fractals per side, evaluated on EVERY bar with
+               y = m*bar_index + recent1 - m*i_recent1 (NaN until two fractals exist)
+    crosses  : ta.cross(close, line) per bar, each bar using its own line;
+               +1.0 = crossover, -1.0 = crossunder, 0.0 = none
+    classes  : 1.0 = HH / HL, -1.0 = LH / LL, 2.0 = fractal with no comparison, 0.0 = none
+    Every array has len(close). Strategy filters (ATR, slope, touches, age) live in
+    _trendline_events and never modify these arrays.
+    """
+    n = len(close) if close is not None else 1
+    try:
+        if close is None or n == 0:
+            raise ValueError("Empty input arrays")
+        y_up, y_dn, cross_upper, cross_lower, up_class, dn_class = auto_trendline_loop(
+            np.ascontiguousarray(high, dtype=np.float64),
+            np.ascontiguousarray(low, dtype=np.float64),
+            np.ascontiguousarray(close, dtype=np.float64),
+            int(fractal_period),
+        )
+        return {
+            "y_up": y_up, "y_dn": y_dn,
+            "cross_upper": cross_upper, "cross_lower": cross_lower,
+            "up_class": up_class, "dn_class": dn_class,
+        }
+    except Exception as e:
+        logger.error(f"Auto Trendline calculation failed: {e}", exc_info=True)
+        return {
+            "y_up": np.full(n, np.nan, dtype=np.float64), "y_dn": np.full(n, np.nan, dtype=np.float64),
+            "cross_upper": np.zeros(n, dtype=np.float64), "cross_lower": np.zeros(n, dtype=np.float64),
+            "up_class": np.zeros(n, dtype=np.float64), "dn_class": np.zeros(n, dtype=np.float64),
+        }
 
 def _tl_pivots(arr: np.ndarray, n: int, k_lo: int, k_hi: int, is_high: bool) -> List[Tuple[int, float]]:
     """Strict fractal pivots k in [k_lo, k_hi]: arr[k] beats the n bars on each side."""
@@ -2740,6 +2775,10 @@ def _trendline_events(
     min_body = float(cfg_obj.TRENDLINE_BREAK_MIN_BODY_RATIO)
     min_pos = float(cfg_obj.TRENDLINE_REJECT_MIN_CLOSE_POS)
     max_bars = int(cfg_obj.TRENDLINE_RETEST_MAX_BARS)
+    # Pine mode: the BREAK cross comes from the Pine-exact replica (closed candles only).
+    pine_tl = None
+    if str(getattr(cfg_obj, "TRENDLINE_BREAK_MODE", "legacy")) == "pine":
+        pine_tl = calculate_auto_trendline_numpy(h[:i15 + 1], l[:i15 + 1], c[:i15 + 1], n)
     pair = PAIR_ID.get() or "?"
 
     def _get_line(piv, is_res, t):
@@ -2762,20 +2801,38 @@ def _trendline_events(
 
         # ── BREAK: close crosses the line, previous close was on the other side ──
         piv = res_pivots if is_buy else sup_pivots
-        line = _get_line(piv, is_buy, i15 - 1)
-        if line is not None:
-            lp, lc = _tl_value(line, i15 - 1), _tl_value(line, i15)
-            if is_buy:
-                crossed = (c[i15 - 1] <= lp and c[i15] > lc and min_break <= (c[i15] - lc) <= max_break
-                           and body_ratio_now >= min_body)
-            else:
-                crossed = (c[i15 - 1] >= lp and c[i15] < lc and min_break <= (lc - c[i15]) <= max_break
-                           and body_ratio_now >= min_body)
-            if crossed:
-                key = f"tl_break_{side}"
-                events[key] = True
-                reasons[key] = (f"Close {c[i15]:.6g} broke {'above' if is_buy else 'below'} "
-                                f"{_desc(line, kind_res if is_buy else kind_sup)} at {lc:.6g}")
+        crossed = False
+        line = None
+        lc = np.nan
+        if pine_tl is not None and len(pine_tl["y_up"]) > i15:
+            # Pine mode: BUY = close crosses OVER the upper line, SELL = close crosses UNDER the
+            # lower line, exactly as ta.cross(close, line) does (each bar uses its own line).
+            # The anchors come from the line known at i15; the quality check judges the bars
+            # before the signal candle, so the break candle itself never counts as "violated".
+            line = _tl_line_at(piv, n, i15, min_slope, ref)
+            if line is not None:
+                touches = _tl_quality(line, is_buy, h, l, c, atr_arr, i15 - 1, cfg_obj)
+                line = None if touches is None else line + (touches,)
+            lc = float(pine_tl["y_up" if is_buy else "y_dn"][i15])
+            cross_flag = float(pine_tl["cross_upper" if is_buy else "cross_lower"][i15])
+            if line is not None and np.isfinite(lc) and (cross_flag > 0.0 if is_buy else cross_flag < 0.0):
+                dist = (c[i15] - lc) if is_buy else (lc - c[i15])
+                crossed = bool(min_break <= dist <= max_break and body_ratio_now >= min_body)
+        elif pine_tl is None:
+            line = _get_line(piv, is_buy, i15 - 1)
+            if line is not None:
+                lp, lc = _tl_value(line, i15 - 1), _tl_value(line, i15)
+                if is_buy:
+                    crossed = (c[i15 - 1] <= lp and c[i15] > lc and min_break <= (c[i15] - lc) <= max_break
+                               and body_ratio_now >= min_body)
+                else:
+                    crossed = (c[i15 - 1] >= lp and c[i15] < lc and min_break <= (lc - c[i15]) <= max_break
+                               and body_ratio_now >= min_body)
+        if crossed and line is not None:
+            key = f"tl_break_{side}"
+            events[key] = True
+            reasons[key] = (f"Close {c[i15]:.6g} broke {'above' if is_buy else 'below'} "
+                            f"{_desc(line, kind_res if is_buy else kind_sup)} at {lc:.6g}")
 
         # ── BOUNCE: wick reaches the line and the close rejects back to the trend side ──
         piv = sup_pivots if is_buy else res_pivots
@@ -2801,16 +2858,30 @@ def _trendline_events(
         piv = res_pivots if is_buy else sup_pivots
         j_lo = max(start + 2 * n + 3, i15 - max_bars)
         for j in range(i15 - 1, j_lo - 1, -1):
-            bl = _get_line(piv, is_buy, j - 1)
-            if bl is None:
-                continue
-            bp, bc = _tl_value(bl, j - 1), _tl_value(bl, j)
-            if is_buy:
-                broke = c[j - 1] <= bp and c[j] > bc
+            if pine_tl is not None:
+                # Pine mode: a "break" is the Pine ta.cross on bar j (the same definition tl_break uses)
+                flag_j = float(pine_tl["cross_upper" if is_buy else "cross_lower"][j])
+                if not (flag_j > 0.0 if is_buy else flag_j < 0.0):
+                    continue
+                bl = _tl_line_at(piv, n, j, min_slope, ref)
+                if bl is None:
+                    continue
+                q_j = _tl_quality(bl, is_buy, h, l, c, atr_arr, j - 1, cfg_obj)
+                if q_j is None:
+                    continue
+                bl = bl + (q_j,)
             else:
-                broke = c[j - 1] >= bp and c[j] < bc
-            if not broke:
-                continue
+                bl = _get_line(piv, is_buy, j - 1)
+                if bl is None:
+                    continue
+                bp, bc = _tl_value(bl, j - 1), _tl_value(bl, j)
+                if is_buy:
+                    broke = c[j - 1] <= bp and c[j] > bc
+                else:
+                    broke = c[j - 1] >= bp and c[j] < bc
+                if not broke:
+                    continue
+
             # most recent break found: judge the retest against THIS fixed line, then stop
             mids = np.arange(j + 1, i15)
             lm = _tl_value(bl, mids) if mids.size else np.empty(0)

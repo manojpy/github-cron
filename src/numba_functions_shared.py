@@ -49,6 +49,7 @@ SIG_GAUSSIAN_TREND_LINE = types.Tuple((f8[:], i4[:]))(f8[:], f8[:], f8[:])
 SIG_WMA_LOOP                 = f8[:](f8[:], i4)
 SIG_HMA_LOOP                 = f8[:](f8[:], i4)
 SIG_MOMENTUM_OSCILLATOR_CORE = f8[:](f8[:], f8[:], f8[:], i4)
+SIG_AUTO_TRENDLINE           = types.Tuple((f8[:], f8[:], f8[:], f8[:], f8[:], f8[:]))(f8[:], f8[:], f8[:], i4)
 
 @njit(SIG_SANITIZE_ARRAY, nogil=True, cache=True)
 def sanitize_array_numba(arr, default):
@@ -911,6 +912,115 @@ def momentum_oscillator_core(high, low, close, length):
     return out_vf 
 
 #=====================================================
+# Auto Trendline [DojiEmoji] kernel - Pine-exact (full history, no filters)
+#=====================================================
+@njit(SIG_AUTO_TRENDLINE, nogil=True, cache=True)
+def auto_trendline_loop(high, low, close, fractal_period):
+    """Pine: ph = ta.pivothigh(n, n)[1] / pl = ta.pivotlow(n, n)[1] (strict > / <),
+    recent_up1/2 + recent_dn1/2 fractal pointers, y = m*bar_index + recent1 - m*i_recent1,
+    cross = ta.cross(close, y) evaluated bar by bar (each bar uses its OWN line).
+
+    Returns (y_up, y_dn, cross_upper, cross_lower, up_class, dn_class):
+      y_up / y_dn            line value per bar (NaN until two fractals exist on that side)
+      cross_upper/_lower     +1.0 crossover, -1.0 crossunder, 0.0 none
+      up_class / dn_class    1.0 HH / HL, -1.0 LH / LL, 2.0 fractal with no comparison, 0.0 none
+    """
+    T = len(close)
+    n = fractal_period
+    y_up = np.full(T, np.nan, dtype=np.float64)
+    y_dn = np.full(T, np.nan, dtype=np.float64)
+    cross_upper = np.zeros(T, dtype=np.float64)
+    cross_lower = np.zeros(T, dtype=np.float64)
+    up_class = np.zeros(T, dtype=np.float64)
+    dn_class = np.zeros(T, dtype=np.float64)
+    if n < 2 or T < 2 * n + 2:
+        return y_up, y_dn, cross_upper, cross_lower, up_class, dn_class
+
+    up1 = np.nan
+    up2 = np.nan
+    dn1 = np.nan
+    dn2 = np.nan
+    iu1 = -1
+    iu2 = -1
+    id1 = -1
+    id2 = -1
+
+    for t in range(T):
+        # [1] shift: the fractal confirmed on bar t sits on bar t - n - 1
+        k = t - n - 1
+        if k >= n:
+            hk = high[k]
+            lk = low[k]
+            is_hi = not np.isnan(hk)
+            is_lo = not np.isnan(lk)
+            for j in range(k - n, k + n + 1):
+                if j == k:
+                    continue
+                hj = high[j]
+                lj = low[j]
+                if is_hi and (np.isnan(hj) or not (hk > hj)):
+                    is_hi = False
+                if is_lo and (np.isnan(lj) or not (lk < lj)):
+                    is_lo = False
+                if (not is_hi) and (not is_lo):
+                    break
+            if is_lo:
+                dn2 = dn1
+                id2 = id1
+                dn1 = lk
+                id1 = k
+                if id2 >= 0:
+                    if dn1 > dn2:
+                        dn_class[t] = 1.0
+                    elif dn1 < dn2:
+                        dn_class[t] = -1.0
+                    else:
+                        dn_class[t] = 2.0
+                else:
+                    dn_class[t] = 2.0
+            if is_hi:
+                up2 = up1
+                iu2 = iu1
+                up1 = hk
+                iu1 = k
+                if iu2 >= 0:
+                    if up1 > up2:
+                        up_class[t] = 1.0
+                    elif up1 < up2:
+                        up_class[t] = -1.0
+                    else:
+                        up_class[t] = 2.0
+                else:
+                    up_class[t] = 2.0
+
+        if iu2 >= 0 and iu1 != iu2:
+            m = (up2 - up1) / (iu2 - iu1)
+            y_up[t] = (m * t) + up1 - (m * iu1)
+        if id2 >= 0 and id1 != id2:
+            m = (dn2 - dn1) / (id2 - id1)
+            y_dn[t] = (m * t) + dn1 - (m * id1)
+
+        if t >= 1:
+            c0 = close[t]
+            c1 = close[t - 1]
+            yu0 = y_up[t]
+            yu1 = y_up[t - 1]
+            if not (np.isnan(yu0) or np.isnan(yu1) or np.isnan(c0) or np.isnan(c1)):
+                if c0 > yu0 and c1 <= yu1:
+                    cross_upper[t] = 1.0
+                elif c0 < yu0 and c1 >= yu1:
+                    cross_upper[t] = -1.0
+            yd0 = y_dn[t]
+            yd1 = y_dn[t - 1]
+            if not (np.isnan(yd0) or np.isnan(yd1) or np.isnan(c0) or np.isnan(c1)):
+                if c0 > yd0 and c1 <= yd1:
+                    cross_lower[t] = 1.0
+                elif c0 < yd0 and c1 >= yd1:
+                    cross_lower[t] = -1.0
+
+    return y_up, y_dn, cross_upper, cross_lower, up_class, dn_class
+
+#=====================================================
 # AOT EXPORT CONFIGURATION
 #=====================================================
 
@@ -938,6 +1048,7 @@ EXPORT_CONFIG = {
     'wma_loop':                 SIG_WMA_LOOP,
     'hma_loop':                 SIG_HMA_LOOP,
     'momentum_oscillator_core': SIG_MOMENTUM_OSCILLATOR_CORE,
+    'auto_trendline_loop':      SIG_AUTO_TRENDLINE,
 }
 
 from aot_meta import (  # noqa: E402

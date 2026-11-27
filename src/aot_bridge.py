@@ -257,6 +257,12 @@ def momentum_oscillator_core(high: np.ndarray, low: np.ndarray,
     """AlgoAlpha Momentum Oscillator (vf), exact Pine port."""
     return _dispatch["momentum_oscillator_core"](high, low, close, length)
 
+def auto_trendline_loop(high: np.ndarray, low: np.ndarray, close: np.ndarray,
+                        fractal_period: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
+                                                      np.ndarray, np.ndarray, np.ndarray]:
+    """Auto Trendline [DojiEmoji]: (y_up, y_dn, cross_upper, cross_lower, up_class, dn_class), Pine-exact."""
+    return _dispatch["auto_trendline_loop"](high, low, close, fractal_period)
+
 # ─────────────────────────────────────────────────────────────────────
 # COMPLETENESS CHECK — catches a forgotten wrapper at import time
 # ──────────────────────────────────────────────────────────────────────

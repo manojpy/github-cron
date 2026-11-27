@@ -219,6 +219,55 @@ def _ref_momentum_oscillator(high: List[float], low: List[float], close: List[fl
     e_hl = _ema([high[i] - low[i] for i in range(n)], length * 2)
     return [nan if (v != v or e != e or e == 0.0) else (v / e * 100.0) / 8.0 for v, e in zip(val2, e_hl)]
 
+def _ref_auto_trendline(high: List[float], low: List[float], close: List[float], n: int):
+    """Independent bar-by-bar reference for Auto Trendline [DojiEmoji]:
+    ta.pivothigh/pivotlow(n, n)[1] (strict), two newest fractals per side, ta.cross(close, line)."""
+    T = len(close)
+    nan = float("nan")
+    y_up = [nan] * T
+    y_dn = [nan] * T
+    cu = [0.0] * T
+    cl = [0.0] * T
+    uc = [0.0] * T
+    dc = [0.0] * T
+    up1 = up2 = dn1 = dn2 = nan
+    iu1 = iu2 = id1 = id2 = None
+    for t in range(T):
+        k = t - n - 1
+        if k >= n:
+            hi = all(high[k] > high[j] for j in range(k - n, k + n + 1) if j != k)
+            lo = all(low[k] < low[j] for j in range(k - n, k + n + 1) if j != k)
+            if lo:
+                dn2, id2, dn1, id1 = dn1, id1, low[k], k
+                dc[t] = 2.0 if id2 is None else (1.0 if dn1 > dn2 else -1.0 if dn1 < dn2 else 2.0)
+            if hi:
+                up2, iu2, up1, iu1 = up1, iu1, high[k], k
+                uc[t] = 2.0 if iu2 is None else (1.0 if up1 > up2 else -1.0 if up1 < up2 else 2.0)
+        if iu1 is not None and iu2 is not None and iu1 != iu2:
+            m = (up2 - up1) / (iu2 - iu1)
+            y_up[t] = m * t + up1 - m * iu1
+        if id1 is not None and id2 is not None and id1 != id2:
+            m = (dn2 - dn1) / (id2 - id1)
+            y_dn[t] = m * t + dn1 - m * id1
+    for y, out in ((y_up, cu), (y_dn, cl)):
+        for t in range(1, T):
+            if math.isnan(y[t]) or math.isnan(y[t - 1]):
+                continue
+            if close[t] > y[t] and close[t - 1] <= y[t - 1]:
+                out[t] = 1.0
+            elif close[t] < y[t] and close[t - 1] >= y[t - 1]:
+                out[t] = -1.0
+    return y_up, y_dn, cu, cl, uc, dc
+
+_AT_NAMES = ("y_up", "y_dn", "cross_upper", "cross_lower", "up_class", "dn_class")
+
+def _auto_trendline_fixture():
+    idx = np.arange(240, dtype=np.float64)
+    close = 100.0 + 4.0 * np.sin(idx / 5.0) + 2.0 * np.sin(idx / 2.3) + 0.03 * idx
+    high = close + 0.6 + 0.3 * np.abs(np.sin(idx))
+    low = close - 0.6 - 0.3 * np.abs(np.cos(idx))
+    return high, low, close
+
 # ---------------------------------------------------------------------------
 # Deterministic synthetic fixtures -- no RNG, must be byte-identical every run
 # ---------------------------------------------------------------------------
@@ -332,6 +381,14 @@ def run_self_test() -> Tuple[bool, List[str]]:
                aot_bridge.momentum_oscillator_core(high, low, close, _len),
                _ref_momentum_oscillator(high.tolist(), low.tolist(), close.tolist(), _len), failures)
 
+    # Auto Trendline [DojiEmoji] kernel vs the independent Pine reference.
+    _at_h, _at_l, _at_c = _auto_trendline_fixture()
+    for _n in (3, 6):
+        _exp_at = _ref_auto_trendline(_at_h.tolist(), _at_l.tolist(), _at_c.tolist(), _n)
+        _act_at = aot_bridge.auto_trendline_loop(_at_h, _at_l, _at_c, _n)
+        for _nm, _a, _e in zip(_AT_NAMES, _act_at, _exp_at):
+            _check(f"auto_trendline_loop.{_nm} (n={_n})", _a, _e, failures)
+
     # --- Analytic invariants on the degenerate flat fixture ---
     flat_atr = aot_bridge.calculate_atr_rma(flat_h, flat_l, flat_c, period)
     flat_atr_tail = flat_atr[period:]
@@ -395,5 +452,11 @@ def run_self_test() -> Tuple[bool, List[str]]:
         jit_dfr_dir, jit_dfr_line = jit_ref.dynamic_flow_direction_loop(hlc3, dfr_basis, dfr_dist, 3.0)
         _check("AOT vs JIT: dynamic_flow_direction_loop.direction", actual_dir, jit_dfr_dir, failures)
         _check("AOT vs JIT: dynamic_flow_direction_loop.line", actual_line, jit_dfr_line, failures)
+
+        for _n in (3, 6):
+            _jit_at = jit_ref.auto_trendline_loop(_at_h, _at_l, _at_c, _n)
+            _aot_at = aot_bridge.auto_trendline_loop(_at_h, _at_l, _at_c, _n)
+            for _nm, _a, _j in zip(_AT_NAMES, _aot_at, _jit_at):
+                _check(f"AOT vs JIT: auto_trendline_loop.{_nm} (n={_n})", _a, _j, failures)
 
     return (len(failures) == 0, failures)
