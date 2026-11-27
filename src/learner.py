@@ -19,7 +19,9 @@ Usage (inside the bot image, OUTCOME_DATA_DIR = clone of the outcome-data repo):
     python learner.py --scoreboard       # print the last stored scoreboard
     python learner.py --intel            # print the last stored intelligence report
     python learner.py --advisor          # print the config adviser's stored recommendations and watchlist
+    python learner.py --brain-report     # also force the Brain report now (otherwise it runs when due)
     python learner.py --data-dir PATH    # override OUTCOME_DATA_DIR
+
 Exit codes: 0 ok, 1 learner error, 2 cannot reach Redis / no data dir.
 """
 from __future__ import annotations
@@ -27,7 +29,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
+import re
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple, Awaitable, cast
@@ -37,6 +41,7 @@ from alerts import TelegramQueue, escape_markdown_v2
 from archive_reader import load_archived_outcomes
 from autopsy import build_intelligence, format_intelligence
 from bot_config import _get_session_from_ts
+from brain_engine import BrainEngine
 from brain_helpers import HYPOTHESIS_POOL_KEY
 from autotune import FIELD as AT_FIELD, KEY_AUTOTUNE
 from autotune import committed as at_committed, evaluate_pending as at_evaluate, observe as at_observe, propose as at_propose
@@ -71,6 +76,66 @@ _CANDLE_SEC = 900
 
 def _say(msg: str) -> None:
     print(msg, flush=True)
+
+_REPORT_NAME_RE = re.compile(r"(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})(?:-(\d{2}))?(?:_\d+)?\.md")
+_BRAIN_REPORT_TIMEOUT_SEC = 600.0
+
+
+def _last_report_age_hours(data_dir: str, now: float) -> Optional[float]:
+    """Hours since the newest archived Brain report (reports/YYYY-MM-DD_HH-MM[-SS][_n].md,
+    UTC), or None when there is none."""
+    from datetime import datetime, timezone
+    try:
+        names = os.listdir(os.path.join(data_dir, "reports"))
+    except OSError:
+        return None
+    best = 0.0
+    for n in names:
+        m = _REPORT_NAME_RE.fullmatch(n)
+        if not m:
+            continue
+        try:
+            t = datetime.strptime(f"{m.group(1)} {m.group(2)}:{m.group(3)}:{m.group(4) or '00'}",
+                                  "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+        best = max(best, t)
+    return (now - best) / 3600.0 if best else None
+
+
+async def _run_brain_report(sdb: RedisStateStore, data_dir: str, force: bool) -> int:
+    """Brain report, moved out of the 15-minute alert run. Runs after the playbook cycle,
+    on the full archive this workflow cloned. Returns 0 (done / not due), 1 (failed)."""
+    if not bool(cfg.ENABLE_BRAIN):
+        _say("[learner] Brain report skipped: ENABLE_BRAIN is off")
+        return 0
+    every_h = float(cfg.BRAIN_REPORT_EVERY_HOURS)
+    age_h = _last_report_age_hours(data_dir, time.time())
+    if force:
+        _say("[learner] Brain report: forced by --brain-report")
+    elif every_h <= 0:
+        _say("[learner] Brain report: automatic reports are off (BRAIN_REPORT_EVERY_HOURS=0)")
+        return 0
+    elif age_h is not None and age_h < every_h - 0.25:      # 15 min of scheduling jitter
+        _say(f"[learner] Brain report not due: last one {age_h:.1f}h ago, every {every_h:g}h")
+        return 0
+    else:
+        _say("[learner] Brain report due: " + ("none archived yet" if age_h is None else f"last one {age_h:.1f}h ago"))
+    t0 = time.time()
+    try:
+        tq_report = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+        ok = await asyncio.wait_for(
+            BrainEngine(sdb).send_report_now(list(cfg.PAIRS), tq_report, logging.getLogger("macd_bot")),
+            timeout=_BRAIN_REPORT_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        _say(f"[learner] Brain report timed out after {_BRAIN_REPORT_TIMEOUT_SEC:.0f}s")
+        return 1
+    except Exception as e:
+        _say(f"[learner] Brain report failed: {e!r}")
+        return 1
+    _say(f"[learner] Brain report finished in {time.time() - t0:.1f}s (ok={ok})")
+    return 0 if ok else 1
 
 def params_from_cfg() -> Dict[str, Any]:
     p = default_params()
@@ -798,7 +863,9 @@ async def run(args: argparse.Namespace) -> int:
                     await _strict_set_many(sdb, [(KEY_ADVISOR, json_dumps(adv_state))], _TTL)
             except Exception as e:
                 _say(f"[learner] config advisor delivery failed: {e!r}")
-        return 0
+        # Brain report: not part of the 15-minute alert run any more. A failed report
+        # fails this job (so the failure notice fires) but never undoes the playbook above.
+        return await _run_brain_report(sdb, data_dir, bool(args.brain_report))
     finally:
         try:
             await asyncio.wait_for(sdb.close(), timeout=3.0)
@@ -832,6 +899,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--autopsy", action="store_true", help="print the last stored autopsy / Trust Meter")
     ap.add_argument("--intel", action="store_true", help="print the last stored intelligence report")
     ap.add_argument("--advisor", action="store_true", help="print the config adviser's stored recommendations and watchlist")
+    ap.add_argument("--brain-report", action="store_true", help="generate the Brain report now, whatever its age")
     ap.add_argument("--data-dir", default="")
     args = ap.parse_args(argv)
     try:

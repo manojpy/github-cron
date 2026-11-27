@@ -27,7 +27,16 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
         threshold suggestion, shadow-mode insight, and a machine-readable
         config patch."""
     engine.clear_ev_first_cache()
+    _bt0 = time.time()
+
+    def _bmark(_label: str) -> None:
+        nonlocal _bt0
+        _now = time.time()
+        logging.getLogger("macd_bot").info(f"⏱️ Brain baseline '{_label}': {_now - _bt0:.2f}s")
+        _bt0 = _now
+
     real_rows, shadow_rows = await self._get_rows()
+    _bmark("rows")
     audit = get_audit() 
     recommendations: List[Dict[str, Any]] = []
     config_patch: List[Dict[str, Any]] = []
@@ -1144,6 +1153,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                 logging.getLogger("macd_bot").info(f"🧪 Gate shadow audit | {_g['text']}")
     except Exception as e:
         audit.record_analysis_exception("gate_shadow_comparison", e)
+    _bmark("core_analysis")
 
     # ── Prediction track record: did the probabilities stated at alert time
     # match what happened, and do they beat the plain base rate? ──
@@ -1172,6 +1182,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
 
     # ── Data foundation: versioned point-in-time features + multi-horizon
     # labels. Counts only; nothing here changes a decision. ──
+    _ds: Optional[Dict[str, Any]] = None
     try:
         _ds, _ds_cache = await self._cached_point_in_time_dataset(
             list(real_rows),
@@ -1180,6 +1191,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
         ai_metrics["data_foundation"] = {**dataset_coverage(_ds), "cache": _ds_cache}
     except Exception as e:
         audit.record_analysis_exception("data_foundation", e)
+    _bmark("prediction_audits_dataset")
 
     # ── Skipped signals: what the alerts that never became a Recorded trade would have
     # earned (graded candidate rows) and what each suppression reason held back (shadow
@@ -1208,6 +1220,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                 ai_metrics["candidate_health"] = _ch
     except Exception as e:
         audit.record_analysis_exception("candidate_health", e)
+    _bmark("skipped_signals_candidate_health")
 
     # ── Results by pair class (report only). ──
     try:
@@ -1224,11 +1237,13 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
     # rules in net P&L on newer, unseen trades? Report-only. ──
     _nev_proof: Optional[Dict[str, Any]] = None
     try:
-        _nev = engine.net_ev_baseline_audit(
+        _nev = await asyncio.to_thread(
+            engine.net_ev_baseline_audit,
             list(real_rows),
             horizon=int(getattr(cfg, "NET_EV_AUDIT_HORIZON", 12)),
             min_test=int(getattr(cfg, "NET_EV_AUDIT_MIN_TEST", 40)),
             default_cost_pct=(float(cfg.BRAIN_FEE_PCT) + float(cfg.BRAIN_SLIPPAGE_PCT)) * 2 * 100,
+            ds=_ds,
         )
         ai_metrics["net_ev_audit"] = _nev
         _nev_proof = {k: _nev.get(k) for k in ("status", "delta_vs_best", "delta_lo", "best_baseline", "n_test", "horizon")}
@@ -1240,6 +1255,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
         )
     except Exception as e:
         audit.record_analysis_exception("net_ev_baseline_audit", e)
+    _bmark("net_ev_audit")
 
     # ── Volatility-scaled plans: would a stop / target / horizon per volatility
     # regime beat ONE tuned plan on newer trades? Read-side; the fixed outcome
@@ -1255,6 +1271,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
         )
     except Exception as e:
         audit.record_analysis_exception("vol_horizon_study", e)
+    _bmark("vol_horizon_study")
 
     # ── Research / Validation / Policy boundary: read-only scan of the source. ──
     if str(getattr(cfg, "LAYER_BOUNDARY_MODE", "report")) != "off":
@@ -1543,6 +1560,7 @@ async def build_baseline_recommendations(self) -> Dict[str, Any]:
                     f"({len(drifted)} feature(s), top PSI={drifted[0]['psi']}: {drifted[0]['feature']}) "
                     f"— the previous model may now be stale against a shifted regime, not just noisy data."
                 )
+            _bmark("market_state_model")
 
     # ── Kill switch: fast-failure stop (streak / rolling drawdown) ──
     _ks_mode = kill_switch_mode()

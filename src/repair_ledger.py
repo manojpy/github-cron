@@ -11,6 +11,7 @@ in the shop depends on.
 from __future__ import annotations
 import asyncio
 import hashlib
+import logging
 import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,6 +27,8 @@ LEDGER_TTL_DAYS = 90
 # window of the plan's own timestamp. The report generator and _store_
 # pending_plan run back-to-back in the same brain cycle, so ±60s is safe.
 APPLY_WINDOW_SEC = 60
+_log = logging.getLogger("macd_bot")
+LEDGER_WRITE_TIMEOUT_SEC = 8.0   # big blob on a ~250 ms RTT link; 2.0 s default timed out
 
 def _matches_scope(row: dict, scope: Optional[dict]) -> bool:
     """True if `row` falls inside the repair's affected subset.
@@ -123,17 +126,25 @@ async def _load_ledger_strict(sdb) -> List[dict]:
         raise ValueError("repair ledger: payload is not a list")
     return data
 
-async def _save_ledger(sdb, entries: List[dict]) -> None:
+async def _save_ledger(sdb, entries: List[dict]) -> bool:
+    """True only when Redis confirmed the write. A caller must never report a
+    repair as recorded when the ledger did not persist it."""
     entries = entries[:LEDGER_MAX]
-    await sdb.set_metadata(LEDGER_KEY, json_dumps(entries),
-                            ttl=LEDGER_TTL_DAYS * 86400)
+    blob = json_dumps(entries)
+    ok = bool(await sdb.set_metadata(LEDGER_KEY, blob,
+                                     timeout=LEDGER_WRITE_TIMEOUT_SEC,
+                                     ttl=LEDGER_TTL_DAYS * 86400))
+    if not ok:
+        _log.warning(
+            f"Repair ledger NOT stored: Redis did not confirm the write "
+            f"({len(entries)} entries, {len(blob)} bytes)"
+        )
+    return ok
 
-async def record_repair_issued(sdb, rec: Dict[str, Any], snapshot: Dict[str, Any], real_rows: Optional[List[dict]] = None) -> Optional[str]:
-    """Call once per emitted repair. snapshot carries the pre-repair metrics
-    the verdict will be measured against. When `real_rows` is supplied and
-    the repair carries a `scope`, also stores scope_wr/scope_n — the WR of
-    the affected subset right now, which the verdict will be compared to."""
-    ts = int(time.time())
+def _build_entry(rec: Dict[str, Any], snapshot: Dict[str, Any],
+                 real_rows: Optional[List[dict]], ts: int) -> Tuple[str, dict]:
+    """Pure: no I/O. Same ID and entry shape as before, so a retry inside the
+    same 15m bucket still refreshes the same row instead of forking history."""
     rid = _repair_id(rec, ts)
     scope = rec.get("scope")
     snapshot = dict(snapshot)
@@ -143,7 +154,7 @@ async def record_repair_issued(sdb, rec: Dict[str, Any], snapshot: Dict[str, Any
             snapshot["scope_wr"] = scope_wr
             snapshot["scope_n"] = scope_n
             snapshot["scope_ev"] = scope_ev
-    entry = {
+    return rid, {
         "id": rid,
         "issued_at": ts,
         "type": rec.get("type"),
@@ -158,22 +169,46 @@ async def record_repair_issued(sdb, rec: Dict[str, Any], snapshot: Dict[str, Any
         "verdict": None,
         "delta_observed": None,
     }
+
+async def record_repairs_issued(sdb, items: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+                                real_rows: Optional[List[dict]] = None) -> List[Optional[str]]:
+    """Batch of record_repair_issued: ONE ledger read + ONE ledger write for the
+    whole repair shop instead of one round trip per repair. `items` is a list of
+    (rec, snapshot) pairs in emission order. Returns one repair id per item, in
+    the same order; every element is None when Redis did not confirm the write,
+    so a caller can never attach an id that was never stored."""
+    if not items:
+        return []
     if sdb.degraded or not sdb._redis:
-        return None
+        return [None] * len(items)
     try:
         entries = await _load_ledger_strict(sdb)
     except Exception:
-        return None
-    # If this repair was already issued in the same 15m bucket, refresh it
-    # rather than duplicating.
-    for i, e in enumerate(entries):
-        if e["id"] == rid:
-            entries[i] = entry
-            await _save_ledger(sdb, entries)
-            return rid
-    entries.insert(0, entry)
-    await _save_ledger(sdb, entries)
-    return rid
+        return [None] * len(items)
+    ts = int(time.time())
+    pos = {e["id"]: i for i, e in enumerate(entries) if isinstance(e, dict) and e.get("id")}
+    fresh: Dict[str, dict] = {}
+    rids: List[Optional[str]] = []
+    for rec, snapshot in items:
+        rid, entry = _build_entry(rec, snapshot, real_rows, ts)
+        rids.append(rid)
+        if rid in pos:
+            entries[pos[rid]] = entry          # same 15m bucket: refresh in place
+        else:
+            fresh[rid] = entry
+    if fresh:
+        entries = list(reversed(fresh.values())) + entries   # newest first, as before
+    if not await _save_ledger(sdb, entries):
+        return [None] * len(items)
+    return rids
+
+async def record_repair_issued(sdb, rec: Dict[str, Any], snapshot: Dict[str, Any], real_rows: Optional[List[dict]] = None) -> Optional[str]:
+    """Call once per emitted repair. snapshot carries the pre-repair metrics
+    the verdict will be measured against. When `real_rows` is supplied and
+    the repair carries a `scope`, also stores scope_wr/scope_n — the WR of
+    the affected subset right now, which the verdict will be compared to.
+    Thin wrapper over record_repairs_issued: None when the write did not land."""
+    return (await record_repairs_issued(sdb, [(rec, snapshot)], real_rows=real_rows))[0]
 
 async def mark_plan_applied(sdb, plan_ts: int, repair_ids: Optional[List[str]] = None) -> int:
     """Called by apply_pending_plan. With `repair_ids`, marks exactly those
@@ -197,8 +232,8 @@ async def mark_plan_applied(sdb, plan_ts: int, repair_ids: Optional[List[str]] =
         if hit:
             e["applied_at"] = now
             n += 1
-    if n:
-        await _save_ledger(sdb, entries)
+    if n and not await _save_ledger(sdb, entries):
+        return 0
     return n
 
 async def record_applied_alert_toggles(sdb, toggles: List[Tuple[str, str]], real_rows: Optional[List[dict]] = None) -> int:
@@ -238,8 +273,8 @@ async def record_applied_alert_toggles(sdb, toggles: List[Tuple[str, str]], real
         })
         known.add(rid)
         added += 1
-    if added:
-        await _save_ledger(sdb, entries)
+    if added and not await _save_ledger(sdb, entries):
+        return 0
     return added
 
 def _row_rejection(r: dict) -> Optional[str]:

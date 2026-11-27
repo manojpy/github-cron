@@ -1899,45 +1899,6 @@ async def run_once() -> Optional[bool]:
             if lock is not None else None
         )
 
-        if os.getenv("CLEAR_REDIS", "false").lower() == "true":
-            if sdb and not sdb.degraded:
-                logger_run.warning("🚨 CLEAR_REDIS requested — purging ALL Redis states...")
-                _reset_prefetch_ok = False  # purge removes the marker: re-read it later
-
-                st, dd, pend, sp, ast, sst, shc, strm, dcache = await _clear_all_redis_states(
-                    sdb, pairs_to_process, logger_run,
-                    clear_active_states=True,
-                    clear_dedups=True,
-                    clear_pending_outcomes=True,
-                    clear_shadow_pending=True,
-                    clear_alert_stats=True,
-                    clear_shadow_stats=True,
-                    clear_outcome_streams=True,
-                    clear_daily_cache=True,
-                    clear_brain_derived=True,
-                )
-                parts = []
-                if st: parts.append(f"States: {st}")
-                if dd: parts.append(f"Dedups: {dd}")
-                if pend: parts.append(f"Pending: {pend}")
-                if sp: parts.append(f"ShadowPending: {sp}")
-                if ast: parts.append(f"AlertStats: {ast}")
-                if sst: parts.append(f"ShadowStats: {sst}")
-                if shc: parts.append(f"ShadowHiConf: {shc}")
-                if strm: parts.append(f"Streams: {strm}")
-                if dcache: parts.append(f"DailyCache: {dcache}")
-                cleared_str = " | ".join(parts) if parts else "Nothing cleared"
-
-                if telegram_queue is None:
-                    telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
-                await telegram_queue.send(escape_markdown_v2(
-                    f"🧹 {cfg.BOT_NAME} Redis purge {'PARTIAL' if getattr(sdb, '_last_purge_incomplete', None) else 'complete'}\n"
-                    f"{cleared_str}\n"
-                    f"Time: {format_ist_time()}"
-                ))
-            else:
-                logger_run.error("CLEAR_REDIS=true but Redis is unavailable/degraded")
-
         if os.getenv("REDIS_INVENTORY", "false").lower() == "true":
             if sdb and not sdb.degraded:
                 try:
@@ -1950,34 +1911,6 @@ async def run_once() -> Optional[bool]:
                     logger_run.warning(f"Redis inventory failed: {e}")
             else:
                 logger_run.error("REDIS_INVENTORY=true but Redis is unavailable/degraded")
-
-        if os.getenv("CLEAR_KILL_SWITCH", "false").lower() == "true":
-            if sdb and not sdb.degraded:
-                logger_run.warning("🔓 CLEAR_KILL_SWITCH requested — manually clearing kill switch...")
-                try:
-                    brain_for_clear = BrainEngine(sdb)
-                    cleared = await brain_for_clear.clear_kill_switch()
-                except Exception as e:
-                    logger_run.error(
-                        f"Kill switch clear raised an exception: {e}"
-                    )
-                    cleared = False
-
-                if telegram_queue is None:
-                    telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
-                if cleared:
-                    await telegram_queue.send(escape_markdown_v2(
-                        f"🔓 {cfg.BOT_NAME} Kill switch manually cleared\n"
-                        f"Time: {format_ist_time()}"
-                    ))
-                else:
-                    logger_run.error("CLEAR_KILL_SWITCH=true but clear failed (see logs above)")
-                    await telegram_queue.send(escape_markdown_v2(
-                        f"⚠️ {cfg.BOT_NAME} Kill switch clear FAILED — check Redis/logs\n"
-                        f"Time: {format_ist_time()}"
-                    ))
-            else:
-                logger_run.error("CLEAR_KILL_SWITCH=true but Redis is unavailable/degraded")
 
         if sdb.degraded and not sdb.degraded_alerted:
             logger_run.critical(
@@ -2278,33 +2211,9 @@ async def run_once() -> Optional[bool]:
             elif redis_mem_pct >= 80:
                 logger_run.warning(f"⚠️ Redis/Valkey memory high — {redis_mem_pct}% of plan limit")
 
-        if cfg.ENABLE_BRAIN and not _ALERT_ONLY_MODE:
-            try:
-                brain = BrainEngine(sdb)
-                # Alerts are already sent. Give the report only the time left before the
-                # hard deadline, so a slow report cannot turn a good run into a failed one.
-                _budget = float(cfg.RUN_TIMEOUT_SECONDS) - (time.time() - start_time) - 20.0
-                if _budget < 30.0:
-                    logger_run.warning(
-                        f"🧠 Brain report skipped: only {max(_budget, 0):.0f}s left before the run deadline"
-                    )
-                elif getattr(cfg, "BRAIN_REPORT_ON_DEMAND", False):
-                    logger_run.info("🧠 Brain report on demand requested — forcing report generation...")
-                    await asyncio.wait_for(
-                        brain.send_report_now(pairs_to_process, telegram_queue, logger_run),
-                        timeout=_budget,
-                    )
-                else:
-                    await asyncio.wait_for(
-                        brain.maybe_generate_report(pairs_to_process, telegram_queue, logger_run),
-                        timeout=_budget,
-                    )
-            except asyncio.TimeoutError:
-                logger_run.warning("🧠 Brain report timed out — alerts were already delivered; report skipped this run")
-            except Exception as e:
-                logger_run.warning(f"Brain report generation failed: {e}")
-        elif _ALERT_ONLY_MODE:
-            logger_run.info("🧠 Brain analysis skipped (alert-only mode)")
+        # The Brain report no longer runs here: the learner workflow generates it
+        # (see learner.py --brain-report / BRAIN_REPORT_EVERY_HOURS), so this run ends
+        # right after the alerts are delivered.
 
         if getattr(cfg, "ENABLE_RUN_DIAGNOSTIC_TELEGRAM", False):
             try:
@@ -2450,6 +2359,108 @@ try:
 except ImportError:
     logger.info(f"❌ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
+async def run_maintenance(clear_redis: bool, clear_kill_switch: bool) -> bool:
+    """One-shot maintenance, started by the 'Cleanup outcome archives' workflow
+    (--clear-redis / --clear-kill-switch). These used to be toggles on the 15-minute
+    alert run; they now run in their own short job so the alert run stays lean.
+    Holds the same run lock as the alert run, so a purge never interleaves with one."""
+    sdb = RedisStateStore(cfg.REDIS_URL)
+    await sdb.connect()
+    lock: Optional[RedisLock] = None
+    ok = True
+    telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+    try:
+        if sdb.degraded or not sdb._redis:
+            logger_main.error("Maintenance: Redis is unavailable/degraded - nothing done")
+            return False
+
+        # Wait up to ~90s for a running alert run to finish (they last about 20s).
+        lock = RedisLock(sdb._redis, "macd_bot_run", owner=sdb)
+        got = False
+        for _ in range(30):
+            got = await lock.acquire(timeout=5.0)
+            if got:
+                break
+            await asyncio.sleep(3.0)
+        if not got:
+            logger_main.error(
+                "Maintenance: could not take the run lock within ~90s "
+                "(an alert run is busy, or Redis errored) - nothing done"
+            )
+            return False
+
+        if clear_redis:
+            logger_main.warning("🚨 --clear-redis requested — purging outcomes + Brain-derived state...")
+            try:
+                st, dd, pend, sp, ast, sst, shc, strm, dcache = await _clear_all_redis_states(
+                    sdb, list(cfg.PAIRS), logger_main,
+                    clear_active_states=True,
+                    clear_dedups=True,
+                    clear_pending_outcomes=True,
+                    clear_shadow_pending=True,
+                    clear_alert_stats=True,
+                    clear_shadow_stats=True,
+                    clear_outcome_streams=True,
+                    clear_daily_cache=True,
+                    clear_brain_derived=True,
+                )
+                parts = []
+                if st: parts.append(f"States: {st}")
+                if dd: parts.append(f"Dedups: {dd}")
+                if pend: parts.append(f"Pending: {pend}")
+                if sp: parts.append(f"ShadowPending: {sp}")
+                if ast: parts.append(f"AlertStats: {ast}")
+                if sst: parts.append(f"ShadowStats: {sst}")
+                if shc: parts.append(f"ShadowHiConf: {shc}")
+                if strm: parts.append(f"Streams: {strm}")
+                if dcache: parts.append(f"DailyCache: {dcache}")
+                cleared_str = " | ".join(parts) if parts else "Nothing cleared"
+                partial = bool(getattr(sdb, "_last_purge_incomplete", None))
+                if partial:
+                    ok = False
+                await telegram_queue.send(escape_markdown_v2(
+                    f"🧹 {cfg.BOT_NAME} Redis purge {'PARTIAL' if partial else 'complete'}\n"
+                    f"{cleared_str}\n"
+                    f"Time: {format_ist_time()}"
+                ))
+            except Exception as e:
+                ok = False
+                logger_main.error(f"Redis purge failed: {e!r}")
+
+        if clear_kill_switch:
+            logger_main.warning("🔓 --clear-kill-switch requested — manually clearing kill switch...")
+            try:
+                cleared = await BrainEngine(sdb).clear_kill_switch()
+            except Exception as e:
+                logger_main.error(f"Kill switch clear raised an exception: {e!r}")
+                cleared = False
+            if cleared:
+                await telegram_queue.send(escape_markdown_v2(
+                    f"🔓 {cfg.BOT_NAME} Kill switch manually cleared\n"
+                    f"Time: {format_ist_time()}"
+                ))
+            else:
+                ok = False
+                logger_main.error("Kill switch clear failed (see logs above)")
+                await telegram_queue.send(escape_markdown_v2(
+                    f"⚠️ {cfg.BOT_NAME} Kill switch clear FAILED — check Redis/logs\n"
+                    f"Time: {format_ist_time()}"
+                ))
+        return ok
+    finally:
+        if lock is not None:
+            try:
+                await lock.release()
+            except Exception as e:
+                logger_main.warning(f"Maintenance: lock release failed: {e!r}")
+        try:
+            await asyncio.wait_for(sdb.close(), timeout=3.0)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(SessionManager.close_session(), timeout=5.0)
+        except Exception:
+            pass
 
 def run_async(coro):
     """asyncio.run() using uvloop's loop factory instead of a global policy.
@@ -2504,6 +2515,10 @@ if __name__ == "__main__":
     parser.add_argument("--validate-only", action="store_true", help="Validate config and exit")
     parser.add_argument("--skip-warmup", action="store_true", help="Skip Numba JIT warmup")
     parser.add_argument("--apply-brain", action="store_true", help="Apply the last Brain action plan and exit")
+    parser.add_argument("--clear-redis", action="store_true",
+                        help="Purge outcomes + Brain-derived Redis state and exit (used by the cleanup workflow)")
+    parser.add_argument("--clear-kill-switch", action="store_true",
+                        help="Clear the kill switch and exit (used by the cleanup workflow)")
     parser.add_argument("--alert-only", action="store_true",
                         help="Run ONLY the alert path (fetch → evaluate → resolve → dispatch). "
                              "Skips Brain analysis entirely. "
@@ -2540,6 +2555,10 @@ if __name__ == "__main__":
                 await sdb.close()
 
         success = run_async(apply_brain_and_exit())
+        sys.exit(0 if success else 1)
+
+    if args.clear_redis or args.clear_kill_switch:
+        success = run_async(run_maintenance(args.clear_redis, args.clear_kill_switch))
         sys.exit(0 if success else 1)
 
     if args.alert_only:

@@ -20,7 +20,7 @@ from threshold_engine import (
     compare_config_versions,
 )
 from repair_ledger import (
-    record_repair_issued,
+    record_repairs_issued,
     evaluate_pending_repairs,
     repair_success_rates,
     ledger_stats,
@@ -281,6 +281,7 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
     # BRAIN_REPAIR_SHOP_MAX is applied inside repair_shop_diagnosis(), which keeps every
     # critical repair plus the two categories that drive automatic follow-ups
     # (revert-patch proposal, root-cause weight cut). The list is not cut again here.
+    _ledger_items: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     for repair in repairs:
         wrapped = {
             "type": "repair_shop",
@@ -309,26 +310,30 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
         if cat in self._repair_help_preds:
             wrapped["p_helps_learned"] = self._repair_help_preds[cat]
 
-        # ── Ledger: record the issue with a pre-repair snapshot.
-        # real_rows lets the ledger compute scope_wr/scope_n so the
-        # verdict later compares like-for-like on the affected subset
-        # rather than the whole book. ──
-        try:
-            snapshot = {
-                "overall_wr": (sum(1 for r in real_rows if r["win"]) / len(real_rows))
-                               if real_rows else None,
-                "n": len(real_rows),
-                "net_ev": ai_metrics.get("net_ev"),
-                "brier": ai_metrics.get("brier_score"),
-            }
-            rid = await record_repair_issued(
-                self.sdb, wrapped, snapshot, real_rows=real_rows,
-            )
-            if rid:
-                wrapped["_repair_id"] = rid
-        except Exception as e:
-            audit.record_analysis_exception("repair_ledger_write", e)          
+        # ── Ledger: collect the pre-repair snapshots here, write them in ONE
+        # batch after the loop (one GET + one SET instead of one per repair).
+        # real_rows lets the ledger compute scope_wr/scope_n so the verdict
+        # later compares like-for-like on the affected subset. ──
+        snapshot = {
+            "overall_wr": (sum(1 for r in real_rows if r["win"]) / len(real_rows))
+                           if real_rows else None,
+            "n": len(real_rows),
+            "net_ev": ai_metrics.get("net_ev"),
+            "brier": ai_metrics.get("brier_score"),
+        }
+        _ledger_items.append((wrapped, snapshot))
         recommendations.append(wrapped)
+
+    if _ledger_items:
+        try:
+            _rids = await record_repairs_issued(
+                self.sdb, _ledger_items, real_rows=real_rows,
+            )
+            for _w, _rid in zip((w for w, _s in _ledger_items), _rids):
+                if _rid:
+                    _w["_repair_id"] = _rid
+        except Exception as e:
+            audit.record_analysis_exception("repair_ledger_write", e)
 
     _phase_mark("repair_shop")
 
@@ -593,7 +598,7 @@ async def build_full_recommendations(self) -> Dict[str, Any]:
 
     _phase_mark("per_alert_breakdown")
 
-    # ── Phase 2: Parameter Autopsy ───────────────────────────────
+    # ── Phase 2: Parameter Autopsy ──────────────────────────────
     if real_rows and any("context" in r for r in real_rows):
         PARAM_ALERT_MAP = {
             "buy_wick_ratio": ["strong_reversal_buy", "hist_rma_buy", "ppohist_buy", "tk_conversion_up", "kijun_cross_up"],

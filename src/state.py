@@ -807,13 +807,13 @@ class RedisStateStore:
                 # plain get/set rather than one of the batch operations.
                 await self._record_redis_failure(op_name, e)
             else:
-                logger.error(f"Redis {op_name} failed: {e}")
+                logger.error(f"Redis {op_name} failed: {e!r}")
             return None
         except Exception as e:
             if _is_quota_exceeded_error(e):
                 await self._record_redis_failure(op_name, e)
             else:
-                logger.error(f"Failed to {op_name}: {e}")
+                logger.error(f"Failed to {op_name}: {e!r}")
             return None
 
     async def get_valkey_usage_snapshot(self) -> Dict[str, Optional[float]]:

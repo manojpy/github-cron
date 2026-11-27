@@ -945,7 +945,7 @@ def online_model_for_serving(state: Optional[Dict[str, Any]]) -> Optional[Dict[s
         "provenance": "online", "base_trained_at": int(base.get("trained_at") or 0),
     }
 
-def net_ev_baseline_audit(rows: List[Row], horizon: int = 12, min_train: int = 100, min_test: int = 40, test_frac: float = 0.3, z: float = 1.645, default_cost_pct: float = 0.0) -> Dict[str, Any]:
+def net_ev_baseline_audit(rows: List[Row], horizon: int = 12, min_train: int = 100, min_test: int = 40, test_frac: float = 0.3, z: float = 1.645, default_cost_pct: float = 0.0, ds: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Does the market-state model pick better trades than simple chronological
     rules, measured in NET percent after costs on newer, unseen trades?
 
@@ -964,7 +964,12 @@ def net_ev_baseline_audit(rows: List[Row], horizon: int = 12, min_train: int = 1
     from feature_store import build_point_in_time_dataset, chronological_split
     from plan_replay import cluster_se
 
-    ds = build_point_in_time_dataset(rows, horizons=(horizon,), default_cost_pct=default_cost_pct)
+    # Reuse a dataset the caller already built (same rows, same cost, horizon
+    # present). Rebuild only when it is missing or does not match.
+    if (ds is None or not ds.get("rows")
+            or ds.get("stats", {}).get("n_input") != len(rows)
+            or horizon not in (ds["rows"][0].get("labels") or {})):
+        ds = build_point_in_time_dataset(rows, horizons=(horizon,), default_cost_pct=default_cost_pct)
     usable = [r for r in ds["rows"] if (r["labels"].get(horizon) or {}).get("net") is not None]
     train, test = chronological_split(usable, test_frac=test_frac, max_horizon=horizon)
     out: Dict[str, Any] = {"horizon": horizon, "n_train": len(train), "n_test": len(test), "feature_hash": ds.get("feature_hash"), "causal": False}
