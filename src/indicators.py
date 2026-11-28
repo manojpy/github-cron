@@ -1706,6 +1706,40 @@ def _bearish_fvg_at(h: np.ndarray, l: np.ndarray, k: int) -> bool:
         return False
     return h[k] < l[k - 2]
 
+def _pine_fvg_flags(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray):
+    """Smart Money Concepts [LuxAlgo] Fair Value Gap conditions for every bar k
+    (chart timeframe, Auto Threshold on). Returns (bull, bear) boolean arrays.
+
+        delta_per = (close[1] - open[1]) / open[1] * 100
+        threshold = ta.cum(abs(delta_per)) / bar_index * 2
+        bull = low > high[2] and close[1] > high[2] and  delta_per > threshold
+        bear = high < low[2] and close[1] < low[2]  and -delta_per > threshold
+    """
+    n = len(h)
+    bull = np.zeros(n, dtype=bool)
+    bear = np.zeros(n, dtype=bool)
+    if n < 3:
+        return bull, bear
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dp = np.full(n, np.nan, dtype=np.float64)
+        dp[1:] = (c[:-1] - o[:-1]) / o[:-1] * 100.0
+        cum = np.cumsum(np.nan_to_num(np.abs(dp), nan=0.0))
+        thr = np.full(n, np.nan, dtype=np.float64)
+        thr[1:] = cum[1:] / np.arange(1, n, dtype=np.float64) * 2.0
+        bull[2:] = (l[2:] > h[:-2]) & (c[1:-1] > h[:-2]) & (dp[2:] > thr[2:])
+        bear[2:] = (h[2:] < l[:-2]) & (c[1:-1] < l[:-2]) & (-dp[2:] > thr[2:])
+    return bull, bear
+
+def _pine_fvg_unfilled(h: np.ndarray, l: np.ndarray, k: int, end: int, is_buy: bool) -> bool:
+    """True while the FVG formed at bar k has not been removed by bar `end`.
+    Pine removes a bullish FVG when low < box bottom (= high[k-2]) and a bearish
+    FVG when high > box top (= high[k]), checked on every bar after it forms."""
+    if end <= k:
+        return True
+    if is_buy:
+        return not bool(np.any(l[k + 1:end + 1] < h[k - 2]))
+    return not bool(np.any(h[k + 1:end + 1] > h[k]))
+
 def _choch_poi_tap(o, h, l, c, br, sweep_idx, is_buy, cfg_obj):
     try:
         atr200 = calculate_atr_rma(h[:br + 1], l[:br + 1], c[:br + 1], 200)
@@ -1747,6 +1781,7 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
     scan_start = max(length, i15 - lookback - persistence)
 
     tops, btms = _get_minor_swings(h, l, length, scan_start, i15)
+    fvg_bull, fvg_bear = _pine_fvg_flags(o, h, l, c)
 
     def _nearest_before(pivots, before_idx):
         for (idx, price, piv_idx) in reversed(pivots):
@@ -1829,13 +1864,15 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
             if not _continuity_ok(sweep_idx, r):
                 continue
 
-            fvg_fn = _bullish_fvg_at if is_buy else _bearish_fvg_at
+            fvg_arr = fvg_bull if is_buy else fvg_bear
             # k = r + 1 completes the classic FVG (displacement candle in the middle), but
             # the array also holds the still-forming candle at i15 + 1. Never read past
             # i15: an FVG ending on an unclosed candle repaints between runs. A gap whose
             # third candle closes later is picked up on the next run through persistence.
+            # Pine (LuxAlgo SMC) FVG: middle-candle close beyond the gap, middle-candle body
+            # above the auto threshold, and the gap must still be unfilled at i15.
             has_fvg = any(
-                fvg_fn(h, l, k)
+                bool(fvg_arr[k]) and _pine_fvg_unfilled(h, l, k, i15, is_buy)
                 for k in range(max(sweep_idx, 2), min(r + 2, i15 + 1, len(h)))
             )
             if cfg_obj.CHOCH_REQUIRE_FVG and not has_fvg:
