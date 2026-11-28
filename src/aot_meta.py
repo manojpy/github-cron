@@ -27,7 +27,8 @@ numba_functions_shared.py and aot_build.py both import SOURCE_VERSION from
 here too, so there is exactly one place to update it.
 """
 
-SOURCE_VERSION = "2026-11-27.1"
+SOURCE_VERSION = "2026-11-28.1"
+# 2026-11-28.1: kalman_loop is now Pine-exact (error_est evolves through warm-up, first output one bar after src's first valid bar); RSI EMA uses ema_loop_pine seed.
 # 2026-11-27.1: added auto_trendline_loop (Auto Trendline [DojiEmoji], Pine-exact).
 # 2026-10-25.1: added wma_loop + hma_loop + momentum_oscillator_core (AlgoAlpha Momentum Oscillator).
 # 2026-10-24.1: added gaussian_filter_loop + efficiency_ratio_loop + gaussian_trend_line_loop (Gaussian Filter Trend).

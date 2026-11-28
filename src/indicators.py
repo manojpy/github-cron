@@ -9,7 +9,7 @@ import aot_bridge
 from bot_config import cfg, logger, Constants, CprNotReadyError, BotConfig, PAIR_ID
 
 from aot_bridge import (
-    sanitize_array_numba, ema_loop, ema_loop_alpha, kalman_loop, ema_loop_pine,
+    sanitize_array_numba, ema_loop_alpha, kalman_loop, ema_loop_pine,
     vwap_daily_loop_safe, rolling_min_max_numba, rolling_mean_numba,
     calculate_ppo_core, calculate_rsi_core, calculate_atr_rma,
     calculate_adx_core, percentile_rank_numba, dynamic_flow_direction_loop,
@@ -259,7 +259,7 @@ def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int,
 
         rsi = calculate_rsi_core(close, rsi_len)
         smooth_rsi = kalman_loop(rsi, kalman_len, 0.01, 0.1)
-        rsi_ema = ema_loop(smooth_rsi, float(ema_len))
+        rsi_ema = ema_loop_pine(smooth_rsi, float(ema_len))
         smooth_rsi = sanitize_array_numba(smooth_rsi, 50.0)
         rsi_ema    = sanitize_array_numba(rsi_ema, 50.0)
 
@@ -678,7 +678,7 @@ def calculate_rsi_guard_numpy(close: np.ndarray, rsi_len: int, kalman_len: int, 
 
         rsi = calculate_rsi_core(close, rsi_len)
         smooth_rsi = kalman_loop(rsi, kalman_len, 0.01, 0.1)
-        rsi_ema = ema_loop(smooth_rsi, float(ema_len))
+        rsi_ema = ema_loop_pine(smooth_rsi, float(ema_len))
         smooth_rsi = sanitize_array_numba(smooth_rsi, np.nan)
         rsi_ema    = sanitize_array_numba(rsi_ema, np.nan)
 

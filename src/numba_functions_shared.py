@@ -273,42 +273,40 @@ def ema_loop_alpha(data, alpha):
 
     return out
 
+
 @njit(SIG_KALMAN_LOOP, nogil=True, cache=True)
 def kalman_loop(src, length, R, Q):
-    """Kalman filter in O(n) - FIXED: applies formula on first valid bar"""
+    """Pine-exact kalman_filter(src, length, R, Q) from 'Smoothed RSI v9.0b'.
+
+    Pine keeps `var estimate = na` and runs the SAME update on every bar, even
+    while src is still na:
+        if na(estimate): estimate := src[1]
+        prediction := estimate
+        kalman_gain := error_est / (error_est + error_meas)
+        estimate := prediction + kalman_gain * (src - prediction)
+        error_est := (1 - kalman_gain) * error_est + Q / length
+    Consequences reproduced here: (a) error_est keeps evolving through the RSI
+    warm-up bars; (b) the first non-na output appears ONE bar after src's first
+    valid bar, seeded with src[1]; (c) a na src makes estimate na again, and it
+    re-seeds from src[1] on the next bar.
+    """
     n = len(src)
     result = np.full(n, np.nan, dtype=np.float64)
 
-    first_valid_idx = -1
-    for i in range(n):
-        if not np.isnan(src[i]):
-            first_valid_idx = i
-            break
-
-    if first_valid_idx == -1:
-        return result
-
-    estimate = src[first_valid_idx]
+    safe_len = float(length) if float(length) > 1.0 else 1.0
     error_est = 1.0
-    error_meas = R * (float(length) if float(length) > 1.0 else 1.0)
-    Q_div_length = Q / (float(length) if float(length) > 1.0 else 1.0)
+    error_meas = R * safe_len
+    q_div_length = Q / safe_len
+    estimate = np.nan
 
-    prediction = estimate
-    kalman_gain = error_est / (error_est + error_meas)
-    estimate = prediction + kalman_gain * (src[first_valid_idx] - prediction)
-    error_est = (1.0 - kalman_gain) * error_est + Q_div_length
-    result[first_valid_idx] = estimate
-
-    for i in range(first_valid_idx + 1, n):
-        current = src[i]
-        if np.isnan(current):
-            error_est = error_est + Q_div_length
-            result[i] = estimate
-            continue
+    for i in range(n):
+        s_prev = src[i - 1] if i > 0 else np.nan
+        if np.isnan(estimate):
+            estimate = s_prev
         prediction = estimate
         kalman_gain = error_est / (error_est + error_meas)
-        estimate = prediction + kalman_gain * (current - estimate)
-        error_est = (1.0 - kalman_gain) * error_est + Q_div_length
+        estimate = prediction + kalman_gain * (src[i] - prediction)
+        error_est = (1.0 - kalman_gain) * error_est + q_div_length
         result[i] = estimate
 
     return result

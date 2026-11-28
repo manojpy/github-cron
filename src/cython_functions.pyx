@@ -26,6 +26,7 @@ cimport numpy as np
 cimport cython
 from libc.math cimport isnan, isinf, fabs, fmax, fmin, cos, sqrt, pow
 
+cdef double NAN_D = float('nan')
 np.import_array()
 
 # ══════════════════════════════════════════════════════════════════════
@@ -315,47 +316,40 @@ def ema_loop_alpha(double[:] data, double alpha):
 # ══════════════════════════════════════════════════════════════════════
 # 7. kalman_loop
 # ══════════════════════════════════════════════════════════════════════
+
 def kalman_loop(double[:] src, int length, double R, double Q):
-    """Kalman filter in O(n) – applies formula on first valid bar."""
+    """Pine-exact kalman_filter(src, length, R, Q) from 'Smoothed RSI v9.0b'.
+
+    Pine runs the same update on every bar (even while src is na): estimate is
+    seeded from src[1] when na, error_est keeps evolving through the warm-up,
+    the first non-na output is ONE bar after src's first valid bar, and a na
+    src makes estimate na again (re-seeded from src[1] on the next bar).
+    """
     cdef int n = src.shape[0]
     cdef np.ndarray result_np = np.full(n, np.nan, dtype=np.float64)
     cdef double[:] result = result_np
-    cdef int first_valid_idx = -1
     cdef int i
-    cdef double estimate, error_est, error_meas, Q_div_length
-    cdef double prediction, kalman_gain, current
+    cdef double estimate = NAN_D
+    cdef double error_est = 1.0
+    cdef double error_meas, q_div_length
+    cdef double prediction, kalman_gain, s_prev
     cdef double length_f = <double>length
     cdef double safe_len = length_f if length_f > 1.0 else 1.0
-    for i in range(n):
-        if not isnan(src[i]):
-            first_valid_idx = i
-            break
 
-    if first_valid_idx == -1:
-        return result_np
-
-    estimate = src[first_valid_idx]
-    error_est = 1.0
     error_meas = R * safe_len
-    Q_div_length = Q / safe_len
+    q_div_length = Q / safe_len
 
-    # First bar: apply Kalman update
-    prediction = estimate
-    kalman_gain = error_est / (error_est + error_meas)
-    estimate = prediction + kalman_gain * (src[first_valid_idx] - prediction)
-    error_est = (1.0 - kalman_gain) * error_est + Q_div_length
-    result[first_valid_idx] = estimate
-
-    for i in range(first_valid_idx + 1, n):
-        current = src[i]
-        if isnan(current):
-            error_est = error_est + Q_div_length
-            result[i] = estimate
-            continue
+    for i in range(n):
+        if i > 0:
+            s_prev = src[i - 1]
+        else:
+            s_prev = NAN_D
+        if isnan(estimate):
+            estimate = s_prev
         prediction = estimate
         kalman_gain = error_est / (error_est + error_meas)
-        estimate = prediction + kalman_gain * (current - estimate)
-        error_est = (1.0 - kalman_gain) * error_est + Q_div_length
+        estimate = prediction + kalman_gain * (src[i] - prediction)
+        error_est = (1.0 - kalman_gain) * error_est + q_div_length
         result[i] = estimate
 
     return result_np
