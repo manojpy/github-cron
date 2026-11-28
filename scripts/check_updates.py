@@ -12,6 +12,8 @@ Checks
   3. uv                 the `uv==` pin in the Dockerfile vs PyPI.
   4. Debian base        the -slim-<codename> in the Dockerfile vs the newest stable Debian.
   5. GitHub Actions     every `uses: owner/repo@vN` in .github/workflows vs the latest release.
+  6. Pinned health      every exact pin (requirements.txt and `uv==`) vs PyPI: yanked, removed or
+                        carrying a known advisory TODAY, with a rollback target that was itself checked.
 
 A passing dry-run only proves the pins can be installed together. It does NOT prove the
 bot still runs: after changing anything, build the image and let build.yml's AOT smoke
@@ -42,6 +44,7 @@ from typing import Any, Dict, List, Optional, Tuple
 try:
     from packaging.requirements import Requirement
     from packaging.specifiers import SpecifierSet
+    from packaging.utils import canonicalize_name
     from packaging.version import InvalidVersion, Version
 except ImportError:
     print("Missing dependency: pip install packaging", file=sys.stderr)
@@ -333,6 +336,174 @@ def check_debian(df: str) -> Tuple[List[str], int]:
         out.append("✅ Debian base is the newest stable.")
     return out, count
 
+# ── 6. Pinned versions that turned bad after they were chosen ────────────────
+def pin_health(name: str, version: str) -> Dict[str, Any]:
+    """State of ONE exact release on PyPI today: still there, yanked, known advisories.
+
+    Uses PyPI's per-release JSON; its `vulnerabilities` list comes from the PyPA advisory database.
+    Returns exists=False when the release no longer exists (404)."""
+    data = http_json(f"https://pypi.org/pypi/{name}/{version}/json")
+    if data is None:
+        return {"exists": False, "yanked": False, "reason": "", "vulns": []}
+    info = data.get("info") or {}
+    vulns: List[Dict[str, Any]] = []
+    for v in data.get("vulnerabilities") or []:
+        if v.get("withdrawn"):
+            continue
+        text = str(v.get("summary") or v.get("details") or "").strip()
+        vulns.append({
+            "id": str(v.get("id") or "?"),
+            "fixed_in": [str(x) for x in (v.get("fixed_in") or [])],
+            "summary": (text.splitlines()[0][:110] if text else ""),
+        })
+    return {"exists": True, "yanked": bool(info.get("yanked")),
+            "reason": str(info.get("yanked_reason") or ""), "vulns": vulns}
+
+
+def previous_pins(name: str, current: str, limit: int = 40) -> List[str]:
+    """Earlier exact pins of `name` in requirements.txt, newest first.
+
+    Reads git history, so it returns [] when the checkout is shallow or not a git repo
+    (the workflow then falls back to older releases from PyPI)."""
+    try:
+        p = subprocess.run(["git", "-C", str(ROOT), "log", f"-n{limit}", "--format=%H", "--", "requirements.txt"],
+                           capture_output=True, text=True, encoding="utf-8", timeout=30)
+        if p.returncode != 0:
+            return []
+        seen: List[str] = []
+        for sha in p.stdout.split():
+            q = subprocess.run(["git", "-C", str(ROOT), "show", f"{sha}:requirements.txt"],
+                               capture_output=True, text=True, encoding="utf-8", timeout=30)
+            if q.returncode != 0:
+                continue
+            for raw in q.stdout.splitlines():
+                try:
+                    req = Requirement(raw.split("#", 1)[0].strip())
+                except Exception:
+                    continue
+                if canonicalize_name(req.name) != canonicalize_name(name):
+                    continue
+                specs = list(req.specifier)
+                if len(specs) == 1 and specs[0].operator == "==":
+                    v = specs[0].version
+                    if v != current and v not in seen:
+                        seen.append(v)
+        return seen
+    except Exception:
+        return []
+
+
+def older_stable(name: str, py_version: str, below: str, keep: int = 4) -> List[str]:
+    """Newest stable, non-yanked releases below `below` that allow `py_version` (fallback rollback candidates)."""
+    data = http_json(f"https://pypi.org/pypi/{name}/json")
+    if not data:
+        return []
+    cap = Version(below)
+    found: List[Version] = []
+    for ver_str, files in (data.get("releases") or {}).items():
+        try:
+            v = Version(ver_str)
+        except InvalidVersion:
+            continue
+        if v >= cap or v.is_prerelease or v.is_devrelease:
+            continue
+        usable = [f for f in files if not f.get("yanked")]
+        if usable and any(not f.get("requires_python") or SpecifierSet(f["requires_python"]).contains(py_version)
+                          for f in usable):
+            found.append(v)
+    return [str(v) for v in sorted(found, reverse=True)[:keep]]
+
+
+def rollback_target(name: str, current: str, py_version: str) -> Tuple[Optional[str], str]:
+    """First earlier version that is itself not yanked and has no known advisory.
+    Prefers the project's own previous pins (what actually ran before); else older PyPI releases."""
+    history = previous_pins(name, current)
+    source = "previous pin in git history"
+    if history:
+        candidates = history[:3]
+    else:
+        source = "newest older stable release on PyPI"
+        candidates = older_stable(name, py_version, current)[:3]
+    for ver in candidates:
+        try:
+            h = pin_health(name, ver)
+        except Exception:
+            continue
+        if h["exists"] and not h["yanked"] and not h["vulns"]:
+            return ver, source
+    return None, source
+
+
+def check_pinned_health(py_version: str) -> Tuple[List[str], int]:
+    pins: List[Tuple[str, str]] = []
+    req_path = ROOT / "requirements.txt"
+    if req_path.exists():
+        pins = [(r["name"], r["pinned"]) for r in read_requirements(req_path) if r["pinned"]]
+    mu = re.search(r"uv==(\d+(?:\.\d+)*)", dockerfile_text())
+    if mu:
+        pins.append(("uv", mu.group(1)))
+    if not pins:
+        return ["No exact pins found."], 0
+    out: List[str] = []
+    count = checked = 0
+    for name, ver in pins:
+        try:
+            h = pin_health(name, ver)
+        except Exception as e:
+            FAILURES.append(f"pinned-version lookup for {name}")
+            out.append(f"- `{name}=={ver}`: lookup failed ({e})")
+            continue
+        checked += 1
+        if h["exists"] and not h["yanked"] and not h["vulns"]:
+            continue
+        count += 1
+        out.append(f"### `{name}=={ver}`")
+        if not h["exists"]:
+            out.append("- ⚠️ **No longer on PyPI** (deleted). A rebuild from scratch cannot install it.")
+        if h["yanked"]:
+            out.append("- ⚠️ **Yanked** by the maintainers" + (f": {h['reason']}" if h["reason"] else "") + ".")
+        if h["vulns"]:
+            ids = ", ".join(v["id"] for v in h["vulns"][:3]) + (", …" if len(h["vulns"]) > 3 else "")
+            out.append(f"- ⚠️ **{len(h['vulns'])} known advisor{'y' if len(h['vulns']) == 1 else 'ies'}** ({ids}).")
+            clears: List[Version] = []     # per advisory, the smallest fixed version above the pin
+            unfixed = 0
+            for v in h["vulns"]:
+                above = []
+                for fx in v["fixed_in"]:
+                    try:
+                        if Version(fx) > Version(ver):
+                            above.append(Version(fx))
+                    except InvalidVersion:
+                        pass
+                if above:
+                    clears.append(min(above))
+                else:
+                    unfixed += 1
+            if clears:
+                out.append(f"- Versions at or above **{max(clears)}** clear every advisory that lists a fix"
+                           + (f"; {unfixed} list no fix above this pin" if unfixed else "") + ".")
+            elif unfixed:
+                out.append("- None of them lists a fixed version above this pin.")
+        try:
+            target, source = rollback_target(name, ver, py_version)
+        except Exception:
+            target, source = None, ""
+        if target:
+            out.append(f"- Rollback candidate: `{name}=={target}` ({source}; checked today: not yanked, no known advisory). "
+                       "Edit `requirements.txt` (`Dockerfile` for uv), then let the build gate decide:")
+            out.append("```")
+            out.append(f"- {name}=={ver}")
+            out.append(f"+ {name}=={target}")
+            out.append("```")
+        else:
+            out.append("- No clean earlier version found among the nearest candidates. Consider moving forward instead; "
+                       "see the version named above and the update table.")
+        out.append("")
+    if not count:
+        out.append(f"✅ All {checked} exact pins exist on PyPI, none is yanked, none has a known advisory.")
+    else:
+        out.append("A rollback candidate is only a package-level check. Rebuild and let `build.yml`'s smoke test decide.")
+    return out, count
 
 # ── 5. GitHub Actions ────────────────────────────────────────────────────────
 def check_actions() -> Tuple[List[str], int]:
@@ -401,6 +572,7 @@ def main() -> int:
         ("uv (Dockerfile)", lambda: check_uv(df)),
         ("Debian base (Dockerfile)", lambda: check_debian(df)),
         ("GitHub Actions", check_actions),
+        ("Pinned versions: yanked, removed or vulnerable", lambda: check_pinned_health(py_version)),
     ):
         lines, n, _ = section(title, fn)
         report += lines
