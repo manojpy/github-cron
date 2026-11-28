@@ -23,6 +23,8 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # full history, so the checker can name the previous requirements.txt pin as the rollback target
 
       - uses: actions/setup-python@v7
         with:
