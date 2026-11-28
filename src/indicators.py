@@ -787,17 +787,11 @@ def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.nd
 
         days = timestamps_daily // 86400
         current_day_number = reference_time // 86400
-        unique_days = np.unique(days)
-        past_days = unique_days[unique_days < current_day_number]
-        
-        if len(past_days) == 0:
-            logger.warning(f"No daily candles found before day #{current_day_number}")
-            return piv
-            
-        yesterday_day_number = past_days[-1]
+        # Strictly yesterday (UTC), exactly like _find_closed_daily_candle() used by CPR:
+        # a missing daily candle must fail closed (zero pivots), never fall back to an older day.
+        yesterday_day_number = current_day_number - 1
 
         yesterday_mask = (days == yesterday_day_number)
-        
         if not np.any(yesterday_mask):
             logger.warning(f"No daily candle for day #{yesterday_day_number}")
             return piv
@@ -894,7 +888,7 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['gaussian_valid_15'] = np.zeros(n_15m, dtype=bool)
             results['gaussian_line_15'] = np.full(n_15m, np.nan, dtype=np.float64)
 
-        # ── Ichimoku cloud (23/65/130/65 — cloud-cross alerts + alternate bias header) ──
+        # ── Ichimoku cloud (cloud-cross alerts + alternate bias header) ──
         # Same BIAS_ICHIMOKU_* periods as the alternate bias header in macd_unified.py.
         if cfg.ICHIMOKU_CLOUD_ENABLED:
             ichimoku = calculate_ichimoku_numpy(
@@ -917,7 +911,7 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['ichimoku_future_red'] = bool_arr.copy()
 
         # ── Tenkan/Kijun (23/65 — Tenkan/Kijun cross alerts only; the TK guard was removed) ──
-        # Same 23/65 lengths as the Ichimoku cloud above; kept as separate config keys.
+        # Separate lengths from the Ichimoku cloud above (TK 23/65 vs cloud 9/26/52/26); own config keys.
         if cfg.ENABLE_TK_CONVERSION_CROSS or cfg.ENABLE_KIJUN_CROSS:
             _, hh_tk_conv = rolling_min_max_numba(data_15m["high"], cfg.ICHIMOKU_TK_CONVERSION_PERIODS)
             ll_tk_conv, _ = rolling_min_max_numba(data_15m["low"], cfg.ICHIMOKU_TK_CONVERSION_PERIODS)

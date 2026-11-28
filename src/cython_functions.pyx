@@ -270,7 +270,7 @@ def ema_loop_pine(double[:] data, double length_float):
 
     return out_np
 
-# ════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════�����══════════
 # 6. ema_loop_alpha
 # ════════════════════════════════════════════════════════════════
 def ema_loop_alpha(double[:] data, double alpha):
@@ -374,7 +374,8 @@ def vwap_daily_loop_safe(double[:] hlc3, double[:] volumes, long long[:] timesta
             last_day = day
         cum_pv += hlc3[i] * volumes[i]
         cum_vol += volumes[i]
-        vwap[i] = cum_pv / cum_vol if cum_vol > 0.0 else hlc3[i]
+        # Pine: volSum > 0 ? pvSum / volSum : na  (no hlc3 fallback)
+        vwap[i] = cum_pv / cum_vol if cum_vol > 0.0 else NAN_D
 
     return vwap_np
 
@@ -532,7 +533,7 @@ def true_range_numba(double[:] high, double[:] low, double[:] close):
 
 # ════════════════════════════════════════════════════════════
 # 12. calculate_atr_rma
-# ════════════════════════════════════════════════════════════
+# ═════════════════════════��══════════════════════════════════
 
 def calculate_atr_rma(double[:] high, double[:] low, double[:] close, int period):
     cdef int n = close.shape[0]
@@ -570,22 +571,24 @@ def calculate_adx_core(double[:] high, double[:] low, double[:] close,
     cdef double[:] trs
     cdef double alpha_di, alpha_adx, di_diff, di_sum
     cdef double h, l, prev_h, prev_l, up, down
+    cdef double last_plus, last_minus
     cdef int i
 
     # 1. Guard first
     if di_length <= 0 or adx_length <= 0 or n < (di_length + adx_length):
         return np.full(n, np.nan, dtype=np.float64)
 
-    # 2. True Range
+    # 2. True Range. Pine ta.dmi uses ta.tr (handle_na=false): na on bar 0.
     tr_np = true_range_numba(high, low, close)
     tr = tr_np
+    tr[0] = NAN_D
 
-    # 3. Directional Movement (populate BEFORE smoothing)
-    pdm_np = np.zeros(n, dtype=np.float64)
-    mdm_np = np.zeros(n, dtype=np.float64)
+    # 3. Directional Movement (populate BEFORE smoothing). ta.change is na on
+    #    bar 0, so the RMA seeds use bars 1..di_length.
+    pdm_np = np.full(n, np.nan, dtype=np.float64)
+    mdm_np = np.full(n, np.nan, dtype=np.float64)
     plus_dm = pdm_np
     minus_dm = mdm_np
-
     for i in range(1, n):
         h = high[i]
         l = low[i]
@@ -605,20 +608,25 @@ def calculate_adx_core(double[:] high, double[:] low, double[:] close,
     mds = mds_np
     trs = trs_np
 
-    # 5. +DI / -DI
+    # 5. +DI / -DI = fixnan(100 * rma(dm) / rma(tr)): x/0 is na and fixnan
+    #    carries the last valid value; before the first valid value it stays na.
+    last_plus = NAN_D
+    last_minus = NAN_D
     for i in range(n):
-        if trs[i] > 0.0 and not isnan(trs[i]):
-            pds[i] = 100.0 * pds[i] / trs[i]
-            mds[i] = 100.0 * mds[i] / trs[i]
-        else:
-            pds[i] = 0.0
-            mds[i] = 0.0
+        if not isnan(trs[i]) and trs[i] > 0.0:
+            last_plus = 100.0 * pds[i] / trs[i]
+            last_minus = 100.0 * mds[i] / trs[i]
+        pds[i] = last_plus
+        mds[i] = last_minus
 
-    # 6. DX (reuses trs_np as scratch)
+    # 6. DX (reuses trs_np as scratch); na while +DI/-DI are na
     for i in range(n):
-        di_diff = fabs(pds[i] - mds[i])
-        di_sum = pds[i] + mds[i]
-        trs[i] = 0.0 if di_sum == 0.0 else 100.0 * di_diff / di_sum
+        if isnan(pds[i]) or isnan(mds[i]):
+            trs[i] = NAN_D
+        else:
+            di_diff = fabs(pds[i] - mds[i])
+            di_sum = pds[i] + mds[i]
+            trs[i] = 0.0 if di_sum == 0.0 else 100.0 * di_diff / di_sum
 
     # 7. ADX = Wilder smoothing of DX
     alpha_adx = 1.0 / (<double>adx_length)
@@ -804,7 +812,7 @@ def range_filter_loop(double[:] x, double[:] r):
 
 # ════════════════════════════════════════════════════════════════════
 # 18. gaussian_filter_loop — Pine: gaussianFilter(src, length, poleCount)
-# ════════════════════════════════════════════════════════════════════
+# ═════��══════════════════════════════════════════════════════════════
 def gaussian_filter_loop(double[:] src, int length, int poles):
     """4-pole cascade Gaussian filter."""
     cdef int n = src.shape[0]

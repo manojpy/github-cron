@@ -233,8 +233,8 @@ class BotConfig(BaseModel):
     SKIP_WARMUP: bool = Field(default=False)
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
     SANITIZE_BAD_CANDLES: bool = Field(default=False, description="If True, drop individual invalid candles instead of rejecting the whole fetch")
-    ICHIMOKU_CLOUD_ENABLED: bool = Field(default=True, description="Compute the Ichimoku cloud (BIAS_ICHIMOKU_* = 23/65/130/65) used by the cloud-cross alerts. It no longer votes in the cloud group (Gaussian Trend does)")
-    ENABLE_ICHIMOKU_COMMON_FILTER: bool = Field(default=False, description="When True, every buy alert additionally requires 15m close above the Ichimoku cloud (close > cloud_upper) AND future cloud green (Span A >= Span B). Every sell alert requires 15m close below the cloud (close < cloud_lower) AND future cloud red (Span A <= Span B). Uses the same 23/65/130/65 periods as ICHIMOKU_CLOUD_ENABLED. Fails closed (blocks) when cloud data is not ready.")
+    ICHIMOKU_CLOUD_ENABLED: bool = Field(default=True, description="Compute the Ichimoku cloud (BIAS_ICHIMOKU_* = 9/26/52/26) used by the cloud-cross alerts. It no longer votes in the cloud group (Gaussian Trend does)")
+    ENABLE_ICHIMOKU_COMMON_FILTER: bool = Field(default=False, description="When True, every buy alert additionally requires 15m close above the Ichimoku cloud (close > cloud_upper) AND future cloud green (Span A >= Span B). Every sell alert requires 15m close below the cloud (close < cloud_lower) AND future cloud red (Span A <= Span B). Uses the same 9/26/52/26 periods as ICHIMOKU_CLOUD_ENABLED. Fails closed (blocks) when cloud data is not ready.")
     GAUSSIAN_TREND_ENABLED: bool = Field(default=True, description="Gaussian Filter Trend (QuantAlgo Pine port) as the trend-cloud vote of the cloud group; replaces the old Ichimoku 9/26/52/26 cloud vote")
     GAUSSIAN_PRESET: Literal['Default', 'Fast Response', 'Smooth Trend'] = Field(default='Default', description="Pine preset. Anything other than Default overrides the GAUSSIAN_* length/pole/ATR/efficiency inputs below, exactly like the Pine script")
     GAUSSIAN_SOURCE: Literal['close', 'hl2', 'hlc3'] = Field(default='close', description="Price source passed through the Gaussian filter (Pine: Price Source)")
@@ -249,7 +249,7 @@ class BotConfig(BaseModel):
     GAUSSIAN_EFFICIENCY_SMOOTH: int = Field(default=5, ge=1, le=200, description="EMA length applied to the Efficiency Ratio (Pine: Efficiency Smoothing)")
     ICHIMOKU_TK_CONVERSION_PERIODS: int = Field(default=23, ge=1, le=300, description="Tenkan (conversion) length used for TK guard + cross alerts, independent of cloud conversion length")
     ICHIMOKU_TK_BASE_PERIODS: int = Field(default=65, ge=1, le=400, description="Kijun (base) length used for TK guard + cross alerts, independent of cloud base length")
-    ENABLE_BIAS_HEADER: bool = Field(default=True, description="Add the pair-universe bias bar (share of pairs in Uptrend / Downtrend / Neutral: any 2 of 3 of 1h SuperTrend pair 5/2.15 + 7/1.85, 15m Ichimoku 23/65/130/65 cloud + future cloud colour, 15m Gaussian line colour; cosmetic only, does not gate alerts) to every outgoing Telegram message")
+    ENABLE_BIAS_HEADER: bool = Field(default=True, description="Add the pair-universe bias bar (share of pairs in Uptrend / Downtrend / Neutral: any 2 of 3 of 1h SuperTrend pair 5/2.15 + 7/1.85, 15m Ichimoku cloud + future cloud colour, 15m Gaussian line colour; cosmetic only, does not gate alerts) to every outgoing Telegram message")
     ALERT_TAKE_MIN_CONVICTION: float = Field(default=70.0, ge=0.0, le=100.0, description="Telegram alert verdict: conviction % at or above which an alert reads TAKE")
     ALERT_WATCH_MIN_CONVICTION: float = Field(default=50.0, ge=0.0, le=100.0, description="Telegram alert verdict: conviction % at or above which an alert reads WATCH (below = AVOID)")
     ALERT_SHADOW_CONVICTION_CAP: float = Field(default=55.0, ge=0.0, le=100.0, description="Conviction ceiling while the only evidence is SHADOW/INSUFFICIENT, so nothing reads TAKE before it has real results")
@@ -975,7 +975,7 @@ class BotConfig(BaseModel):
         # silently NaN and its gate evaluates False for every pair.
         last_idx = Constants.FETCH_LIMIT_15M - 2
         warmups = {
-            'ICHIMOKU cloud 23/65/130/65 (SPANB+DISPLACEMENT-2)':
+            'ICHIMOKU cloud BIAS_ICHIMOKU_* (SPANB+DISPLACEMENT-2)':
                 self.BIAS_ICHIMOKU_SPANB_PERIODS + self.BIAS_ICHIMOKU_DISPLACEMENT - 2
                 if (self.ICHIMOKU_CLOUD_ENABLED or self.ENABLE_BIAS_HEADER) else 0,
             'GAUSSIAN trend (5 x LENGTH + EFF_LEN + 3 x EFF_SMOOTH + ATR_LEN)':

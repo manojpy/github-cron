@@ -327,7 +327,8 @@ def vwap_daily_loop_safe(hlc3, volumes, timestamps):
             last_day = day
         cum_pv += hlc3[i] * volumes[i]
         cum_vol += volumes[i]
-        vwap[i] = cum_pv / cum_vol if cum_vol > 0.0 else hlc3[i]
+        # Pine: volSum > 0 ? pvSum / volSum : na  (no hlc3 fallback)
+        vwap[i] = cum_pv / cum_vol if cum_vol > 0.0 else np.nan
 
     return vwap
 
@@ -489,9 +490,13 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
     if di_length <= 0 or adx_length <= 0 or n < (di_length + adx_length):
         return np.full(n, np.nan, dtype=np.float64)
 
+    # Pine ta.dmi/ADX: ta.tr (handle_na=false) is na on bar 0, and
+    # up/down = ta.change(high)/-ta.change(low) are na on bar 0, so the Wilder
+    # (RMA) seeds use bars 1..di_length, not 0..di_length-1.
     tr = true_range_numba(high, low, close)
-    plus_dm = np.zeros(n, dtype=np.float64)
-    minus_dm = np.zeros(n, dtype=np.float64)
+    tr[0] = np.nan
+    plus_dm = np.full(n, np.nan, dtype=np.float64)
+    minus_dm = np.full(n, np.nan, dtype=np.float64)
 
     for i in range(1, n):
         h = high[i]
@@ -509,19 +514,25 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
     minus_dm_smooth = ema_loop_alpha(minus_dm, alpha_di)
     tr_smooth = ema_loop_alpha(tr, alpha_di)
 
+    # plus = fixnan(100 * rma(plusDM) / rma(tr)): x/0 is na and fixnan carries
+    # the last valid value forward; before the first valid value it stays na.
+    last_plus = np.nan
+    last_minus = np.nan
     for i in range(n):
-        if tr_smooth[i] > 0.0 and not np.isnan(tr_smooth[i]):
-            plus_dm_smooth[i] = 100.0 * plus_dm_smooth[i] / tr_smooth[i]
-            minus_dm_smooth[i] = 100.0 * minus_dm_smooth[i] / tr_smooth[i]
+        if not np.isnan(tr_smooth[i]) and tr_smooth[i] > 0.0:
+            last_plus = 100.0 * plus_dm_smooth[i] / tr_smooth[i]
+            last_minus = 100.0 * minus_dm_smooth[i] / tr_smooth[i]
+        plus_dm_smooth[i] = last_plus
+        minus_dm_smooth[i] = last_minus
+
+    # dx = abs(plus - minus) / (sum == 0 ? 1 : sum); na while plus/minus are na.
+    for i in range(n):
+        if np.isnan(plus_dm_smooth[i]) or np.isnan(minus_dm_smooth[i]):
+            tr_smooth[i] = np.nan
         else:
-            plus_dm_smooth[i] = 0.0
-            minus_dm_smooth[i] = 0.0
-
-    for i in range(n):
-        di_diff = abs(plus_dm_smooth[i] - minus_dm_smooth[i])
-        di_sum = plus_dm_smooth[i] + minus_dm_smooth[i]
-        tr_smooth[i] = 0.0 if di_sum == 0.0 else 100.0 * di_diff / di_sum
-
+            di_diff = abs(plus_dm_smooth[i] - minus_dm_smooth[i])
+            di_sum = plus_dm_smooth[i] + minus_dm_smooth[i]
+            tr_smooth[i] = 0.0 if di_sum == 0.0 else 100.0 * di_diff / di_sum
     alpha_adx = 1.0 / float(adx_length)
     adx = ema_loop_alpha(tr_smooth, alpha_adx)
     return adx

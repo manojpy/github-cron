@@ -104,7 +104,7 @@ class GateResult:
     base_buy_trend: bool; base_sell_trend: bool
     rma50_15_val: float; rma200_5_val: float
 
-    # -- Gaussian trend (cloud_up/cloud_down) + Ichimoku 23/65/130/65 cloud levels (cloud-cross alerts) --
+    # -- Gaussian trend (cloud_up/cloud_down) + Ichimoku cloud levels (cloud-cross alerts) --
     cloud_up: Optional[bool]; cloud_down: Optional[bool]
     cloud_upper_val: float; cloud_lower_val: float
     cloud_upper_prev: float; cloud_lower_prev: float
@@ -702,7 +702,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData, da
         _df_cross_tf = getattr(cfg, "CROSS_ALERT_TF", "5m")
         _use_5m_df_cross = (_df_cross_tf == "5m")
 
-        # Ichimoku cloud (23/65/130/65) — used by the cloud-cross alerts only.
+        # Ichimoku cloud — used by the cloud-cross alerts only.
         if _use_5m_ichimoku_cross and i5 >= 1:
             cloud_upper_arr = gate_indicators["ichimoku_cloud_upper_5m"]
             cloud_lower_arr = gate_indicators["ichimoku_cloud_lower_5m"]

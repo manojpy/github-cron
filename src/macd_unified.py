@@ -528,7 +528,7 @@ async def compute_bias_context(prepared_tasks: List[Tuple[str, str, Dict[str, An
     """Pair-universe directional-bias pre-pass. Cosmetic only: feeds the bias line
     appended to every outgoing alert this run (cfg.ENABLE_BIAS_HEADER); never gates
     or filters an alert. See BiasContext docstring for the per-pair rule
-    (any 2 of 3: 1h SuperTrend pair, 15m Ichimoku 23/65/130/65 cloud + future
+    (any 2 of 3: 1h SuperTrend pair, 15m Ichimoku cloud + future
     cloud colour, 15m Gaussian line colour)."""
     parsed_cache = parsed_cache or {}
     up = down = neutral = 0
@@ -561,7 +561,7 @@ async def compute_bias_context(prepared_tasks: List[Tuple[str, str, Dict[str, An
                 h1_high, h1_low, h1_close,
                 cfg.BIAS_SUPERTREND_2_PERIOD, cfg.BIAS_SUPERTREND_2_FACTOR)[-1])
 
-            # ── 2) 15m Ichimoku cloud 23/65/130/65 + future cloud colour ──
+            # ── 2) 15m Ichimoku cloud + future cloud colour ──
             ichi = calculate_ichimoku_numpy(
                 pd_15m.high, pd_15m.low, pd_15m.close,
                 cfg.BIAS_ICHIMOKU_CONVERSION_PERIODS, cfg.BIAS_ICHIMOKU_BASE_PERIODS,

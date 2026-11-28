@@ -209,7 +209,7 @@ class BiasContext:
     cfg.ENABLE_BIAS_HEADER. Never gates or filters an alert.
     A pair counts as (any 2 of the 3 conditions below):
       up      - 1) 15m close above BOTH 1h SuperTrends (5/2.15 and 7/1.85)
-                2) 15m close above the 15m Ichimoku cloud (23/65/130/65) AND the
+                2) 15m close above the 15m Ichimoku cloud AND the
                    future cloud green (Span A >= Span B)
                 3) 15m Gaussian trend line green
       down    - 1) 15m close below BOTH 1h SuperTrends
